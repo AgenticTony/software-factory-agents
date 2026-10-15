@@ -1,0 +1,1145 @@
+{
+  "version": 1,
+  "project": "software-factory",
+  "updated_at": "2026-10-16T00:00:00Z",
+  "tasks": [
+    {
+      "id": "F-00",
+      "title": "Phase 0 owner prerequisites",
+      "source": "BUILD-ORDER.md#f-00--owner-prerequisites",
+      "kind": "owner_only",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [],
+      "risk": [],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [],
+      "budget": {
+        "size": "S",
+        "max_attempts": 1,
+        "max_turns": 80,
+        "wall_clock_min": 60
+      },
+      "attempts": [],
+      "links": {},
+      "owner_steps": [
+        {
+          "text": "Email Z.ai support with two questions:",
+          "done": false
+        },
+        {
+          "text": "Check the legacy term's end date on Z.ai's \"My plan\" page.",
+          "done": false
+        },
+        {
+          "text": "Check JobFinderOS's **production** env on Render for `GLM_BASE_URL`. If it's the Coding Plan endpoint (`api/coding/paas/v4`), move production to a metered key, or the Mistral-hosted path (MIG-WO5), **before F-13**.",
+          "done": false
+        },
+        {
+          "text": "Turn on branch protection on JobFinderOS `main`: PRs required, CI required, no force-push.",
+          "done": false
+        },
+        {
+          "text": "Create macOS keychain items for the live-check secrets: `JFO_PROBE_PASS`, `JFO_SUPABASE_ANON_KEY`.",
+          "done": false
+        },
+        {
+          "text": "Create the GitHub repo for the factory, private.",
+          "done": false
+        }
+      ]
+    },
+    {
+      "id": "F-01",
+      "title": "Repo scaffold",
+      "source": "BUILD-ORDER.md#f-01--repo-scaffold",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [],
+      "risk": [],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "`factory --help` lists `approve`, `run`, `loop`, `status`, `import`, `verify-live` (stubs allowed).",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f01.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "`pytest` and `ruff check` pass in CI on a PR.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f01.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "`.factory/project.yaml` for this repo validates against `schema/project.schema.json`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f01.py::test_ac_3"
+          }
+        }
+      ],
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 80,
+        "wall_clock_min": 60
+      },
+      "attempts": [],
+      "links": {}
+    },
+    {
+      "id": "F-02",
+      "title": "Contract loading and validation",
+      "source": "BUILD-ORDER.md#f-02--contract-loading-and-validation",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-01"
+      ],
+      "risk": [],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "These are rejected with a readable error:",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f02.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "`acceptance_hash` is identical when the acceptance JSON's keys are reordered, and different when any text changes.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f02.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "The `tasks.json` in this repo validates.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f02.py::test_ac_3"
+          }
+        }
+      ],
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 80,
+        "wall_clock_min": 60
+      },
+      "attempts": [],
+      "links": {}
+    },
+    {
+      "id": "F-03",
+      "title": "State machine and picker",
+      "source": "BUILD-ORDER.md#f-03--state-machine-and-picker",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-02"
+      ],
+      "risk": [],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "Every transition not in the table raises; one test per illegal edge class.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f03.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "The picker returns nothing when a writer task is `in_progress` for the repo.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f03.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "The picker respects priority, then queue order. It skips non-`ready` tasks and non-build kinds.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f03.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "A `repo:id` cross-repo dependency is never treated as met automatically.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f03.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "A task with an approved contract whose `acceptance` hash no longer matches goes back to `draft`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f03.py::test_ac_5"
+          }
+        },
+        {
+          "id": "AC-6",
+          "text": "A simulated crash mid-write leaves the previous `tasks.json` intact.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f03.py::test_ac_6"
+          }
+        }
+      ],
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      },
+      "attempts": [],
+      "links": {}
+    },
+    {
+      "id": "F-04",
+      "title": "factory approve",
+      "source": "BUILD-ORDER.md#f-04--factory-approve-id",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-03"
+      ],
+      "risk": [],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "Approving a task with no acceptance items is refused.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f04.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "After approval, the status is `ready` or `blocked` according to its dependencies.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f04.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "`--yes` is not accepted when the task has risk flags. Risk-flagged approval is always interactive.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f04.py::test_ac_3"
+          }
+        }
+      ],
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 80,
+        "wall_clock_min": 60
+      },
+      "attempts": [],
+      "links": {}
+    },
+    {
+      "id": "F-05",
+      "title": "Clone manager and sandbox",
+      "source": "BUILD-ORDER.md#f-05--clone-manager-and-sandbox",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-01"
+      ],
+      "risk": [
+        "external_service"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "A sandboxed process can't write outside the run dir.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f05.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "A sandboxed process can't read a file in `~/factory/holdouts`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f05.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "A sandboxed process can't reach a non-allowlisted domain, and can reach `api.z.ai`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f05.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "No `GH_TOKEN`/`GITHUB_TOKEN` or keychain-derived variable is visible inside the sandbox.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f05.py::test_ac_4"
+          }
+        }
+      ],
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      },
+      "attempts": [],
+      "links": {}
+    },
+    {
+      "id": "F-06",
+      "title": "Session runner (headless Claude Code on Z.ai)",
+      "source": "BUILD-ORDER.md#f-06--session-runner",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-05"
+      ],
+      "risk": [
+        "external_service"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "With a stub `claude` binary, the runner kills the session at the wall-clock limit and returns `aborted`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f06.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Malformed JSON output is reported as a failed attempt, not a crash.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f06.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "The hook blocks an Edit to a protected path inside a real session.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f06.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "A real smoke session against Z.ai completes a trivial prompt, and the recorded model name is read from the result.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f06.py::test_ac_4"
+          }
+        }
+      ],
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      },
+      "attempts": [],
+      "links": {},
+      "owner_steps": [
+        {
+          "text": "F-00 step 1 answered before AC-4 is run repeatedly or on a schedule.",
+          "done": false
+        }
+      ]
+    },
+    {
+      "id": "F-07",
+      "title": "L0 deterministic gates",
+      "source": "BUILD-ORDER.md#f-07--l0-deterministic-gates",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-02"
+      ],
+      "risk": [],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "A modified protected file → FAIL with `protected_path_touched`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f07.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "A changed dependency manifest → escalation `new_dependency`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f07.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "A touched risk path that wasn't declared → the flag is added and escalation is `risk_path_touched`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f07.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "A deleted test, or an added skip marker → FAIL.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f07.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "A pre-existing error at a baseline `file:line` doesn't fail; a new error in the same file at another line does.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f07.py::test_ac_5"
+          }
+        }
+      ],
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      },
+      "attempts": [],
+      "links": {}
+    },
+    {
+      "id": "F-08",
+      "title": "L1 red-first proof",
+      "source": "BUILD-ORDER.md#f-08--l1-red-first-proof",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-07"
+      ],
+      "risk": [],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "A fixture where the named test already passes on base → FAIL (\"test proves nothing\").",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f08.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "A proper red-first fixture → PASS.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f08.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "A contract `test` check naming a test that doesn't exist → FAIL with `contract_ambiguous`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f08.py::test_ac_3"
+          }
+        }
+      ],
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 80,
+        "wall_clock_min": 60
+      },
+      "attempts": [],
+      "links": {}
+    },
+    {
+      "id": "F-09",
+      "title": "Agent prompts + L2 review",
+      "source": "BUILD-ORDER.md#f-09--agent-prompts--l2-review",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-06"
+      ],
+      "risk": [],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "Reviewer output that isn't valid verdict JSON → treated as FAIL.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f09.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "The prompt-hash test fails if a prompt file changes without the pin being updated.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f09.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "The reviewer prompt includes the mandatory checklist from VALIDATOR-SPEC L2: real schema vs mock, scope, states, lifecycle.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f09.py::test_ac_3"
+          }
+        }
+      ],
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      },
+      "attempts": [],
+      "links": {}
+    },
+    {
+      "id": "F-10",
+      "title": "factory run / factory loop + PR creation",
+      "source": "BUILD-ORDER.md#f-10--factory-run--factory-loop--pr-creation",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-03",
+        "F-04",
+        "F-06",
+        "F-07",
+        "F-08",
+        "F-09"
+      ],
+      "risk": [
+        "deploy"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "End to end on a fixture repo, with a stub model that makes a correct change: a PR is opened and the task is `in_review` with one attempt logged.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f10.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "A stub model that fails three times → `needs_human` with `attempts_exhausted`, and no PR.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f10.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "A quota/429 error stops `loop` and marks `quota_exhausted`, with no retry.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f10.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "`loop` won't start a session during 08:00–12:00 Mon–Fri Swedish time. The window comes from config.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f10.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "The code contains no `gh pr merge` call (a grep test).",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f10.py::test_ac_5"
+          }
+        }
+      ],
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      },
+      "attempts": [],
+      "links": {}
+    },
+    {
+      "id": "F-11",
+      "title": "factory status: daily summary + metrics",
+      "source": "BUILD-ORDER.md#f-11--factory-status-daily-summary--metrics",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-03"
+      ],
+      "risk": [],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "For a fixture `tasks.json`, the summary lists every `needs_human` task with its escalation reason.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f11.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Metrics computed from `attempts` match hand-computed values for the fixture.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f11.py::test_ac_2"
+          }
+        }
+      ],
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 80,
+        "wall_clock_min": 60
+      },
+      "attempts": [],
+      "links": {}
+    },
+    {
+      "id": "F-12",
+      "title": "Importer (factory import)",
+      "source": "BUILD-ORDER.md#f-12--importer-factory-import",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-06",
+        "F-02"
+      ],
+      "risk": [],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "The output validates against the schema, or the import is refused.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f12.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Every imported task is `draft`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f12.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "Running it twice with no doc changes proposes no diff for existing tasks. Status and attempts are preserved.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f12.py::test_ac_3"
+          }
+        }
+      ],
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      },
+      "attempts": [],
+      "links": {}
+    },
+    {
+      "id": "F-13",
+      "title": "Onboard JobFinderOS (pilot)",
+      "source": "BUILD-ORDER.md#f-13--onboard-jobfinderos-pilot",
+      "kind": "owner_only",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-00",
+        "F-10",
+        "F-11",
+        "F-12"
+      ],
+      "risk": [
+        "cross_repo"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [],
+      "budget": {
+        "size": "S",
+        "max_attempts": 1,
+        "max_turns": 80,
+        "wall_clock_min": 60
+      },
+      "attempts": [],
+      "links": {},
+      "owner_steps": [
+        {
+          "text": "Readiness run: every `project.yaml` command passes unattended on a clean clone.",
+          "done": false
+        },
+        {
+          "text": "Resolve every `TODO(verify)` in `projects/jobfinderos.project.yaml`; commit it as `JobFinderOS/.factory/project.yaml`.",
+          "done": false
+        },
+        {
+          "text": "Run `factory import`; read the full diff line by line; commit.",
+          "done": false
+        },
+        {
+          "text": "Approve 2–3 self-contained build WOs, not WO-13/16/17 (payments), WO-27 (decision) or WO-29/30 (research-gated).",
+          "done": false
+        },
+        {
+          "text": "Run `factory run` once, watching. Merge or reject the PR yourself.",
+          "done": false
+        }
+      ]
+    },
+    {
+      "id": "F-14",
+      "title": "L4 verify-live + merged/deployed tracking",
+      "source": "BUILD-ORDER.md#f-14--l4-verify-live--mergeddeployed-tracking",
+      "kind": "build",
+      "priority": "P2",
+      "status": "draft",
+      "depends_on": [
+        "F-10"
+      ],
+      "risk": [
+        "deploy"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "A failing live check → revert PR opened, task `needs_human`, queue paused.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f14.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "A task can't reach `done` without a recorded L4 PASS.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f14.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "Secrets never appear in logs or the summary (a test with a canary value).",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f14.py::test_ac_3"
+          }
+        }
+      ],
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      },
+      "attempts": [],
+      "links": {}
+    },
+    {
+      "id": "F-15",
+      "title": "L3 holdout runner",
+      "source": "BUILD-ORDER.md#f-15--l3-holdout-runner",
+      "kind": "build",
+      "priority": "P2",
+      "status": "draft",
+      "depends_on": [
+        "F-10"
+      ],
+      "risk": [],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "A holdout FAIL blocks the PR.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f15.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Holdout files are absent from every run dir and every prompt (a test).",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f15.py::test_ac_2"
+          }
+        }
+      ],
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      },
+      "attempts": [],
+      "links": {}
+    },
+    {
+      "id": "F-16",
+      "title": "Seeded-bug validator eval",
+      "source": "BUILD-ORDER.md#f-16--seeded-bug-validator-eval",
+      "kind": "build",
+      "priority": "P2",
+      "status": "draft",
+      "depends_on": [
+        "F-07",
+        "F-08",
+        "F-09"
+      ],
+      "risk": [],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "The report shows the catch rate per layer for a fixture set of seeded bugs.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f16.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "The phantom-table seed is caught by L0 or L2 on the SoloAdventurer fixture.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f16.py::test_ac_2"
+          }
+        }
+      ],
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      },
+      "attempts": [],
+      "links": {}
+    },
+    {
+      "id": "F-17",
+      "title": "Onboard SoloAdventurer Web",
+      "source": "BUILD-ORDER.md#f-17--onboard-soloadventurer-web",
+      "kind": "owner_only",
+      "priority": "P3",
+      "status": "draft",
+      "depends_on": [
+        "F-13",
+        "F-14",
+        "F-15"
+      ],
+      "risk": [
+        "cross_repo"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [],
+      "budget": {
+        "size": "S",
+        "max_attempts": 1,
+        "max_turns": 80,
+        "wall_clock_min": 60
+      },
+      "attempts": [],
+      "links": {}
+    },
+    {
+      "id": "F-18",
+      "title": "Triage quarantine + first watcher",
+      "source": "BUILD-ORDER.md#f-18--triage-quarantine--first-watcher",
+      "kind": "build",
+      "priority": "P3",
+      "status": "draft",
+      "depends_on": [
+        "F-14"
+      ],
+      "risk": [
+        "external_service"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "The triage session's sandbox has no repo write access and no GitHub token.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f18.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Its output is schema-valid draft tasks only. Free text never reaches an implementer.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f18.py::test_ac_2"
+          }
+        }
+      ],
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      },
+      "attempts": [],
+      "links": {}
+    },
+    {
+      "id": "F-19",
+      "title": "Meta loop (delta edits to prompts)",
+      "source": "BUILD-ORDER.md#f-19--meta-loop",
+      "kind": "build",
+      "priority": "P3",
+      "status": "draft",
+      "depends_on": [
+        "F-11",
+        "F-16"
+      ],
+      "risk": [],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "A PR that touches validators, holdouts, contract tests or schemas is rejected by L0.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f19.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Edits are additions, removals or changes to individual items, never whole-file rewrites (a diff-size check).",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f19.py::test_ac_2"
+          }
+        }
+      ],
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      },
+      "attempts": [],
+      "links": {}
+    },
+    {
+      "id": "F-20",
+      "title": "Cross-provider reviewer",
+      "source": "BUILD-ORDER.md#f-20--cross-provider-reviewer",
+      "kind": "build",
+      "priority": "P3",
+      "status": "draft",
+      "depends_on": [
+        "F-09"
+      ],
+      "risk": [
+        "external_service"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "A risk-flagged task's PR shows two independent verdicts.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f20.py::test_ac_1"
+          }
+        }
+      ],
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 80,
+        "wall_clock_min": 60
+      },
+      "attempts": [],
+      "links": {}
+    },
+    {
+      "id": "F-21",
+      "title": "Per-category auto-merge",
+      "source": "BUILD-ORDER.md#f-21--per-category-auto-merge",
+      "kind": "build",
+      "priority": "P3",
+      "status": "draft",
+      "depends_on": [
+        "F-16",
+        "F-20"
+      ],
+      "risk": [
+        "deploy"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "The schema still rejects auto-merge on any risk-flagged task.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f21.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Auto-merge switches off automatically if the category's revert rate crosses the threshold.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f21.py::test_ac_2"
+          }
+        }
+      ],
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      },
+      "attempts": [],
+      "links": {}
+    }
+  ]
+}

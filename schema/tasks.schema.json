@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factory.local/schema/tasks.schema.json",
+  "title": "Factory task queue (.factory/tasks.json)",
+  "description": "Written only by the orchestrator. Agents read the task they are assigned; they never write this file. See TASK-CONTRACT.md.",
+  "type": "object",
+  "required": ["version", "project", "tasks"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "const": 1 },
+    "project": { "type": "string", "description": "Matches project.yaml `name`." },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "tasks": { "type": "array", "items": { "$ref": "#/$defs/task" } }
+  },
+  "$defs": {
+    "status": {
+      "enum": ["draft", "blocked", "ready", "in_progress", "in_review", "deploying", "awaiting_owner", "needs_human", "done", "not_buildable"]
+    },
+    "risk_flag": {
+      "enum": ["auth", "payments", "rls", "migration", "safety", "privacy", "new_dependency", "deploy", "cross_repo", "external_service"]
+    },
+    "escalation": {
+      "enum": ["attempts_exhausted", "budget_exhausted", "risk_path_touched", "new_dependency", "protected_path_touched", "contract_ambiguous", "quota_exhausted", "live_check_failed", "cross_repo"]
+    },
+    "check": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "enum": ["test", "command", "holdout", "prod_probe", "manual"] },
+        "ref": { "type": "string", "description": "test node id, command, holdout scenario id, or live_checks key" },
+        "expect": { "type": "string", "description": "Optional expected output/exit description" }
+      },
+      "allOf": [
+        { "if": { "properties": { "type": { "not": { "const": "manual" } } } }, "then": { "required": ["type", "ref"] } }
+      ]
+    },
+    "acceptance_item": {
+      "type": "object",
+      "required": ["id", "text", "check"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^AC-[0-9]+$" },
+        "text": { "type": "string" },
+        "check": { "$ref": "#/$defs/check" }
+      }
+    },
+    "slice": {
+      "type": "object",
+      "required": ["id", "text", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "text": { "type": "string" },
+        "status": { "enum": ["todo", "in_progress", "in_review", "merged", "failed"] },
+        "acceptance_ids": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "attempt": {
+      "type": "object",
+      "required": ["run_id", "slice_id", "started", "outcome"],
+      "additionalProperties": false,
+      "properties": {
+        "run_id": { "type": "string" },
+        "slice_id": { "type": "string" },
+        "model": { "type": "string", "description": "Model per seat, e.g. implementer=glm-5.3 verifier=glm-5.3" },
+        "started": { "type": "string", "format": "date-time" },
+        "ended": { "type": "string", "format": "date-time" },
+        "outcome": { "enum": ["pass", "fail", "escalated", "aborted"] },
+        "rounds": { "type": "integer", "minimum": 0 },
+        "turns": { "type": "integer", "minimum": 0 },
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "pr": { "type": "string" },
+        "validator_report": { "type": "string", "description": "Path to the stored validator report" },
+        "escalation": { "$ref": "#/$defs/escalation" },
+        "note": { "type": "string" }
+      }
+    },
+    "task": {
+      "type": "object",
+      "required": ["id", "title", "source", "kind", "priority", "status", "depends_on", "risk", "gates", "acceptance", "budget"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "source": { "type": "string", "description": "Repo-relative path + optional #heading of the doc that owns the spec" },
+        "kind": { "enum": ["build", "docs", "decision", "research", "owner_only"] },
+        "priority": { "enum": ["P1", "P2", "P3"] },
+        "status": { "$ref": "#/$defs/status" },
+        "depends_on": { "type": "array", "items": { "type": "string", "description": "Task id, or repo:id for cross-repo" } },
+        "risk": { "type": "array", "items": { "$ref": "#/$defs/risk_flag" }, "uniqueItems": true },
+        "gates": {
+          "type": "object",
+          "required": ["spec_approval", "merge", "deploy"],
+          "additionalProperties": false,
+          "properties": {
+            "spec_approval": { "type": "boolean" },
+            "merge": { "enum": ["human", "auto"] },
+            "deploy": { "enum": ["human", "auto"] }
+          }
+        },
+        "acceptance": { "type": "array", "items": { "$ref": "#/$defs/acceptance_item" } },
+        "acceptance_hash": { "type": "string", "description": "sha256 of canonical acceptance JSON, set at spec approval" },
+        "approved_by": { "type": "string" },
+        "approved_at": { "type": "string", "format": "date-time" },
+        "owner_steps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["text", "done"],
+            "additionalProperties": false,
+            "properties": { "text": { "type": "string" }, "done": { "type": "boolean" } }
+          }
+        },
+        "slices": { "type": "array", "items": { "$ref": "#/$defs/slice" } },
+        "budget": {
+          "type": "object",
+          "required": ["size", "max_attempts", "max_turns", "wall_clock_min"],
+          "additionalProperties": false,
+          "properties": {
+            "size": { "enum": ["S", "M"], "description": "L is not allowed: slice it" },
+            "max_attempts": { "type": "integer", "minimum": 1, "maximum": 3 },
+            "max_turns": { "type": "integer", "minimum": 1 },
+            "wall_clock_min": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "attempts": { "type": "array", "items": { "$ref": "#/$defs/attempt" } },
+        "links": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "pr": { "type": "string" },
+            "branch": { "type": "string" },
+            "execution_record": { "type": "string" },
+            "step": { "type": "string", "description": "e.g. SoloAdventurer execution-order step number" }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "risk": { "minItems": 1 } } },
+          "then": { "properties": { "gates": { "properties": { "merge": { "const": "human" } } } } }
+        },
+        {
+          "if": { "properties": { "status": { "enum": ["ready", "in_progress", "in_review", "deploying", "awaiting_owner", "done"] } } },
+          "then": { "required": ["acceptance_hash", "approved_at"], "properties": { "acceptance": { "minItems": 1 } } }
+        },
+        {
+          "if": { "properties": { "kind": { "enum": ["decision", "research", "owner_only"] } } },
+          "then": { "properties": { "status": { "enum": ["draft", "not_buildable", "done"] } } }
+        }
+      ]
+    }
+  }
+}

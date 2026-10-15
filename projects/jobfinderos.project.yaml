@@ -1,0 +1,95 @@
+# DRAFT adapter for JobFinderOS — the pilot project.
+# Destination: JobFinderOS/.factory/project.yaml. Validate against schema/project.schema.json.
+# Commands are copied from CLAUDE.md "Stack & run commands" and .github/workflows/ci.yml (2026-10-15).
+# Lines marked TODO(verify) are my inference, not read from the repo — confirm before onboarding.
+
+name: jobfinderos
+
+repo:
+  path: ~/Desktop/JobFinderOS
+  default_branch: main
+  remote: https://github.com/AgenticTony/JobFinderOS.git
+  merge_method: squash            # TODO(verify)
+
+commands:
+  setup: >-
+    cd backend && python3.12 -m venv .venv && .venv/bin/pip install -r requirements.dev.lock
+    && cd ../frontend && npm install --no-audit --no-fund
+  lint: cd backend && .venv/bin/ruff check --select I,F app/ tests/ scripts/   # CI's ruleset; default ruleset has ~590 pre-existing hits
+  typecheck: cd frontend && npx tsc --noEmit --noUnusedLocals --noUnusedParameters
+  test: cd backend && PYTHONPATH=. .venv/bin/python -m pytest tests/ -q          # 437 tests must be green (CLAUDE.md)
+  build: cd frontend && npm run build
+  extra:
+    frontend_unit: cd frontend && node --test 'tests/**/*.test.ts'
+    flow: cd backend && PYTHONPATH=. .venv/bin/python tests/test_flow.py
+    migration_single_head: cd backend && .venv/bin/python scripts/check_migration_drift.py --single-head-only   # TODO(verify) flag name; CI runs the full script with a prod reader role
+    dev_lock: cd backend && .venv/bin/python scripts/check_dev_lock.py
+
+# CLAUDE.md standard 8: the test database must NEVER be the live database.
+# The sandbox has no production DSN, so this is enforced structurally, not by instruction.
+
+paths:
+  risk:
+    migration: ["backend/alembic/**", "backend/app/core/database.py"]
+    auth: ["backend/app/users.py", "backend/app/core/*auth*", "frontend/**/auth/**"]   # TODO(verify) frontend auth path
+    payments: ["**/billing/**", "**/*paddle*"]                                          # WO-13/WO-16 will create these
+    deploy: ["render.yaml", "ops/**", ".github/workflows/**", "backend/Dockerfile*"]
+    external_service: ["backend/app/services/*composio*", "backend/app/services/*gmail*"]  # TODO(verify) send-from-Gmail path; fill-never-submit invariant
+    privacy: ["backend/app/core/*sentry*", "backend/app/models/**"]                     # TODO(verify)
+  protected:
+    - ".factory/**"
+    - ".github/workflows/**"
+    - "backend/tests/test_calibration.py"        # pins prompt versions; silent edits must fail CI
+    - "backend/tests/**/conftest.py"
+    - "CLAUDE.md"
+    # Per-task: the orchestrator adds the test files named in the task's acceptance checks
+    # once the contract is approved, so workers cannot weaken the tests that define "done".
+
+dependency_manifests:
+  - backend/requirements.lock
+  - backend/requirements.dev.lock
+  - backend/requirements.txt
+  - frontend/package.json
+  - frontend/package-lock.json
+
+deploy:
+  mechanism: render (backend api + hunt cron) + cloudflare-pages direct upload (frontend)
+  auto_on_merge: false           # render.yaml autoDeploy: false; Pages is NOT git-integrated
+  command: bash ops/deploy_frontend.sh   # backend: Render deploy via API — TODO(verify) the exact command the owner uses
+  notes: >-
+    Merging does not ship. Deploy debt can accumulate silently (#120/#121 were merged but not deployed).
+    The orchestrator must record "merged" and "deployed" separately and never infer one from the other.
+
+live_checks:
+  verify_deployment:
+    command: bash ops/verify_deployment.sh
+    secrets: [JFO_PROBE_PASS, JFO_SUPABASE_ANON_KEY]   # exported as PROBE_PASS / SUPABASE_ANON_KEY
+    when: every_deploy
+  migration_drift:
+    command: gh run list --workflow migration-drift.yml --branch main --limit 1 --json conclusion -q '.[0].conclusion'   # must print "success"
+    when: risk:migration
+
+holdouts:
+  dir: ~/factory/holdouts/jobfinderos      # outside the repo; agents' sandbox denies reads here
+  runner: "TODO — start with 3 scenarios: signup→first hunt; draft generated with zero fabrication flags; landing renders in /sv"
+
+docs_allowlist:
+  - fastapi.tiangolo.com
+  - docs.sqlalchemy.org
+  - alembic.sqlalchemy.org
+  - docs.pydantic.dev
+  - supabase.com
+  - nextjs.org
+  - react.dev
+  - tailwindcss.com
+  - docs.z.ai
+  - docs.composio.dev
+  - developers.cloudflare.com
+  - render.com
+
+network_allowlist:
+  - pypi.org
+  - files.pythonhosted.org
+  - registry.npmjs.org
+
+cross_repo: []

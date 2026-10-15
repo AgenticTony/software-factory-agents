@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+
+# Session/agent tooling — never part of the factory
+.remember/
+.v2c/
+.video_agent/
+out/
+
+# Factory run state (sandbox clones, execution records); tasks.json IS committed
+.factory/runs/
+
+# OS
+.DS_Store

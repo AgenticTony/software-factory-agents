@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factory.local/schema/project.schema.json",
+  "title": "Factory project profile (.factory/project.yaml)",
+  "description": "The per-project adapter. YAML on disk, validated against this schema after parsing. See TASK-CONTRACT.md §5.",
+  "type": "object",
+  "required": ["name", "repo", "commands", "paths", "deploy", "live_checks", "docs_allowlist"],
+  "additionalProperties": false,
+  "properties": {
+    "name": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+    "repo": {
+      "type": "object",
+      "required": ["path", "default_branch", "remote"],
+      "additionalProperties": false,
+      "properties": {
+        "path": { "type": "string" },
+        "default_branch": { "type": "string" },
+        "remote": { "type": "string" },
+        "merge_method": { "enum": ["squash", "merge", "rebase"] }
+      }
+    },
+    "commands": {
+      "type": "object",
+      "required": ["setup", "test"],
+      "additionalProperties": false,
+      "properties": {
+        "setup": { "type": "string" },
+        "lint": { "type": "string" },
+        "typecheck": { "type": "string" },
+        "test": { "type": "string" },
+        "build": { "type": "string" },
+        "extra": { "type": "object", "additionalProperties": { "type": "string" } }
+      }
+    },
+    "baselines": { "type": "string", "description": "Repo-relative path to a baseline file, if any" },
+    "paths": {
+      "type": "object",
+      "required": ["risk", "protected"],
+      "additionalProperties": false,
+      "properties": {
+        "risk": {
+          "type": "object",
+          "description": "risk flag -> list of globs",
+          "additionalProperties": { "type": "array", "items": { "type": "string" } }
+        },
+        "protected": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "dependency_manifests": { "type": "array", "items": { "type": "string" } },
+    "deploy": {
+      "type": "object",
+      "required": ["mechanism", "auto_on_merge"],
+      "additionalProperties": false,
+      "properties": {
+        "mechanism": { "type": "string" },
+        "auto_on_merge": { "type": "boolean" },
+        "command": { "type": "string" },
+        "notes": { "type": "string" }
+      }
+    },
+    "live_checks": {
+      "type": "object",
+      "description": "name -> {command, secrets, when}. Run by the orchestrator OUTSIDE the agent sandbox.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["command", "when"],
+        "additionalProperties": false,
+        "properties": {
+          "command": { "type": "string" },
+          "secrets": { "type": "array", "items": { "type": "string" }, "description": "Keychain item names exported as env vars" },
+          "when": { "enum": ["every_deploy", "risk:migration", "risk:rls", "risk:auth", "risk:deploy", "scheduled"] }
+        }
+      }
+    },
+    "holdouts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dir": { "type": "string" },
+        "runner": { "type": "string" }
+      }
+    },
+    "docs_allowlist": { "type": "array", "items": { "type": "string" } },
+    "network_allowlist": { "type": "array", "items": { "type": "string" }, "description": "Extra domains (package registries) beyond docs_allowlist and the model endpoint" },
+    "cross_repo": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "path", "reason"],
+        "additionalProperties": false,
+        "properties": { "name": { "type": "string" }, "path": { "type": "string" }, "reason": { "type": "string" } }
+      }
+    }
+  }
+}

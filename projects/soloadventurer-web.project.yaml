@@ -1,0 +1,84 @@
+# DRAFT adapter for SoloAdventurer Web — second project, after the JobFinderOS pilot.
+# Destination: SoloAdventurerWeb/.factory/project.yaml. Validate against schema/project.schema.json.
+# Commands from package.json + CLAUDE.md (2026-10-15). TODO(verify) lines are inference.
+
+name: soloadventurer-web
+
+repo:
+  path: ~/Desktop/SoloAdventurerWeb
+  default_branch: main
+  remote: https://github.com/AgenticTony/soloadventurer_web_app.git
+  merge_method: squash             # CLAUDE.md "Merge method: squash"
+
+commands:
+  setup: npm ci
+  lint: npm run lint
+  typecheck: npm run typecheck
+  test: npx jest --silent
+  build: npm run build
+  extra:
+    e2e: npm run e2e                # cypress; needs a running dev server — TODO(verify) how CI runs it
+
+baselines: .claude/state/baselines.json   # test counts + known_typecheck_errors; reuse the verifier's rules
+
+paths:
+  risk:
+    auth: ["src/middleware.ts", "src/app/(auth)/**", "src/lib/supabase/**"]       # TODO(verify) supabase client dir
+    safety: ["src/components/moderation/**", "src/contexts/PrivacyContext.tsx", "**/*report*", "**/*block*"]
+    privacy: ["src/app/profile/**", "src/lib/api.ts"]
+    rls: ["supabase/**"]
+    deploy: [".github/workflows/**", "next.config.js", "vercel.json"]
+  protected:
+    - ".factory/**"
+    - ".claude/state/**"
+    - ".github/workflows/**"
+    - "docs/sprints/**"            # implementer.md already forbids editing these
+    - "CLAUDE.md"
+    - "jest.setup.ts"
+    - "__mocks__/**"               # the mocked-Supabase class of false-green; changes need a human
+
+dependency_manifests: [package.json, package-lock.json]
+
+deploy:
+  mechanism: vercel git integration
+  auto_on_merge: true            # merging IS deploying — the merge gate is the deploy gate
+  notes: >-
+    Until auto-deploy is replaced by manual promotion, every merge is a production release.
+    Keep gates.merge = human for all tasks.
+
+live_checks:
+  health:
+    command: curl -sf https://www.soloadventurer.travel/api/waitlist
+    when: every_deploy
+  vercel_status:
+    command: vercel ls --prod
+    when: every_deploy
+  preflight:
+    command: python ~/Desktop/SoloAdventurer_app/scripts/preflight.py   # diffs DEPLOYED Supabase project vs repo
+    secrets: [SA_SUPABASE_ACCESS_TOKEN]                                 # TODO(verify) what preflight.py needs
+    when: risk:rls
+  schema_refs:
+    command: python ~/Desktop/SoloAdventurer_app/scripts/check-schema-refs.py   # phantom-table ratchet — TODO(verify) it scans web too
+    when: every_deploy
+
+holdouts:
+  dir: ~/factory/holdouts/soloadventurer-web
+  runner: "TODO — Cypress specs against a preview deploy: sign in; block a user (row lands in `blocks`); report a message (row lands in `reports`); join waitlist"
+
+docs_allowlist:
+  - nextjs.org
+  - react.dev
+  - supabase.com
+  - tailwindcss.com
+  - vercel.com
+  - posthog.com
+  - docs.cypress.io
+  - jestjs.io
+
+network_allowlist:
+  - registry.npmjs.org
+
+cross_repo:
+  - name: soloadventurer-mobile
+    path: ~/Desktop/SoloAdventurer_app
+    reason: Owns the shared Supabase schema, RLS, edge functions and migrations. Web only consumes. Any task that depends on or touches the backend is cross_repo → needs_human in v0.

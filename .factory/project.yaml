@@ -1,0 +1,54 @@
+# The factory's own project profile. During bootstrap (BUILD-ORDER.md F-01..F-11)
+# the repo is built interactively, one work order per session.
+name: software-factory
+
+repo:
+  path: ~/Desktop/Software_Factory_Agents
+  default_branch: main
+  remote: https://github.com/AgenticTony/software-factory-agents.git   # TODO(verify): created in F-00 step 6
+  merge_method: squash
+
+commands:
+  setup: pip install -e ".[dev]"
+  lint: ruff check .
+  test: pytest -q
+
+paths:
+  risk:
+    # Control files: touching these changes how work is chosen or judged.
+    safety: ["schema/**", "TASK-CONTRACT.md", "VALIDATOR-SPEC.md", ".factory/tasks.json"]
+    deploy: [".github/workflows/**"]
+  protected:
+    - ".factory/**"
+    - ".github/workflows/**"
+    - "schema/**"
+    - "TASK-CONTRACT.md"
+    - "VALIDATOR-SPEC.md"
+    - "CLAUDE.md"
+    # Per-task: the orchestrator adds each task's acceptance-test files once the
+    # contract is approved, so workers cannot weaken the tests that define "done".
+
+dependency_manifests:
+  - pyproject.toml
+
+deploy:
+  mechanism: none (local CLI; nothing ships)
+  auto_on_merge: false
+
+live_checks: {}   # no deployment target in v0; F-14 adds the mechanism
+
+holdouts:
+  dir: ~/factory/holdouts/software-factory
+  runner: "TODO — define with F-15"
+
+docs_allowlist:
+  - docs.python.org
+  - docs.pytest.org
+  - json-schema.org
+  - docs.z.ai
+
+network_allowlist:
+  - pypi.org
+  - files.pythonhosted.org
+
+cross_repo: []
