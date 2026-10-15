@@ -5,7 +5,7 @@ name: software-factory
 repo:
   path: ~/Desktop/Software_Factory_Agents
   default_branch: main
-  remote: https://github.com/AgenticTony/software-factory-agents.git   # TODO(verify): created in F-00 step 6
+  remote: https://github.com/AgenticTony/software-factory-agents.git
   merge_method: squash
 
 commands:
@@ -16,7 +16,7 @@ commands:
 paths:
   risk:
     # Control files: touching these changes how work is chosen or judged.
-    safety: ["schema/**", "TASK-CONTRACT.md", "VALIDATOR-SPEC.md", ".factory/tasks.json"]
+    factory_control: ["schema/**", "TASK-CONTRACT.md", "VALIDATOR-SPEC.md", ".factory/**"]
     deploy: [".github/workflows/**"]
   protected:
     - ".factory/**"

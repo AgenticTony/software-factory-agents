@@ -40,7 +40,8 @@
       "properties": {
         "risk": {
           "type": "object",
-          "description": "risk flag -> list of globs",
+          "description": "risk flag -> list of globs. Keys must be risk flags from tasks.schema.json.",
+          "propertyNames": { "enum": ["auth", "payments", "rls", "migration", "safety", "privacy", "new_dependency", "deploy", "cross_repo", "external_service", "factory_control"] },
           "additionalProperties": { "type": "array", "items": { "type": "string" } }
         },
         "protected": { "type": "array", "items": { "type": "string" } }

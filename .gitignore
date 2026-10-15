@@ -16,8 +16,8 @@ dist/
 .video_agent/
 out/
 
-# Factory run state (sandbox clones, execution records); tasks.json IS committed
-.factory/runs/
+# Run dirs live OUTSIDE the repo (~/factory/runs/, DESIGN D3) — nothing to ignore here.
+# .factory/tasks.json and .factory/project.yaml ARE committed.
 
 # OS
 .DS_Store
