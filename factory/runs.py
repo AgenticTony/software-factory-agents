@@ -125,10 +125,12 @@ def create_run(
         try:
             shutil.copytree(warm_cache, dest, dirs_exist_ok=True)
             _relocate_venv(Path(warm_cache), dest)
-            _seed_cache_excludes(dest, warm_cache)
+            _seed_run_excludes(dest, warm_cache)
         except OSError as exc:
             shutil.rmtree(dest, ignore_errors=True)
             raise RunError(f"warm cache copy from {warm_cache} into {dest} failed: {exc}")
+    else:
+        _seed_run_excludes(dest, None)
 
     settings_path = root / "sandbox" / f"{project}-{dest.name}.json"
     return RunDir(project=project, run_id=dest.name, root=dest, settings_path=settings_path)
@@ -203,24 +205,27 @@ def _relocate_venv(cache: Path, dest: Path) -> None:
                 path.write_text(text)
 
 
-def _seed_cache_excludes(dest: Path, warm_cache: Path) -> None:
-    """Add the copied cache's top-level entries to ``.git/info/exclude``.
+def _seed_run_excludes(dest: Path, warm_cache: Path | None) -> None:
+    """Anchor the run's scratch dirs — and the warm cache's top-level
+    entries, if any — in ``.git/info/exclude``.
 
     Keeps a session's ``git add -A`` from committing ``node_modules`` /
-    ``.venv`` into the PR when the target repo's .gitignore doesn't cover
-    them. Entries are anchored with a leading ``/`` so they match only at
-    the run root — a bare ``lib/`` would ignore every ``src/lib`` in the
-    repo and silently hide agent-written files from the diff. ``.git/info``
-    is sandbox-denyWritten, so the agent can't undo it.
+    ``.venv`` when the target repo's .gitignore doesn't cover them, and —
+    always — from committing the sandbox's own scratch: ``.home`` (pip/npm
+    caches, Claude Code session state and transcripts) and ``.tmp``.
+    Entries are anchored with a leading ``/`` so they match only at the run
+    root. ``.git/info`` is sandbox-denyWritten, so the agent can't undo it.
     """
     exclude = dest / ".git" / "info" / "exclude"
     exclude.parent.mkdir(parents=True, exist_ok=True)
-    entries = [
-        f"/{entry.name}" + ("/" if entry.is_dir() else "")
-        for entry in sorted(Path(warm_cache).iterdir())
-    ]
+    entries = ["/.home/", "/.tmp/"]
+    if warm_cache is not None:
+        entries += [
+            f"/{entry.name}" + ("/" if entry.is_dir() else "")
+            for entry in sorted(Path(warm_cache).iterdir())
+        ]
     with exclude.open("a") as fh:
-        fh.write("\n# factory: warm dependency cache (seeded by create_run)\n")
+        fh.write("\n# factory: run scratch (seeded by create_run)\n")
         fh.write("\n".join(entries) + "\n")
 
 

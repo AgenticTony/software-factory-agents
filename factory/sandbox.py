@@ -20,11 +20,13 @@ token or a keychain-derived variable.
 
 import json
 import os
+import select
 import shlex
 import shutil
 import signal
 import subprocess
 import sys
+import time
 from contextlib import suppress
 from functools import lru_cache
 from pathlib import Path
@@ -41,32 +43,40 @@ _FORBIDDEN_ENV_EXACT = frozenset(
 )
 _FORBIDDEN_ENV_PREFIXES = ("GH_", "GITHUB_")
 
-# The only variable names a sandboxed session may ever see. Everything else
-# is dropped on every path — ambient os.environ never crosses, and neither
-# does a caller's dict: `env={**os.environ, token}` (the obvious F-06 call)
-# leaks nothing because only these names survive the merge. Adding a name
-# here is a deliberate, reviewable act; that is the point.
+# Names a session may ever see, split by where they may come from:
+#
+# * AMBIENT_* — inherited from the orchestrator's environment. Deliberately
+#   excludes every seat/secret/git name: the orchestrator's own
+#   ANTHROPIC_* keys, or GIT_CONFIG_* set by CI, must never ride into a
+#   session by inheritance (a real Anthropic key reaching a Z.ai seat,
+#   exec-capable git config arriving unasked).
+# * SESSION_* — allowed ONLY from the caller's explicit ``env=``: the model
+#   seat (base URL, the one secret the sandbox holds, API timeout) and the
+#   git identity (the sandbox can't read ~/.gitconfig). GIT_CONFIG_* is not
+#   on any list — env-injected git config is exec-capable; `git -c` on the
+#   command line is the controlled route.
+#
+# Adding a name to either list is a deliberate, reviewable act.
+AMBIENT_ENV_ALLOWLIST = frozenset({"PATH", "LANG", "TZ"})
+AMBIENT_ENV_PREFIXES = ("LC_",)
 SESSION_ENV_ALLOWLIST = frozenset(
     {
         "PATH",
         "LANG",
         "TZ",
         "TMPDIR",
-        # the model seat (F-06): base URL, the one secret the sandbox holds
         "ANTHROPIC_BASE_URL",
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_MODEL",
         "API_TIMEOUT_MS",
-        # git identity: the sandbox cannot read ~/.gitconfig (home is denied),
-        # so identity arrives explicitly per session
         "GIT_AUTHOR_NAME",
         "GIT_AUTHOR_EMAIL",
         "GIT_COMMITTER_NAME",
         "GIT_COMMITTER_EMAIL",
     }
 )
-SESSION_ENV_PREFIXES = ("LC_", "GIT_CONFIG_")  # locales; `git -c` via env
+SESSION_ENV_PREFIXES = ("LC_",)
 
 # Seconds to wait for output after the process group is killed: pipe buffer
 # drains fast when every writer is dead; a process that escaped the group
@@ -178,33 +188,38 @@ def sandbox_env(
     extra: dict[str, str] | None = None,
     forbidden: tuple[str, ...] = (),
 ) -> dict[str, str]:
-    """Build the child env: allowlisted names only, HOME inside the run.
+    """Build the child env: ambient base + allowlisted extras, HOME inside
+    the run.
 
-    Two rules, applied to every path (ambient *and* caller-supplied):
+    Three rules, applied on every path:
 
-    * only names in :data:`SESSION_ENV_ALLOWLIST` (or the ``LC_``/
-      ``GIT_CONFIG_`` prefixes) survive — so ``extra=dict(os.environ)``
-      cannot smuggle an unlisted secret across, and neither can ambient
-      inheritance;
-    * the GitHub/forbidden scrub runs on top of the allowlist.
+    * ambient inheritance is limited to :data:`AMBIENT_ENV_ALLOWLIST`
+      (PATH/LANG/TZ and ``LC_*``) — the orchestrator's own seat keys and
+      git config never enter a session unasked;
+    * the caller's ``extra`` is limited to :data:`SESSION_ENV_ALLOWLIST`
+      (and ``LC_*``) — ``extra=dict(os.environ)`` cannot smuggle an
+      unlisted secret across, because os.environ's secret names are not on
+      the session list;
+    * the GitHub/forbidden scrub runs on top of both.
 
-    HOME points at ``<run_dir>/.home`` — a writable scratch, because the
-    real home is denyRead and every tool that touches ``~/.cache`` or
-    ``~/.config`` would otherwise fail. TMPDIR points at ``<run_dir>/.tmp``
-    (writes are allowed nowhere else).
+    HOME points at ``<run_dir>/.home`` and TMPDIR at ``<run_dir>/.tmp`` —
+    writable scratch (the real home is denyRead; writes are allowed nowhere
+    outside the run). Both are git-excluded by ``create_run``.
     """
     run_dir = Path(run_dir)
     home = run_dir / ".home"
     home.mkdir(parents=True, exist_ok=True)
     tmp = run_dir / ".tmp"
     tmp.mkdir(parents=True, exist_ok=True)
-    env: dict[str, str] = {}
-    merged = dict(os.environ)
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in AMBIENT_ENV_ALLOWLIST or key.startswith(AMBIENT_ENV_PREFIXES)
+    }
     if extra:
-        merged.update(extra)
-    for key, value in merged.items():
-        if key in SESSION_ENV_ALLOWLIST or key.startswith(SESSION_ENV_PREFIXES):
-            env[key] = value
+        for key, value in extra.items():
+            if key in SESSION_ENV_ALLOWLIST or key.startswith(SESSION_ENV_PREFIXES):
+                env[key] = value
     env["HOME"] = str(home)
     env["TMPDIR"] = str(tmp)
     return scrub_env(env, forbidden)
@@ -349,14 +364,21 @@ def run_sandboxed(
             token}`` cannot smuggle an unlisted secret across. Scrub
             keychain-derived names yourself (via :func:`sandbox_env`) — the
             settings file denies them as the backstop layer.
-        timeout: Wall-clock seconds for the leader. On expiry — and also on
-            a normal leader exit, so stragglers never outlive the run — the
-            whole process group is SIGKILLed; output drains for at most
-            :data:`_DRAIN_GRACE_SEC`, after which any pipe still held by a
-            process that escaped the group (setsid) is force-closed. Such an
+        timeout: Wall-clock seconds for the leader. The pipes are pumped by
+            reader threads while the leader runs (``proc.wait`` on PIPEd
+            output would deadlock past the ~64KB pipe buffer). On expiry —
+            and also on a normal leader exit, so stragglers never outlive
+            the run — the whole process group is SIGKILLed; the readers get
+            :data:`_DRAIN_GRACE_SEC` to drain, after which pipes still held
+            by a process that escaped the group (setsid) are force-closed
+            with whatever output was already read preserved. Such an
             escapee may itself survive (killing by pid namespace is srt's
-            side, via bwrap's ``--die-with-parent``); the orchestrator never
-            waits for it, and its model credentials die with the run dir.
+            side, via bwrap's ``--die-with-parent``): the orchestrator
+            stops waiting for it, and it loses *network* because srt's
+            filtering proxy died — but it keeps the model token in its
+            memory and environment for as long as it lives; deleting the
+            run dir revokes nothing. Treat escaped processes as a prompt
+            for the owner to rotate the seat token if abuse is suspected.
         cwd: Working dir (default: the run dir).
         srt_bin_path: Test injection for the srt binary (still pin-checked).
             There is no production override path.
@@ -396,48 +418,95 @@ def run_sandboxed(
         cwd=str(cwd if cwd else run_dir),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
         start_new_session=True,
     )
+    # Pump the pipes with non-blocking reads while the leader runs: waiting
+    # on the process with PIPEd output deadlocks the moment a command writes
+    # past the pipe buffer (~64KB) — pytest -v, npm install logs, Claude
+    # Code streams all blow past it. Nothing in this process ever blocks on
+    # a pipe: every read goes through select with a bounded timeout.
+    streams = {"out": proc.stdout.fileno(), "err": proc.stderr.fileno()}
+    buffers = {"out": bytearray(), "err": bytearray()}
+    for fd in streams.values():
+        os.set_blocking(fd, False)
     timed_out = False
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
+    deadline = None if timeout is None else time.monotonic() + timeout
+
+    # Phase 1: pump while the leader runs. Polling (not wait()) so a leader
+    # that exits while a background child still holds the pipes is noticed
+    # within 0.5s and the stragglers are killed instead of stalling us.
+    while proc.poll() is None:
+        if deadline is not None and time.monotonic() >= deadline:
+            timed_out = True
+            break
+        if deadline is None:
+            wait = 0.5
+        else:
+            wait = max(0.0, min(0.5, deadline - time.monotonic()))
+        _pump(streams, buffers, wait)
+
     # Kill every remaining group member: on timeout the leader is one of
     # them; on a normal exit this reaps background children the session
     # left behind (`npm run dev &`, test servers) so nothing outlives the
     # run holding its pipes or its credentials.
     with suppress(ProcessLookupError, PermissionError):
         os.killpg(proc.pid, signal.SIGKILL)  # pid == pgid (session leader)
-    try:
-        out, err = proc.communicate(timeout=_DRAIN_GRACE_SEC)
-    except subprocess.TimeoutExpired:
-        out, err = _force_close(proc)
+    proc.wait()  # reap the leader
+
+    # Phase 2: bounded drain — whatever the killed tree left in the pipes,
+    # plus EOF now that its writers are dead. A process that escaped the
+    # group (setsid) keeps its write-end open; the grace expiry is what
+    # stops us waiting for it. The raw fds are then simply closed (nothing
+    # of ours is blocked on them) and the output read so far is kept.
+    drain_deadline = time.monotonic() + _DRAIN_GRACE_SEC
+    while any(fd >= 0 for fd in streams.values()):
+        if time.monotonic() >= drain_deadline:
+            break
+        _pump(streams, buffers, max(0.0, drain_deadline - time.monotonic()))
+    # Close the owning file objects exactly once each (single-threaded here,
+    # so nothing can be mid-read on them): raw os.close would race the
+    # buffered objects' own close at GC time and leak unraisable warnings.
+    for stream in (proc.stdout, proc.stderr):
+        with suppress(OSError, ValueError):
+            stream.close()
+    out = buffers["out"].decode(errors="replace")
+    err = buffers["err"].decode(errors="replace")
     if timed_out:
         raise subprocess.TimeoutExpired(proc.args, timeout, output=out, stderr=err)
     return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
 
-def _force_close(proc: subprocess.Popen) -> tuple[str, str]:
-    """A process that escaped the group holds the pipes past the drain
-    grace. Close them and reap the leader: the orchestrator returns with
-    whatever output made it out, never hanging on the escapee."""
-    for stream in (proc.stdout, proc.stderr):
-        if stream is not None:
-            with suppress(OSError):
-                stream.close()
-    proc.wait()
-    return "", ""
+def _pump(streams: dict, buffers: dict, wait: float) -> None:
+    """One bounded select+read round over the open pipes. EOF marks the
+    stream closed by setting its fd entry to -1."""
+    open_fds = [fd for fd in streams.values() if fd >= 0]
+    if not open_fds:
+        return
+    ready, _, _ = select.select(open_fds, [], [], wait)
+    for name, fd in streams.items():
+        if fd < 0 or fd not in ready:
+            continue
+        try:
+            chunk = os.read(fd, 1 << 16)
+        except BlockingIOError:
+            continue
+        if chunk:
+            buffers[name] += chunk
+        else:  # EOF: every writer on this pipe is gone
+            streams[name] = -1
 
 
 def _toolchain_allowread(home: Path, toolchain: "Sequence[Path]") -> set[Path]:
     """Directories below ``home`` that must stay readable so the session's
-    toolchain can exec: the resolved binary's own directory and every
-    ancestor up to (excluding) home — which, for a ``bin/`` directory,
-    automatically includes the enclosing version prefix (pyenv's
-    ``versions/3.12``, nvm's ``versions/node/v22``, uv's tool dir) where the
+    toolchain can exec: **only the resolved binary's own directory**, plus
+    its parent when that directory is a ``bin/`` — the version prefix
+    (pyenv's ``versions/3.12``, nvm's ``versions/node/v22``) where the
     interpreter's ``lib/`` and ``site-packages`` live.
+
+    Ancestors are deliberately NOT re-allowed: allowing the chain up to
+    ``$HOME`` would re-open whole subtrees like ``~/.local`` and
+    ``~/.local/share`` — uv's credential store, cursor-agent, Copilot
+    shims and whatever else lives there.
     """
     entries: set[Path] = set()
     for raw in toolchain:
@@ -447,9 +516,11 @@ def _toolchain_allowread(home: Path, toolchain: "Sequence[Path]") -> set[Path]:
         except OSError:
             continue
         directory = binary.parent
-        while directory != home and home in directory.parents:
-            entries.add(directory)
-            directory = directory.parent
+        if directory == home or home not in directory.parents:
+            continue
+        entries.add(directory)
+        if directory.name == "bin" and directory.parent != home:
+            entries.add(directory.parent)
     return entries
 
 

