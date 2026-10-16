@@ -3,11 +3,16 @@
 The factory refuses to operate on state it cannot trust. Every load of
 ``tasks.json`` or ``project.yaml`` is checked twice: first against the
 semantic rules the queue depends on (readable, task-named messages), then
-against the JSON Schemas as the general backstop. Any failure raises
-ContractError with a message a human can act on — a stack of raw
-jsonschema output is not acceptable at 3am.
+against the JSON Schemas as the general backstop. The schemas are the
+authoritative rule set; the semantic layer is a readable front-end that
+mirrors the subset needing human-readable messages and must stay
+scope-matched to them (see the mirror notes below).
+
+Any failure — unreadable file, bad parse, semantic violation, schema
+violation — raises ContractError with a message a human can act on.
 """
 
+import functools
 import hashlib
 import json
 from pathlib import Path
@@ -15,12 +20,27 @@ from typing import Any
 
 import jsonschema
 import yaml
+from jsonschema.exceptions import best_match
 
 SCHEMA_DIR = Path(__file__).resolve().parent.parent / "schema"
 
-# Kinds the factory never executes (TASK-CONTRACT §2). They surface to the
-# owner; only build/docs are ever picked.
+# Kinds the factory never executes (TASK-CONTRACT §2).
+# MIRRORS the schema's task allOf rule 3 (non-executable kinds limited to
+# these statuses). Keep both in sync.
 NON_EXECUTABLE_KINDS = {"decision", "research", "owner_only"}
+NON_EXECUTABLE_STATUSES = {"draft", "not_buildable", "done"}
+
+# Statuses that require a frozen contract. MIRRORS the schema's task allOf
+# rule 2 (post-approval statuses require acceptance_hash + approved_at).
+# Keep both in sync.
+POST_APPROVAL_STATUSES = {
+    "ready",
+    "in_progress",
+    "in_review",
+    "deploying",
+    "awaiting_owner",
+    "done",
+}
 
 
 class ContractError(Exception):
@@ -28,67 +48,163 @@ class ContractError(Exception):
 
 
 def canonical_json(value: Any) -> str:
-    """Canonical form: sorted keys, no whitespace."""
+    """Canonicalise to the hashing form.
+
+    Args:
+        value: Any JSON-serialisable value.
+
+    Returns:
+        Canonical JSON string: sorted keys, no whitespace.
+    """
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
 def acceptance_hash(acceptance: list) -> str:
-    """SHA-256 of the canonical JSON of a task's acceptance list.
+    """Hash a task's acceptance list.
 
     Frozen at spec approval (F-04); any later edit to the acceptance text
     changes the hash and sends the task back to draft (F-03).
+
+    Args:
+        acceptance: The task's ``acceptance`` list.
+
+    Returns:
+        Hex SHA-256 digest of the canonical JSON of ``acceptance``.
     """
     return hashlib.sha256(canonical_json(acceptance).encode("utf-8")).hexdigest()
 
 
+def _field(task: dict, key: str) -> Any:
+    """Read a task field only when it is a string.
+
+    Non-string values are returned as None so set membership and equality
+    checks below never crash on unhashable input; the schema then describes
+    the actual type error.
+    """
+    value = task.get(key)
+    return value if isinstance(value, str) else None
+
+
 def _check_semantics(tasks: Any, origin: str) -> None:
-    """The rules the queue depends on, checked before schema validation so
-    the named cases get task-specific messages instead of jsonschema's."""
+    """Readable front-end for the schema rules the queue depends on.
+
+    Runs before schema validation so the named failure cases get task-specific
+    messages instead of jsonschema's. Non-list/non-dict shapes are left to
+    the schema, which reports them with structure.
+
+    Args:
+        tasks: The parsed ``tasks`` array.
+        origin: File name for error messages.
+
+    Raises:
+        ContractError: On the first semantic violation found.
+    """
     if not isinstance(tasks, list):
-        return  # malformed shape: let the schema report it with structure
+        return
     for task in tasks:
         if not isinstance(task, dict):
             continue
-        tid = task.get("id", "<missing id>")
-        risk = task.get("risk") or []
+        tid = task.get("id")
+        tid = tid if isinstance(tid, str) else "<missing id>"
+        risk = task.get("risk")
         gates = task.get("gates") if isinstance(task.get("gates"), dict) else {}
 
         if risk and gates.get("merge") == "auto":
             raise ContractError(
                 f"{origin}: task {tid} has risk flags {risk} but gates.merge=auto; "
-                f"any risk flag forces human merge (TASK-CONTRACT §2)"
+                "any risk flag forces human merge (TASK-CONTRACT §2)"
             )
-        kind = task.get("kind")
-        status = task.get("status")
-        if kind in NON_EXECUTABLE_KINDS and status == "ready":
+        kind = _field(task, "kind")
+        status = _field(task, "status")
+        if kind in NON_EXECUTABLE_KINDS and status not in NON_EXECUTABLE_STATUSES:
+            shown = status if status is not None else "<missing>"
             raise ContractError(
-                f"{origin}: task {tid} is kind={kind} but status=ready; "
+                f"{origin}: task {tid} is kind={kind} but status={shown}; "
                 f"{kind} tasks are never executable — they live in draft or not_buildable"
             )
-        if status == "ready" and not task.get("acceptance_hash"):
+        if status in POST_APPROVAL_STATUSES and not task.get("acceptance_hash"):
             raise ContractError(
-                f"{origin}: task {tid} is ready but has no acceptance_hash; "
+                f"{origin}: task {tid} is {status} but has no acceptance_hash; "
                 "approve the spec first so the contract is frozen (factory approve)"
             )
 
 
-def _validate(instance: Any, schema_path: Path, origin: str) -> None:
+def _read(path: Path, origin: str) -> str:
+    """Read a file, refusing unreadable/non-UTF-8 input.
+
+    Args:
+        path: File to read.
+        origin: File name for error messages.
+
+    Returns:
+        The file's text.
+
+    Raises:
+        ContractError: If the file is missing, unreadable, or not UTF-8.
+    """
     try:
-        schema = json.loads(schema_path.read_text())
-    except FileNotFoundError as exc:
-        raise ContractError(f"{origin}: schema not found at {schema_path}") from exc
-    validator = jsonschema.Draft202012Validator(schema)
-    for error in sorted(validator.iter_errors(instance), key=lambda e: list(e.absolute_path)):
-        path = "/".join(str(part) for part in error.absolute_path) or "<root>"
-        raise ContractError(f"{origin}: schema violation at {path}: {error.message}")
+        return path.read_text()
+    except OSError as exc:
+        raise ContractError(f"{origin}: cannot read file: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise ContractError(f"{origin}: file is not valid UTF-8: {exc}") from exc
+
+
+@functools.lru_cache(maxsize=None)
+def _validator(schema_path: Path) -> jsonschema.Draft202012Validator:
+    """Build (once) the validator for a schema file.
+
+    Args:
+        schema_path: Path to the JSON Schema file.
+
+    Returns:
+        A cached validator for that schema.
+
+    Raises:
+        ContractError: If the schema file is missing, unreadable, or not JSON.
+    """
+    try:
+        schema = json.loads(_read(schema_path, str(schema_path)))
+    except json.JSONDecodeError as exc:
+        raise ContractError(f"schema {schema_path} is not valid JSON: {exc}") from exc
+    return jsonschema.Draft202012Validator(schema)
+
+
+def _validate(instance: Any, schema_path: Path, origin: str) -> None:
+    """Validate against a schema, raising the most relevant error.
+
+    Args:
+        instance: Parsed document to check.
+        schema_path: Path to the JSON Schema file.
+        origin: File name for error messages.
+
+    Raises:
+        ContractError: On the first (most relevant) schema violation.
+    """
+    error = best_match(_validator(schema_path).iter_errors(instance))
+    if error is not None:
+        loc = "/".join(str(part) for part in error.absolute_path) or "<root>"
+        raise ContractError(f"{origin}: schema violation at {loc}: {error.message}")
 
 
 def load_tasks(path: Path | str, schema_path: Path | None = None) -> dict:
-    """Load and fully validate a tasks.json queue. Refuses invalid state."""
+    """Load and fully validate a tasks.json queue.
+
+    Args:
+        path: Path to the queue file (e.g. ``.factory/tasks.json``).
+        schema_path: Optional override for the tasks schema path.
+
+    Returns:
+        The parsed queue document.
+
+    Raises:
+        ContractError: If the file is unreadable or not JSON, semantically
+            invalid, or schema-invalid.
+    """
     path = Path(path)
     origin = str(path)
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(_read(path, origin))
     except json.JSONDecodeError as exc:
         raise ContractError(f"{origin}: invalid JSON: {exc}") from exc
     _check_semantics(data.get("tasks") if isinstance(data, dict) else None, origin)
@@ -97,11 +213,23 @@ def load_tasks(path: Path | str, schema_path: Path | None = None) -> dict:
 
 
 def load_profile(path: Path | str, schema_path: Path | None = None) -> dict:
-    """Load and fully validate a project.yaml profile. Refuses invalid state."""
+    """Load and fully validate a project.yaml profile.
+
+    Args:
+        path: Path to the profile file (e.g. ``.factory/project.yaml``).
+        schema_path: Optional override for the profile schema path.
+
+    Returns:
+        The parsed profile mapping.
+
+    Raises:
+        ContractError: If the file is unreadable or not YAML, not a mapping,
+            or schema-invalid.
+    """
     path = Path(path)
     origin = str(path)
     try:
-        data = yaml.safe_load(path.read_text())
+        data = yaml.safe_load(_read(path, origin))
     except yaml.YAMLError as exc:
         raise ContractError(f"{origin}: invalid YAML: {exc}") from exc
     if not isinstance(data, dict):

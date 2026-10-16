@@ -1,4 +1,9 @@
-"""F-02 acceptance tests — BUILD-ORDER.md, work order F-02."""
+"""F-02 acceptance tests — BUILD-ORDER.md, work order F-02.
+
+Contract rule (CLAUDE.md): an acceptance ref ``tests/test_f02.py::test_ac_N``
+means a test function with exactly that name. The extra descriptive tests
+below cover paths the acceptance refs don't name.
+"""
 
 import copy
 import hashlib
@@ -42,7 +47,7 @@ def _tasks_file(tmp_path, tasks):
     return path
 
 
-def test_ac_1_invalid_states_are_rejected_with_readable_errors(tmp_path):
+def test_ac_1(tmp_path):
     # a risk-flagged task with merge: auto
     path = _tasks_file(
         tmp_path,
@@ -85,7 +90,7 @@ def test_ac_1_invalid_states_are_rejected_with_readable_errors(tmp_path):
         load_profile(profile)
 
 
-def test_ac_2_acceptance_hash_is_order_insensitive_and_change_sensitive():
+def test_ac_2():
     item = {
         "id": "AC-1",
         "text": "it works",
@@ -108,7 +113,63 @@ def test_ac_2_acceptance_hash_is_order_insensitive_and_change_sensitive():
     assert acceptance_hash([item]) == expected
 
 
-def test_ac_3_this_repos_tasks_json_validates():
+def test_ac_3(tmp_path):
     data = load_tasks(REPO / ".factory" / "tasks.json")
     ids = [t["id"] for t in data["tasks"]]
-    assert ids == [f"F-{i:02d}" for i in range(22)]
+    # The queue validates and parses as ours; contents are not pinned, so
+    # adding or reordering work orders doesn't redden a validation test.
+    assert ids, "queue must not be empty"
+    assert len(set(ids)) == len(ids), "task ids must be unique"
+    assert all(i.startswith("F-") for i in ids), f"unexpected ids: {ids}"
+
+
+def test_missing_and_malformed_files_are_refused_not_raised(tmp_path):
+    # missing tasks.json / profile
+    with pytest.raises(ContractError, match="cannot read"):
+        load_tasks(tmp_path / "absent-tasks.json")
+    with pytest.raises(ContractError, match="cannot read"):
+        load_profile(tmp_path / "absent-profile.yaml")
+
+    # non-UTF-8 bytes
+    binary = tmp_path / "binary.json"
+    binary.write_bytes(b"\xff\xfe\x00bad")
+    with pytest.raises(ContractError, match="not valid UTF-8"):
+        load_tasks(binary)
+
+    # top-level JSON list instead of the queue object
+    listing = tmp_path / "list.json"
+    listing.write_text(json.dumps(["not", "a", "queue"]))
+    with pytest.raises(ContractError, match="schema violation"):
+        load_tasks(listing)
+
+    # empty YAML file (parses to None, not a mapping)
+    empty = tmp_path / "empty.yaml"
+    empty.write_text("")
+    with pytest.raises(ContractError, match="must be a YAML mapping"):
+        load_profile(empty)
+
+
+def test_unhashable_field_values_are_refused_not_crashed(tmp_path):
+    # a list where a string enum belongs — must be a readable refusal,
+    # never a TypeError from the semantic pass
+    path = _tasks_file(tmp_path, [_task(id="T-KIND", kind=["build"])])
+    with pytest.raises(ContractError, match="kind"):
+        load_tasks(path)
+
+    path = _tasks_file(tmp_path, [_task(id="T-STATUS", status=["ready"])])
+    with pytest.raises(ContractError, match="status"):
+        load_tasks(path)
+
+    # task entry that is not an object at all
+    path = _tasks_file(tmp_path, [["not", "a", "task"]])
+    with pytest.raises(ContractError, match="schema violation"):
+        load_tasks(path)
+
+
+def test_post_approval_statuses_all_require_hash(tmp_path):
+    # The semantic layer must mirror the schema's full rule: ready is only
+    # the first of the statuses that require a frozen contract.
+    for status in ["in_progress", "in_review", "deploying", "awaiting_owner", "done"]:
+        path = _tasks_file(tmp_path, [_task(id=f"T-{status}", status=status)])
+        with pytest.raises(ContractError, match="acceptance_hash"):
+            load_tasks(path)
