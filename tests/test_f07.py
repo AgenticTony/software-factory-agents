@@ -13,7 +13,10 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from factory.l0 import (
+    GateError,
     contract_test_files,
     diff_file_changes,
     parse_errors,
@@ -511,3 +514,130 @@ def test_baselined_location_cannot_mask_unattributed_failure(tmp_path):
     report = _run(repo, profile, baseline={"known_errors": {"lib/foo.py": [10]}})
     assert report.verdict == "fail"
     assert any(f.id == "command_failed" for f in report.findings)
+
+
+# --- Deferred review fixes (PR #8 review, findings 6-10) -------------------
+
+
+def test_cwd_relative_error_paths_match_repo_baseline(tmp_path):
+    """``cd backend && ...`` reports backend-relative paths; the baseline is repo-relative."""
+    repo = _repo(tmp_path, "cwd", {"backend/app/x.py": "x = 1\n", "lib/foo.py": "y = 1\n"})
+    _change(repo, files={"backend/app/x.py": "x = 2\n"})
+    lint = (
+        "cd backend && printf 'app/x.py:3:1: F401 old\\napp/x.py:4:1: F401 new\\n'; exit 1"
+    )
+    root = "printf './lib/foo.py:7:1: E1 old\\n'; exit 1"
+    profile = dict(BASE_PROFILE)
+    profile["commands"] = {"setup": "true", "lint": lint, "typecheck": root, "test": "true"}
+    report = _run(
+        repo,
+        profile,
+        baseline={"known_errors": {"backend/app/x.py": [3], "lib/foo.py": [7]}},
+    )
+    assert [(f.file, f.line) for f in report.findings if f.id == "new_error"] == [
+        ("backend/app/x.py", 4)
+    ]
+    assert any("backend/app/x.py:3" in n for n in report.preexisting_notes)
+    assert any("lib/foo.py:7" in n for n in report.preexisting_notes)
+
+
+def test_soloadventurer_baseline_schema_is_supported(tmp_path):
+    """SoloAdventurer's real keys: known_typecheck_errors.files + jest.tests."""
+    baseline = {
+        "jest": {"tests": 5, "suites": 2, "command": "npm test -- --ci"},
+        "known_typecheck_errors": {"count": 1, "files": {"src/x.ts": [12]}},
+        "ci_status": {"overall": "GREEN"},
+    }
+    repo = _repo(
+        tmp_path,
+        "solo",
+        {"src/x.ts": "const a = 1\n", ".claude/state/baselines.json": json.dumps(baseline)},
+    )
+    _change(repo, files={"src/x.ts": "const a = 2\n"})
+    profile = dict(BASE_PROFILE)
+    profile["baselines"] = ".claude/state/baselines.json"
+    profile["commands"] = {
+        "setup": "true",
+        "typecheck": "printf 'src/x.ts(12,5): error TS2322: old\\n'; exit 1",
+        "test": "echo 'Tests: 3 passed, 3 total'",
+    }
+    report = _run(repo, profile)
+    ids = {f.id for f in report.findings}
+    assert "new_error" not in ids
+    assert "baseline_invalid" not in ids
+    assert "test_count_dropped" in ids
+    assert any("src/x.ts:12" in n for n in report.preexisting_notes)
+
+
+def test_baseline_without_recognised_keys_fails(tmp_path):
+    repo = _repo(
+        tmp_path,
+        "foreign",
+        {"lib/a.py": "x = 1\n", "baselines.json": json.dumps({"ci_status": {"x": 1}})},
+    )
+    _change(repo, files={"lib/a.py": "x = 2\n"})
+    profile = dict(BASE_PROFILE)
+    profile["baselines"] = "baselines.json"
+    report = _run(repo, profile)
+    assert report.verdict == "fail"
+    assert any(f.id == "baseline_invalid" for f in report.findings)
+
+
+def test_unreadable_test_count_does_not_skip_floor(tmp_path):
+    repo = _repo(tmp_path, "nocount", {"lib/a.py": "x = 1\n"})
+    _change(repo, files={"lib/a.py": "x = 2\n"})
+    profile = dict(BASE_PROFILE)
+    profile["commands"] = {"setup": "true", "test": "echo all good"}
+    report = _run(repo, profile, baseline={"min_tests": 5})
+    assert report.verdict == "fail"
+    assert any(f.id == "test_count_unknown" for f in report.findings)
+
+
+@pytest.mark.parametrize(
+    "baseline",
+    [
+        {"known_errors": {"lib/a.py": ["ten"]}},
+        {"known_errors": {"lib/a.py": [True]}},
+        {"known_errors": {"lib/a.py": [3.5]}},
+        {"min_tests": True},
+        {"min_tests": 4.5},
+        {"known_typecheck_errors": {"files": {"lib/a.py": ["x"]}}},
+        {"jest": {"tests": "many"}},
+    ],
+)
+def test_bad_baseline_entries_are_invalid(tmp_path, baseline):
+    repo = _repo(tmp_path, "badentries", {"lib/a.py": "x = 1\n"})
+    _change(repo, files={"lib/a.py": "x = 2\n"})
+    profile = dict(BASE_PROFILE)
+    profile["commands"] = {"setup": "true", "test": "echo '9 passed'"}
+    report = _run(repo, profile, baseline=baseline)
+    assert report.verdict == "fail"
+    assert any(f.id == "baseline_invalid" for f in report.findings)
+
+
+def test_checkout_not_at_head_ref_raises(tmp_path):
+    repo = _repo(tmp_path, "wronghead", {"lib/a.py": "x = 1\n"})
+    _change(repo, files={"lib/a.py": "x = 2\n"})
+    _git(repo, "checkout", "main")
+    with pytest.raises(GateError, match="head_ref"):
+        _run(repo)
+
+
+def test_dirty_working_tree_raises(tmp_path):
+    repo = _repo(tmp_path, "dirty", {"lib/a.py": "x = 1\n"})
+    _change(repo, files={"lib/a.py": "x = 2\n"})
+    (repo / "stray.txt").write_text("uncommitted\n")
+    with pytest.raises(GateError, match="clean"):
+        _run(repo)
+
+
+def test_rename_test_to_non_test_path_is_deleted(tmp_path):
+    repo = _repo(
+        tmp_path, "renout", {"tests/test_keep.py": "def test_k():\n    assert True\n"}
+    )
+    _change(repo, rename=(("tests/test_keep.py", "lib/keep_helpers.py"),))
+    report = _run(repo)
+    assert report.verdict == "fail"
+    assert any(
+        f.id == "test_deleted" and f.file == "tests/test_keep.py" for f in report.findings
+    )

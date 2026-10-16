@@ -28,6 +28,7 @@
         "lint": { "type": "string" },
         "typecheck": { "type": "string" },
         "test": { "type": "string" },
+        "test_ref": { "type": "string", "description": "Shell template that runs ONE named test for the L1 red-first proof. Placeholders, substituted by literal replacement (shell braces like ${VAR} pass through): {ref} = the quoted test node id, {path} and {name} = its file and test-name halves (jest-style runners take them separately), {python} = the orchestrator's interpreter. Default: python -m pytest -q {ref}." },
         "build": { "type": "string" },
         "extra": { "type": "object", "additionalProperties": { "type": "string" } }
       }
