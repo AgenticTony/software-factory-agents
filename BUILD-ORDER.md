@@ -4,7 +4,7 @@ The factory's own build plan, written in the format the factory will consume: on
 
 **Bootstrapping:** the factory can't build itself before it exists. F-01 to F-11 are built **interactively**, by you plus a Claude Code session (GLM or Claude), one WO per session. Once F-10 works end to end, the factory takes over its own remaining WOs (F-14 onward). That's the first real test, on a repo where a mistake only hurts the factory itself.
 
-**Stack:** Python 3.12, `pytest`, `ruff`, JSON Schema validation, headless Claude Code for agent sessions, `gh` for PRs, `srt` / Claude Code sandbox for isolation. No web framework; it's a CLI.
+**Stack:** Python ≥ 3.11 (CI: 3.11 + 3.13), `pytest`, `ruff`, JSON Schema validation, Claude Agent SDK (`claude-agent-sdk`, pinned) for agent sessions, `gh` for PRs, `srt` / Claude Code sandbox for isolation. No web framework; it's a CLI.
 
 ---
 
@@ -18,7 +18,7 @@ The factory's own build plan, written in the format the factory will consume: on
 | **F-03** | State machine and picker | 1 | F-02 | — | M |
 | **F-04** | `factory approve` | 1 | F-03 | — | S |
 | **F-05** | Clone manager and sandbox | 1 | F-01 | external_service | M |
-| **F-06** | Session runner (headless Claude Code on Z.ai) | 1 | F-05 | external_service | M |
+| **F-06** | Session runner (Claude Agent SDK on Z.ai) | 1 | F-05 | external_service | M |
 | **F-07** | L0 deterministic gates | 1 | F-02 | — | M |
 | **F-08** | L1 red-first proof | 1 | F-07 | — | S |
 | **F-09** | Agent prompts + L2 review | 1 | F-06 | — | M |
@@ -46,7 +46,7 @@ Order to build in: **F-00 (in parallel) → F-01 → F-02 → F-03 → F-04 → 
 
 Owner steps:
 1. Email Z.ai support with two questions:
-   - Are scheduled, unattended headless Claude Code runs allowed on the Coding Plan?
+   - Are scheduled, unattended Claude Code runs (via the Claude Agent SDK) allowed on the Coding Plan? (The owner has decided to proceed; this is for the record.)
    - Does renewing a legacy Max plan keep the prompt-based quota?
 2. Check the legacy term's end date on Z.ai's "My plan" page.
 3. Check JobFinderOS's **production** env on Render for `GLM_BASE_URL`. If it's the Coding Plan endpoint (`api/coding/paas/v4`), move production to a metered key, or the Mistral-hosted path (MIG-WO5), **before F-13**.
@@ -114,17 +114,26 @@ Acceptance (tests must *attempt* the forbidden action, not just inspect config):
 - AC-4 No `GH_TOKEN`/`GITHUB_TOKEN` or keychain-derived variable is visible inside the sandbox.
 
 ### F-06 — Session runner
-`run_session(seat, prompt, cwd, max_turns, timeout_min)` wraps `claude -p --output-format json --max-turns N` inside the F-05 sandbox.
-- **Env:** per-seat env: Z.ai base URL, auth token from the keychain, `API_TIMEOUT_MS`.
-- **Clock:** wall-clock is enforced, and paused outside the session.
-- **Hooks:** a per-run settings file with a PreToolUse hook that denies Edit/Write on `paths.protected`.
-- **Record:** turns, tokens and the model reported back.
+`run_session(seat, prompt, cwd, max_turns, timeout_min)` calls `claude_agent_sdk.query()` with a `ClaudeAgentOptions` built per seat, inside the F-05 sandbox. The whole runner process runs under `srt`, so the Claude Code subprocess the SDK spawns inherits the sandbox.
+- **Options:**
+  - `cwd` = run dir
+  - `env` = Z.ai base URL, auth token from the keychain, `API_TIMEOUT_MS`
+  - `max_turns`; `system_prompt` = the seat prompt (F-09)
+  - `setting_sources=[]`: no user/project settings, so a session can't pick up your personal Claude config
+  - per-seat `allowed_tools` / `disallowed_tools`: the reviewer gets no Write/Edit
+- **Hooks:** in-process `PreToolUse` callbacks via `HookMatcher`:
+  - `Write|Edit|NotebookEdit` → deny if `tool_input.file_path` matches `paths.protected`
+  - `Bash` → deny `git push`, `gh `, and anything touching `~/.config/gh`
+- **Clock:** wall-clock is enforced with `asyncio.wait_for` around the message stream, and paused outside the session.
+- **Record:** from `ResultMessage`: `num_turns`, `subtype`, `is_error`, `terminal_reason`, tokens, and the model name from `model_usage`.
+- **Testability:** `query` is injected, so tests use a fake async generator instead of a real model.
 
 Acceptance:
-- AC-1 With a stub `claude` binary, the runner kills the session at the wall-clock limit and returns `aborted`.
-- AC-2 Malformed JSON output is reported as a failed attempt, not a crash.
-- AC-3 The hook blocks an Edit to a protected path inside a real session.
-- AC-4 A real smoke session against Z.ai completes a trivial prompt, and the recorded model name is read from the result.
+- AC-1 With an injected fake `query` that never finishes, the runner stops at the wall-clock limit and returns `aborted`.
+- AC-2 A `ResultMessage` with an error subtype (`error_max_turns`, `error_during_execution`, or `is_error` with `api_error_status`), and an SDK exception, are each recorded as a failed attempt with the reason. Neither crashes the runner.
+- AC-3 The protected-path hook returns `permissionDecision: "deny"` for an Edit/Write to a protected path (unit test on the callback), and blocks one inside a real session.
+- AC-4 A real smoke session against Z.ai completes a trivial prompt, and the recorded model name is read from `model_usage`.
+- AC-5 The built options have `setting_sources == []`. The session env contains no GitHub token and no keychain secret other than the Z.ai token.
 
 Owner steps: F-00 step 1 answered before AC-4 is run repeatedly or on a schedule.
 
