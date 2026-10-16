@@ -5,7 +5,9 @@ branch and applies the deterministic diff policy to ``git diff
 <base>...<head>``. No model is involved: every rule here is checkable from
 the diff and the command output alone.
 
-Baseline file format (repo-relative path named by ``profile["baselines"]``)::
+Baseline file format (repo-relative path named by ``profile["baselines"]``,
+read as committed at ``base_ref`` — never from the slice's own branch, so a
+worker cannot exempt its own errors by editing it)::
 
     {
       "known_errors": {"lib/foo.py": [10, 20]},
@@ -55,9 +57,12 @@ from pathlib import Path
 # exist.
 TEST_GLOBS = (
     "tests/*",
+    "*/tests/*",
     "test/*",
+    "*/test/*",
     "*__tests__/*",
     "test_*.py",
+    "*/test_*.py",
     "*_test.py",
     "*.test.ts",
     "*.test.tsx",
@@ -94,6 +99,20 @@ ERROR_LINE_PATTERNS = (
     re.compile(r"^(?P<file>[^\s:]+):(?P<line>\d+)(?::\d+)?:\s"),
     # TypeScript style: path(line,col): error TSxxxx: message
     re.compile(r"^(?P<file>[^\s(]+)\((?P<line>\d+),\d+\):\s*error"),
+)
+
+# Lines that report a failure without a ``file:line`` we could baseline.
+# Baseline exemptions cover lint/typecheck diagnostics only (verifier.md's
+# precision rule); a failing test or a tool crash is never pre-existing, so
+# any of these in a failed command's output FAILs even when every parsed
+# location is baselined.
+FAILURE_MARKERS = (
+    re.compile(r"^(?:FAILED|ERROR)\s+\S"),  # pytest short summary
+    re.compile(r"\b[1-9]\d* failed\b"),  # pytest / jest totals
+    re.compile(r"^not ok\b"),  # TAP, node --test
+    re.compile(r"^#\s*fail\s+[1-9]"),  # node --test totals
+    re.compile(r"^Traceback \(most recent call last\):"),  # Python crash
+    re.compile(r"^(?:error|fatal)\b"),  # tool-level error, no location
 )
 
 _TEST_COUNT = re.compile(r"(\d+)\s+passed")
@@ -239,8 +258,13 @@ def diff_file_changes(repo: Path, base_ref: str, head_ref: str) -> list:
     Raises:
         GateError: If git fails or the refs don't resolve.
     """
-    status_out = _git(repo, "diff", "--name-status", "-M", f"{base_ref}...{head_ref}")
-    diff_out = _git(repo, "diff", "-M", f"{base_ref}...{head_ref}")
+    # Pin output format: user config (color, noprefix, external diff
+    # drivers) must not change what the parser sees.
+    fmt = ("--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/")
+    status_out = _git(
+        repo, "diff", *fmt, "--name-status", "-M", f"{base_ref}...{head_ref}"
+    )
+    diff_out = _git(repo, "diff", *fmt, "-M", f"{base_ref}...{head_ref}")
     hunks = _parse_unified_diff(diff_out)
 
     changes = []
@@ -283,7 +307,13 @@ def _parse_unified_diff(text: str) -> dict:
             old_no, new_no = int(m.group(1)), int(m.group(2))
             in_hunk = True
             continue
-        if not in_hunk or key is None or line[:1] not in "+-":
+        if not in_hunk or key is None:
+            continue
+        if line.startswith(" "):
+            old_no += 1
+            new_no += 1
+            continue
+        if line[:1] not in ("+", "-"):
             continue
         added, removed = result[key]
         if line.startswith("+"):
@@ -312,6 +342,14 @@ def parse_errors(output: str) -> list:
                 found.add((m.group("file"), int(m.group("line"))))
                 break
     return sorted(found)
+
+
+def _failure_marker(output: str) -> str | None:
+    """Return the first output line reporting an unbaselinable failure."""
+    for line in output.splitlines():
+        if any(p.search(line) for p in FAILURE_MARKERS):
+            return line.strip()
+    return None
 
 
 def parse_test_count(output: str) -> int | None:
@@ -412,12 +450,17 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None):
     return findings, sorted(escalations), risk_flags_added
 
 
-def _load_baseline(profile: dict, repo: Path):
-    """Load the baseline file named by the profile, if any.
+def _load_baseline(profile: dict, repo: Path, base_ref: str):
+    """Load the baseline file named by the profile, as committed at base.
+
+    Reading it from ``base_ref`` rather than the checkout means the slice's
+    own edits to the baseline (widened ``known_errors``, a lowered
+    ``min_tests``) cannot exempt the slice. Bumps land via a human merge.
 
     Args:
         profile: The loaded ``project.yaml`` mapping.
-        repo: Repository the baseline path is relative to.
+        repo: Repository holding ``base_ref``.
+        base_ref: The trusted ref the baseline is read from.
 
     Returns:
         ``(baseline, missing_finding)`` — the parsed mapping (or ``{}``)
@@ -426,10 +469,9 @@ def _load_baseline(profile: dict, repo: Path):
     declared = profile.get("baselines")
     if not declared:
         return {}, None
-    path = repo / declared
     try:
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+        data = json.loads(_git(repo, "show", f"{base_ref}:{declared}"))
+    except (GateError, json.JSONDecodeError) as exc:
         return {}, Finding(
             "baseline_missing",
             f"baseline file {declared} unreadable ({exc}); every error is new",
@@ -442,6 +484,16 @@ def _load_baseline(profile: dict, repo: Path):
     return data, None
 
 
+def _text(data) -> str:
+    """Normalise captured output: POSIX ``TimeoutExpired`` carries raw bytes
+    (or ``None``) even when the run asked for text."""
+    if data is None:
+        return ""
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="replace")
+    return data
+
+
 def _run_command(name: str, command: str, repo: Path, timeout_sec: int):
     """Run one profile command in the repo with a wall-clock cap."""
     try:
@@ -450,13 +502,13 @@ def _run_command(name: str, command: str, repo: Path, timeout_sec: int):
             shell=True,
             cwd=repo,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout_sec,
         )
         return CommandResult(name, command, proc.returncode, proc.stdout + proc.stderr)
     except subprocess.TimeoutExpired as exc:
-        out = (exc.stdout or "") + (exc.stderr or "")
-        output = out.decode() if isinstance(out, bytes) else (out or "")
+        output = _text(exc.stdout) + _text(exc.stderr)
         return CommandResult(name, command, None, output, timed_out=True)
 
 
@@ -483,7 +535,7 @@ def run_l0(
         head_ref: The slice's branch ref.
         task: The task record (risk flags, contract test refs).
         baseline: Baseline mapping; when ``None``, loaded from the
-            profile's ``baselines`` path inside ``repo``.
+            profile's ``baselines`` path as committed at ``base_ref``.
         timeout_sec: Per-command wall-clock cap.
 
     Returns:
@@ -497,7 +549,7 @@ def run_l0(
     findings, escalations, risk_flags_added = check_diff_policy(profile, changes, task)
 
     if baseline is None:
-        baseline, missing = _load_baseline(profile, repo)
+        baseline, missing = _load_baseline(profile, repo, base_ref)
         if missing:
             findings.append(missing)
     known_errors: dict[str, set[int]] = {}
@@ -579,6 +631,15 @@ def run_l0(
                         line=line,
                     )
                 )
+        marker = _failure_marker(result.output)
+        if marker:
+            findings.append(
+                Finding(
+                    "command_failed",
+                    f"{name} exited {result.exit_code} reporting a failure no "
+                    f"baseline entry covers: {marker}",
+                )
+            )
 
     if min_tests is not None:
         test_result = next((r for r in results if r.name == "test"), None)

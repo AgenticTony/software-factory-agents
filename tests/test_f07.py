@@ -9,6 +9,7 @@ test-count floors, setup failure, command timeouts, tsc-style error
 parsing and a missing baseline file.
 """
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -423,3 +424,90 @@ def test_diff_file_changes_reads_git(tmp_path):
     renamed = changes["tests/test_renamed.py"]
     assert renamed.status == "R"
     assert renamed.old_path == "tests/test_b.py"
+
+
+# --- Review fixes (PR #8 review) -------------------------------------------
+
+
+def test_timeout_with_partial_stdout_does_not_crash(tmp_path):
+    """POSIX TimeoutExpired carries raw bytes stdout and None stderr."""
+    repo = _repo(tmp_path, "slowout", {"lib/a.py": "x = 1\n"})
+    _change(repo, files={"lib/a.py": "x = 2\n"})
+    profile = dict(BASE_PROFILE)
+    profile["commands"] = {"setup": "true", "test": "echo partial; sleep 5"}
+    report = _run(repo, profile, timeout_sec=1)
+    assert report.verdict == "fail"
+    assert any(f.id == "command_timeout" for f in report.findings)
+    test_result = next(r for r in report.command_results if r.name == "test")
+    assert "partial" in test_result.output
+
+
+def test_nested_test_dir_is_recognised(tmp_path):
+    """Monorepo layouts (backend/tests/...) are test files too."""
+    repo = _repo(
+        tmp_path,
+        "nested",
+        {
+            "backend/tests/test_api.py": "def test_a():\n    assert True\n",
+            "backend/tests/test_gone.py": "def test_g():\n    assert True\n",
+            "pkg/sub/test_colocated.py": "def test_c():\n    assert True\n",
+        },
+    )
+    _change(
+        repo,
+        files={
+            "backend/tests/test_api.py": (
+                "import pytest\n\n\n@pytest.mark.skip(reason='later')\n"
+                "def test_a():\n    assert True\n"
+            ),
+            "pkg/sub/test_colocated.py": "def test_c():\n    pass\n",
+        },
+        delete=("backend/tests/test_gone.py",),
+    )
+    report = _run(repo)
+    ids = {(f.id, f.file) for f in report.findings}
+    assert ("test_deleted", "backend/tests/test_gone.py") in ids
+    assert ("skip_marker_added", "backend/tests/test_api.py") in ids
+    assert ("assertion_removed", "pkg/sub/test_colocated.py") in ids
+
+
+def test_diff_line_numbers_count_context_lines(tmp_path):
+    base = "a\nb\nc\n    assert x\ne\n"
+    repo = _repo(tmp_path, "ctx", {"tests/test_ctx.py": base})
+    _change(repo, files={"tests/test_ctx.py": "a\nb\nc\n    pytest.skip()\ne\n"})
+    (change,) = diff_file_changes(repo, "main", "feature")
+    assert change.added_lines == [(4, "    pytest.skip()")]
+    assert change.removed_lines == [(4, "    assert x")]
+
+
+def test_baseline_is_read_from_base_not_head(tmp_path):
+    """A worker can't exempt its own errors by editing the baseline file."""
+    base_line = json.dumps({"known_errors": {"lib/foo.py": [10]}})
+    repo = _repo(tmp_path, "basefile", {"lib/foo.py": "x = 1\n", "baselines.json": base_line})
+    widened = json.dumps({"known_errors": {"lib/foo.py": [10, 20]}})
+    _change(repo, files={"lib/foo.py": "x = 2\n", "baselines.json": widened})
+    lint = "printf 'lib/foo.py:10:1: E1 old\\nlib/foo.py:20:1: E2 new\\n'; exit 1"
+    profile = dict(BASE_PROFILE)
+    profile["commands"] = {"setup": "true", "lint": lint, "test": "true"}
+    profile["baselines"] = "baselines.json"
+    report = _run(repo, profile)
+    assert report.verdict == "fail"
+    assert [(f.file, f.line) for f in report.findings if f.id == "new_error"] == [
+        ("lib/foo.py", 20)
+    ]
+
+
+def test_baselined_location_cannot_mask_unattributed_failure(tmp_path):
+    """A red command with an unparsed failure FAILs even if every parsed hit is known."""
+    repo = _repo(tmp_path, "mask", {"lib/foo.py": "x = 1\n"})
+    _change(repo, files={"lib/foo.py": "x = 2\n"})
+    test_cmd = (
+        "printf 'lib/foo.py:10: AssertionError\\n"
+        "FAILED tests/test_new.py::test_n - assert 1 == 2\\n"
+        "1 failed, 4 passed in 0.1s\\n'; exit 1"
+    )
+    profile = dict(BASE_PROFILE)
+    profile["commands"] = {"setup": "true", "test": test_cmd}
+    report = _run(repo, profile, baseline={"known_errors": {"lib/foo.py": [10]}})
+    assert report.verdict == "fail"
+    assert any(f.id == "command_failed" for f in report.findings)
