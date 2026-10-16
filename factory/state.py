@@ -221,29 +221,63 @@ def _unmerged_slices(task: dict) -> list:
     return [s for s in (task.get("slices") or []) if s.get("status") != "merged"]
 
 
-def _deps_met(task: dict, by_id: dict) -> bool:
-    """Check ``depends_on`` against this queue (TASK-CONTRACT §2).
+def _unmet_by_id(task: dict, by_id: dict) -> list:
+    """The task's open dependency ids against a prebuilt {id: task} index.
 
-    A ``repo:id`` dependency (anything with a colon) is cross-repo and is
-    never met automatically — a human must mark it met. A same-repo
-    dependency is met only when the referenced task is ``done`` in this
-    queue; a dependency on an id not in the queue counts as unmet.
+    Implements the TASK-CONTRACT §2/§4 dependency rule: a ``repo:id``
+    dependency (anything with a colon) is cross-repo and is never met
+    automatically — a human must mark it met; a same-repo dependency is
+    met only when the referenced task is ``done`` in this queue; a
+    dependency on an id not in the queue counts as unmet.
 
     Args:
         task: The task whose dependencies to check.
         by_id: Queue index {id: task}, built once by the caller.
     """
+    open_: list = []
     for dep in task.get("depends_on", []):
         if not isinstance(dep, str) or ":" in dep:
-            return False
+            open_.append(dep)
+            continue
         target = by_id.get(dep)
         if target is None or target.get("status") != "done":
-            return False
-    return True
+            open_.append(dep)
+    return open_
 
 
-def _now_iso() -> str:
-    """UTC now in the queue's timestamp style (second precision, Z)."""
+def _deps_met(task: dict, by_id: dict) -> bool:
+    """True when every ``depends_on`` is met (see ``_unmet_by_id``)."""
+    return not _unmet_by_id(task, by_id)
+
+
+def unmet_dependencies(task: dict, tasks: list) -> list:
+    """The task's open dependencies against a plain task list.
+
+    Public read-only view of the picker's dependency rule, used by F-04
+    to route approval to ``ready`` or ``blocked`` and to name what a
+    task is waiting on.
+
+    Args:
+        task: The task whose dependencies to check.
+        tasks: The queue's ``tasks`` array.
+
+    Returns:
+        The unmet dependency ids, in declared order.
+    """
+    return _unmet_by_id(task, {t.get("id"): t for t in tasks})
+
+
+def dependencies_met(task: dict, tasks: list) -> bool:
+    """True when every dependency of ``task`` is met (see ``unmet_dependencies``)."""
+    return not unmet_dependencies(task, tasks)
+
+
+def now_iso() -> str:
+    """UTC now in the queue's timestamp style (second precision, Z).
+
+    Public so every writer stamps timestamps identically (F-04 approval
+    fields, queue ``updated_at``).
+    """
     return (
         datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     )
@@ -629,7 +663,7 @@ class TaskQueue:
             OSError: If the write fails; the previous file is intact.
         """
         candidate = copy.deepcopy(self.doc)
-        candidate["updated_at"] = _now_iso()
+        candidate["updated_at"] = now_iso()
         try:
             validate_queue(candidate, str(self.path), self._schema_path)
             with self._exclusive_lock():
