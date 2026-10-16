@@ -581,6 +581,46 @@
             "type": "test",
             "ref": "tests/test_f09.py::test_ac_3"
           }
+        },
+        {
+          "id": "AC-4",
+          "text": "Every reviewer finding carries `axis` (`spec` or `standards`). A finding without one is invalid verdict JSON (AC-1 applies). A `blocking` finding on either axis means FAIL, whatever the other axis says.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f09.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "The assembled reviewer prompt contains the smell baseline, the test-quality checks and the project's `standards` files. The assembled implementer prompt contains none of the `standards` files.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f09.py::test_ac_5"
+          }
+        },
+        {
+          "id": "AC-6",
+          "text": "`project.schema.json` accepts an optional `standards: [string]` and `tasks.schema.json` accepts an optional per-task `out_of_scope: [string]`. Unknown keys are still rejected. Both tests are red before the schema change.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f09.py::test_ac_6"
+          }
+        },
+        {
+          "id": "AC-7",
+          "text": "The L1 report (F-08's `L1Report`) records a `red_reason` per test ref: `assertion`, `collection` or `unknown`. A fixture whose test imports a not-yet-existing module gives `collection`, and a failing assert gives `assertion`. The verdict doesn't depend on it.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f09.py::test_ac_7"
+          }
+        },
+        {
+          "id": "AC-8",
+          "text": "Every vendored prompt file sits under `prompts/vendor/` next to its upstream `LICENSE` and the source commit SHA. A test fails if either is missing.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f09.py::test_ac_8"
+          }
         }
       ],
       "budget": {
@@ -662,6 +702,38 @@
           "check": {
             "type": "test",
             "ref": "tests/test_f10.py::test_ac_6"
+          }
+        },
+        {
+          "id": "AC-7",
+          "text": "The PR body has these sections: **Summary**, **Evidence**, **Merge Danger** (Door + Blast Radius), **Contract**, **Validator report**. The PR isn't opened if any is missing.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f10.py::test_ac_7"
+          }
+        },
+        {
+          "id": "AC-8",
+          "text": "**Evidence** is built by the orchestrator from the L1 report, not from model text. For each contract test ref it shows red on base (with `red_reason`) and green on head. Nothing the implementer writes can alter this section.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f10.py::test_ac_8"
+          }
+        },
+        {
+          "id": "AC-9",
+          "text": "**Door** is `one-way` when the task carries any of `migration`, `deploy`, `external_service`, `payments` or `privacy` (data that has leaked can't be recalled), and `two-way` otherwise. **Blast Radius** lists the risk flags and matched `paths.risk` globs, or `contained`. The implementer may add prose below them but can't change either value.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f10.py::test_ac_9"
+          }
+        },
+        {
+          "id": "AC-10",
+          "text": "An attempt that starts in a fresh session (re-queued run, rejected-PR fix round) receives the task's progress log, entries 1..N. The log is orchestrator-owned, lives outside the clone and is append-only: rewriting an earlier entry raises.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f10.py::test_ac_10"
           }
         }
       ],
@@ -757,6 +829,14 @@
           "check": {
             "type": "test",
             "ref": "tests/test_f12.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "The importer reads `.factory/out-of-scope/` (TASK-CONTRACT §5). A proposed task that resembles a record is listed in the import summary with the record's path. It's still proposed as `draft` and is never dropped or rejected on its own: you confirm the match.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f12.py::test_ac_4"
           }
         }
       ],
@@ -1027,6 +1107,22 @@
             "type": "test",
             "ref": "tests/test_f18.py::test_ac_2"
           }
+        },
+        {
+          "id": "AC-3",
+          "text": "Triage checks `.factory/out-of-scope/` the same way the importer does (F-12 AC-4).",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f18.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "A bug draft carries at least one `test` acceptance item that reproduces the reported symptom. A signal that can't be turned into one is listed in the summary as needing info and doesn't become a draft.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f18.py::test_ac_4"
+          }
         }
       ],
       "budget": {
@@ -1078,6 +1174,22 @@
           "check": {
             "type": "test",
             "ref": "tests/test_f19.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "The review also reads the session transcripts of the attempts it samples, because agents push through friction that never shows up as a failure. Every proposal cites the run id and turn it comes from.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f19.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "A proposal that targets anything other than a prompt file (a new check, CI, `standards`, steering files) comes out as a `draft` task for you, never as a meta-loop PR. Agents can't edit what judges them (Principle 5).",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f19.py::test_ac_5"
           }
         }
       ],
