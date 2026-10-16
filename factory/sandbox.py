@@ -8,12 +8,14 @@ The factory refuses to sandbox anything unless ``srt --version`` matches
 of quietly weakening the sandbox.
 
 The settings file (DESIGN-LOCAL-FACTORY D3) allows writes only inside the
-run dir, denies reads of the holdouts, ``~/.ssh``, ``~/.config/gh`` and
-every other run, and allows network only to the model endpoint plus the
-project profile's ``docs_allowlist`` and ``network_allowlist``. Credentials
-are defence-in-depth: the environment is scrubbed before the child is
-spawned *and* the settings file denies the same names inside srt, so a
-caller mistake can't leak a GitHub token or a keychain-derived variable.
+run dir (minus its ``.git/hooks`` and ``.git/config`` — see GIT_HARDENING
+in :mod:`factory.runs`), denies reads of the entire home directory (the run
+dir is re-allowed), the holdouts, and every other run, and allows network
+only to the model endpoint plus the project profile's ``docs_allowlist``
+and ``network_allowlist``. Credentials are defence-in-depth: the
+environment is scrubbed before the child is spawned *and* the settings file
+denies the same names inside srt, so a caller mistake can't leak a GitHub
+token or a keychain-derived variable.
 """
 
 import json
@@ -183,6 +185,7 @@ def build_settings(
         "network": {"allowedDomains": allowed_domains, "deniedDomains": []},
         "filesystem": {
             "denyRead": [
+                str(Path("~").expanduser()),
                 str(factory_root / "holdouts"),
                 str(Path("~/.ssh").expanduser()),
                 str(Path("~/.config/gh").expanduser()),
@@ -190,7 +193,16 @@ def build_settings(
             ],
             "allowRead": [str(run_dir)],
             "allowWrite": [str(run_dir)],
-            "denyWrite": [],
+            # The run's git control files are not the agent's to edit: a hook
+            # or core.hooksPath/fsmonitor redirect planted here executes later,
+            # OUTSIDE the sandbox, when the orchestrator commits and pushes
+            # with its own credentials. srt already protects the repo under
+            # the child's cwd; these absolute denies make that guarantee ours,
+            # independent of cwd.
+            "denyWrite": [
+                str(run_dir / ".git" / "hooks"),
+                str(run_dir / ".git" / "config"),
+            ],
         },
         "credentials": {
             "envVars": [{"mode": "deny", "name": name} for name in denied_names]
@@ -242,10 +254,13 @@ def run_sandboxed(
     run_dir = Path(run_dir)
     tmp = run_dir / ".tmp"
     tmp.mkdir(parents=True, exist_ok=True)
-    if env is None:
-        child_env = sandbox_env(run_dir)
-    else:
-        child_env = scrub_env(env)
+    # The allowlist applies on every path: an explicit env is an overlay of
+    # deliberately chosen names on the same minimal base — ambient variables
+    # never cross just because a caller supplied a dict, so passing
+    # os.environ wholesale is impossible by construction (only the base keys
+    # would come through). Scrub keychain-derived names yourself (via
+    # ``forbidden=``); the settings file denies them as the backstop layer.
+    child_env = sandbox_env(run_dir, extra=env)
     # srt's Linux network bridges create unix sockets in node's tmpdir().
     # A TMPDIR deep inside the run dir overflows the kernel's ~108-byte
     # sun_path limit and the bridges silently never come up ("Failed to

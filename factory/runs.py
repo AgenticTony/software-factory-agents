@@ -17,6 +17,13 @@ from pathlib import Path
 
 FACTORY_ROOT_DEFAULT = Path.home() / "factory"
 
+# Every git command the orchestrator runs outside the sandbox disables hooks
+# and fsmonitor: a hook planted inside a run (or a stale one from a bypassed
+# deny) must never execute with the orchestrator's credentials. Sessions
+# inside the sandbox can't rewrite .git/hooks or .git/config either (the
+# sandbox settings deny both), so this is the outer layer of the same rule.
+GIT_HARDENING = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
+
 
 class RunError(Exception):
     """A run dir cannot be created or cleaned up as requested."""
@@ -73,7 +80,7 @@ def create_run(
         dest = runs_root / project / _new_run_id()
 
     result = subprocess.run(
-        ["git", "clone", "--filter=blob:none", source.as_uri(), str(dest)],
+        ["git", *GIT_HARDENING, "clone", "--filter=blob:none", source.as_uri(), str(dest)],
         capture_output=True,
         text=True,
     )
@@ -93,7 +100,7 @@ def create_run(
             shutil.rmtree(dest, ignore_errors=True)
             raise RunError(f"ref {ref!r} not found in clone of {source} (run {dest})")
         result = subprocess.run(
-            ["git", "-C", str(dest), "checkout", "--detach", commit],
+            ["git", *GIT_HARDENING, "-C", str(dest), "checkout", "--detach", commit],
             capture_output=True,
             text=True,
         )
@@ -131,7 +138,10 @@ def _resolve_commit(repo: Path, ref: str) -> str | None:
     """First of ``ref`` / ``origin/<ref>`` that resolves to a commit, else None."""
     for candidate in (ref, f"origin/{ref}"):
         result = subprocess.run(
-            ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"],
+            [
+                "git", *GIT_HARDENING, "-C", str(repo),
+                "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}",
+            ],
             capture_output=True,
             text=True,
         )

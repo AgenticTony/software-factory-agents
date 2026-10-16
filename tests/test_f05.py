@@ -261,6 +261,7 @@ def test_ac_4(tmp_path: Path):
             shlex.join(_child(script, ["GH_TOKEN", keychain_derived])),
         ],
         env=leaky,
+        cwd=str(run.root),  # outside the denied home dir, like run_sandboxed
         capture_output=True,
         text=True,
         timeout=60,
@@ -315,7 +316,8 @@ def test_settings_allowlist_is_model_endpoint_plus_profile_lists(tmp_path: Path)
     assert net["deniedDomains"] == []
     fs = settings["filesystem"]
     assert fs["allowWrite"] == [str(run.root)]
-    assert fs["denyWrite"] == []
+    assert str(run.root / ".git" / "hooks") in fs["denyWrite"]
+    assert str(run.root / ".git" / "config") in fs["denyWrite"]
     assert str(run.root) in fs["allowRead"]
 
 
@@ -418,3 +420,183 @@ def test_scrub_env_strips_github_prefixes_and_forbidden_names():
     assert "GH_HOST" not in env and "GITHUB_REPOSITORY" not in env
     assert env["ANTHROPIC_AUTH_TOKEN"] == "keep-me"
     assert "PATH" in env and "HOME" in env
+
+
+# --- review round: raw sockets, git-hook escapes, env allowlist, home reads ---
+
+
+def test_direct_socket_to_non_allowlisted_ip_is_blocked(tmp_path: Path):
+    """A process that ignores the proxy env vars and dials a raw IP must be
+    blocked too — proxy filtering alone is not the boundary. 1.1.1.1:443 is
+    a real, stable, non-allowlisted endpoint; the socket API cannot use the
+    proxy, so this exercises the kernel-level network denial."""
+    run, _, settings = _make_run(tmp_path)
+    script = textwrap.dedent(
+        """
+        import socket, sys
+        try:
+            conn = socket.create_connection((sys.argv[1], 443), timeout=10)
+            conn.close()
+            print("direct:CONNECTED", flush=True)
+        except Exception as exc:
+            print(f"direct:BLOCKED {type(exc).__name__}: {exc}", flush=True)
+        """
+    )
+    proc = run_sandboxed(
+        _child(script, ["1.1.1.1"]), run.root, run.settings_path, timeout=60
+    )
+    assert "direct:BLOCKED" in proc.stdout, (
+        f"raw socket to non-allowlisted 1.1.1.1:443 connected — proxy filtering "
+        f"is the only network boundary\n{proc.stdout}{proc.stderr}"
+    )
+
+
+def test_git_hook_and_config_planting_is_denied_in_sandbox(tmp_path: Path):
+    """A sandboxed process must not write .git/hooks or .git/config: hooks
+    planted there execute later, OUTSIDE the sandbox, when the orchestrator
+    commits and pushes with its own credentials."""
+    run, _, settings = _make_run(tmp_path)
+    script = textwrap.dedent(
+        """
+        import sys
+        def attempt(label, fn):
+            try:
+                fn()
+                print(f"{label}:ok", flush=True)
+            except Exception as exc:
+                print(f"{label}:denied {type(exc).__name__}", flush=True)
+        hook, config = sys.argv[1], sys.argv[2]
+        attempt("hook", lambda: open(hook, "w").write("#!/bin/sh\\ntouch /tmp/pwned\\n"))
+        attempt("config", lambda: open(config, "a").write("[core] hooksPath = /tmp\\n"))
+        attempt("commitmsg", lambda: open(sys.argv[3], "w").write("normal write"))
+        """
+    )
+    commitmsg = run.root / ".git" / "COMMIT_EDITMSG"
+    proc = run_sandboxed(
+        _child(script, [str(run.root / ".git/hooks/pre-commit"),
+                        str(run.root / ".git/config"),
+                        str(commitmsg)]),
+        run.root,
+        run.settings_path,
+        timeout=60,
+    )
+    outcomes = dict(line.split(":", 1) for line in proc.stdout.splitlines())
+    assert outcomes["hook"].startswith("denied"), (
+        f".git/hooks write allowed — a planted hook could fire outside the sandbox\n"
+        f"{proc.stdout}{proc.stderr}"
+    )
+    assert outcomes["config"].startswith("denied"), (
+        f".git/config write allowed — core.hooksPath could be redirected\n"
+        f"{proc.stdout}{proc.stderr}"
+    )
+    assert outcomes["commitmsg"] == "ok", (
+        f"normal .git writes are broken too — the denial is too broad\n{proc.stdout}{proc.stderr}"
+    )
+
+
+def test_planted_hook_never_fires_for_orchestrator_git(tmp_path: Path):
+    """Even if a hook somehow gets planted (deny bypass, stale run), the
+    orchestrator's own git commands must never execute it: every git call
+    runs with hooks and fsmonitor disabled. The control proves the detector
+    works by firing the hook with a plain git commit first."""
+    from factory.runs import GIT_HARDENING
+
+    run = create_run("fixture", _fixture_repo(tmp_path), factory_root=_factory_root(tmp_path))
+    marker = tmp_path / "hook-ran"
+    hook = run.root / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\ntouch '{marker}'\n")
+    hook.chmod(0o755)
+
+    (run.root / "one.txt").write_text("1\n")
+    _git(run.root, "add", "-A")
+    _git(run.root, "commit", "-m", "plain git — control")  # plain git DOES fire it
+    assert marker.exists(), "control failed: the planted hook did not fire for plain git"
+    marker.unlink()
+
+    (run.root / "two.txt").write_text("2\n")
+    _git(run.root, "add", "-A")
+    subprocess.run(
+        ["git", "-C", str(run.root), *GIT_HARDENING, "commit", "-m", "hardened"],
+        check=True, capture_output=True, text=True,
+    )
+    assert not marker.exists(), (
+        "the planted hook fired during an orchestrator git command — GIT_HARDENING "
+        "must disable core.hooksPath and core.fsmonitor on every orchestrator-side git call"
+    )
+
+
+def test_provided_env_never_inherits_ambient_variables(tmp_path: Path, monkeypatch):
+    """The allowlist applies on every path: an explicit env= overlay can pass
+    deliberately chosen names, but nothing ambient leaks in from os.environ
+    just because a caller supplied a dict."""
+    run, _, settings = _make_run(tmp_path)
+    monkeypatch.setenv("FACTORY_TEST_AMBIENT_SECRET", "ambient-leak")
+    script = textwrap.dedent(
+        """
+        import os, sys
+        for name in sys.argv[1:]:
+            value = os.environ.get(name)
+            print(f"{name}={value if value is not None else 'absent'}", flush=True)
+        """
+    )
+    proc = run_sandboxed(
+        _child(script, ["FACTORY_TEST_AMBIENT_SECRET", "API_TIMEOUT_MS"]),
+        run.root,
+        run.settings_path,
+        env={"API_TIMEOUT_MS": "3000000"},
+        timeout=60,
+    )
+    seen = dict(line.split("=", 1) for line in proc.stdout.splitlines())
+    assert seen["FACTORY_TEST_AMBIENT_SECRET"] == "absent", (
+        f"ambient os.environ variable crossed the sandbox via the env= path\n"
+        f"{proc.stdout}{proc.stderr}"
+    )
+    assert seen["API_TIMEOUT_MS"] == "3000000", proc.stdout
+
+
+def test_home_reads_are_denied(tmp_path: Path):
+    """~ is denied for reads (the run dir is re-allowed): the WO's "other
+    projects" plus everything else in the owner's home — ~/.aws, shell rc
+    files, other checkouts — is none of a session's business."""
+    probe = Path("~/.factory-sandbox-probe").expanduser()
+    probe.write_text("home secret\n")
+    try:
+        run, _, settings = _make_run(tmp_path)
+        script = textwrap.dedent(
+            """
+            import sys
+            def attempt(label, fn):
+                try:
+                    fn()
+                    print(f"{label}:ok", flush=True)
+                except Exception as exc:
+                    print(f"{label}:denied {type(exc).__name__}", flush=True)
+            attempt("home", lambda: open(sys.argv[1]).read())
+            attempt("control", lambda: open(sys.argv[2]).read())
+            """
+        )
+        proc = run_sandboxed(
+            _child(script, [str(probe), "/etc/hosts"]),
+            run.root,
+            run.settings_path,
+            timeout=60,
+        )
+        outcomes = dict(line.split(":", 1) for line in proc.stdout.splitlines())
+        assert outcomes["home"].startswith("denied"), (
+            f"a file in the owner's home was readable inside the sandbox\n"
+            f"{proc.stdout}{proc.stderr}"
+        )
+        assert outcomes["control"] == "ok", (
+            f"system reads are broken too — the denial is too broad\n{proc.stdout}{proc.stderr}"
+        )
+    finally:
+        probe.unlink(missing_ok=True)
+
+
+def test_settings_deny_git_control_paths_and_home(tmp_path: Path):
+    run, _, settings = _make_run(tmp_path)
+    deny_write = [str(Path(p)) for p in settings["filesystem"]["denyWrite"]]
+    assert str(run.root / ".git" / "hooks") in deny_write
+    assert str(run.root / ".git" / "config") in deny_write
+    deny_read = [str(Path(p).expanduser()) for p in settings["filesystem"]["denyRead"]]
+    assert str(Path("~").expanduser()) in deny_read
