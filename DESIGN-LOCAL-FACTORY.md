@@ -127,8 +127,8 @@ The inline blueprint diagram from this session shows the same flow.
 | `factory` CLI (orchestrator) | `import`, `approve <id>`, `run` (one slice), `loop` (until queue empty, quota hit or escalation), `status`, `verify-live <id>` | — |
 | Contract validation | JSON Schema check of `tasks.json` + `project.yaml` on every load; refuse to run on invalid state | `schema/*.json` |
 | Session runner | Starts one agent session in a sandboxed clone with seat-specific model, env, tools, hooks and turn cap | Claude Agent SDK (`claude-agent-sdk`): `query()` + `ClaudeAgentOptions` + `HookMatcher` |
-| Implementer prompt | One slice, red-first test, conventional commit, structured report | SoloAdventurer `.claude/agents/implementer.md`, generalised |
-| Reviewer prompt | Default FAIL, contract-vs-diff, project checklist | SoloAdventurer `.claude/agents/verifier.md`, generalised |
+| Implementer prompt | One slice, red-first test, conventional commit, structured report | SoloAdventurer `.claude/agents/implementer.md`, generalised; mattpocock/skills `tdd` (vendored, F-09) |
+| Reviewer prompt | Default FAIL, two axes (spec + standards), project checklist, test quality | SoloAdventurer `.claude/agents/verifier.md`, generalised; mattpocock/skills `code-review` (vendored, F-09) |
 | Importer prompt | Proposes `tasks.json` from planning docs; you review the diff | — |
 | L0/L1 engine | Deterministic: commands, baseline, diff policy, red-first proof | Rules from `verifier.md` |
 | L3/L4 runner | Holdout runner, `live_checks` from the profile | `ops/verify_deployment.sh`, `preflight.py`, `check-schema-refs.py`, migration-drift workflow |
@@ -251,4 +251,5 @@ Every contract is approved by you; every PR is merged by you; risk flags are per
 - [Z.ai — Claude Code setup](https://docs.z.ai/scenario-example/develop-tools/claude.md) · [Coding Plan FAQ](https://docs.z.ai/devpack/faq) · [Coding Plan overview / quotas](https://docs.z.ai/devpack/overview)
 - [Anthropic sandbox-runtime (srt)](https://github.com/anthropic-experimental/sandbox-runtime) · [Claude Code sandboxing](https://code.claude.com/docs/en/sandboxing)
 - Requesty, Agent SDK with a custom base URL: the SDK reads `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` — [docs](https://docs.requesty.ai/integrations/anthropic-agent-sdks.md)
+- [mattpocock/skills](https://github.com/mattpocock/skills) @ `49dd158` (MIT): `tdd`, `code-review`, `pr`, `diagnosing-bugs`, `triage`, `retro`. A solo practitioner's operating details under the lab architecture above; where it differs (agent-run merges, parallel writers) this design wins.
 - Rest: see [REVIEW-IMPROVEMENTS.md](REVIEW-IMPROVEMENTS.md) sources

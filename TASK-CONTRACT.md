@@ -27,6 +27,7 @@ One record per work item (WO, story, or step). Big items are split into **slices
 | `risk` | Static flags declared from the doc: `auth`, `payments`, `rls`, `migration`, `safety`, `privacy`, `new_dependency`, `deploy`, `cross_repo`, `external_service`, `factory_control` (changes to how work is chosen or judged: schemas, contracts, validator config). The validator adds dynamic flags from the diff (§ VALIDATOR-SPEC L0). |
 | `gates` | `spec_approval` (bool), `merge` (`human`/`auto`), `deploy` (`human`/`auto`). Any risk flag forces `human` on merge. In v0 everything is `human`. |
 | `acceptance` | The **validation contract**: list of `{id, text, check}`. `check.type` is `test` (named test that must fail before / pass after), `command`, `holdout` (scenario id), `prod_probe` (post-deploy check), or `manual` (becomes an owner step). Frozen when the spec is approved: `acceptance_hash` = SHA-256 of the canonical JSON. A changed hash after approval sends the task back to `draft` — except a `done` task, which is **flagged for your review** instead: reopening verified work is a human decision, never automatic. |
+| `out_of_scope` | Optional list of things this task must **not** change or add, e.g. adjacent features that look related. It gives the L2 Spec axis something concrete to check scope creep against (VALIDATOR-SPEC L2). You write it at approval, alongside `acceptance`. It isn't part of `acceptance_hash` (F-04 hashes `acceptance` only), so editing it after approval doesn't send the task back to `draft`. |
 | `owner_steps` | `[{text, done}]` — things only you can do (JobFinderOS "Owner steps (not buildable by a session)"; SoloAdventurer 👤 items). |
 | `slices` | `[{id, text, status, acceptance_ids}]` — ordered build units. One session builds one slice. |
 | `budget` | `{size: S|M, max_attempts, max_turns, wall_clock_min}`. L-sized work must be sliced; the factory refuses an unsliced L. |
@@ -104,7 +105,10 @@ The adapter. Everything the factory must know about a repo that isn't in a task.
 | `live_checks` | Post-deploy commands the orchestrator runs **outside** the sandbox with secrets from the macOS keychain. |
 | `holdouts` | Directory outside the repo (`~/factory/holdouts/<project>/`) and how to run it. |
 | `docs_allowlist` | Domains the agent may fetch for docs grounding (both projects mandate official-docs lookups). |
+| `standards` | Optional repo-relative paths of the project's coding-standards docs (e.g. `CODING_STANDARDS.md`, `CONTRIBUTING.md`). **Read by the L2 reviewer only**, never pushed to the implementer. Mechanical rules belong in L0 tooling, not here. |
 | `cross_repo` | Sibling repos whose changes can break this one. v0: any task touching them → `needs_human`. |
+
+**Out-of-scope register (`.factory/out-of-scope/`).** One markdown file per rejected *concept* (not per request): what was rejected, the durable reason, and the requests that asked for it. Only you write it. It's a protected path, and it records rejected enhancements, never features that turned out to exist already. The importer (F-12) and triage (F-18) read it, and a draft that resembles a record is shown to you with the record cited. Matching is by concept, not keyword, and **you confirm the match**: nothing is rejected automatically. Adapted from mattpocock/skills `triage`.
 
 ## 6. Onboarding an existing project
 
