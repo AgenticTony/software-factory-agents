@@ -173,7 +173,8 @@ def test_blocked_round_trip_then_escalation_is_legal(tmp_path):
 
 def test_l4_branches_from_deploying(tmp_path):
     # live check FAIL -> needs_human; PASS with open owner steps ->
-    # awaiting_owner -> done (steps ticked)
+    # awaiting_owner -> done (steps ticked; the guard refuses done
+    # while a step is open)
     path = _queue_file(tmp_path, [_task(id="T-FAIL", status="deploying")])
     TaskQueue(path).transition("T-FAIL", "needs_human")
 
@@ -190,8 +191,83 @@ def test_l4_branches_from_deploying(tmp_path):
     )
     queue = TaskQueue(path)
     queue.transition("T-OWNER", "awaiting_owner")
+    queue.get("T-OWNER")["owner_steps"][0]["done"] = True  # you tick the step
     queue.transition("T-OWNER", "done")
     assert TaskQueue(path).get("T-OWNER")["status"] == "done"
+
+
+def test_owner_step_guards(tmp_path):
+    # done asserts every owner step is ticked; awaiting_owner with none
+    # open would wait on nothing (added in the F-04 review round —
+    # reconcile must not close a task its owner steps hold open).
+    path = _queue_file(
+        tmp_path,
+        [
+            _task(
+                id="T-OPEN",
+                status="deploying",
+                owner_steps=[{"text": "answer Z.ai", "done": False}],
+            )
+        ],
+    )
+    queue = TaskQueue(path)
+    with pytest.raises(TransitionError, match="owner step"):
+        queue.transition("T-OPEN", "done")
+    queue.transition("T-OPEN", "awaiting_owner")  # legal: a step is open
+    with pytest.raises(TransitionError, match="never done"):
+        TaskQueue(path).transition("T-OPEN", "done")
+    queue.get("T-OPEN")["owner_steps"][0]["done"] = True
+    queue.transition("T-OPEN", "done")
+    assert TaskQueue(path).get("T-OPEN")["status"] == "done"
+
+    path = _queue_file(tmp_path, [_task(id="T-CLOSED", status="deploying")], name="t2.json")
+    with pytest.raises(TransitionError, match="would wait on nothing"):
+        TaskQueue(path).transition("T-CLOSED", "awaiting_owner")
+    TaskQueue(path).transition("T-CLOSED", "done")
+
+
+# --- Multi-edge transitions (F-04 reconcile) ------------------------------
+
+
+def test_transition_path_applies_the_final_status_in_one_save(tmp_path, monkeypatch):
+    saves = []
+    original = TaskQueue.save
+
+    def counting_save(self):
+        saves.append(1)
+        original(self)
+
+    monkeypatch.setattr(TaskQueue, "save", counting_save)
+    path = _queue_file(tmp_path, [_task(id="T-1", status="draft")])
+    TaskQueue(path).transition_path("T-1", ["ready", "in_progress", "in_review"])
+    assert TaskQueue(path).get("T-1")["status"] == "in_review"
+    assert len(saves) == 1
+
+
+def test_transition_path_refuses_illegal_or_guarded_paths_without_writing(tmp_path):
+    path = _queue_file(tmp_path, [_task(id="T-1", status="draft")])
+    before = path.read_text()
+    queue = TaskQueue(path)
+    with pytest.raises(TransitionError, match="illegal transition ready -> in_review"):
+        queue.transition_path("T-1", ["ready", "in_review"])
+    with pytest.raises(StateError):
+        queue.transition_path("T-1", [])
+    assert path.read_text() == before
+
+    # Guards run on the final status: done needs every slice merged.
+    sliced = _task(
+        id="T-SLICED",
+        status="draft",
+        slices=[{"id": "S-1", "text": "only slice", "status": "todo"}],
+    )
+    path = _queue_file(tmp_path, [sliced], name="tasks2.json")
+    before = path.read_text()
+    with pytest.raises(TransitionError, match="slice"):
+        TaskQueue(path).transition_path(
+            "T-SLICED",
+            ["ready", "in_progress", "in_review", "deploying", "done"],
+        )
+    assert path.read_text() == before
 
 
 @pytest.mark.parametrize("start", sorted(CONTRACT_FROZEN_STATUSES))

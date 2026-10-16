@@ -70,9 +70,9 @@ def _run_approve(args: argparse.Namespace) -> int:
         approver = args.approved_by or default_approver()
         queue = TaskQueue(args.queue)
         if args.reconcile_bootstrap:
-            results = reconcile_bootstrap(
-                queue, args.ledger, approved_by=approver, assume_yes=args.yes
-            )
+            # No --yes here by design (see main): every entry is confirmed
+            # interactively.
+            results = reconcile_bootstrap(queue, args.ledger, approved_by=approver)
             for result in results:
                 print(f"{result.task_id}: {result.action} — {result.detail}")
             return 1 if any(r.action == "failed" for r in results) else 0
@@ -84,6 +84,9 @@ def _run_approve(args: argparse.Namespace) -> int:
     except (ApprovalError, ContractError) as exc:
         print(f"factory approve: {exc}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        print("factory approve: interrupted", file=sys.stderr)
+        return 130
 
 
 def main(argv: list | None = None) -> int:
@@ -102,6 +105,11 @@ def main(argv: list | None = None) -> int:
         if bool(args.task_id) == bool(args.reconcile_bootstrap):
             parser.error(
                 "approve takes exactly one of: a task id, or --reconcile-bootstrap"
+            )
+        if args.reconcile_bootstrap and args.yes:
+            parser.error(
+                "--yes is not accepted with --reconcile-bootstrap: the ledger is "
+                "plain markdown, so reconcile confirms every entry interactively"
             )
         return _run_approve(args)
     print(

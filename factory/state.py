@@ -267,9 +267,16 @@ def unmet_dependencies(task: dict, tasks: list) -> list:
     return _unmet_by_id(task, {t.get("id"): t for t in tasks})
 
 
-def dependencies_met(task: dict, tasks: list) -> bool:
-    """True when every dependency of ``task`` is met (see ``unmet_dependencies``)."""
-    return not unmet_dependencies(task, tasks)
+def open_owner_steps(task: dict) -> list:
+    """The task's owner steps that aren't ticked yet (TASK-CONTRACT §2).
+
+    Args:
+        task: The task record.
+
+    Returns:
+        The open ``owner_steps`` entries, in declared order.
+    """
+    return [step for step in (task.get("owner_steps") or []) if not step.get("done")]
 
 
 def now_iso() -> str:
@@ -383,6 +390,38 @@ def _check_slice_rules(task: dict, new_status: str) -> None:
         )
 
 
+def _check_owner_step_rules(task: dict, new_status: str) -> None:
+    """Enforce the owner-step semantics of ``done`` / ``awaiting_owner``.
+
+    TASK-CONTRACT §3: ``deploying -> awaiting_owner`` is "L4 passed,
+    owner steps still open", ``deploying -> done`` is "L4 passed, no
+    open owner steps", and ``awaiting_owner -> done`` is "owner steps
+    ticked" — so ``done`` asserts every step is ticked, and
+    ``awaiting_owner`` exists only while at least one is open (with none
+    open it would wait on nothing; the task resolves to ``done``).
+
+    Args:
+        task: The task record.
+        new_status: The requested status.
+
+    Raises:
+        TransitionError: If the owner-step state contradicts the status.
+    """
+    tid = task.get("id")
+    open_steps = open_owner_steps(task)
+    if new_status == "done" and open_steps:
+        texts = "; ".join(step.get("text", "?") for step in open_steps)
+        raise TransitionError(
+            f"{tid}: owner step(s) still open: {texts}; the task is "
+            "awaiting_owner until you tick them, never done"
+        )
+    if new_status == "awaiting_owner" and not open_steps:
+        raise TransitionError(
+            f"{tid}: no owner steps are open; awaiting_owner would wait on "
+            "nothing — resolve the task to done instead"
+        )
+
+
 class TaskQueue:
     """The orchestrator's handle on a ``tasks.json`` — its only writer.
 
@@ -437,14 +476,51 @@ class TaskQueue:
         Raises:
             StateError: If the task doesn't exist.
             TransitionError: If the edge isn't in the table, or the slice
-                state contradicts it (see ``_check_slice_rules``).
+                or owner-step state contradicts it.
             ContractError: If the resulting queue wouldn't validate.
             ConcurrentWriteError: If another writer changed the file.
         """
         task = self.get(task_id)
         check_transition(task.get("status"), new_status)
         _check_slice_rules(task, new_status)
+        _check_owner_step_rules(task, new_status)
         task["status"] = new_status
+        self.save()
+
+    def transition_path(self, task_id: str, statuses: list) -> None:
+        """Move a task through a sequence of legal transitions in one save.
+
+        Every consecutive edge is validated against the table, and the
+        slice and owner-step guards run on the final status, before
+        anything is written; only the final status is persisted.
+        Intermediate statuses in a path are history being replayed, not
+        state to publish: persisting each would mean a full locked save
+        per step, a crash window that strands a half-moved task, and a
+        transient ``in_progress`` that never held the run lease.
+        Reconcile (F-04) is the intended caller.
+
+        Args:
+            task_id: Task id.
+            statuses: The statuses to move through, in order; the last
+                one is the resulting status. Must be non-empty.
+
+        Raises:
+            StateError: If the task doesn't exist or ``statuses`` is empty.
+            TransitionError: If any consecutive edge isn't in the table,
+                or the guards refuse the final status.
+            ContractError: If the resulting queue wouldn't validate.
+            ConcurrentWriteError: If another writer changed the file.
+        """
+        if not statuses:
+            raise StateError(f"{task_id}: transition_path needs at least one status")
+        task = self.get(task_id)
+        current = task.get("status")
+        for new_status in statuses:
+            check_transition(current, new_status)
+            current = new_status
+        _check_slice_rules(task, statuses[-1])
+        _check_owner_step_rules(task, statuses[-1])
+        task["status"] = statuses[-1]
         self.save()
 
     def append_attempt(self, task_id: str, attempt: dict) -> None:

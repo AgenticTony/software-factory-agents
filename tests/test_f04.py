@@ -378,7 +378,10 @@ def test_reconcile_walks_to_an_intermediate_status(tmp_path):
     assert task["approved_by"] == "Tester"
 
 
-def test_reconcile_risk_flagged_entry_refuses_yes(tmp_path):
+def test_reconcile_risk_flagged_entry_confirms_interactively(tmp_path):
+    # Reconcile has no --yes at all (see the CLI test below); a
+    # risk-flagged entry reconciles after its interactive confirmation,
+    # mirroring AC-3's interactive path for single approvals.
     ledger = _ledger_file(
         tmp_path,
         "## T-1 — x\n\n- **AC-1** proven: yes.\n- **AC-2** proven: yes.\n"
@@ -386,10 +389,143 @@ def test_reconcile_risk_flagged_entry_refuses_yes(tmp_path):
     )
     path = _queue_file(tmp_path, [_task(risk=["payments"])])
     results = reconcile_bootstrap(
-        TaskQueue(path), ledger, approved_by="Tester", assume_yes=True
+        TaskQueue(path), ledger, approved_by="Tester", confirm=say_yes
+    )
+    assert results[0].action == "reconciled"
+    assert TaskQueue(path).get("T-1")["status"] == "done"
+
+
+# --- Extra: review-round regressions (PR #7 findings) ----------------------
+
+
+def test_reconcile_failure_writes_nothing(tmp_path):
+    # Reviewer repro: an entry refused partway (an unmerged slice can't
+    # reach done) must leave the file byte-identical — no approved task
+    # stranded at an intermediate status that a re-run then skips.
+    task = _task(slices=[{"id": "S-1", "text": "only slice", "status": "todo"}])
+    path = _queue_file(tmp_path, [task])
+    ledger = _ledger_file(
+        tmp_path,
+        "## T-1 — x\n\n- **AC-1** proven: yes.\n- **AC-2** proven: yes.\n"
+        "- **Status to set at reconcile:** `done`.\n",
+    )
+    before = path.read_text()
+    results = reconcile_bootstrap(
+        TaskQueue(path), ledger, approved_by="Tester", confirm=say_yes
     )
     assert results[0].action == "failed"
-    assert "payments" in results[0].detail
+    assert "slice" in results[0].detail
+    assert path.read_text() == before
+
+
+def test_reconcile_routes_open_owner_steps_to_awaiting_owner(tmp_path):
+    # Reviewer repro: a recorded done with owner steps still open is
+    # awaiting_owner (TASK-CONTRACT §3), never done.
+    task = _task(owner_steps=[{"text": "answer Z.ai before scheduling", "done": False}])
+    path = _queue_file(tmp_path, [task])
+    ledger = _ledger_file(
+        tmp_path,
+        "## T-1 — x\n\n- **AC-1** proven: yes.\n- **AC-2** proven: yes.\n"
+        "- **Status to set at reconcile:** `done`.\n",
+    )
+    results = reconcile_bootstrap(
+        TaskQueue(path), ledger, approved_by="Tester", confirm=say_yes
+    )
+    assert results[0].action == "reconciled"
+    assert "owner steps are open" in results[0].detail
+    on_disk = TaskQueue(path).get("T-1")
+    assert on_disk["status"] == "awaiting_owner"
+    assert on_disk["acceptance_hash"] == acceptance_hash(ACCEPTANCE)
+
+
+@pytest.mark.parametrize(
+    "target", ["in_review", "deploying", "awaiting_owner", "done"]
+)
+def test_reconcile_pending_criteria_block_post_build_targets(tmp_path, target):
+    # Every recorded status that asserts the build passed validation
+    # requires all criteria proven — not just done.
+    path = _queue_file(tmp_path, [_task()])
+    ledger = _ledger_file(
+        tmp_path,
+        "## T-1 — x\n\n- **AC-1** proven: yes.\n- **AC-2** pending: not yet.\n"
+        f"- **Status to set at reconcile:** `{target}`.\n",
+    )
+    results = reconcile_bootstrap(
+        TaskQueue(path), ledger, approved_by="Tester", confirm=say_yes
+    )
+    assert results[0].action == "failed"
+    assert "pending" in results[0].detail
+    assert TaskQueue(path).get("T-1")["status"] == "draft"
+
+
+def test_reconcile_pending_criteria_can_still_escalate(tmp_path):
+    # needs_human is the honest recorded status for unproven work.
+    path = _queue_file(tmp_path, [_task()])
+    ledger = _ledger_file(
+        tmp_path,
+        "## T-1 — x\n\n- **AC-1** proven: yes.\n- **AC-2** pending: not yet.\n"
+        "- **Status to set at reconcile:** `needs_human`.\n",
+    )
+    results = reconcile_bootstrap(
+        TaskQueue(path), ledger, approved_by="Tester", confirm=say_yes
+    )
+    assert results[0].action == "reconciled"
+    assert TaskQueue(path).get("T-1")["status"] == "needs_human"
+
+
+def test_reconcile_writes_once_per_entry(tmp_path, monkeypatch):
+    # One atomic save per entry: no intermediate statuses hit disk (the
+    # crash window the reviewer's stranding repro exploited) and no
+    # transient in_progress without the run lease.
+    tasks = [_task(id="F-1"), _task(id="F-2", depends_on=["F-1"])]
+    path = _queue_file(tmp_path, tasks)
+    ledger = _ledger_file(tmp_path, LEDGER)
+    saves = []
+    original = TaskQueue.save
+
+    def counting_save(self):
+        saves.append(1)
+        original(self)
+
+    monkeypatch.setattr(TaskQueue, "save", counting_save)
+    results = reconcile_bootstrap(
+        TaskQueue(path), ledger, approved_by="Tester", confirm=say_yes
+    )
+    assert [r.action for r in results[:2]] == ["reconciled", "reconciled"]
+    assert TaskQueue(path).get("F-2")["status"] == "done"
+    assert len(saves) == 2
+
+
+def test_parser_cleans_heading_punctuation():
+    entries = parse_bootstrap_ledger(
+        "## F-05: Clone manager\n\n- **AC-1** proven: yes.\n"
+        "- **Status to set at reconcile:** `done`.\n"
+    )
+    assert entries[0]["id"] == "F-05"
+    assert entries[0]["status"] == "done"
+
+
+def test_parser_surfaces_a_malformed_status_line():
+    # A status marker without parseable backticks still counts as an
+    # entry (status None), so reconcile fails it visibly instead of the
+    # work order silently staying draft.
+    entries = parse_bootstrap_ledger(
+        "## W-9 — x\n\n- **Status to set at reconcile:** done, no backticks\n"
+    )
+    assert entries and entries[0]["id"] == "W-9"
+    assert entries[0]["status"] is None
+
+
+def test_eof_on_prompt_declines(tmp_path, monkeypatch):
+    # No TTY / closed stdin is a decline, never an EOFError traceback.
+    def raise_eof(_prompt):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", raise_eof)
+    path = _queue_file(tmp_path, [_task()])
+    queue = TaskQueue(path)
+    with pytest.raises(ApprovalDeclined):
+        approve_task(queue, "T-1", approved_by="Tester")
     assert TaskQueue(path).get("T-1")["status"] == "draft"
 
 
@@ -467,3 +603,22 @@ def test_cli_requires_a_task_id_or_reconcile():
         main(["approve"])
     with pytest.raises(SystemExit):
         main(["approve", "T-1", "--reconcile-bootstrap"])
+
+
+def test_cli_refuses_yes_with_reconcile_bootstrap():
+    # AC-4: reconcile confirms every entry interactively; --yes would
+    # turn plain markdown into done tasks with nobody reading them.
+    with pytest.raises(SystemExit):
+        main(["approve", "--reconcile-bootstrap", "--yes"])
+
+
+def test_cli_eof_on_prompt_exits_cleanly(tmp_path, capsys, monkeypatch):
+    def raise_eof(_prompt):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", raise_eof)
+    path = _queue_file(tmp_path, [_task()])
+    code = main(["approve", "T-1", "--queue", str(path)])
+    assert code == 1
+    assert "declined" in capsys.readouterr().err
+    assert TaskQueue(path).get("T-1")["status"] == "draft"
