@@ -16,7 +16,7 @@ commands:
 paths:
   risk:
     # Control files: touching these changes how work is chosen or judged.
-    safety: ["schema/**", "TASK-CONTRACT.md", "VALIDATOR-SPEC.md", ".factory/tasks.json"]
+    factory_control: ["schema/**", "TASK-CONTRACT.md", "VALIDATOR-SPEC.md", ".factory/**"]
     deploy: [".github/workflows/**"]
   protected:
     - ".factory/**"
