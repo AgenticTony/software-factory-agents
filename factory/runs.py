@@ -144,10 +144,14 @@ def create_run(
 
 
 def cleanup_run(run: RunDir) -> None:
-    """Delete the run's clone and settings file. Idempotent: a missing run
-    (already cleaned, or never finished creating) is not an error."""
+    """Delete the run's clone, settings file and staged runner copy
+    (``<settings>-runner/``, written by the F-06 session runner). Idempotent:
+    a missing run (already cleaned, or never finished creating) is not an
+    error."""
     shutil.rmtree(run.root, ignore_errors=True)
     run.settings_path.unlink(missing_ok=True)
+    shutil.rmtree(run.settings_path.with_name(run.settings_path.name + "-runner"),
+                  ignore_errors=True)
 
 
 def _new_run_id() -> str:

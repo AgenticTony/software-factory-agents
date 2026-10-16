@@ -10,6 +10,11 @@ requires-python = ">=3.11"
 dependencies = [
     "jsonschema>=4",
     "PyYAML>=6",
+    # Exact pin (BUILD-ORDER stack line). The runner is written against the
+    # 0.2.x ResultMessage shape — model_usage, terminal_reason,
+    # api_error_status — which 0.1.x drops entirely. A drift here must be a
+    # red CI run, not a silent behaviour change.
+    "claude-agent-sdk==0.2.168",
 ]
 
 [project.optional-dependencies]
