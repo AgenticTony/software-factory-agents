@@ -26,7 +26,7 @@ One record per work item (WO, story, or step). Big items are split into **slices
 | `status` | See §3. |
 | `risk` | Static flags declared from the doc: `auth`, `payments`, `rls`, `migration`, `safety`, `privacy`, `new_dependency`, `deploy`, `cross_repo`, `external_service`, `factory_control` (changes to how work is chosen or judged: schemas, contracts, validator config). The validator adds dynamic flags from the diff (§ VALIDATOR-SPEC L0). |
 | `gates` | `spec_approval` (bool), `merge` (`human`/`auto`), `deploy` (`human`/`auto`). Any risk flag forces `human` on merge. In v0 everything is `human`. |
-| `acceptance` | The **validation contract**: list of `{id, text, check}`. `check.type` is `test` (named test that must fail before / pass after), `command`, `holdout` (scenario id), `prod_probe` (post-deploy check), or `manual` (becomes an owner step). Frozen when the spec is approved: `acceptance_hash` = SHA-256 of the canonical JSON. A changed hash after approval sends the task back to `draft`. |
+| `acceptance` | The **validation contract**: list of `{id, text, check}`. `check.type` is `test` (named test that must fail before / pass after), `command`, `holdout` (scenario id), `prod_probe` (post-deploy check), or `manual` (becomes an owner step). Frozen when the spec is approved: `acceptance_hash` = SHA-256 of the canonical JSON. A changed hash after approval sends the task back to `draft` — except a `done` task, which is **flagged for your review** instead: reopening verified work is a human decision, never automatic. |
 | `owner_steps` | `[{text, done}]` — things only you can do (JobFinderOS "Owner steps (not buildable by a session)"; SoloAdventurer 👤 items). |
 | `slices` | `[{id, text, status, acceptance_ids}]` — ordered build units. One session builds one slice. |
 | `budget` | `{size: S|M, max_attempts, max_turns, wall_clock_min}`. L-sized work must be sliced; the factory refuses an unsliced L. |
@@ -65,6 +65,15 @@ draft ──(you approve spec + contract)──▶ ready ◀──(deps met)─�
 | `needs_human` | orchestrator | Escalated. `attempts[-1].escalation` says why. Never retried automatically. |
 | `done` | orchestrator | All slices merged, L4 live check passed, owner steps ticked. **Requires live evidence — CI green is not enough.** |
 | `not_buildable` | importer | `decision`/`research`/`owner_only` kinds. Listed in your daily summary. |
+
+Recovery and continuation edges (same allowed-transition table, kept out of the diagram for readability):
+
+| Edge | Set when |
+|---|---|
+| `in_progress → ready` | the run aborted with no PR and no outcome (orchestrator crash, killed session). The task re-enters the queue under the same attempt budget. Liveness comes from a **run lease**, an OS lock the session holds for its whole life and the OS releases when the process dies. `reclaim_abandoned` applies this edge only when the lease is free, so a live run is never reclaimed, and a run that died before its first attempt record still is. |
+| `in_review → in_progress` | you rejected the PR — the task returns for a fix round. |
+| `deploying → ready` | the previous slice merged and live-verified and more slices remain. Owner-step and `done` evaluation waits until the last slice merges; a task can only be `done`/`awaiting_owner` with every slice merged. |
+| `ready → blocked` | a dependency regressed (its task was reopened or demoted). `sync_readiness` reconciles both directions. |
 
 Escalation reasons (enum): `attempts_exhausted`, `budget_exhausted`, `risk_path_touched`, `new_dependency`, `protected_path_touched`, `contract_ambiguous`, `quota_exhausted`, `live_check_failed`, `cross_repo`.
 
