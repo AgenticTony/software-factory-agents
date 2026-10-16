@@ -170,6 +170,7 @@ Acceptance:
 - AC-3 A quota/429 error stops `loop` and marks `quota_exhausted`, with no retry.
 - AC-4 `loop` won't start a session during 08:00–12:00 Mon–Fri Swedish time. The window comes from config.
 - AC-5 The code contains no `gh pr merge` call (a grep test).
+- AC-6 Every attempt records `prompt_versions` (seat → prompt content hash, from F-09) and `skills` (the skills loaded). An attempt without them is a schema error.
 
 ### F-11 — `factory status`: daily summary + metrics
 Write a markdown summary per project:
@@ -232,9 +233,10 @@ A Sentry-alert → triage-session pipeline. That session has no secrets, can't p
 ## Phase 4 — Self-improvement and gate dial-down
 
 ### F-19 — Meta loop
-A weekly review of escalations and L2 findings → PRs with **itemised delta edits** to prompt files.
+A weekly review of escalations and L2 findings → PRs with **itemised delta edits** to prompt files. Edits target what actually caused failures. Every attempt records which prompt versions and skills it used (F-10 AC-6), and the review traces failures back to them. This is a non-trained version of the credit-assignment idea in market-based post-training ([arXiv 2610.22322](https://arxiv.org/abs/2610.22322)).
 - AC-1 A PR that touches validators, holdouts, contract tests or schemas is rejected by L0.
 - AC-2 Edits are additions, removals or changes to individual items, never whole-file rewrites (a diff-size check).
+- AC-3 The weekly review groups failed and escalated attempts by `prompt_versions` and `skills`, and reports each version's failure share. Each proposed edit names the version it targets and the evidence (attempt run ids) behind it.
 
 ### F-20 — Cross-provider reviewer
 A per-seat provider config. Risk-flagged tasks get a second L2 review from a different provider.

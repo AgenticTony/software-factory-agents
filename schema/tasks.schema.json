@@ -58,7 +58,7 @@
     },
     "attempt": {
       "type": "object",
-      "required": ["run_id", "slice_id", "started", "outcome"],
+      "required": ["run_id", "slice_id", "started", "outcome", "prompt_versions", "skills"],
       "additionalProperties": false,
       "properties": {
         "run_id": { "type": "string" },
@@ -74,6 +74,8 @@
         "pr": { "type": "string" },
         "validator_report": { "type": "string", "description": "Path to the stored validator report" },
         "escalation": { "$ref": "#/$defs/escalation" },
+        "prompt_versions": { "type": "object", "description": "seat -> prompt content hash (F-09); used for credit assignment in F-19", "additionalProperties": { "type": "string" } },
+        "skills": { "type": "array", "items": { "type": "string" }, "description": "Skills loaded in the session, name@version" },
         "note": { "type": "string" }
       }
     },

@@ -639,6 +639,14 @@
             "type": "test",
             "ref": "tests/test_f10.py::test_ac_5"
           }
+        },
+        {
+          "id": "AC-6",
+          "text": "Every attempt records `prompt_versions` (seat → prompt content hash, from F-09) and `skills` (the skills loaded). An attempt without them is a schema error.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f10.py::test_ac_6"
+          }
         }
       ],
       "budget": {
@@ -1046,6 +1054,14 @@
           "check": {
             "type": "test",
             "ref": "tests/test_f19.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "The weekly review groups failed and escalated attempts by `prompt_versions` and `skills`, and reports each version's failure share. Each proposed edit names the version it targets and the evidence (attempt run ids) behind it.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f19.py::test_ac_3"
           }
         }
       ],
