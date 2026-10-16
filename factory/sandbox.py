@@ -181,6 +181,13 @@ def build_settings(
     denied_names = sorted(
         set(_FORBIDDEN_ENV_EXACT) | {name for name in forbidden_env if name}
     )
+    # srt's Linux sandbox runs its vendor helpers (apply-seccomp, the java
+    # agent jar) from INSIDE the bwrap namespace. On hosts where this repo
+    # sits under $HOME — CI runners check out under /home/runner — the
+    # home-wide denyRead below would hide them and every sandboxed command
+    # would die at startup. Re-allow exactly the runtime's own package dir;
+    # the factory's source (and everything else in the repo) stays denied.
+    srt_package = _REPO_ROOT / "node_modules" / "@anthropic-ai" / "sandbox-runtime"
     return {
         "network": {"allowedDomains": allowed_domains, "deniedDomains": []},
         "filesystem": {
@@ -191,7 +198,7 @@ def build_settings(
                 str(Path("~/.config/gh").expanduser()),
                 str(runs_root),
             ],
-            "allowRead": [str(run_dir)],
+            "allowRead": [str(run_dir), str(srt_package)],
             "allowWrite": [str(run_dir)],
             # The run's git control files are not the agent's to edit: a hook
             # or core.hooksPath/fsmonitor redirect planted here executes later,
