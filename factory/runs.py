@@ -121,9 +121,10 @@ def create_run(
             )
 
     if warm_cache is not None:
+        _refuse_tracked_collisions(dest, warm_cache)
         try:
             shutil.copytree(warm_cache, dest, dirs_exist_ok=True)
-            _relocate_venv(Path(warm_cache).resolve(), dest)
+            _relocate_venv(Path(warm_cache), dest)
             _seed_cache_excludes(dest, warm_cache)
         except OSError as exc:
             shutil.rmtree(dest, ignore_errors=True)
@@ -145,31 +146,61 @@ def _new_run_id() -> str:
     return f"{stamp}-{uuid.uuid4().hex[:6]}"
 
 
+def _refuse_tracked_collisions(dest: Path, warm_cache: Path) -> None:
+    """Refuse a cache that would overwrite tracked files: a stray
+    package-lock.json in the cache would silently mutate the checkout the
+    agent is supposed to diff against (phantom lockfile changes, L0
+    new_dependency escalations, cache content in the PR)."""
+    tracked = subprocess.run(
+        ["git", *GIT_HARDENING, "-C", str(dest), "ls-files"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    top_tracked = {
+        line.split("/", 1)[0] for line in tracked.splitlines() if line.strip()
+    }
+    collisions = sorted(
+        {entry.name for entry in Path(warm_cache).iterdir()} & top_tracked
+    )
+    if collisions:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise RunError(
+            f"warm cache would overwrite tracked files in the run: "
+            f"{', '.join(collisions)}"
+        )
+
+
 def _relocate_venv(cache: Path, dest: Path) -> None:
     """Rewrite a copied venv's absolute cache paths to the run dir.
 
     A venv is not relocatable as-is: ``bin/*`` shebangs and ``activate``
-    embed the venv's absolute path, and ``pyvenv.cfg`` points at its home.
-    Left as the cache path, ``.venv/bin/pip`` executes the *cache's*
-    interpreter and installs target the cache — writes the sandbox denies.
+    embed the venv's absolute path, ``pyvenv.cfg`` points at its home, and
+    ``.pth`` files reference install locations. Left as the cache path,
+    ``.venv/bin/pip`` executes the *cache's* interpreter and installs target
+    the cache — writes the sandbox denies. The venv embeds the path it was
+    *created through*, so both the given path and its resolved form (a
+    symlinked cache: ``/tmp`` vs ``/private/tmp`` on macOS) are rewritten.
     Best-effort by prefix substitution; only venv-looking trees are touched.
     """
     for venv_name in (".venv", "venv"):
         venv = dest / venv_name
         if not (venv / "pyvenv.cfg").exists():
             continue
-        old, new = str(cache / venv_name), str(venv)
-        candidates = [venv / "pyvenv.cfg"]
+        olds = {str(cache / venv_name), str(cache.resolve() / venv_name)}
+        new = str(venv)
+        targets = [venv / "pyvenv.cfg"]
         bin_dir = venv / "bin"
         if bin_dir.is_dir():
-            candidates.extend(p for p in bin_dir.iterdir() if p.is_file())
-        for path in candidates:
+            targets.extend(p for p in bin_dir.iterdir() if p.is_file())
+        targets.extend(venv.glob("lib*/python*/site-packages/*.pth"))
+        for path in targets:
             try:
                 text = path.read_text()
             except (OSError, UnicodeDecodeError):
                 continue  # binaries (symlinked interpreters) have no text to fix
-            if old in text:
-                path.write_text(text.replace(old, new))
+            if any(old in text for old in olds):
+                for old in olds:
+                    text = text.replace(old, new)
+                path.write_text(text)
 
 
 def _seed_cache_excludes(dest: Path, warm_cache: Path) -> None:
@@ -177,12 +208,15 @@ def _seed_cache_excludes(dest: Path, warm_cache: Path) -> None:
 
     Keeps a session's ``git add -A`` from committing ``node_modules`` /
     ``.venv`` into the PR when the target repo's .gitignore doesn't cover
-    them. ``.git/info`` is sandbox-denyWritten, so the agent can't undo it.
+    them. Entries are anchored with a leading ``/`` so they match only at
+    the run root — a bare ``lib/`` would ignore every ``src/lib`` in the
+    repo and silently hide agent-written files from the diff. ``.git/info``
+    is sandbox-denyWritten, so the agent can't undo it.
     """
     exclude = dest / ".git" / "info" / "exclude"
     exclude.parent.mkdir(parents=True, exist_ok=True)
     entries = [
-        entry.name + ("/" if entry.is_dir() else "")
+        f"/{entry.name}" + ("/" if entry.is_dir() else "")
         for entry in sorted(Path(warm_cache).iterdir())
     ]
     with exclude.open("a") as fh:

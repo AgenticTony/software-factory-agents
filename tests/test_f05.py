@@ -14,6 +14,7 @@ before pytest. If any of that breaks, these tests fail loudly.
 
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -26,6 +27,7 @@ from factory.runs import RunError, cleanup_run, create_run
 from factory.sandbox import (
     SRT_PIN,
     SandboxError,
+    _toolchain_allowread,
     build_settings,
     ensure_srt,
     run_sandboxed,
@@ -34,6 +36,7 @@ from factory.sandbox import (
     write_settings,
 )
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
 MODEL_ENDPOINT = "api.z.ai"
 
 
@@ -298,12 +301,17 @@ def test_ensure_srt_fails_when_srt_is_missing(tmp_path: Path):
         ensure_srt(srt_bin_path=tmp_path / "does-not-exist")
 
 
-def test_missing_srt_is_a_failure_not_a_skip(tmp_path: Path, monkeypatch):
-    """A broken install fails loudly; there is no skip path (owner rule)."""
-    monkeypatch.setenv("FACTORY_SRT_BIN", str(tmp_path / "missing-srt"))
+def test_missing_srt_is_a_failure_not_a_skip(tmp_path: Path):
+    """A broken install fails loudly; there is no skip path (owner rule).
+    Injection is by parameter — there is no env override to set."""
     run, _, settings = _make_run(tmp_path)
-    with pytest.raises(SandboxError, match="FACTORY_SRT_BIN"):
-        run_sandboxed(["true"], run.root, run.settings_path)
+    with pytest.raises(SandboxError, match="srt"):
+        run_sandboxed(
+            ["true"],
+            run.root,
+            run.settings_path,
+            srt_bin_path=tmp_path / "missing-srt",
+        )
     assert not (run.root / "inside.txt").exists()
 
 
@@ -654,20 +662,6 @@ def test_build_settings_rejects_an_unrecognised_run_layout(tmp_path: Path):
     assert str(tmp_path / "holdouts") in deny
 
 
-def test_srt_bin_override_is_inert_outside_tests(tmp_path: Path, monkeypatch):
-    """FACTORY_SRT_BIN is a test hook, honoured only under pytest. In
-    production a stale export must be ignored, not handed the sandbox to
-    impersonate (echo the pin, exec without srt)."""
-    ran = tmp_path / "fake-ran"
-    fake = tmp_path / "fake-srt"
-    fake.write_text(f"#!/bin/sh\ntouch '{ran}'\necho '{SRT_PIN}'\n")
-    fake.chmod(0o755)
-    monkeypatch.setenv("FACTORY_SRT_BIN", str(fake))
-    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
-    assert ensure_srt() == SRT_PIN  # the real pinned binary, not the fake
-    assert not ran.exists(), "the FACTORY_SRT_BIN fake ran outside a test context"
-
-
 def test_ensure_srt_caches_the_version_check(tmp_path: Path):
     """The pin check costs a Node boot; it must run once per binary state,
     not once per sandboxed command. The counting fake proves invocations."""
@@ -779,3 +773,238 @@ def test_sibling_run_reads_are_denied(tmp_path: Path):
         f"a sibling project's run was readable inside the sandbox\n"
         f"{proc.stdout}{proc.stderr}"
     )
+
+
+# --- review round 3: env allowlist for real, toolchain access, HOME scratch, ---
+# --- bounded teardown, anchored excludes, venv edge cases --------------------
+
+
+def test_env_dict_of_os_environ_is_allowlisted(tmp_path: Path, monkeypatch):
+    """The scenario the finding describes: F-06 passes {**os.environ, token}.
+    A planted ambient secret must NOT cross; the deliberate session names
+    must. Nothing about this is satisfied by 'the caller chose the dict' —
+    os.environ IS a dict the caller can pass."""
+    run, _, _ = _make_run(tmp_path)
+    monkeypatch.setenv("FAKE_AWS_SECRET", "leak123")
+    script = textwrap.dedent(
+        """
+        import os, sys
+        for name in sys.argv[1:]:
+            value = os.environ.get(name)
+            print(f"{name}={value if value is not None else 'absent'}", flush=True)
+        """
+    )
+    names = ["FAKE_AWS_SECRET", "AWS_SECRET_ACCESS_KEY", "ANTHROPIC_AUTH_TOKEN",
+             "API_TIMEOUT_MS"]
+    proc = run_sandboxed(
+        _child(script, names),
+        run.root,
+        run.settings_path,
+        env={**os.environ, "ANTHROPIC_AUTH_TOKEN": "zai-token",
+             "API_TIMEOUT_MS": "3000000"},
+        timeout=60,
+    )
+    seen = dict(line.split("=", 1) for line in proc.stdout.splitlines())
+    assert seen["FAKE_AWS_SECRET"] == "absent", (
+        f"ambient secret crossed via env=dict(os.environ)\n{proc.stdout}{proc.stderr}"
+    )
+    assert seen["AWS_SECRET_ACCESS_KEY"] == "absent", proc.stdout
+    assert seen["ANTHROPIC_AUTH_TOKEN"] == "zai-token", proc.stdout
+    assert seen["API_TIMEOUT_MS"] == "3000000", proc.stdout
+
+
+def test_toolchain_under_home_is_executable(tmp_path: Path):
+    """F-06 runs the Claude Code CLI, which may live under $HOME
+    (~/.local/bin/claude, pyenv, uv, nvm). The home-wide denyRead must not
+    make the session's own toolchain unexecutable: build_settings re-allows
+    the resolved toolchain paths (binary dir, its version prefix when the
+    dir is a bin/, and every ancestor below home)."""
+    home = Path.home()
+    tool_root = home / ".factory-sandbox-toolchain-test"
+    tool_bin = tool_root / "bin"
+    tool_bin.mkdir(parents=True, exist_ok=True)
+    try:
+        claude = tool_bin / "claude"
+        claude.write_text("#!/bin/sh\necho 'claude 2.0.0 (toolchain ok)'\n")
+        claude.chmod(0o755)
+        run, _, _ = _make_run(tmp_path)
+        settings = build_settings(
+            {}, run.root, model_endpoint=MODEL_ENDPOINT, toolchain=[claude]
+        )
+        write_settings(settings, run.settings_path)
+        proc = run_sandboxed(
+            [str(claude), "--version"], run.root, run.settings_path, timeout=60
+        )
+        assert "toolchain ok" in proc.stdout, (
+            f"toolchain binary under $HOME could not run: rc={proc.returncode}\n"
+            f"{proc.stdout}{proc.stderr}"
+        )
+    finally:
+        shutil.rmtree(tool_root, ignore_errors=True)
+
+
+def test_toolchain_allowread_covers_version_prefix_and_ancestors(tmp_path: Path):
+    home = Path.home()
+    fake = home / ".factory-sandbox-tc-unit" / "v1" / "bin" / "python"
+    entries = _toolchain_allowread(home, [fake])
+    expected = {
+        home / ".factory-sandbox-tc-unit",
+        home / ".factory-sandbox-tc-unit" / "v1",
+        home / ".factory-sandbox-tc-unit" / "v1" / "bin",
+    }
+    assert expected == entries, f"got {entries}"
+
+
+def test_home_is_a_writable_scratch_inside_the_run(tmp_path: Path):
+    """HOME points at <run>/.home, not the (now unreadable) real home: pip,
+    npm, git and Claude Code all want a HOME they can read and write."""
+    run, _, _ = _make_run(tmp_path)
+    script = textwrap.dedent(
+        """
+        import os, pathlib
+        home = pathlib.Path(os.environ["HOME"])
+        print(f"HOME={home}", flush=True)
+        (home / ".cache").mkdir(parents=True, exist_ok=True)
+        (home / ".cache" / "probe").write_text("ok")
+        print(f"cache=ok", flush=True)
+        """
+    )
+    proc = run_sandboxed(
+        _child(script, []), run.root, run.settings_path, timeout=60
+    )
+    assert proc.stdout.splitlines()[0] == f"HOME={run.root / '.home'}", (
+        f"HOME is not the run scratch dir\n{proc.stdout}{proc.stderr}"
+    )
+    assert "cache=ok" in proc.stdout, proc.stdout
+
+
+def test_background_child_does_not_stall_the_return(tmp_path: Path):
+    """A session that leaves `npm run dev &` behind must not hold the
+    orchestrator: once the leader exits, the group is killed and the return
+    is bounded even though the background child inherited the pipes."""
+    run, _, _ = _make_run(tmp_path)
+    script = textwrap.dedent(
+        """
+        import subprocess, sys
+        subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        print("leader done", flush=True)
+        """
+    )
+    started = time.monotonic()
+    proc = run_sandboxed(_child(script, []), run.root, run.settings_path, timeout=60)
+    elapsed = time.monotonic() - started
+    assert "leader done" in proc.stdout
+    assert elapsed < 25, (
+        f"run_sandboxed took {elapsed:.1f}s to return after the leader exited — "
+        "a background child is holding the pipes"
+    )
+
+
+def test_timeout_stays_bounded_against_a_detached_process(tmp_path: Path):
+    """A process that escapes the process group (setsid) survives killpg and
+    holds the pipes. The timeout must still return in bounded time (drain
+    grace + forced pipe close), not wait for the escapee."""
+    run, _, _ = _make_run(tmp_path)
+    script = textwrap.dedent(
+        """
+        import subprocess, sys, time
+        subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            start_new_session=True,
+        )
+        time.sleep(60)
+        """
+    )
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_sandboxed(_child(script, []), run.root, run.settings_path, timeout=3)
+    elapsed = time.monotonic() - started
+    assert elapsed < 25, (
+        f"TimeoutExpired took {elapsed:.1f}s to propagate — a detached child "
+        "held the pipes past the drain grace"
+    )
+
+
+def test_srt_bin_ignores_env_overrides_entirely(monkeypatch):
+    """No env var can redirect the sandbox binary in production: the override
+    mechanism is gone; tests inject via the srt_bin_path parameter."""
+    from factory.sandbox import srt_bin as srt_bin_fn
+
+    monkeypatch.setenv("FACTORY_SRT_BIN", "/tmp/definitely-not-srt")
+    assert srt_bin_fn() == REPO_ROOT / "node_modules" / ".bin" / "srt"
+
+
+def test_run_sandboxed_takes_an_injected_srt_binary(tmp_path: Path):
+    """The parameter is the only injection path (and still pin-checked)."""
+    run, _, _ = _make_run(tmp_path)
+    fake = _fake_srt(tmp_path, "0.0.78")
+    with pytest.raises(SandboxError, match="0.0.78"):
+        run_sandboxed(
+            ["true"], run.root, run.settings_path, srt_bin_path=fake
+        )
+    assert not (run.root / "true-ran").exists()
+
+
+def test_cache_excludes_are_anchored_to_the_run_root(tmp_path: Path):
+    """A cache entry named `lib` must not ignore src/lib anywhere in the
+    repo — unanchored excludes would hide agent-written files from
+    `git add -A` and ship an incomplete PR."""
+    cache = tmp_path / "warm-cache"
+    (cache / "lib").mkdir(parents=True)
+    (cache / "lib" / "cached.so").write_text("cache")
+    run = create_run(
+        "fixture", _fixture_repo(tmp_path), factory_root=_factory_root(tmp_path),
+        warm_cache=cache,
+    )
+    nested = run.root / "src" / "lib" / "new_module.py"
+    nested.parent.mkdir(parents=True)
+    nested.write_text("agent code\n")
+    ignored = subprocess.run(
+        ["git", "-C", str(run.root), "check-ignore", "-q", "src/lib/new_module.py"],
+        capture_output=True,
+    )
+    assert ignored.returncode == 1, (
+        "src/lib/new_module.py is ignored by an unanchored cache exclude"
+    )
+    root_ignored = subprocess.run(
+        ["git", "-C", str(run.root), "check-ignore", "-q", "lib/cached.so"],
+        capture_output=True,
+    )
+    assert root_ignored.returncode == 0, "the cache's own lib/ is not excluded"
+
+
+def test_venv_relocation_handles_symlinked_cache_paths(tmp_path: Path):
+    """A cache reached via a symlink embeds the *given* path in shebangs
+    (/tmp vs /private/tmp on macOS); rewriting only the resolved path is a
+    silent no-op. Both forms must be rewritten."""
+    real = tmp_path / "real-cache"
+    venv_bin = real / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "pip").write_text("")  # filled below with the linked path
+    (real / ".venv" / "pyvenv.cfg").write_text("")
+
+    link = tmp_path / "linked-cache"
+    os.symlink(real, link)
+    (venv_bin / "pip").write_text(f"#!{link}/.venv/bin/python\n")
+
+    run = create_run(
+        "fixture", _fixture_repo(tmp_path), factory_root=_factory_root(tmp_path),
+        warm_cache=link,
+    )
+    assert (run.root / ".venv" / "bin" / "pip").read_text().startswith(
+        f"#!{run.root}/.venv/bin/python"
+    ), "shebang written through the symlinked path was not relocated"
+
+
+def test_warm_cache_refuses_tracked_file_collisions(tmp_path: Path):
+    """A cache entry that would overwrite a tracked file (package-lock.json,
+    requirements.txt) must refuse, not silently mutate the checkout the
+    agent is supposed to diff against."""
+    cache = tmp_path / "warm-cache"
+    cache.mkdir()
+    (cache / "README.md").write_text("cache content, not the repo's\n")
+    with pytest.raises(RunError, match="README.md"):
+        create_run(
+            "fixture", _fixture_repo(tmp_path), factory_root=_factory_root(tmp_path),
+            warm_cache=cache,
+        )
