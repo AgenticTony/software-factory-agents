@@ -17,6 +17,7 @@ import shlex
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -604,3 +605,177 @@ def test_settings_deny_git_control_paths_and_home(tmp_path: Path):
     assert str(run.root / ".git" / "config") in deny_write
     deny_read = [str(Path(p).expanduser()) for p in settings["filesystem"]["denyRead"]]
     assert str(Path("~").expanduser()) in deny_read
+
+
+# --- review round 2: process groups, layout pinning, override gating, ---------- 
+# --- lazy clones, warm-cache hygiene -------------------------------------------
+
+
+def test_timeout_kills_the_whole_process_group(tmp_path: Path):
+    """A wall-clock timeout must kill srt AND the shell/agent processes it
+    spawned, or an aborted session keeps writing and calling the model while
+    the next run starts. srt runs as a session leader, so killpg reaches the
+    grandchildren; the heartbeat proves they died."""
+    run, _, _ = _make_run(tmp_path)
+    heartbeat = run.root / "heartbeat"
+    script = textwrap.dedent(
+        f"""
+        import subprocess, time
+        subprocess.Popen(
+            ["/bin/sh", "-c", "while true; do echo x >> '{heartbeat}'; sleep 0.2; done"]
+        )
+        time.sleep(60)
+        """
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_sandboxed(_child(script, []), run.root, run.settings_path, timeout=4)
+    time.sleep(1.0)
+    first = heartbeat.stat().st_size
+    time.sleep(1.2)
+    assert heartbeat.stat().st_size == first, (
+        "the heartbeat kept growing after the timeout — sandboxed descendants "
+        "survived the kill and are still running unsupervised"
+    )
+
+
+def test_build_settings_rejects_an_unrecognised_run_layout(tmp_path: Path):
+    """The factory root must not be guessed silently: a run dir outside the
+    canonical runs/<project>/<id> layout has to fail loudly (or get an
+    explicit factory_root), or the holdouts deny would name a wrong path and
+    the real one would stay readable."""
+    odd = tmp_path / "not-runs" / "fixture" / "abc123"
+    odd.mkdir(parents=True)
+    with pytest.raises(SandboxError, match="factory_root"):
+        build_settings({}, odd, model_endpoint=MODEL_ENDPOINT)
+    settings = build_settings(
+        {}, odd, model_endpoint=MODEL_ENDPOINT, factory_root=tmp_path
+    )
+    deny = [str(Path(p).expanduser()) for p in settings["filesystem"]["denyRead"]]
+    assert str(tmp_path / "holdouts") in deny
+
+
+def test_srt_bin_override_is_inert_outside_tests(tmp_path: Path, monkeypatch):
+    """FACTORY_SRT_BIN is a test hook, honoured only under pytest. In
+    production a stale export must be ignored, not handed the sandbox to
+    impersonate (echo the pin, exec without srt)."""
+    ran = tmp_path / "fake-ran"
+    fake = tmp_path / "fake-srt"
+    fake.write_text(f"#!/bin/sh\ntouch '{ran}'\necho '{SRT_PIN}'\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("FACTORY_SRT_BIN", str(fake))
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    assert ensure_srt() == SRT_PIN  # the real pinned binary, not the fake
+    assert not ran.exists(), "the FACTORY_SRT_BIN fake ran outside a test context"
+
+
+def test_ensure_srt_caches_the_version_check(tmp_path: Path):
+    """The pin check costs a Node boot; it must run once per binary state,
+    not once per sandboxed command. The counting fake proves invocations."""
+    calls = tmp_path / "calls"
+    fake = tmp_path / "counting-srt"
+    fake.write_text(f"#!/bin/sh\necho x >> '{calls}'\necho '{SRT_PIN}'\n")
+    fake.chmod(0o755)
+    ensure_srt(srt_bin_path=fake)
+    ensure_srt(srt_bin_path=fake)
+    ensure_srt(srt_bin_path=fake)
+    assert calls.read_text().count("x") == 1
+
+
+def test_clone_is_actually_partial(tmp_path: Path):
+    """--filter=blob:none must be honoured by the local file:// server (it
+    needs uploadpack.allowFilter), not just recorded in the config: the
+    other branch's file blob must be MISSING from the clone."""
+    source = _fixture_repo(tmp_path)
+    _git(source, "checkout", "-b", "other-branch")
+    (source / "other.txt").write_text("other branch\n")
+    _git(source, "add", "-A")
+    _git(source, "commit", "-m", "other branch")
+    _git(source, "checkout", "main")
+
+    run = create_run("fixture", source, factory_root=_factory_root(tmp_path))
+    listing = subprocess.run(
+        ["git", "-C", str(run.root), "cat-file", "--batch-all-objects", "--batch-check"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    present = {line.split()[0] for line in listing.splitlines() if line.split()[1] == "blob"}
+
+    def blob_sha(rev: str, path: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(run.root), "rev-parse", f"{rev}:{path}"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    assert blob_sha("HEAD", "README.md") in present, "checked-out blob missing?!"
+    assert blob_sha("origin/other-branch", "other.txt") not in present, (
+        "the clone is fully materialised — the blob filter was ignored by the "
+        "local server and every run pays a full clone"
+    )
+
+
+def test_warm_cache_is_relocated_and_excluded_from_commits(tmp_path: Path):
+    """A copied venv carries absolute paths from the cache (shebangs,
+    pyvenv.cfg); they are rewritten to the run dir. Cache entries also go
+    into .git/info/exclude so a session's `git add -A` can't commit them,
+    and .git/info joins the sandbox's denied writes so the agent can't undo
+    the excludes."""
+    cache = tmp_path / "warm-cache"
+    (cache / "node_modules").mkdir(parents=True)
+    (cache / "node_modules" / "lib.js").write_text("module.exports = 1\n")
+    venv_bin = cache / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "pip").write_text(f"#!{cache}/.venv/bin/python\n# -*- coding: utf-8 -*-\n")
+    (venv_bin / "activate").write_text(f"VIRTUAL_ENV='{cache}/.venv'\n")
+    (cache / ".venv" / "pyvenv.cfg").write_text(f"home = {cache}/base\n")
+
+    run = create_run(
+        "fixture", _fixture_repo(tmp_path), factory_root=_factory_root(tmp_path),
+        warm_cache=cache,
+    )
+    assert (run.root / ".venv" / "bin" / "pip").read_text().startswith(
+        f"#!{run.root}/.venv/bin/python"
+    ), "shebang still points into the warm cache"
+    activate = (run.root / ".venv" / "bin" / "activate").read_text()
+    assert f"VIRTUAL_ENV='{run.root}/.venv'" in activate
+    exclude = (run.root / ".git" / "info" / "exclude").read_text()
+    assert ".venv/" in exclude and "node_modules/" in exclude, (
+        f"warm-cache entries not excluded: {exclude!r}"
+    )
+
+    settings = build_settings({}, run.root, model_endpoint=MODEL_ENDPOINT)
+    deny_write = [str(Path(p)) for p in settings["filesystem"]["denyWrite"]]
+    assert str(run.root / ".git" / "info") in deny_write
+
+
+def test_sibling_run_reads_are_denied(tmp_path: Path):
+    """Other projects' (and sibling) runs are unreadable — the WO's "other
+    projects" clause, proven by an attempt on a real sibling run."""
+    source = _fixture_repo(tmp_path)
+    root = _factory_root(tmp_path)
+    first = create_run("project-a", source, factory_root=root)
+    second = create_run("project-b", source, factory_root=root)
+    (first.root / "sibling-secret.txt").write_text("other project's data\n")
+    for run in (first, second):
+        write_settings(
+            build_settings({}, run.root, model_endpoint=MODEL_ENDPOINT),
+            run.settings_path,
+        )
+    script = textwrap.dedent(
+        """
+        import sys
+        try:
+            open(sys.argv[1]).read()
+            print("sibling:ok", flush=True)
+        except Exception as exc:
+            print(f"sibling:denied {type(exc).__name__}", flush=True)
+        """
+    )
+    proc = run_sandboxed(
+        _child(script, [str(first.root / "sibling-secret.txt")]),
+        second.root,
+        second.settings_path,
+        timeout=60,
+    )
+    assert proc.stdout.startswith("sibling:denied"), (
+        f"a sibling project's run was readable inside the sandbox\n"
+        f"{proc.stdout}{proc.stderr}"
+    )

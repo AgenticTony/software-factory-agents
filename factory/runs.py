@@ -79,8 +79,17 @@ def create_run(
     while dest.exists():  # uuid suffix makes this near-impossible; stay safe
         dest = runs_root / project / _new_run_id()
 
+    # uploadpack.allowFilter: a local file:// server refuses blob filters by
+    # default, git then WARNS ("filtering not recognized by server, ignoring")
+    # and silently does a full clone — every run would copy all blobs of all
+    # history, defeating D3's "clones are cheap". Overriding the upload-pack
+    # command turns the filter on for the local source too.
     result = subprocess.run(
-        ["git", *GIT_HARDENING, "clone", "--filter=blob:none", source.as_uri(), str(dest)],
+        [
+            "git", *GIT_HARDENING, "clone", "--filter=blob:none",
+            "--upload-pack", "git -c uploadpack.allowFilter=true upload-pack",
+            source.as_uri(), str(dest),
+        ],
         capture_output=True,
         text=True,
     )
@@ -114,6 +123,8 @@ def create_run(
     if warm_cache is not None:
         try:
             shutil.copytree(warm_cache, dest, dirs_exist_ok=True)
+            _relocate_venv(Path(warm_cache).resolve(), dest)
+            _seed_cache_excludes(dest, warm_cache)
         except OSError as exc:
             shutil.rmtree(dest, ignore_errors=True)
             raise RunError(f"warm cache copy from {warm_cache} into {dest} failed: {exc}")
@@ -132,6 +143,51 @@ def cleanup_run(run: RunDir) -> None:
 def _new_run_id() -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{stamp}-{uuid.uuid4().hex[:6]}"
+
+
+def _relocate_venv(cache: Path, dest: Path) -> None:
+    """Rewrite a copied venv's absolute cache paths to the run dir.
+
+    A venv is not relocatable as-is: ``bin/*`` shebangs and ``activate``
+    embed the venv's absolute path, and ``pyvenv.cfg`` points at its home.
+    Left as the cache path, ``.venv/bin/pip`` executes the *cache's*
+    interpreter and installs target the cache — writes the sandbox denies.
+    Best-effort by prefix substitution; only venv-looking trees are touched.
+    """
+    for venv_name in (".venv", "venv"):
+        venv = dest / venv_name
+        if not (venv / "pyvenv.cfg").exists():
+            continue
+        old, new = str(cache / venv_name), str(venv)
+        candidates = [venv / "pyvenv.cfg"]
+        bin_dir = venv / "bin"
+        if bin_dir.is_dir():
+            candidates.extend(p for p in bin_dir.iterdir() if p.is_file())
+        for path in candidates:
+            try:
+                text = path.read_text()
+            except (OSError, UnicodeDecodeError):
+                continue  # binaries (symlinked interpreters) have no text to fix
+            if old in text:
+                path.write_text(text.replace(old, new))
+
+
+def _seed_cache_excludes(dest: Path, warm_cache: Path) -> None:
+    """Add the copied cache's top-level entries to ``.git/info/exclude``.
+
+    Keeps a session's ``git add -A`` from committing ``node_modules`` /
+    ``.venv`` into the PR when the target repo's .gitignore doesn't cover
+    them. ``.git/info`` is sandbox-denyWritten, so the agent can't undo it.
+    """
+    exclude = dest / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    entries = [
+        entry.name + ("/" if entry.is_dir() else "")
+        for entry in sorted(Path(warm_cache).iterdir())
+    ]
+    with exclude.open("a") as fh:
+        fh.write("\n# factory: warm dependency cache (seeded by create_run)\n")
+        fh.write("\n".join(entries) + "\n")
 
 
 def _resolve_commit(repo: Path, ref: str) -> str | None:

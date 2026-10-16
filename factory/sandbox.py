@@ -21,7 +21,10 @@ token or a keychain-derived variable.
 import json
 import os
 import shlex
+import signal
 import subprocess
+from contextlib import suppress
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -44,12 +47,15 @@ class SandboxError(Exception):
 def srt_bin() -> Path:
     """Path to the pinned srt binary (``node_modules/.bin/srt``).
 
-    Overridable with ``FACTORY_SRT_BIN`` so tests can inject fakes; the
-    override must still report the pinned version or :func:`ensure_srt`
-    refuses it.
+    ``FACTORY_SRT_BIN`` overrides the location, but **only under pytest**
+    (``PYTEST_CURRENT_TEST`` set): it exists so tests can inject fakes. In
+    production the override is inert — a stale export or an env-pinned
+    wrapper that echoes the pinned version and execs without srt must never
+    be handed the sandbox to impersonate. Fakes must still report the pinned
+    version or :func:`ensure_srt` refuses them.
     """
     override = os.environ.get("FACTORY_SRT_BIN")
-    if override:
+    if override and "PYTEST_CURRENT_TEST" in os.environ:
         return Path(override)
     return _REPO_ROOT / "node_modules" / ".bin" / "srt"
 
@@ -57,9 +63,13 @@ def srt_bin() -> Path:
 def ensure_srt(srt_bin_path: Path | None = None) -> str:
     """Check ``srt --version`` against the pin and return the version string.
 
+    The check is cached per binary state (path + mtime + size): it costs a
+    Node boot, and the binary cannot change mid-process without the
+    fingerprint changing. Failures are never cached.
+
     Args:
         srt_bin_path: Binary to check (default: the repo-pinned install, or
-            ``FACTORY_SRT_BIN``).
+            ``FACTORY_SRT_BIN`` under pytest).
 
     Returns:
         The reported version, which equals :data:`SRT_PIN`.
@@ -75,9 +85,17 @@ def ensure_srt(srt_bin_path: Path | None = None) -> str:
             f"with `npm ci` (package.json pins @anthropic-ai/sandbox-runtime "
             f"at {SRT_PIN}), or point FACTORY_SRT_BIN at the right binary."
         )
+    stat = binary.stat()
+    return _verified_srt(str(binary), (stat.st_mtime_ns, stat.st_size))
+
+
+@lru_cache(maxsize=None)
+def _verified_srt(binary: str, fingerprint: tuple[int, int]) -> str:
+    """Run the actual version check once per binary state. ``fingerprint``
+    (mtime, size) busts the cache if the binary is replaced on disk."""
     try:
         proc = subprocess.run(
-            [str(binary), "--version"],
+            [binary, "--version"],
             capture_output=True,
             text=True,
             timeout=60,
@@ -150,12 +168,9 @@ def build_settings(
     *,
     model_endpoint: str,
     forbidden_env: tuple[str, ...] = (),
+    factory_root: Path | None = None,
 ) -> dict:
     """Build the srt settings dict for one run from the project profile.
-
-    Layout assumption: ``run_dir`` is ``<factory_root>/runs/<project>/<run-id>``
-    (what :func:`factory.runs.create_run` produces), so the factory root and
-    runs root are derived from it.
 
     Args:
         profile: The loaded ``project.yaml`` (``docs_allowlist`` /
@@ -166,13 +181,32 @@ def build_settings(
             host). Its hostname joins the network allowlist.
         forbidden_env: Keychain-derived env names denied in addition to the
             structural GitHub set (same list the orchestrator scrubs).
+        factory_root: Explicit factory root. When omitted it is derived from
+            the canonical ``<factory_root>/runs/<project>/<run-id>`` layout —
+            and that derivation is *asserted*, never guessed silently: a run
+            dir with a different nesting raises instead of quietly pointing
+            the holdouts deny at a wrong path (which would leave the real
+            holdouts readable).
 
     Returns:
         A settings dict accepted by ``srt --settings``.
+
+    Raises:
+        SandboxError: ``run_dir`` doesn't follow the canonical layout and no
+            explicit ``factory_root`` was given.
     """
     run_dir = Path(run_dir).resolve()
     runs_root = run_dir.parent.parent
-    factory_root = runs_root.parent
+    if factory_root is None:
+        if runs_root.name != "runs":
+            raise SandboxError(
+                f"cannot derive the factory root from {run_dir}: its layout is not "
+                "runs/<project>/<run-id>. Pass factory_root explicitly, or the "
+                "holdouts deny would name a path that doesn't exist."
+            )
+        factory_root = runs_root.parent
+    else:
+        factory_root = Path(factory_root).resolve()
     allowed_domains = [
         _endpoint_host(model_endpoint),
         *profile.get("docs_allowlist", []),
@@ -205,10 +239,13 @@ def build_settings(
             # OUTSIDE the sandbox, when the orchestrator commits and pushes
             # with its own credentials. srt already protects the repo under
             # the child's cwd; these absolute denies make that guarantee ours,
-            # independent of cwd.
+            # independent of cwd. `.git/info` holds the exclude file the
+            # orchestrator seeds with warm-cache entries (create_run) — the
+            # agent must not undo those excludes either.
             "denyWrite": [
                 str(run_dir / ".git" / "hooks"),
                 str(run_dir / ".git" / "config"),
+                str(run_dir / ".git" / "info"),
             ],
         },
         "credentials": {
@@ -246,8 +283,12 @@ def run_sandboxed(
             GitHub names; scrub keychain-derived names yourself (via
             :func:`sandbox_env`) — the settings file denies them as the
             backstop layer.
-        timeout: Wall-clock seconds for the child (propagates
-            ``subprocess.TimeoutExpired``).
+        timeout: Wall-clock seconds for the child. On expiry the whole
+            process group — srt, its shell, and every process the session
+            spawned — is SIGKILLed, then ``subprocess.TimeoutExpired`` is
+            raised. Killing srt alone would leave the session's processes
+            running unsupervised, still writing the run dir and calling the
+            model while the next run starts.
         cwd: Working dir (default: the run dir).
 
     Returns:
@@ -256,6 +297,8 @@ def run_sandboxed(
     Raises:
         SandboxError: srt is missing or not at the pinned version — checked
             before the child is spawned.
+        subprocess.TimeoutExpired: the wall clock ran out; the entire process
+            group is dead by the time it propagates.
     """
     ensure_srt()
     run_dir = Path(run_dir)
@@ -279,8 +322,10 @@ def run_sandboxed(
     command = f"TMPDIR={shlex.quote(str(tmp))} {shlex.join(cmd)}"
     # srt runs the command through a shell itself; `-c` takes one command
     # string verbatim ("no escaping applied"), so shlex.join carries our
-    # argv across that boundary without quoting accidents.
-    return subprocess.run(
+    # argv across that boundary without quoting accidents. srt becomes a
+    # session leader (start_new_session), so the timeout can kill the whole
+    # tree — shell, session processes, socat bridges — with one killpg.
+    proc = subprocess.Popen(
         [
             str(srt_bin()),
             "--settings",
@@ -290,10 +335,19 @@ def run_sandboxed(
         ],
         env=child_env,
         cwd=str(cwd if cwd else run_dir),
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout,
+        start_new_session=True,
     )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        with suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)  # pid == pgid (session leader)
+        out, err = proc.communicate()  # reap the killed tree
+        raise subprocess.TimeoutExpired(proc.args, timeout, output=out, stderr=err) from exc
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
 
 def _endpoint_host(endpoint: str) -> str:
