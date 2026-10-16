@@ -3,7 +3,9 @@
 Runs a project's ``project.yaml`` commands on a checkout of the slice's
 branch and applies the deterministic diff policy to ``git diff
 <base>...<head>``. No model is involved: every rule here is checkable from
-the diff and the command output alone.
+the diff and the command output alone. The shared gate primitives
+(findings, command results, git access, diff parsing, test-file and
+contract-ref recognition) live in ``factory.gates``.
 
 Baseline file format (repo-relative path named by ``profile["baselines"]``,
 read as committed at ``base_ref`` — never from the slice's own branch, so a
@@ -45,16 +47,19 @@ and lets the human override.
 Heuristics kept deliberately conservative (default verdict FAIL; evidence
 flips it, per the verifier's standing rule):
 
-- Test files are recognised by conventional globs (``TEST_GLOBS``); the
-  exact test files named in the task's approved contract are additionally
-  treated as protected paths, locked at approval.
+- Test files are recognised by the conventional globs in
+  ``gates.TEST_GLOBS`` (nested test dirs and ``conftest.py`` at any depth
+  included — conftest is test infrastructure); the exact test files named
+  in the task's approved contract are additionally treated as protected
+  paths, locked at approval.
 - Skip markers and removed assertions are line heuristics over the diff's
   added/removed lines in test files. A moved assertion trips the rule; a
   human reviews the FAIL.
 - Command output is scanned for ``file:line`` errors (gcc/ruff and tsc
-  styles). A failing command whose output yields no parseable location is
-  a FAIL with the raw output attached — an error we cannot attribute is
-  not pre-existing.
+  styles). A failing command whose output yields no parseable location —
+  or that reports a failure no baseline entry can cover (a failed test, a
+  traceback, a tool crash) — is a FAIL with the raw output attached: an
+  error we cannot attribute is not pre-existing.
 
 Deferred beyond v0 (needs the F-05 sandbox network allowlist): the
 ``new_dependency`` registry checks (package exists, older than 30 days,
@@ -62,34 +67,25 @@ not a near-miss of a popular name). L0 records the escalation; the checks
 run when there is a sandbox to run them in.
 """
 
-import fnmatch
 import json
 import posixpath
 import re
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import ClassVar
 
-# Conventional test-path globs, matched with fnmatch semantics (``*``
-# crosses ``/``). Projects with unusual layouts should name their test
-# files in the contract (which protects them) until per-project overrides
-# exist.
-TEST_GLOBS = (
-    "tests/*",
-    "*/tests/*",
-    "test/*",
-    "*/test/*",
-    "*__tests__/*",
-    "test_*.py",
-    "*/test_*.py",
-    "*_test.py",
-    "*.test.ts",
-    "*.test.tsx",
-    "*.test.js",
-    "*.spec.ts",
-    "*.spec.tsx",
-    "*.spec.js",
+from factory.gates import (
+    CommandResult,
+    Finding,
+    GateError,
+    GateReport,
+    contract_test_files,
+    diff_file_changes,
 )
+from factory.gates import git as _git
+from factory.gates import is_test_file as _is_test_file
+from factory.gates import matches as _matches
+from factory.gates import run_command as _run_command
 
 # Added lines in test files matching any of these -> skip_marker_added.
 SKIP_MARKER_PATTERNS = (
@@ -143,58 +139,8 @@ _CD_PREFIX = re.compile(r"^\s*cd\s+(?P<dir>[^\s;&|'\"]+)\s*&&")
 _GATE_ORDER = ("lint", "typecheck", "test", "build")
 
 
-class GateError(Exception):
-    """L0 cannot run as configured (git failure, bad refs, bad state)."""
-
-
 @dataclass
-class Finding:
-    """A deterministic L0 finding. FAIL-class findings decide the verdict."""
-
-    id: str
-    text: str
-    file: str | None = None
-    line: int | None = None
-
-
-@dataclass
-class CommandResult:
-    """One executed profile command."""
-
-    name: str
-    command: str
-    exit_code: int | None
-    output: str
-    timed_out: bool = False
-
-    def to_dict(self) -> dict:
-        return {
-            "name": self.name,
-            "command": self.command,
-            "exit_code": self.exit_code,
-            "output": self.output,
-            "timed_out": self.timed_out,
-        }
-
-
-@dataclass
-class FileChange:
-    """One changed path from ``git diff --name-status -M``.
-
-    ``added_lines``/``removed_lines`` carry ``(line_number, text)`` pairs
-    from the unified diff (new-file / old-file numbering respectively).
-    For renames, ``path`` is the new path, ``old_path`` the previous one.
-    """
-
-    path: str
-    status: str
-    old_path: str | None = None
-    added_lines: list = field(default_factory=list)
-    removed_lines: list = field(default_factory=list)
-
-
-@dataclass
-class L0Report:
+class L0Report(GateReport):
     """The L0 verdict plus everything F-09/F-10 consume downstream.
 
     ``escalations`` name the immediate-stop classes in VALIDATOR-SPEC
@@ -202,149 +148,21 @@ class L0Report:
     when the verdict itself is a pass.
     """
 
-    verdict: str
-    findings: list = field(default_factory=list)
+    layer: ClassVar[str] = "L0"
     escalations: list = field(default_factory=list)
     risk_flags_added: list = field(default_factory=list)
-    command_results: list = field(default_factory=list)
     preexisting_notes: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
-            "layer": "L0",
+            "layer": self.layer,
             "verdict": self.verdict,
-            "findings": [f.__dict__ | {} for f in self.findings],
+            "findings": self.findings_as_dicts(),
             "escalations": self.escalations,
             "risk_flags_added": self.risk_flags_added,
-            "commands": [c.to_dict() for c in self.command_results],
+            "commands": self.commands_as_dicts(),
             "preexisting_notes": self.preexisting_notes,
         }
-
-
-def _matches(path: str, patterns) -> bool:
-    """True when the posix relpath matches any glob (fnmatch, case-sensitive)."""
-    return any(fnmatch.fnmatchcase(path, pat) for pat in patterns)
-
-
-def _is_test_file(path: str) -> bool:
-    return _matches(path, TEST_GLOBS)
-
-
-def contract_test_files(task: dict) -> set:
-    """Collect the test files named in a task's approved acceptance checks.
-
-    Every ``check.type: test`` ref of the form ``path::name`` contributes
-    ``path``. These files are protected paths for the task's diff, locked
-    at approval (VALIDATOR-SPEC L0): a worker cannot weaken the tests that
-    define "done".
-
-    Args:
-        task: A task record (may be empty).
-
-    Returns:
-        The set of repo-relative test file paths.
-    """
-    files: set[str] = set()
-    for item in task.get("acceptance") or []:
-        check = item.get("check") if isinstance(item, dict) else None
-        if isinstance(check, dict) and check.get("type") == "test":
-            ref = check.get("ref")
-            if isinstance(ref, str) and "::" in ref:
-                files.add(ref.split("::", 1)[0].strip())
-    return files
-
-
-def _git(repo: Path, *args: str) -> str:
-    """Run git in the repo, raising GateError on any failure."""
-    proc = subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=True
-    )
-    if proc.returncode != 0:
-        raise GateError(
-            f"git {' '.join(args[:2])} failed in {repo}: {proc.stderr.strip()}"
-        )
-    return proc.stdout
-
-
-def diff_file_changes(repo: Path, base_ref: str, head_ref: str) -> list:
-    """Compute the changed files of ``base...head`` with diff line detail.
-
-    Args:
-        repo: Repository (or worktree/clone) holding both refs.
-        base_ref: Base ref (compared from the merge-base).
-        head_ref: Head ref carrying the slice.
-
-    Returns:
-        ``FileChange`` list; renames detected (``-M``).
-
-    Raises:
-        GateError: If git fails or the refs don't resolve.
-    """
-    # Pin output format: user config (color, noprefix, external diff
-    # drivers) must not change what the parser sees.
-    fmt = ("--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/")
-    status_out = _git(
-        repo, "diff", *fmt, "--name-status", "-M", f"{base_ref}...{head_ref}"
-    )
-    diff_out = _git(repo, "diff", *fmt, "-M", f"{base_ref}...{head_ref}")
-    hunks = _parse_unified_diff(diff_out)
-
-    changes = []
-    for row in status_out.splitlines():
-        if not row.strip():
-            continue
-        parts = row.split("\t")
-        status = re.match(r"^[A-Z]+", parts[0]).group()
-        if status == "U":
-            raise GateError(f"unmerged path in diff of {head_ref}: {row}")
-        path = parts[-1]
-        old_path = parts[1] if status == "R" and len(parts) == 3 else None
-        added, removed = hunks.get(path, ([], []))
-        changes.append(FileChange(path, status, old_path, added, removed))
-    return changes
-
-
-def _parse_unified_diff(text: str) -> dict:
-    """Key a unified diff by its b-side path, tracking line numbers.
-
-    Returns:
-        ``{path: (added, removed)}`` where each list holds
-        ``(line_number, line_text)`` (new-file / old-file numbering).
-    """
-    header = re.compile(r"^diff --git a/(.*) b/(.*)$")
-    hunk = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
-    result: dict[str, tuple[list, list]] = {}
-    key = None
-    in_hunk = False
-    new_no = old_no = 0
-    for line in text.splitlines():
-        m = header.match(line)
-        if m:
-            key = m.group(2)
-            in_hunk = False
-            result.setdefault(key, ([], []))
-            continue
-        m = hunk.match(line)
-        if m:
-            old_no, new_no = int(m.group(1)), int(m.group(2))
-            in_hunk = True
-            continue
-        if not in_hunk or key is None:
-            continue
-        if line.startswith(" "):
-            old_no += 1
-            new_no += 1
-            continue
-        if line[:1] not in ("+", "-"):
-            continue
-        added, removed = result[key]
-        if line.startswith("+"):
-            added.append((new_no, line[1:]))
-            new_no += 1
-        else:
-            removed.append((old_no, line[1:]))
-            old_no += 1
-    return result
 
 
 def parse_errors(output: str) -> list:
@@ -366,14 +184,6 @@ def parse_errors(output: str) -> list:
     return sorted(found)
 
 
-def _failure_marker(output: str) -> str | None:
-    """Return the first output line reporting an unbaselinable failure."""
-    for line in output.splitlines():
-        if any(p.search(line) for p in FAILURE_MARKERS):
-            return line.strip()
-    return None
-
-
 def parse_test_count(output: str) -> int | None:
     """Read the passing-test count from test output (pytest/jest summaries).
 
@@ -382,6 +192,14 @@ def parse_test_count(output: str) -> int | None:
     """
     counts = [int(n) for n in _TEST_COUNT.findall(output)]
     return max(counts) if counts else None
+
+
+def _failure_marker(output: str) -> str | None:
+    """Return the first output line reporting an unbaselinable failure."""
+    for line in output.splitlines():
+        if any(p.search(line) for p in FAILURE_MARKERS):
+            return line.strip()
+    return None
 
 
 def check_diff_policy(profile: dict, changes: list, task: dict | None = None):
@@ -410,7 +228,7 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None):
     escalations: set[str] = set()
     matched_flags: set[str] = set()
 
-    def events(change: FileChange):
+    def events(change):
         """(path, verb) pairs; a rename deletes the old path, modifies the new."""
         if change.status == "R":
             return [(change.old_path, "deleted"), (change.path, "modified")]
@@ -654,34 +472,6 @@ def _assert_checkout(repo: Path, head_ref: str) -> None:
         raise GateError(
             f"working tree is not clean at head_ref {head_ref}:\n{dirty[:500]}"
         )
-
-
-def _text(data) -> str:
-    """Normalise captured output: POSIX ``TimeoutExpired`` carries raw bytes
-    (or ``None``) even when the run asked for text."""
-    if data is None:
-        return ""
-    if isinstance(data, bytes):
-        return data.decode("utf-8", errors="replace")
-    return data
-
-
-def _run_command(name: str, command: str, repo: Path, timeout_sec: int):
-    """Run one profile command in the repo with a wall-clock cap."""
-    try:
-        proc = subprocess.run(
-            command,
-            shell=True,
-            cwd=repo,
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_sec,
-        )
-        return CommandResult(name, command, proc.returncode, proc.stdout + proc.stderr)
-    except subprocess.TimeoutExpired as exc:
-        output = _text(exc.stdout) + _text(exc.stderr)
-        return CommandResult(name, command, None, output, timed_out=True)
 
 
 def run_l0(

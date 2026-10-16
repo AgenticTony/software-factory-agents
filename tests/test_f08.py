@@ -4,17 +4,17 @@ Contract rule (CLAUDE.md): an acceptance ref ``tests/test_f08.py::test_ac_N``
 means a test function with exactly that name. The extra tests below cover
 paths the acceptance refs don't name: refs that don't name a test, a green
 phase that still fails, a test committed before its implementation, command
-timeouts, custom ``test_ref`` templates, repo restoration after the gate,
-the schema accepting ``commands.test_ref``, and deleted/renamed test files
-inside the red phase.
+timeouts, template overrides (path/name placeholders, shell braces), a base
+that moved past the merge-base, stale bytecode between phases, "not found"
+text inside failing output, conftest as test infrastructure, renames across
+the test boundary, repo restoration after the gate, and the schema
+accepting ``commands.test_ref``.
 """
 
 import subprocess
 from pathlib import Path
 
-import pytest
-
-from factory.l0 import GateError
+from factory.gates import ref_path
 from factory.l1 import contract_test_refs, run_l1
 
 PROFILE = {"name": "fixture", "commands": {}}
@@ -69,6 +69,20 @@ def _change(
         (repo / rel).unlink()
     _git(repo, "add", "-A")
     _git(repo, "commit", "-m", "change")
+
+
+def _advance_main(repo: Path, files: dict[str, str], delete: tuple[str, ...] = ()) -> None:
+    """Move ``main`` past the branch point after the slice exists."""
+    _git(repo, "checkout", "main")
+    for rel, text in files.items():
+        target = repo / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+    for rel in delete:
+        (repo / rel).unlink()
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "main moves on")
+    _git(repo, "checkout", "feature")
 
 
 def _task(*refs: str) -> dict:
@@ -233,14 +247,31 @@ def test_custom_test_ref_template(tmp_path):
     ).command
 
 
-def test_broken_test_ref_template_refuses_to_run(tmp_path):
-    """A bad template fails before the gate touches the checkout."""
-    repo = _red_first_repo(tmp_path, "badtpl")
-    profile = {"name": "fixture", "commands": {"test_ref": "run {oops}"}}
-    with pytest.raises(GateError):
-        _run(repo, _task("tests/test_feature.py::test_answer"), profile=profile)
-    # The repo was never moved off the slice branch.
-    assert _git_out(repo, "rev-parse", "--abbrev-ref", "HEAD") == "feature"
+def test_template_path_and_name_placeholders(tmp_path):
+    """jest-style runners take the file and the test name as separate
+    arguments; {path} and {name} exist for them."""
+    repo = _red_first_repo(tmp_path, "jestish")
+    profile = {
+        "name": "fixture",
+        "commands": {"test_ref": "{python} -m pytest -q {path} -k {name}"},
+    }
+    report = _run(repo, _task("tests/test_feature.py::test_answer"), profile=profile)
+    assert report.verdict == "pass"
+    red = _result(report, "red:tests/test_feature.py::test_answer").command
+    assert "tests/test_feature.py" in red and "-k" in red and "test_answer" in red
+
+
+def test_template_shell_braces_pass_through(tmp_path):
+    """${VAR} is shell syntax, not a template placeholder: literal
+    replacement means it reaches the command untouched (no GateError)."""
+    repo = _red_first_repo(tmp_path, "braces")
+    profile = {
+        "name": "fixture",
+        "commands": {"test_ref": "{python} -m pytest -q {ref} # ${HOME} literal"},
+    }
+    report = _run(repo, _task("tests/test_feature.py::test_answer"), profile=profile)
+    assert report.verdict == "pass"
+    assert "${HOME}" in _result(report, "red:tests/test_feature.py::test_answer").command
 
 
 def test_no_test_checks_is_a_pass_with_nothing_to_prove(tmp_path):
@@ -259,9 +290,169 @@ def test_no_test_checks_is_a_pass_with_nothing_to_prove(tmp_path):
     assert report.command_results == []
 
 
+# --- Red phase targets the merge-base, not base's tip ----------------------
+
+
+def test_main_fixing_impl_after_branch_does_not_fake_red(tmp_path):
+    """main moved past the branch point and fixed impl itself: red at
+    main's tip would pass and falsely report test_proves_nothing. The red
+    proof runs at the merge-base the diff was computed against."""
+    repo = _red_first_repo(tmp_path, "mbfix")
+    _advance_main(repo, files={"impl.py": "def answer():\n    return 42  # fixed on main\n"})
+    report = _run(repo, _task("tests/test_feature.py::test_answer"))
+    assert report.verdict == "pass"
+    assert report.findings == []
+
+
+def test_parallel_deletion_on_main_does_not_crash_the_red_phase(tmp_path):
+    """main deleted (after the branch point) a file the slice also deleted:
+    the diff's D must apply against the merge-base tree, where the file
+    still exists."""
+    repo = _repo(
+        tmp_path,
+        "mbdel",
+        {
+            "impl.py": "def answer():\n    return 0\n",
+            "tests/test_old.py": "def test_old():\n    assert True\n",
+        },
+    )
+    _change(
+        repo,
+        files={
+            "impl.py": "def answer():\n    return 42\n",
+            "tests/test_feature.py": TEST_SOURCE,
+        },
+        delete=("tests/test_old.py",),
+    )
+    _advance_main(repo, files={}, delete=("tests/test_old.py",))
+    report = _run(repo, _task("tests/test_feature.py::test_answer"))
+    assert report.verdict == "pass"
+    assert report.findings == []
+
+
+# --- Phase isolation --------------------------------------------------------
+
+
+def test_red_bytecode_cannot_leak_into_green(tmp_path):
+    """A same-size source edit is exactly the case where Python's
+    mtime+size check would reuse base's .pyc: the phases are cleaned
+    between runs, and nothing is left in the tree afterwards."""
+    repo = _repo(tmp_path, "pyc", {"impl.py": "def answer():\n    return 40 + 1\n"})
+    _change(
+        repo,
+        files={
+            "impl.py": "def answer():\n    return 41 + 1\n",  # same size as base
+            "tests/test_feature.py": TEST_SOURCE,
+        },
+    )
+    report = _run(repo, _task("tests/test_feature.py::test_answer"))
+    assert report.verdict == "pass"
+    leftovers = [
+        p.name for p in repo.rglob("*") if p.name in ("__pycache__", ".pytest_cache")
+    ]
+    assert leftovers == []
+
+
+def test_not_found_text_in_failure_output_is_not_ambiguous(tmp_path):
+    """A real failure whose output says 'Not Found' is a worker problem
+    (test_not_green), not a missing test (contract_ambiguous)."""
+    repo = _repo(tmp_path, "nf", {"impl.py": "def answer():\n    return '404 Not Found'\n"})
+    test = (
+        "def test_answer():\n"
+        "    from impl import answer\n\n"
+        "    assert answer() == 'ok'\n"
+    )
+    _change(
+        repo,
+        files={
+            "impl.py": "def answer():\n    return '404 Not Found: /x'\n",
+            "tests/test_feature.py": test,
+        },
+    )
+    report = _run(repo, _task("tests/test_feature.py::test_answer"))
+    assert report.verdict == "fail"
+    assert any(f.id == "test_not_green" for f in report.findings)
+    assert not any(f.id == "contract_ambiguous" for f in report.findings)
+
+
+# --- Test-infrastructure and rename handling in the red phase --------------
+
+
+def test_diff_conftest_applies_in_red_phase(tmp_path):
+    """A conftest.py shipped by the diff is test infrastructure: red
+    applies it, so a test that would pass on base (given the fixture) is
+    caught as proving nothing instead of reading as a red fixture error."""
+    repo = _repo(tmp_path, "conf", {"impl.py": "def answer():\n    return 42\n"})
+    _change(
+        repo,
+        files={
+            "impl.py": "def answer():\n    return 42  # documented\n",
+            "conftest.py": "import pytest\n\n\n@pytest.fixture\ndef seed():\n    return 1\n",
+            "tests/test_feature.py": (
+                "def test_answer(seed):\n"
+                "    from impl import answer\n\n"
+                "    assert seed + answer() == 43\n"
+            ),
+        },
+    )
+    report = _run(repo, _task("tests/test_feature.py::test_answer"))
+    assert report.verdict == "fail"
+    assert any(f.id == "test_proves_nothing" for f in report.findings)
+
+
+def test_rename_out_of_tests_dir_does_not_leak_impl_into_red(tmp_path):
+    """tests/magic.py -> src/magic.py: only the test half applies in red.
+    Checking head's implementation file out into red would make the test
+    pass there and mask the proof with a false test_proves_nothing."""
+    repo = _repo(
+        tmp_path,
+        "moveout",
+        {
+            "impl.py": "def answer():\n    return 0\n",
+            "tests/magic.py": "def answer():\n    return 0\n",
+        },
+    )
+    _git(repo, "checkout", "-b", "feature")
+    (repo / "src").mkdir()
+    _git(repo, "mv", "tests/magic.py", "src/magic.py")
+    (repo / "src" / "magic.py").write_text("def answer():\n    return 42\n")
+    (repo / "tests" / "test_feature.py").write_text(
+        "from src.magic import answer\n\n\ndef test_answer():\n    assert answer() == 42\n"
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "change")
+    report = _run(repo, _task("tests/test_feature.py::test_answer"))
+    assert report.verdict == "pass"
+    assert report.findings == []
+
+
+def test_rename_into_tests_dir_keeps_base_implementation(tmp_path):
+    """src/keep.py -> tests/keep.py: red checks out the new test file but
+    must NOT delete the base implementation file the rename moved away."""
+    repo = _repo(
+        tmp_path,
+        "movein",
+        {
+            "impl.py": "def answer():\n    return 0\n",
+            "src/keep.py": "tag = 1\n",
+        },
+    )
+    _change(
+        repo,
+        rename=(("src/keep.py", "tests/keep.py"),),
+        files={
+            "impl.py": "def answer():\n    return 42\n",
+            "tests/test_feature.py": TEST_SOURCE,
+        },
+    )
+    report = _run(repo, _task("tests/test_feature.py::test_answer"))
+    assert report.verdict == "pass"
+    assert report.findings == []
+
+
 def test_deleted_and_renamed_test_files_apply_in_red_phase(tmp_path):
     """The red phase stages the diff's test-file side: deletions really
-    delete, renames really move; neither crashes the gate."""
+    delete, test-to-test renames really move; neither crashes the gate."""
     repo = _repo(
         tmp_path,
         "applytests",
@@ -316,6 +507,12 @@ def test_contract_test_refs_ordered_and_deduped():
         "tests/test_b.py::test_y",
     ]
     assert contract_test_refs({}) == []
+
+
+def test_ref_path_strips_the_file_half():
+    assert ref_path("tests/test_x.py::test_a") == "tests/test_x.py"
+    assert ref_path("tests/test_x.py ::test_a") == "tests/test_x.py"
+    assert ref_path("tests/test_x.py") is None
 
 
 def test_schema_accepts_test_ref(tmp_path):
