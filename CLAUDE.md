@@ -35,6 +35,11 @@ agents do the volume. Architecture and reasoning: `DESIGN-LOCAL-FACTORY.md`.
 
 ## Working here
 
-- Python >= 3.11; CI tests 3.11 and 3.13. Setup: `pip install -e ".[dev]"`. CLI: `factory --help`.
+- Python >= 3.11; CI tests 3.11 and 3.13. CLI: `factory --help`.
+- Setup: `pip install -e ".[dev]"` **and** `npm ci` (installs the pinned sandbox
+  runtime `srt` from `package-lock.json`; needs Node >= 22.12). System deps:
+  none on macOS; Linux `bubblewrap socat ripgrep`, and on Ubuntu
+  24.04+ `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`. Without
+  them the F-05 sandbox tests fail (never skip) — see README "Setup".
 - Bootstrap phase: one work order per session (F-01 to F-11, BUILD-ORDER.md).
 - CI (`.github/workflows/ci.yml`) runs ruff + pytest on every PR.
