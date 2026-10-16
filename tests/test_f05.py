@@ -502,6 +502,10 @@ def test_planted_hook_never_fires_for_orchestrator_git(tmp_path: Path):
     from factory.runs import GIT_HARDENING
 
     run = create_run("fixture", _fixture_repo(tmp_path), factory_root=_factory_root(tmp_path))
+    # Clones carry no git identity (local config doesn't propagate, and the
+    # runner has no global one) — the orchestrator side sets it explicitly.
+    _git(run.root, "config", "user.email", "orchestrator@factory.local")
+    _git(run.root, "config", "user.name", "factory orchestrator")
     marker = tmp_path / "hook-ran"
     hook = run.root / ".git" / "hooks" / "pre-commit"
     hook.write_text(f"#!/bin/sh\ntouch '{marker}'\n")
