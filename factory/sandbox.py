@@ -240,13 +240,21 @@ def run_sandboxed(
     """
     ensure_srt()
     run_dir = Path(run_dir)
+    tmp = run_dir / ".tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
     if env is None:
         child_env = sandbox_env(run_dir)
     else:
         child_env = scrub_env(env)
-        tmp = run_dir / ".tmp"
-        tmp.mkdir(parents=True, exist_ok=True)
-        child_env["TMPDIR"] = str(tmp)
+    # srt's Linux network bridges create unix sockets in node's tmpdir().
+    # A TMPDIR deep inside the run dir overflows the kernel's ~108-byte
+    # sun_path limit and the bridges silently never come up ("Failed to
+    # create bridge sockets"). So srt itself runs with no TMPDIR (node falls
+    # back to the system temp, which is short), and the *child* gets its
+    # run-dir TMPDIR as a shell assignment prefix instead — same environment
+    # for the command, short socket paths for srt.
+    child_env.pop("TMPDIR", None)
+    command = f"TMPDIR={shlex.quote(str(tmp))} {shlex.join(cmd)}"
     # srt runs the command through a shell itself; `-c` takes one command
     # string verbatim ("no escaping applied"), so shlex.join carries our
     # argv across that boundary without quoting accidents.
@@ -256,7 +264,7 @@ def run_sandboxed(
             "--settings",
             str(settings_path),
             "-c",
-            shlex.join(cmd),
+            command,
         ],
         env=child_env,
         cwd=str(cwd if cwd else run_dir),
