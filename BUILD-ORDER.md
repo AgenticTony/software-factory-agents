@@ -98,6 +98,7 @@ Acceptance:
 - AC-1 Approving a task with no acceptance items is refused.
 - AC-2 After approval, the status is `ready` or `blocked` according to its dependencies.
 - AC-3 `--yes` is not accepted when the task has risk flags. Risk-flagged approval is always interactive.
+- AC-4 `factory approve --reconcile-bootstrap` reads `.factory/BOOTSTRAP.md`. For each entry, after interactive confirmation, it approves the task and moves it through legal transitions to its recorded status. A criterion marked "pending" can never produce `done`.
 
 ### F-05 — Clone manager and sandbox
 - Create `~/factory/runs/<project>/<run-id>/` as a `git clone --filter=blob:none` from the local repo.

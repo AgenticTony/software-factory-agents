@@ -23,18 +23,22 @@ def build_parser() -> argparse.ArgumentParser:
         prog="factory",
         description="Local agent software factory control plane.",
     )
-    sub = parser.add_subparsers(dest="command", required=False)
+    sub = parser.add_subparsers(dest="command", required=True)
     for name, wo in STUBS.items():
         sub.add_parser(name, help=f"stub — implemented in {wo}")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    if args.command is None:
-        parser.print_help()
-        return 2
+    """Parses arguments and dispatches a subcommand.
+
+    Args:
+        argv: Arguments without the program name; defaults to sys.argv[1:].
+
+    Returns:
+        Process exit code. Stubs return 2 (not implemented).
+    """
+    args = build_parser().parse_args(argv)
     print(
         f"factory {args.command}: not implemented yet (scheduled in {STUBS[args.command]})",
         file=sys.stderr,
