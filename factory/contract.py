@@ -190,6 +190,26 @@ def _validate(instance: Any, schema_path: Path, origin: str) -> None:
         raise ContractError(f"{origin}: schema violation at {loc}: {error.message}")
 
 
+def validate_queue(
+    data: Any, origin: str = "tasks", schema_path: Path | None = None
+) -> None:
+    """Validate a parsed queue document: semantics, then schema.
+
+    The write path (F-03) uses this before persisting so invalid queue
+    state can never be written; ``load_tasks`` uses it after parsing.
+
+    Args:
+        data: The parsed queue document.
+        origin: File name (or label) for error messages.
+        schema_path: Optional override for the tasks schema path.
+
+    Raises:
+        ContractError: On the first semantic or schema violation found.
+    """
+    _check_semantics(data.get("tasks") if isinstance(data, dict) else None, origin)
+    _validate(data, schema_path or SCHEMA_DIR / "tasks.schema.json", origin)
+
+
 def load_tasks(path: Path | str, schema_path: Path | None = None) -> dict:
     """Load and fully validate a tasks.json queue.
 
@@ -210,8 +230,7 @@ def load_tasks(path: Path | str, schema_path: Path | None = None) -> dict:
         data = json.loads(_read(path, origin))
     except json.JSONDecodeError as exc:
         raise ContractError(f"{origin}: invalid JSON: {exc}") from exc
-    _check_semantics(data.get("tasks") if isinstance(data, dict) else None, origin)
-    _validate(data, schema_path or SCHEMA_DIR / "tasks.schema.json", origin)
+    validate_queue(data, origin, schema_path)
     return data
 
 

@@ -29,3 +29,19 @@ Entries record evidence, not claims. Each criterion is marked proven, pending, o
 - **AC-2** proven: `tests/test_f02.py::test_ac_2` passes — order-insensitive, change-sensitive, exact SHA-256/canonical-JSON formula.
 - **AC-3** proven: `tests/test_f02.py::test_ac_3` passes — the real `tasks.json` loads and validates; uniqueness/prefix asserted, contents deliberately not pinned.
 - **Status to set at reconcile:** `done` once PR #4's CI is green and you merge it. No deploy target, so L4 doesn't apply.
+
+---
+
+## F-03 — State machine and picker
+
+- **Commits:** `feat/f03-state-machine` → PR (see repo). Red-first: the suite failed on the missing `factory.state` module before implementation.
+- **Built:** 2026-10-16. Interactive session.
+- **Design notes:** TASK-CONTRACT §3's diagram as an explicit 19-edge `ALLOWED_TRANSITIONS` table; the eight `X -> draft` edges exist solely for "contract changed" (§2), with `demote_changed_contracts()` as their caller — a demoted task needs human re-approval (F-04), so it can never auto-retry. `not_buildable` has no outgoing edges (importer sets it at creation). The §4 picker is a pure function plus a `TaskQueue` store that is the only write path: validate (F-02) → check `attempts` grew only → temp file + `os.replace` → roll back memory on any failure.
+- **AC-1** proven: `tests/test_f03.py::test_ac_1` walks **all** 100 status pairs — the 19 table edges return their reason, the other 81 raise `TransitionError`; the store-level refusal leaves file and memory untouched. One test per illegal edge class: `test_illegal_edge_class_raises` (self / forward skip / backward / lateral / exit-from-needs_human / exit-from-not_buildable).
+- **AC-2** proven: `test_ac_2` — any `in_progress` task makes `pick_next` and `TaskQueue.pick` return None.
+- **AC-3** proven: `test_ac_3` — P1 later in the queue beats P2 earlier; equal priority resolved by queue order; draft/blocked/in_review and decision/research/owner_only skipped; `docs` picked.
+- **AC-4** proven: `test_ac_4` — a `repo:id` dep is never met, even when a task with that literal id sits `done` in the same queue; same-repo dep on a `done` task is met (`test_dependency_must_be_done_in_this_queue` covers open and missing deps).
+- **AC-5** proven: `test_ac_5` — external acceptance edit without a hash update → `demote_changed_contracts()` returns the id, persists `draft`; a matching hash leaves the task untouched.
+- **AC-6** proven: `test_ac_6` — `os.replace` crashing mid-write leaves the previous `tasks.json` byte-identical, loadable, and no temp junk behind; `test_crash_during_serialisation_leaves_file_intact` covers the earlier crash window.
+- **Extra invariants tested:** append-only `attempts` (rewrite, clear, and task-removal each refused with file intact), `save` refuses schema-invalid state, attempts are schema-validated on append, `updated_at` stamped per write, slice selection (first incomplete / fall-through fully merged / unsliced = one unit).
+- **Status to set at reconcile:** `done` once this PR's CI is green (ruff + pytest on 3.11 + 3.13) and you merge it. No deploy target, so L4 doesn't apply.
