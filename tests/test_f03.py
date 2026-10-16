@@ -10,7 +10,7 @@ handling and the append-only enforcement on ``attempts``.
 import copy
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -19,6 +19,7 @@ from factory.state import (
     ALLOWED_TRANSITIONS,
     CONTRACT_FROZEN_STATUSES,
     STATUSES,
+    ConcurrentWriteError,
     StateError,
     TaskQueue,
     TransitionError,
@@ -98,7 +99,7 @@ def test_ac_1(tmp_path):
     with pytest.raises(TransitionError) as exc:
         queue.transition("T-1", "done")
     assert "illegal transition ready -> done" in str(exc.value)
-    assert "allowed from ready: draft, in_progress" in str(exc.value)
+    assert "allowed from ready: blocked, draft, in_progress" in str(exc.value)
     assert queue.get("T-1")["status"] == "ready"
     assert path.read_text() == before
 
@@ -114,11 +115,11 @@ ILLEGAL_EDGE_CLASSES = {
         ("in_progress", "deploying"),
     ],
     "backward_without_contract_change": [
-        ("in_progress", "ready"),
-        ("in_review", "in_progress"),
         ("deploying", "in_review"),
+        ("deploying", "in_progress"),
         ("awaiting_owner", "deploying"),
         ("done", "awaiting_owner"),
+        ("in_review", "ready"),
     ],
     "lateral": [
         ("in_review", "needs_human"),
@@ -276,13 +277,31 @@ def test_ac_5(tmp_path):
     path.write_text(json.dumps(doc, indent=2))
 
     queue = TaskQueue(path)
-    assert queue.demote_changed_contracts() == ["T-1"]
+    audit = queue.demote_changed_contracts()
+    assert audit.demoted == ["T-1"]
+    assert audit.flagged_done == []
     assert TaskQueue(path).get("T-1")["status"] == "draft"
     # a matching hash leaves the task alone
     path = _queue_file(tmp_path, [_task(id="T-2", status="ready")])
     queue = TaskQueue(path)
-    assert queue.demote_changed_contracts() == []
+    audit = queue.demote_changed_contracts()
+    assert audit.demoted == []
+    assert audit.flagged_done == []
     assert queue.get("T-2")["status"] == "ready"
+
+
+def test_done_task_with_changed_contract_is_flagged_not_demoted(tmp_path):
+    # merged, live-verified work is never auto-reopened: a stale hash on a
+    # done task surfaces in flagged_done and the status stays done
+    path = _queue_file(tmp_path, [_task(id="T-DONE", status="done")])
+    doc = json.loads(path.read_text())
+    doc["tasks"][0]["acceptance"][0]["text"] = "it works differently"
+    path.write_text(json.dumps(doc, indent=2))
+
+    audit = TaskQueue(path).demote_changed_contracts()
+    assert audit.demoted == []
+    assert audit.flagged_done == ["T-DONE"]
+    assert TaskQueue(path).get("T-DONE")["status"] == "done"
 
 
 # --- AC-6: crash mid-write -------------------------------------------------
@@ -436,3 +455,171 @@ def test_save_stamps_updated_at(tmp_path):
     doc = json.loads(path.read_text())
     assert doc["updated_at"].endswith("Z")
     datetime.fromisoformat(doc["updated_at"].replace("Z", "+00:00"))
+
+
+# --- Review fixes: concurrency --------------------------------------------
+
+
+def test_concurrent_writer_cannot_silently_overwrite(tmp_path):
+    # factory loop and a human-run factory approve are two writers on one
+    # tasks.json; the second writer must be refused, not lose the first's
+    # attempt
+    path = _queue_file(tmp_path, [_task(id="T-1", status="in_progress")])
+    writer_a = TaskQueue(path)
+    writer_b = TaskQueue(path)
+
+    writer_a.append_attempt("T-1", dict(_ATTEMPT))
+    with pytest.raises(ConcurrentWriteError, match="changed on disk"):
+        writer_b.append_attempt("T-1", {**_ATTEMPT, "run_id": "r2"})
+
+    # A's attempt survives; a reloaded writer sees both orders
+    attempts = TaskQueue(path).get("T-1")["attempts"]
+    assert [a["run_id"] for a in attempts] == ["r1"]
+    TaskQueue(path).append_attempt("T-1", {**_ATTEMPT, "run_id": "r2"})
+    attempts = TaskQueue(path).get("T-1")["attempts"]
+    assert [a["run_id"] for a in attempts] == ["r1", "r2"]
+
+
+def test_concurrent_writer_cannot_overwrite_a_transition(tmp_path):
+    path = _queue_file(tmp_path, [_task(id="T-1", status="ready")])
+    writer_a = TaskQueue(path)
+    writer_b = TaskQueue(path)
+
+    writer_a.transition("T-1", "in_progress")
+    # legal in B's stale view (it still sees ready), refused at the disk check
+    with pytest.raises(ConcurrentWriteError):
+        writer_b.transition("T-1", "in_progress")
+    assert TaskQueue(path).get("T-1")["status"] == "in_progress"
+
+
+# --- Review fixes: file format and validation ------------------------------
+
+
+def test_non_ascii_survives_a_save(tmp_path):
+    # the reviewed queue file uses literal em-dashes and arrows; escaping
+    # them would put every such line into every future diff
+    path = _queue_file(tmp_path, [_task(id="T-1", title="ship — done → prod ✓")])
+    TaskQueue(path).transition("T-1", "blocked")
+    raw = path.read_text(encoding="utf-8")
+    assert "— done → prod ✓" in raw
+    assert "\\u2014" not in raw
+
+
+def test_duplicate_task_ids_are_rejected(tmp_path):
+    path = tmp_path / "tasks.json"
+    doc = {"version": 1, "project": "fixture", "tasks": [_task(id="WO-15"), _task(id="WO-15")]}
+    path.write_text(json.dumps(doc))
+    with pytest.raises(ContractError, match="duplicate task id WO-15"):
+        TaskQueue(path)
+
+
+# --- Review fixes: error hierarchy -----------------------------------------
+
+
+def test_state_errors_are_contract_errors():
+    # callers wrap queue operations in `except ContractError`; state and
+    # concurrency failures must not fly past that handler
+    assert issubclass(StateError, ContractError)
+    assert issubclass(TransitionError, ContractError)
+    assert issubclass(ConcurrentWriteError, ContractError)
+
+
+def test_illegal_transition_is_caught_as_contract_error(tmp_path):
+    path = _queue_file(tmp_path, [_task(id="T-1", status="ready")])
+    with pytest.raises(ContractError):
+        TaskQueue(path).transition("T-1", "done")
+
+
+# --- Review fixes: recovery and continuation edges --------------------------
+
+
+def test_rejected_pr_returns_for_a_fix_round(tmp_path):
+    path = _queue_file(tmp_path, [_task(id="T-1", status="in_review")])
+    TaskQueue(path).transition("T-1", "in_progress")
+    assert TaskQueue(path).get("T-1")["status"] == "in_progress"
+
+
+def test_aborted_run_returns_to_ready(tmp_path):
+    path = _queue_file(tmp_path, [_task(id="T-1", status="in_progress")])
+    TaskQueue(path).transition("T-1", "ready")
+    assert TaskQueue(path).get("T-1")["status"] == "ready"
+
+
+def test_slice_continuation_from_deploying(tmp_path):
+    slices = [
+        {"id": "S-1", "text": "a", "status": "merged"},
+        {"id": "S-2", "text": "b", "status": "todo"},
+    ]
+    path = _queue_file(tmp_path, [_task(id="T-1", status="deploying", slices=slices)])
+    queue = TaskQueue(path)
+    queue.transition("T-1", "ready")  # previous slice merged; S-2 remains
+    assert TaskQueue(path).get("T-1")["status"] == "ready"
+
+    # done/awaiting_owner require every slice merged
+    path = _queue_file(tmp_path, [_task(id="T-1", status="deploying", slices=slices)])
+    queue = TaskQueue(path)
+    with pytest.raises(TransitionError, match="S-2"):
+        queue.transition("T-1", "done")
+    with pytest.raises(TransitionError, match="S-2"):
+        queue.transition("T-1", "awaiting_owner")
+
+    # all slices merged: terminal edges legal, continuation refused
+    merged = [dict(s, status="merged") for s in slices]
+    path = _queue_file(tmp_path, [_task(id="T-1", status="deploying", slices=merged)])
+    queue = TaskQueue(path)
+    with pytest.raises(TransitionError, match="no unmerged slices"):
+        queue.transition("T-1", "ready")
+    queue.transition("T-1", "done")
+
+    # an unsliced task has no continuation either
+    path = _queue_file(tmp_path, [_task(id="T-1", status="deploying")])
+    queue = TaskQueue(path)
+    with pytest.raises(TransitionError, match="no unmerged slices"):
+        queue.transition("T-1", "ready")
+    queue.transition("T-1", "done")
+
+
+def test_reclaim_abandoned_runs(tmp_path):
+    stale = {**_ATTEMPT, "started": "2026-10-16T10:00:00Z"}
+    fresh = {**_ATTEMPT, "started": "2026-10-16T11:55:00Z"}
+    path = _queue_file(
+        tmp_path,
+        [
+            _task(id="T-STALE", status="in_progress", attempts=[stale]),
+            _task(id="T-FRESH", status="in_progress", attempts=[fresh]),
+            _task(id="T-NOATTEMPT", status="in_progress"),
+        ],
+    )
+    now = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
+    reclaimed = TaskQueue(path).reclaim_abandoned(now)
+    assert reclaimed == ["T-STALE"]
+    reloaded = TaskQueue(path)
+    assert reloaded.get("T-STALE")["status"] == "ready"
+    assert reloaded.get("T-FRESH")["status"] == "in_progress"
+    assert reloaded.get("T-NOATTEMPT")["status"] == "in_progress"
+
+
+def test_sync_readiness_reconciles_with_dependencies(tmp_path):
+    path = _queue_file(
+        tmp_path,
+        [
+            _task(id="DEP", status="in_review"),
+            _task(id="T-REGRESSED", depends_on=["DEP"]),
+            _task(id="DEP-2", status="done"),
+            _task(id="T-UNBLOCKED", status="blocked", depends_on=["DEP-2"]),
+            _task(id="T-CROSSREPO", status="blocked", depends_on=["soloadventurer-mobile:9b"]),
+        ],
+    )
+    changed = TaskQueue(path).sync_readiness()
+    assert changed == ["T-REGRESSED", "T-UNBLOCKED"]
+    reloaded = TaskQueue(path)
+    assert reloaded.get("T-REGRESSED")["status"] == "blocked"
+    assert reloaded.get("T-UNBLOCKED")["status"] == "ready"
+    # cross-repo deps are never met automatically: stays blocked
+    assert reloaded.get("T-CROSSREPO")["status"] == "blocked"
+
+
+def test_ready_to_blocked_edge_is_legal(tmp_path):
+    path = _queue_file(tmp_path, [_task(id="T-1", status="ready")])
+    TaskQueue(path).transition("T-1", "blocked")
+    assert TaskQueue(path).get("T-1")["status"] == "blocked"

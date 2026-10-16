@@ -101,10 +101,18 @@ def _check_semantics(tasks: Any, origin: str) -> None:
     """
     if not isinstance(tasks, list):
         return
+    seen_ids: set[str] = set()
     for task in tasks:
         if not isinstance(task, dict):
             continue
         tid = task.get("id")
+        if isinstance(tid, str):
+            if tid in seen_ids:
+                raise ContractError(
+                    f"{origin}: duplicate task id {tid}; task ids must be "
+                    "unique or dependency and attempt records become ambiguous"
+                )
+            seen_ids.add(tid)
         tid = tid if isinstance(tid, str) else "<missing id>"
         risk = task.get("risk")
         gates = task.get("gates") if isinstance(task.get("gates"), dict) else {}

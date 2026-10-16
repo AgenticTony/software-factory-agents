@@ -22,3 +22,6 @@ out/
 
 # OS
 .DS_Store
+
+# Writer lock for tasks.json (F-03) — runtime artifact, never committed
+.factory/*.lock
