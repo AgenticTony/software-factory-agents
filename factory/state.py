@@ -41,7 +41,7 @@ import os
 import uuid
 from collections import namedtuple
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from factory.contract import (
@@ -132,6 +132,10 @@ class TransitionError(StateError):
 
 class ConcurrentWriteError(StateError):
     """tasks.json changed on disk since this queue was loaded."""
+
+
+class RunInProgressError(StateError):
+    """Another session holds the run lease for this queue."""
 
 
 def check_transition(current: str, new: str) -> str:
@@ -244,16 +248,6 @@ def _now_iso() -> str:
         datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     )
 
-
-def _parse_dt(value: str) -> datetime | None:
-    """Parse an ISO-8601 date-time; naive values are read as UTC."""
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (AttributeError, ValueError):
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
 
 
 def _atomic_write_json(path: Path, doc: dict) -> None:
@@ -473,43 +467,96 @@ class TaskQueue:
             self.save()
         return ContractAudit(demoted=demoted, flagged_done=flagged_done)
 
-    def reclaim_abandoned(self, now: datetime) -> list[str]:
-        """Return ``in_progress`` tasks whose run blew the wall clock to
-        ``ready``.
+    @contextlib.contextmanager
+    def begin_run(self, task_id: str):
+        """Take the run lease and move a task to ``in_progress``.
 
-        A session that dies mid-run (orchestrator crash, killed process,
-        laptop sleep) leaves its task ``in_progress``, which blocks the
-        whole queue. A task whose last attempt started more than
-        ``budget.wall_clock_min`` ago is stale: it goes back to ``ready``
-        through the aborted-run edge and re-enters the queue under the
-        same attempt budget. Attempt records themselves are owned by the
-        session runner (F-06); this method only moves the status. A task
-        with no attempts is treated as freshly picked and left alone.
+        The run lease is an exclusive OS lock on ``<queue>.run.lock``,
+        held for the whole session. The OS releases it the moment the
+        holding process exits, crashed or not, so liveness never depends
+        on timestamps. A session that dies leaves its task ``in_progress``
+        with the lease free, which :meth:`reclaim_abandoned` detects.
+        The lease is taken *before* the transition, so no window exists
+        where a task is ``in_progress`` without a live holder.
 
         Args:
-            now: Current time (timezone-aware).
+            task_id: Task to start (must be ``ready``).
+
+        Yields:
+            None. The lease is released when the block exits; the task's
+            next status is the caller's to set.
+
+        Raises:
+            RunInProgressError: If another session holds the lease.
+            StateError: If the task doesn't exist.
+            TransitionError: If the task isn't ``ready``.
+        """
+        with self._run_lease(holder=task_id):
+            self.transition(task_id, "in_progress")
+            yield
+
+    def reclaim_abandoned(self) -> list[str]:
+        """Return ``in_progress`` tasks abandoned by a dead session to ``ready``.
+
+        If the run lease is held, a session is alive and nothing is
+        reclaimed, however long it has been running. If the lease is
+        free, no session is alive, so every ``in_progress`` task was
+        abandoned (crash, killed process, laptop sleep), including one that
+        died before recording its first attempt. Each goes back to
+        ``ready`` through the aborted-run edge and re-enters the queue
+        under the same attempt budget.
 
         Returns:
-            The ids of reclaimed tasks, in queue order.
+            The ids of reclaimed tasks, in queue order; empty while a run
+            is live.
         """
-        reclaimed: list[str] = []
-        for task in self.doc.get("tasks", []):
-            if task.get("status") != "in_progress":
-                continue
-            attempts = task.get("attempts") or []
-            if not attempts:
-                continue
-            started = _parse_dt(attempts[-1].get("started", ""))
-            limit = task.get("budget", {}).get("wall_clock_min")
-            if started is None or not isinstance(limit, int):
-                continue
-            if now - started > timedelta(minutes=limit):
-                check_transition("in_progress", "ready")
-                task["status"] = "ready"
-                reclaimed.append(task.get("id"))
-        if reclaimed:
-            self.save()
-        return reclaimed
+        try:
+            lease = self._run_lease(holder="reclaim")
+            lease.__enter__()
+        except RunInProgressError:
+            return []
+        try:
+            reclaimed: list[str] = []
+            for task in self.doc.get("tasks", []):
+                if task.get("status") == "in_progress":
+                    check_transition("in_progress", "ready")
+                    task["status"] = "ready"
+                    reclaimed.append(task.get("id"))
+            if reclaimed:
+                self.save()
+            return reclaimed
+        finally:
+            lease.__exit__(None, None, None)
+
+    @contextlib.contextmanager
+    def _run_lease(self, holder: str):
+        """Hold the non-blocking exclusive run lease on ``<queue>.run.lock``.
+
+        Args:
+            holder: Recorded in the lock file, for diagnostics.
+
+        Raises:
+            RunInProgressError: If the lease is already held; the message
+                names the holder.
+        """
+        lease_path = self.path.with_name(self.path.name + ".run.lock")
+        with lease_path.open("a+") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                current = lease_path.read_text().strip() or "unknown"
+                raise RunInProgressError(
+                    f"{self.path}: a run is in progress (lease held by {current}); "
+                    "one writer task per repo"
+                ) from exc
+            try:
+                handle.seek(0)
+                handle.truncate()
+                handle.write(holder)
+                handle.flush()
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def sync_readiness(self) -> list[str]:
         """Reconcile ``ready``/``blocked`` with dependencies.

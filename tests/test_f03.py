@@ -10,7 +10,7 @@ handling and the append-only enforcement on ``attempts``.
 import copy
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 
 import pytest
 
@@ -20,6 +20,7 @@ from factory.state import (
     CONTRACT_FROZEN_STATUSES,
     STATUSES,
     ConcurrentWriteError,
+    RunInProgressError,
     StateError,
     TaskQueue,
     TransitionError,
@@ -580,6 +581,9 @@ def test_slice_continuation_from_deploying(tmp_path):
 
 
 def test_reclaim_abandoned_runs(tmp_path):
+    # No run lease is held, so every in_progress task is abandoned — whether
+    # its last attempt is old, recent, or (crash before the first attempt
+    # record) missing entirely. Reclaim no longer guesses from timestamps.
     stale = {**_ATTEMPT, "started": "2026-10-16T10:00:00Z"}
     fresh = {**_ATTEMPT, "started": "2026-10-16T11:55:00Z"}
     path = _queue_file(
@@ -590,13 +594,49 @@ def test_reclaim_abandoned_runs(tmp_path):
             _task(id="T-NOATTEMPT", status="in_progress"),
         ],
     )
-    now = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
-    reclaimed = TaskQueue(path).reclaim_abandoned(now)
-    assert reclaimed == ["T-STALE"]
+    reclaimed = TaskQueue(path).reclaim_abandoned()
+    assert reclaimed == ["T-STALE", "T-FRESH", "T-NOATTEMPT"]
     reloaded = TaskQueue(path)
-    assert reloaded.get("T-STALE")["status"] == "ready"
-    assert reloaded.get("T-FRESH")["status"] == "in_progress"
-    assert reloaded.get("T-NOATTEMPT")["status"] == "in_progress"
+    for tid in reclaimed:
+        assert reloaded.get(tid)["status"] == "ready"
+
+
+def test_reclaim_never_takes_a_live_run(tmp_path):
+    # A live session must not be reclaimed, however long it runs (setup and
+    # L0-L3 validation are outside the session clock, so elapsed time says
+    # nothing about liveness).
+    path = _queue_file(tmp_path, [_task(id="T-1")])
+    runner = TaskQueue(path)
+    with runner.begin_run("T-1"):
+        old = {**_ATTEMPT, "started": "2000-01-01T00:00:00Z"}
+        runner.append_attempt("T-1", old)
+        assert TaskQueue(path).reclaim_abandoned() == []
+        assert TaskQueue(path).get("T-1")["status"] == "in_progress"
+
+
+def test_reclaim_frees_a_crash_before_the_first_attempt(tmp_path):
+    # Picked (in_progress) but the session died before recording an attempt.
+    path = _queue_file(tmp_path, [_task(id="T-1")])
+    runner = TaskQueue(path)
+    with pytest.raises(RuntimeError):
+        with runner.begin_run("T-1"):
+            raise RuntimeError("session died")
+    assert TaskQueue(path).get("T-1")["status"] == "in_progress"
+    assert TaskQueue(path).reclaim_abandoned() == ["T-1"]
+    assert TaskQueue(path).get("T-1")["status"] == "ready"
+
+
+def test_begin_run_refuses_a_second_concurrent_run(tmp_path):
+    path = _queue_file(tmp_path, [_task(id="T-1"), _task(id="T-2")])
+    with TaskQueue(path).begin_run("T-1"):
+        with pytest.raises(RunInProgressError, match="T-1"):
+            with TaskQueue(path).begin_run("T-2"):
+                pass
+    assert TaskQueue(path).get("T-2")["status"] == "ready"
+
+
+def test_run_lease_is_a_contract_error():
+    assert issubclass(RunInProgressError, ContractError)
 
 
 def test_sync_readiness_reconciles_with_dependencies(tmp_path):
@@ -623,3 +663,24 @@ def test_ready_to_blocked_edge_is_legal(tmp_path):
     path = _queue_file(tmp_path, [_task(id="T-1", status="ready")])
     TaskQueue(path).transition("T-1", "blocked")
     assert TaskQueue(path).get("T-1")["status"] == "blocked"
+
+
+def test_lease_is_freed_when_the_holding_process_dies(tmp_path):
+    # The point of an OS lock: a process that dies without cleanup (here
+    # os._exit, no finally blocks run) still releases it.
+    import subprocess
+    import sys
+
+    path = _queue_file(tmp_path, [_task(id="T-1")])
+    script = (
+        "import os, sys\n"
+        "sys.path.insert(0, sys.argv[2])\n"
+        "from factory.state import TaskQueue\n"
+        "q = TaskQueue(sys.argv[1])\n"
+        "ctx = q.begin_run('T-1'); ctx.__enter__()\n"
+        "os._exit(0)\n"
+    )
+    repo = str(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    subprocess.run([sys.executable, "-c", script, str(path), repo], check=True)
+    assert TaskQueue(path).get("T-1")["status"] == "in_progress"
+    assert TaskQueue(path).reclaim_abandoned() == ["T-1"]

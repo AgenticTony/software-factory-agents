@@ -70,7 +70,7 @@ Recovery and continuation edges (same allowed-transition table, kept out of the 
 
 | Edge | Set when |
 |---|---|
-| `in_progress → ready` | the run aborted with no PR and no outcome (orchestrator crash, killed session). The task re-enters the queue under the same attempt budget; `reclaim_abandoned` applies it when the last attempt is older than `budget.wall_clock_min`. |
+| `in_progress → ready` | the run aborted with no PR and no outcome (orchestrator crash, killed session). The task re-enters the queue under the same attempt budget. Liveness comes from a **run lease**, an OS lock the session holds for its whole life and the OS releases when the process dies. `reclaim_abandoned` applies this edge only when the lease is free, so a live run is never reclaimed, and a run that died before its first attempt record still is. |
 | `in_review → in_progress` | you rejected the PR — the task returns for a fix round. |
 | `deploying → ready` | the previous slice merged and live-verified and more slices remain. Owner-step and `done` evaluation waits until the last slice merges; a task can only be `done`/`awaiting_owner` with every slice merged. |
 | `ready → blocked` | a dependency regressed (its task was reopened or demoted). `sync_readiness` reconciles both directions. |
