@@ -253,9 +253,11 @@ def build_settings(
             holdouts readable).
         toolchain: Binaries the session must be able to exec even though
             they live under the (denied) home dir — Claude Code, pyenv/uv
-            pythons, nvm node. Each is resolved and its directory chain
-            below home is re-allowed for reading. Default: this Python plus
-            :data:`TOOLCHAIN_BINS` found on PATH.
+            pythons, nvm node. Each gets its resolved install dir, the
+            sibling ``lib/`` of a ``bin/`` install dir, and the symlink
+            files on the way re-allowed for reading — never ancestor
+            directories (see :func:`_toolchain_allowread`). Default: this
+            Python plus :data:`TOOLCHAIN_BINS` found on PATH.
 
     Returns:
         A settings dict accepted by ``srt --settings``.
@@ -364,21 +366,23 @@ def run_sandboxed(
             token}`` cannot smuggle an unlisted secret across. Scrub
             keychain-derived names yourself (via :func:`sandbox_env`) — the
             settings file denies them as the backstop layer.
-        timeout: Wall-clock seconds for the leader. The pipes are pumped by
-            reader threads while the leader runs (``proc.wait`` on PIPEd
-            output would deadlock past the ~64KB pipe buffer). On expiry —
-            and also on a normal leader exit, so stragglers never outlive
-            the run — the whole process group is SIGKILLed; the readers get
-            :data:`_DRAIN_GRACE_SEC` to drain, after which pipes still held
-            by a process that escaped the group (setsid) are force-closed
-            with whatever output was already read preserved. Such an
-            escapee may itself survive (killing by pid namespace is srt's
-            side, via bwrap's ``--die-with-parent``): the orchestrator
-            stops waiting for it, and it loses *network* because srt's
-            filtering proxy died — but it keeps the model token in its
-            memory and environment for as long as it lives; deleting the
-            run dir revokes nothing. Treat escaped processes as a prompt
-            for the owner to rotate the seat token if abuse is suspected.
+        timeout: Wall-clock seconds for the leader. While it runs, the
+            pipes are pumped by a single-threaded ``select`` loop over
+            non-blocking fds (``proc.wait`` on PIPEd output would deadlock
+            past the ~64KB pipe buffer); nothing in this process ever blocks
+            on a pipe. On expiry — and also on a normal leader exit, so
+            stragglers never outlive the run — the whole process group is
+            SIGKILLed, then the pipes drain for at most
+            :data:`_DRAIN_GRACE_SEC`; after that, pipes still held by a
+            process that escaped the group (setsid) are closed, with the
+            output read so far preserved. Such an escapee may itself
+            survive (killing by pid namespace is srt's side, via bwrap's
+            ``--die-with-parent``): the orchestrator stops waiting for it,
+            and it loses *network* because srt's filtering proxy died — but
+            it keeps the model token in its memory and environment for as
+            long as it lives; deleting the run dir revokes nothing. Treat
+            escaped processes as a prompt for the owner to rotate the seat
+            token if abuse is suspected.
         cwd: Working dir (default: the run dir).
         srt_bin_path: Test injection for the srt binary (still pin-checked).
             There is no production override path.
@@ -497,30 +501,50 @@ def _pump(streams: dict, buffers: dict, wait: float) -> None:
 
 
 def _toolchain_allowread(home: Path, toolchain: "Sequence[Path]") -> set[Path]:
-    """Directories below ``home`` that must stay readable so the session's
-    toolchain can exec: **only the resolved binary's own directory**, plus
-    its parent when that directory is a ``bin/`` — the version prefix
-    (pyenv's ``versions/3.12``, nvm's ``versions/node/v22``) where the
-    interpreter's ``lib/`` and ``site-packages`` live.
+    """Paths below ``home`` that must stay readable so the session's
+    toolchain can exec:
+
+    * the resolved binary's own directory;
+    * when that directory is a ``bin/``, its sibling ``lib/`` — where an
+      interpreter's stdlib and site-packages live (pyenv's
+      ``versions/3.12/lib``, nvm's ``versions/node/v22/lib``). Never the
+      whole parent: for ``~/.local/bin`` that would re-open all of
+      ``~/.local`` (``~/.local/share`` holds uv's credential store,
+      cursor-agent, Copilot shims);
+    * every symlink on the way to the binary, as the literal link *file*
+      (never its directory). The native Claude Code install is
+      ``~/.local/bin/claude -> ~/.local/share/claude/versions/X``; without
+      the link itself, exec by that path or by PATH lookup is denied
+      (rc=126 / rc=127) even though the target is readable.
 
     Ancestors are deliberately NOT re-allowed: allowing the chain up to
-    ``$HOME`` would re-open whole subtrees like ``~/.local`` and
-    ``~/.local/share`` — uv's credential store, cursor-agent, Copilot
-    shims and whatever else lives there.
+    ``$HOME`` would re-open whole subtrees like ``~/.local``.
     """
     entries: set[Path] = set()
+
+    def below_home(path: Path) -> bool:
+        return path != home and home in path.parents
+
     for raw in toolchain:
-        binary = Path(raw).expanduser()
+        link = Path(raw).expanduser()
+        if not link.is_absolute():
+            continue
+        for _ in range(40):  # same hop limit as the kernel's ELOOP
+            if not link.is_symlink():
+                break
+            if below_home(link):
+                entries.add(link)
+            link = link.parent / os.readlink(link)
         try:
-            binary = binary.resolve()
+            binary = Path(raw).expanduser().resolve()
         except OSError:
             continue
         directory = binary.parent
-        if directory == home or home not in directory.parents:
+        if not below_home(directory):
             continue
         entries.add(directory)
         if directory.name == "bin" and directory.parent != home:
-            entries.add(directory.parent)
+            entries.add(directory.parent / "lib")
     return entries
 
 

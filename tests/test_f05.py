@@ -817,8 +817,8 @@ def test_toolchain_under_home_is_executable(tmp_path: Path):
     """F-06 runs the Claude Code CLI, which may live under $HOME
     (~/.local/bin/claude, pyenv, uv, nvm). The home-wide denyRead must not
     make the session's own toolchain unexecutable: build_settings re-allows
-    the resolved toolchain paths (binary dir, its version prefix when the
-    dir is a bin/, and every ancestor below home)."""
+    the resolved toolchain paths (binary dir, its sibling lib/ when the
+    dir is a bin/, and the literal symlinks on the way — never ancestors)."""
     home = Path.home()
     tool_root = home / ".factory-sandbox-toolchain-test"
     tool_bin = tool_root / "bin"
@@ -1066,7 +1066,7 @@ def test_ambient_seat_and_git_config_names_do_not_cross(tmp_path: Path, monkeypa
 
 
 def test_toolchain_allowread_is_install_dir_only():
-    """Only the resolved install dir is re-allowed (plus the version prefix
+    """Only the resolved install dir is re-allowed (plus the sibling lib/
     when the binary sits in a bin/), never the ancestors: re-allowing the
     chain re-opens ~/.local and ~/.local/share — uv's credential store,
     cursor-agent, Copilot shims and friends live there."""
@@ -1079,7 +1079,7 @@ def test_toolchain_allowread_is_install_dir_only():
     python = base / "pyenv" / "versions" / "3.12" / "bin" / "python"
     assert _toolchain_allowread(home, [python]) == {
         base / "pyenv" / "versions" / "3.12" / "bin",
-        base / "pyenv" / "versions" / "3.12",  # the interpreter's lib/ lives here
+        base / "pyenv" / "versions" / "3.12" / "lib",  # stdlib + site-packages
     }
 
 
@@ -1153,3 +1153,66 @@ def test_timeout_preserves_partial_output(tmp_path: Path):
     assert "BEFORE-DETACH-MARKER" in output, (
         f"partial output discarded on force-close: {output!r}"
     )
+
+
+# --- review round 5 ----------------------------------------------------------
+
+
+def test_toolchain_symlink_under_home_executes(tmp_path: Path):
+    """The native Claude Code install is a symlink under $HOME
+    (~/.local/bin/claude -> ~/.local/share/claude/versions/X). Exec through
+    the link — directly and via a PATH lookup — must work, not just through
+    the resolved path: F-06 finds the CLI by name."""
+    home = Path.home()
+    base = home / ".factory-sandbox-tc-r5"
+    link_dir = base / "bin"
+    real_dir = base / "share" / "tool" / "versions" / "1.0"
+    real_dir.mkdir(parents=True, exist_ok=True)
+    link_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        real = real_dir / "r5tool"
+        real.write_text("#!/bin/sh\necho 'r5 symlink ok'\n")
+        real.chmod(0o755)
+        link = link_dir / "r5tool"
+        link.symlink_to(Path("..") / "share" / "tool" / "versions" / "1.0" / "r5tool")
+        run, _, _ = _make_run(tmp_path)
+        settings = build_settings({}, run.root, model_endpoint=MODEL_ENDPOINT,
+                                  toolchain=[link])
+        write_settings(settings, run.settings_path)
+        via_link = run_sandboxed([str(link)], run.root, run.settings_path, timeout=60)
+        assert "r5 symlink ok" in via_link.stdout, (
+            f"exec via the symlink failed: rc={via_link.returncode}\n"
+            f"{via_link.stdout}{via_link.stderr}"
+        )
+        via_path = run_sandboxed(
+            ["r5tool"], run.root, run.settings_path, timeout=60,
+            env={"PATH": f"{link_dir}{os.pathsep}{os.environ['PATH']}"},
+        )
+        assert "r5 symlink ok" in via_path.stdout, (
+            f"PATH lookup of the symlinked tool failed: rc={via_path.returncode}\n"
+            f"{via_path.stdout}{via_path.stderr}"
+        )
+        # Only the link file itself is re-allowed, never its directory.
+        allow = settings["filesystem"]["allowRead"]
+        assert str(link) in allow and str(link_dir) not in allow
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_bin_dir_parent_never_reopens_a_shared_prefix():
+    """A binary living in ~/.local/bin must not re-allow all of ~/.local
+    (uv credentials, cursor-agent, ... under ~/.local/share). For a bin/ dir
+    only its sibling lib/ (where an interpreter's stdlib and site-packages
+    live) joins the reads, never the whole parent."""
+    home = Path.home()
+    reads = _toolchain_allowread(home, [home / ".local" / "bin" / "sometool"])
+    assert home / ".local" not in reads, reads
+    assert reads == {home / ".local" / "bin", home / ".local" / "lib"}
+
+
+def test_run_sandboxed_docstring_matches_the_select_pump():
+    """The teardown is a single-threaded select loop; the docstring must not
+    describe the abandoned reader-thread design."""
+    doc = run_sandboxed.__doc__ or ""
+    assert "reader thread" not in doc.lower(), "docstring still describes reader threads"
+    assert "select" in doc
