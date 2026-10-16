@@ -168,6 +168,16 @@ Acceptance:
 - AC-1 Reviewer output that isn't valid verdict JSON → treated as FAIL.
 - AC-2 The prompt-hash test fails if a prompt file changes without the pin being updated.
 - AC-3 The reviewer prompt includes the mandatory checklist from VALIDATOR-SPEC L2: real schema vs mock, scope, states, lifecycle.
+- AC-4 Every reviewer finding carries `axis` (`spec` or `standards`). A finding without one is invalid verdict JSON (AC-1 applies). A `blocking` finding on either axis means FAIL, whatever the other axis says.
+- AC-5 The assembled reviewer prompt contains the smell baseline, the test-quality checks and the project's `standards` files. The assembled implementer prompt contains none of the `standards` files.
+- AC-6 `project.schema.json` accepts an optional `standards: [string]` and `tasks.schema.json` accepts an optional per-task `out_of_scope: [string]`. Unknown keys are still rejected. Both tests are red before the schema change.
+- AC-7 The L1 report (F-08's `L1Report`) records a `red_reason` per test ref: `assertion`, `collection` or `unknown`. A fixture whose test imports a not-yet-existing module gives `collection`, and a failing assert gives `assertion`. The verdict doesn't depend on it.
+- AC-8 Every vendored prompt file sits under `prompts/vendor/` next to its upstream `LICENSE` and the source commit SHA. A test fails if either is missing.
+
+Prompt sources. The seat prompts adapt [mattpocock/skills](https://github.com/mattpocock/skills) @ `49dd158` (MIT), copied in and pinned by AC-2 rather than loaded as live skills:
+- **Implementer:** `tdd`: red before green, one test and its minimal code per cycle, vertical slices (not every test first and then all the code), test anti-patterns, mocks only at system boundaries. Refactoring belongs to review, not the loop. His "confirm the seams with the user" step becomes "the contract's `test` refs are the agreed seams": the session is AFK.
+- **Bug tasks** (from F-18): `diagnosing-bugs` Phase 1: a tight, red-capable reproduction command that has already been run once, before any hypothesis. If no correct seam exists for a regression test, that is reported as a finding and isn't papered over.
+- **Reviewer:** `code-review`: the two axes and the smell baseline (VALIDATOR-SPEC L2). The issue-tracker lookup is dropped, because the contract is passed in directly.
 
 ### F-10 — `factory run` / `factory loop` + PR creation
 - **`run`:** pick → clone → implementer session → L0 + L1 on a clean clone → L2 → (fail: findings back, up to `max_attempts`) → push the branch with the orchestrator's token → `gh pr create`, with the contract and validator report in the body → `in_review`.
@@ -181,6 +191,12 @@ Acceptance:
 - AC-4 `loop` won't start a session during 08:00–12:00 Mon–Fri Swedish time. The window comes from config.
 - AC-5 The code contains no `gh pr merge` call (a grep test).
 - AC-6 Every attempt records `prompt_versions` (seat → prompt content hash, from F-09) and `skills` (the skills loaded). An attempt without them is a schema error.
+- AC-7 The PR body has these sections: **Summary**, **Evidence**, **Merge Danger** (Door + Blast Radius), **Contract**, **Validator report**. The PR isn't opened if any is missing.
+- AC-8 **Evidence** is built by the orchestrator from the L1 report, not from model text. For each contract test ref it shows red on base (with `red_reason`) and green on head. Nothing the implementer writes can alter this section.
+- AC-9 **Door** is `one-way` when the task carries any of `migration`, `deploy`, `external_service`, `payments` or `privacy` (data that has leaked can't be recalled), and `two-way` otherwise. **Blast Radius** lists the risk flags and matched `paths.risk` globs, or `contained`. The implementer may add prose below them but can't change either value.
+- AC-10 An attempt that starts in a fresh session (re-queued run, rejected-PR fix round) receives the task's progress log, entries 1..N. The log is orchestrator-owned, lives outside the clone and is append-only: rewriting an earlier entry raises.
+
+PR body shape adapted from mattpocock/skills `pr` (its Summary visuals credit Dex Horthy's `show-me`). The difference: Evidence and Merge Danger come from validator facts, not the agent's own account.
 
 ### F-11 — `factory status`: daily summary + metrics
 Write a markdown summary per project:
@@ -199,6 +215,7 @@ Acceptance:
 - AC-1 The output validates against the schema, or the import is refused.
 - AC-2 Every imported task is `draft`.
 - AC-3 Running it twice with no doc changes proposes no diff for existing tasks. Status and attempts are preserved.
+- AC-4 The importer reads `.factory/out-of-scope/` (TASK-CONTRACT §5). A proposed task that resembles a record is listed in the import summary with the record's path. It's still proposed as `draft` and is never dropped or rejected on its own: you confirm the match.
 
 ### F-13 — Onboard JobFinderOS (pilot)
 **Kind:** owner_only. This is the onboarding steps in TASK-CONTRACT §6, run on the real repo.
@@ -239,6 +256,8 @@ A monthly job: seed 5–10 known bugs on a branch, run the validator, record the
 A Sentry-alert → triage-session pipeline. That session has no secrets, can't push, and outputs only `draft` tasks for your approval.
 - AC-1 The triage session's sandbox has no repo write access and no GitHub token.
 - AC-2 Its output is schema-valid draft tasks only. Free text never reaches an implementer.
+- AC-3 Triage checks `.factory/out-of-scope/` the same way the importer does (F-12 AC-4).
+- AC-4 A bug draft carries at least one `test` acceptance item that reproduces the reported symptom. A signal that can't be turned into one is listed in the summary as needing info and doesn't become a draft.
 
 ## Phase 4 — Self-improvement and gate dial-down
 
@@ -247,6 +266,10 @@ A weekly review of escalations and L2 findings → PRs with **itemised delta edi
 - AC-1 A PR that touches validators, holdouts, contract tests or schemas is rejected by L0.
 - AC-2 Edits are additions, removals or changes to individual items, never whole-file rewrites (a diff-size check).
 - AC-3 The weekly review groups failed and escalated attempts by `prompt_versions` and `skills`, and reports each version's failure share. Each proposed edit names the version it targets and the evidence (attempt run ids) behind it.
+- AC-4 The review also reads the session transcripts of the attempts it samples, because agents push through friction that never shows up as a failure. Every proposal cites the run id and turn it comes from.
+- AC-5 A proposal that targets anything other than a prompt file (a new check, CI, `standards`, steering files) comes out as a `draft` task for you, never as a meta-loop PR. Agents can't edit what judges them (Principle 5).
+
+Review categories adapted from mattpocock/skills `retro`: navigation, automated checks, coding standards, steering-file bloat and no-ops, tool economy, information access. His warning applies too: a fully automated retro loop chases false positives, which is why every output is a proposal you review.
 
 ### F-20 — Cross-provider reviewer
 A per-seat provider config. Risk-flagged tasks get a second L2 review from a different provider.

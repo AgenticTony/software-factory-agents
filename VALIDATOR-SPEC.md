@@ -45,17 +45,31 @@ Both projects already require "a test that would fail without the change". The v
 
 A test that passes on the base commit proves nothing, and this is where false greens get through.
 
+**What L1 can't prove.** Red-then-green shows that the test depends on the change. It doesn't show that the test checks behaviour. Two cases pass L1 and still prove nothing:
+
+- **Red for the wrong reason.** The test is red on base only because the symbol it imports doesn't exist yet (collection or import error), so the run never reached an assertion. This is how red-first legitimately looks for a brand-new function, so L1 can't reject it. It does mean the red phase proved only that the name was missing.
+- **Tautological or implementation-coupled assertions.** The expected value recomputes what the code computes (`assert add(a, b) == a + b`), or the test asserts on mocked internal collaborators or call counts instead of the result at a public interface. It goes red on base (the code is missing), green on head, and would stay green under a wrong implementation that mirrors the same logic.
+
+L1 therefore records **how** each ref went red (`assertion` vs `collection`) in its report. Judging assertion quality is L2's job (the test-quality checks below), and holdouts (L3) back it up with checks the agent never sees.
+
 ### L2 — Adversarial review (the only model-judged layer)
 
 - **Fresh session**, read-only tools (Read, Grep, Glob, Bash for running checks only). Reuse SoloAdventurer's `verifier.md` as the base prompt: *default verdict FAIL; evidence flips it, claims do not.*
-- **Input:** the approved contract, the diff, L0/L1 output. **Not** the implementer's narrative. The reviewer judges what was built against what was asked.
+- **Input:** the approved contract, the diff, L0/L1 output (including each ref's red reason). **Not** the implementer's narrative. The reviewer judges what was built against what was asked.
+- **Two axes, reviewed separately** (adapted from mattpocock/skills `code-review`). A change can pass one and fail the other, so neither is allowed to mask the other:
+  - **Spec:** does the diff implement the contract? It reports acceptance items that are missing or partial, behaviour nobody asked for (scope creep, checked against the contract's `out_of_scope`), and items that look implemented but wrongly. Each finding quotes the acceptance item it concerns.
+  - **Standards:** does the diff follow the project's documented standards (`project.yaml` `standards`)? A fixed baseline of named code smells (Fowler, *Refactoring* ch. 3: Mysterious Name, Duplicated Code, Feature Envy, Data Clumps, Primitive Obsession, Repeated Switches, Shotgun Surgery, Divergent Change, Speculative Generality, Message Chains, Middle Man, Refused Bequest) always applies. A documented project standard overrides a smell. A smell is always a judgement call, never a hard violation, so it never blocks on its own. Anything L0 tooling already enforces is skipped. A project with no `standards` runs the baseline only, and the report says so.
+  - Standards live with the reviewer, not the implementer: the implementer has the most context pressure, and the reviewer receives a diff and has the least.
 - **Mandatory checklist** (from your own incident history):
   - Does any new backend call (table, RPC, edge function, column) exist in the **real schema**, or only in a mock? A test that mocks the client is not evidence the backend exists.
   - Does the change touch only the slice's scope?
   - Loading, error, empty and offline states — and does offline UI report *unknown*, not a false "disabled"?
   - New provider/subscription/cache: what invalidates it, who cancels it, what happens on logout?
+  - **Test quality** (the part L1 can't prove). Every contract test, and especially any ref L1 reports as red only by `collection`:
+    - Does its expected value come from an independent source (a literal, a worked example, the acceptance text), or does it recompute what the code does?
+    - Does it assert through the public interface, or on mocked internal collaborators, private methods or call counts? Mocks belong only at system boundaries (external APIs, time, randomness).
 - **Model:** a different model from the implementer where possible. With GLM-only, the self-preference bias is real, so L0, L1 and L3 — none judged by the model — carry most of the weight. Add a cross-provider reviewer when budget allows (see design doc §7).
-- Output: JSON `{verdict, findings: [{id, severity, file, line, text}]}`, stored as the `validator_report`.
+- Output: JSON `{verdict, findings: [{id, axis, severity, file, line, text}]}`, with `axis` being `spec` or `standards`, stored as the `validator_report`. A finding with severity `blocking` on either axis means FAIL. Findings are not re-ranked across axes.
 
 ### L3 — Holdout scenarios (agents never see them)
 
@@ -86,6 +100,8 @@ attempt 3: fix → L0 → L1 → L2
   FAIL → needs_human (attempts_exhausted). Never retried automatically.
 PASS → L3 → PR opened → you merge → deploy → L4
 ```
+
+Not every round shares a session: an aborted run re-enters the queue, and a PR you reject comes back as a fix round, maybe days later. A **fresh** session carries no context, so the orchestrator keeps a per-task **progress log**, an append-only record of each attempt's report and findings (from Anthropic's long-running-harness `progress.txt` pattern). The log lives outside the clone, and every new session gets a read-only copy. The agent never edits earlier entries.
 
 `max_attempts` defaults to 3, matching your existing `loop.md`. Risk, protected-path, new-dependency and cross-repo hits escalate **immediately**: no retries, since retrying won't make them safe.
 
