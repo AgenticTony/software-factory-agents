@@ -1,0 +1,8 @@
+{
+  "name": "software-factory-sandbox",
+  "private": true,
+  "description": "Pins the sandbox runtime (srt) used by factory/sandbox.py. The factory verifies the version at runtime (SRT_PIN) and refuses to run on a mismatch. Install with: npm ci",
+  "devDependencies": {
+    "@anthropic-ai/sandbox-runtime": "0.0.79"
+  }
+}

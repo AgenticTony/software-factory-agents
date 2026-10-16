@@ -25,3 +25,6 @@ out/
 
 # Writer lock for tasks.json (F-03) — runtime artifact, never committed
 .factory/*.lock
+
+# srt (sandbox runtime) — pinned in package.json; only the lockfile is committed
+node_modules/
