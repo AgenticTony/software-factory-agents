@@ -173,3 +173,31 @@ def test_post_approval_statuses_all_require_hash(tmp_path):
         path = _tasks_file(tmp_path, [_task(id=f"T-{status}", status=status)])
         with pytest.raises(ContractError, match="acceptance_hash"):
             load_tasks(path)
+
+
+def test_post_approval_statuses_also_require_approved_at(tmp_path):
+    # Mirrors the schema's full rule: hash AND approved_at, not just the hash.
+    path = _tasks_file(
+        tmp_path, [_task(id="T-NOAPPROVAL", status="ready", acceptance_hash="x" * 64)]
+    )
+    with pytest.raises(ContractError, match=r"T-NOAPPROVAL.*approved_at"):
+        load_tasks(path)
+
+
+def test_non_executable_message_names_every_allowed_status(tmp_path):
+    path = _tasks_file(
+        tmp_path,
+        [
+            _task(
+                id="T-RES",
+                kind="research",
+                status="in_progress",
+                acceptance_hash="x" * 64,
+                approved_at="2026-10-16T00:00:00Z",
+            )
+        ],
+    )
+    with pytest.raises(ContractError) as exc:
+        load_tasks(path)
+    for allowed in ("draft", "not_buildable", "done"):
+        assert allowed in str(exc.value)

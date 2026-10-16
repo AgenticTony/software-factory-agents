@@ -118,15 +118,18 @@ def _check_semantics(tasks: Any, origin: str) -> None:
         status = _field(task, "status")
         if kind in NON_EXECUTABLE_KINDS and status not in NON_EXECUTABLE_STATUSES:
             shown = status if status is not None else "<missing>"
+            allowed = ", ".join(sorted(NON_EXECUTABLE_STATUSES))
             raise ContractError(
                 f"{origin}: task {tid} is kind={kind} but status={shown}; "
-                f"{kind} tasks are never executable — they live in draft or not_buildable"
+                f"{kind} tasks are never executable — allowed statuses: {allowed}"
             )
-        if status in POST_APPROVAL_STATUSES and not task.get("acceptance_hash"):
-            raise ContractError(
-                f"{origin}: task {tid} is {status} but has no acceptance_hash; "
-                "approve the spec first so the contract is frozen (factory approve)"
-            )
+        if status in POST_APPROVAL_STATUSES:
+            missing = [k for k in ("acceptance_hash", "approved_at") if not task.get(k)]
+            if missing:
+                raise ContractError(
+                    f"{origin}: task {tid} is {status} but has no {' or '.join(missing)}; "
+                    "approve the spec first so the contract is frozen (factory approve)"
+                )
 
 
 def _read(path: Path, origin: str) -> str:
