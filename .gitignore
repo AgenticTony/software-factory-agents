@@ -12,6 +12,7 @@ dist/
 
 # Session/agent tooling — never part of the factory
 .remember/
+.superstack/
 .v2c/
 .video_agent/
 out/
