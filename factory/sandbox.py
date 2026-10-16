@@ -13,9 +13,13 @@ in :mod:`factory.runs`), denies reads of the entire home directory (the run
 dir is re-allowed), the holdouts, and every other run, and allows network
 only to the model endpoint plus the project profile's ``docs_allowlist``
 and ``network_allowlist``. Credentials are defence-in-depth: the
-environment is scrubbed before the child is spawned *and* the settings file
-denies the same names inside srt, so a caller mistake can't leak a GitHub
-token or a keychain-derived variable.
+environment is scrubbed before the child is spawned (allowlist, then the
+whole ``GH_*``/``GITHUB_*`` prefix), *and* the settings file denies GitHub
+names inside srt as a backstop. srt's deny takes exact names only, so the
+backstop lists the well-known token names plus every ``GH_*``/``GITHUB_*``
+variable present when the settings are built, plus the caller's
+keychain-derived names — a prefixed secret that appears only *after* the
+settings were built is caught by the scrub alone.
 """
 
 import json
@@ -88,6 +92,12 @@ _DRAIN_GRACE_SEC = 10.0
 # and re-allowed for reading by build_settings (the home-wide denyRead would
 # otherwise make the session's own toolchain unexecutable — rc=126).
 TOOLCHAIN_BINS = ("node", "npm", "npx", "claude", "git", "curl")
+
+# Well-known GitHub credential names, always on the settings backstop even
+# when absent from the environment at build time.
+_GITHUB_TOKEN_NAMES = frozenset(
+    {"GH_APP_TOKEN", "GH_PAT", "GITHUB_PAT", "GITHUB_APP_PRIVATE_KEY"}
+)
 
 
 class SandboxError(Exception):
@@ -279,7 +289,7 @@ def build_settings(
     else:
         factory_root = Path(factory_root).resolve()
     if toolchain is None:
-        toolchain = [sys.executable]
+        toolchain = [sys.executable, *_python_toolchain()]
         toolchain += [Path(found) for name in TOOLCHAIN_BINS
                       if (found := shutil.which(name))]
     allowed_domains = [
@@ -288,7 +298,10 @@ def build_settings(
         *profile.get("network_allowlist", []),
     ]
     denied_names = sorted(
-        set(_FORBIDDEN_ENV_EXACT) | {name for name in forbidden_env if name}
+        set(_FORBIDDEN_ENV_EXACT)
+        | _GITHUB_TOKEN_NAMES
+        | {k for k in os.environ if k.upper().startswith(_FORBIDDEN_ENV_PREFIXES)}
+        | {name for name in forbidden_env if name}
     )
     # srt's Linux sandbox runs its vendor helpers (apply-seccomp, the java
     # agent jar) from INSIDE the bwrap namespace. On hosts where this repo
@@ -498,6 +511,36 @@ def _pump(streams: dict, buffers: dict, wait: float) -> None:
             buffers[name] += chunk
         else:  # EOF: every writer on this pipe is gone
             streams[name] = -1
+
+
+@lru_cache(maxsize=None)
+def _python_toolchain() -> tuple[Path, ...]:
+    """The real interpreters behind ``python3``/``python`` on PATH.
+
+    pyenv (and friends) put a *script* named ``python3`` on PATH, not a
+    symlink, so ``shutil.which`` alone names the shim — re-allowing the shim
+    dir leaves the interpreter it runs unreadable. Each found command is
+    asked for its own ``sys.executable`` instead (outside the sandbox, once
+    per process). A command that fails or hangs is skipped, not fatal.
+    """
+    found: list[Path] = []
+    for name in ("python3", "python"):
+        command = shutil.which(name)
+        if not command:
+            continue
+        try:
+            proc = subprocess.run(
+                [command, "-c", "import sys; print(sys.executable)"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        executable = proc.stdout.strip()
+        if proc.returncode == 0 and executable:
+            real = Path(os.path.realpath(executable))
+            if real not in found:
+                found.append(real)
+    return tuple(found)
 
 
 def _toolchain_allowread(home: Path, toolchain: "Sequence[Path]") -> set[Path]:

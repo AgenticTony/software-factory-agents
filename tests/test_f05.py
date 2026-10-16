@@ -12,6 +12,7 @@ socat and ripgrep, and lifts the AppArmor unprivileged-userns restriction
 before pytest. If any of that breaks, these tests fail loudly.
 """
 
+import json
 import os
 import shlex
 import shutil
@@ -1216,3 +1217,84 @@ def test_run_sandboxed_docstring_matches_the_select_pump():
     doc = run_sandboxed.__doc__ or ""
     assert "reader thread" not in doc.lower(), "docstring still describes reader threads"
     assert "select" in doc
+
+
+# --- review follow-ups (fresh-context review of d898f10) ------------------
+
+
+def test_settings_backstop_denies_every_github_name_in_the_environment(
+    tmp_path: Path, monkeypatch
+):
+    """F1: scrub_env drops the whole GH_/GITHUB_ prefix, but srt's
+    credentials.envVars deny takes exact names only. The backstop must name
+    every GitHub-prefixed variable actually present when settings are built
+    (plus well-known token names), or a scrub-bypassing caller leaks e.g. a
+    GH_APP_TOKEN while GH_TOKEN is stripped."""
+    monkeypatch.setenv("GH_APP_TOKEN", "prefix-leak")
+    monkeypatch.setenv("GITHUB_PAT_EXTRA", "prefix-leak-2")
+    run, _, _ = _make_run(tmp_path)
+    settings = json.loads(run.settings_path.read_text())
+    denied = {e["name"] for e in settings["credentials"]["envVars"]}
+    assert {"GH_APP_TOKEN", "GITHUB_PAT_EXTRA", "GH_TOKEN", "GITHUB_TOKEN"} <= denied
+
+    script = "import os; print('GH_APP_TOKEN=' + repr(os.environ.get('GH_APP_TOKEN')))"
+    proc = subprocess.run(
+        [str(srt_bin()), "--settings", str(run.settings_path), "-c",
+         shlex.join(_child(script, []))],
+        env=dict(os.environ), cwd=run.root, capture_output=True, text=True,
+        timeout=60,
+    )
+    assert "GH_APP_TOKEN=None" in proc.stdout, (
+        f"settings backstop let a GH_-prefixed secret through\n{proc.stdout}{proc.stderr}"
+    )
+
+
+def test_warm_cache_symlinks_are_preserved_not_followed(tmp_path: Path):
+    """F2: prebuilt venvs and node_modules are full of symlinks. A dangling
+    or circular link must not abort the run, links stay links (a venv's
+    bin/python is not copied as a 6MB file), and an absolute link pointing
+    into the cache is retargeted into the run (the cache may be unreadable
+    inside the sandbox)."""
+    cache = tmp_path / "warm-cache"
+    (cache / "node_modules" / "a").mkdir(parents=True)
+    (cache / "node_modules" / "a" / "index.js").write_text("module.exports = 1\n")
+    os.symlink("/nonexistent/target", cache / "node_modules" / "dangling")
+    os.symlink("..", cache / "node_modules" / "a" / "self")  # pnpm-style cycle
+    os.symlink(cache / "node_modules" / "a" / "index.js", cache / "node_modules" / "abs")
+    (cache / ".venv" / "bin").mkdir(parents=True)
+    (cache / ".venv" / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    real_python = Path(os.path.realpath(sys.executable))
+    os.symlink(real_python, cache / ".venv" / "bin" / "python")
+
+    run = create_run(
+        "fixture", _fixture_repo(tmp_path), factory_root=_factory_root(tmp_path),
+        warm_cache=cache,
+    )
+    nm = run.root / "node_modules"
+    assert (nm / "dangling").is_symlink()
+    assert (nm / "a" / "self").is_symlink()
+    py = run.root / ".venv" / "bin" / "python"
+    assert py.is_symlink() and Path(os.readlink(py)) == real_python, (
+        "venv interpreter symlink was dereferenced into a copy"
+    )
+    assert Path(os.readlink(nm / "abs")) == nm / "a" / "index.js", (
+        "absolute link into the cache still points at the cache"
+    )
+
+
+def test_python_toolchain_follows_shims_to_the_real_interpreter(tmp_path: Path, monkeypatch):
+    """P3: pyenv puts a bash *script* named python3 on PATH, not a symlink,
+    so shutil.which() alone names the shim. The toolchain must allow the real
+    interpreter the shim runs (asked via sys.executable), so a $HOME-based
+    pyenv/uv python stays executable inside the sandbox."""
+    from factory.sandbox import _python_toolchain
+    shim_dir = tmp_path / "shims"
+    shim_dir.mkdir()
+    shim = shim_dir / "python3"
+    shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim_dir}{os.pathsep}{os.environ['PATH']}")
+    _python_toolchain.cache_clear()
+    found = _python_toolchain()
+    assert Path(os.path.realpath(sys.executable)) in found, found
+    assert shim not in found, "the shim script itself must not stand in for python"

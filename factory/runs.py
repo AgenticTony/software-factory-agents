@@ -8,6 +8,7 @@ produces is disposable: ``cleanup_run`` deletes the clone and its sandbox
 settings without a trace.
 """
 
+import os
 import shutil
 import subprocess
 import uuid
@@ -123,7 +124,13 @@ def create_run(
     if warm_cache is not None:
         _refuse_tracked_collisions(dest, warm_cache)
         try:
-            shutil.copytree(warm_cache, dest, dirs_exist_ok=True)
+            # symlinks=True: prebuilt venvs/node_modules are full of links.
+            # Following them aborts the run on any dangling or circular link
+            # (pnpm-style `self -> ..`) and copies a venv's bin/python as a
+            # full interpreter file. Links are kept as links; absolute links
+            # into the cache are then retargeted into the run.
+            shutil.copytree(warm_cache, dest, symlinks=True, dirs_exist_ok=True)
+            _retarget_cache_links(Path(warm_cache), dest)
             _relocate_venv(Path(warm_cache), dest)
             _seed_run_excludes(dest, warm_cache)
         except OSError as exc:
@@ -171,6 +178,29 @@ def _refuse_tracked_collisions(dest: Path, warm_cache: Path) -> None:
         )
 
 
+def _retarget_cache_links(cache: Path, dest: Path) -> None:
+    """Point absolute symlinks that lead into the cache at the run's copy.
+
+    A link copied verbatim with an absolute cache target would still reach
+    into the cache — which the sandbox may not even let the session read.
+    Relative links and links to anything outside the cache are untouched.
+    """
+    prefixes = sorted({str(cache), str(cache.resolve())}, key=len, reverse=True)
+    for dirpath, dirnames, filenames in os.walk(dest, followlinks=False):
+        for name in (*dirnames, *filenames):
+            link = Path(dirpath) / name
+            if not link.is_symlink():
+                continue
+            target = os.readlink(link)
+            if not os.path.isabs(target):
+                continue
+            for prefix in prefixes:
+                if target == prefix or target.startswith(prefix + os.sep):
+                    link.unlink()
+                    os.symlink(str(dest) + target[len(prefix):], link)
+                    break
+
+
 def _relocate_venv(cache: Path, dest: Path) -> None:
     """Rewrite a copied venv's absolute cache paths to the run dir.
 
@@ -192,7 +222,10 @@ def _relocate_venv(cache: Path, dest: Path) -> None:
         targets = [venv / "pyvenv.cfg"]
         bin_dir = venv / "bin"
         if bin_dir.is_dir():
-            targets.extend(p for p in bin_dir.iterdir() if p.is_file())
+            # Never rewrite through a symlink: it may point outside the run.
+            targets.extend(
+                p for p in bin_dir.iterdir() if p.is_file() and not p.is_symlink()
+            )
         targets.extend(venv.glob("lib*/python*/site-packages/*.pth"))
         for path in targets:
             try:
