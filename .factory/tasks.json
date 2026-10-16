@@ -350,7 +350,7 @@
     },
     {
       "id": "F-06",
-      "title": "Session runner (headless Claude Code on Z.ai)",
+      "title": "Session runner (Claude Agent SDK on Z.ai)",
       "source": "BUILD-ORDER.md#f-06--session-runner",
       "kind": "build",
       "priority": "P1",
@@ -369,7 +369,7 @@
       "acceptance": [
         {
           "id": "AC-1",
-          "text": "With a stub `claude` binary, the runner kills the session at the wall-clock limit and returns `aborted`.",
+          "text": "With an injected fake `query` that never finishes, the runner stops at the wall-clock limit and returns `aborted`.",
           "check": {
             "type": "test",
             "ref": "tests/test_f06.py::test_ac_1"
@@ -377,7 +377,7 @@
         },
         {
           "id": "AC-2",
-          "text": "Malformed JSON output is reported as a failed attempt, not a crash.",
+          "text": "A `ResultMessage` with an error subtype (`error_max_turns`, `error_during_execution`, or `is_error` with `api_error_status`), and an SDK exception, are each recorded as a failed attempt with the reason. Neither crashes the runner.",
           "check": {
             "type": "test",
             "ref": "tests/test_f06.py::test_ac_2"
@@ -385,7 +385,7 @@
         },
         {
           "id": "AC-3",
-          "text": "The hook blocks an Edit to a protected path inside a real session.",
+          "text": "The protected-path hook returns `permissionDecision: \"deny\"` for an Edit/Write to a protected path (unit test on the callback), and blocks one inside a real session.",
           "check": {
             "type": "test",
             "ref": "tests/test_f06.py::test_ac_3"
@@ -393,10 +393,18 @@
         },
         {
           "id": "AC-4",
-          "text": "A real smoke session against Z.ai completes a trivial prompt, and the recorded model name is read from the result.",
+          "text": "A real smoke session against Z.ai completes a trivial prompt, and the recorded model name is read from `model_usage`.",
           "check": {
             "type": "test",
             "ref": "tests/test_f06.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "The built options have `setting_sources == []`. The session env contains no GitHub token and no keychain secret other than the Z.ai token.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f06.py::test_ac_5"
           }
         }
       ],

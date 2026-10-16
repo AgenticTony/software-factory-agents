@@ -126,7 +126,7 @@ The inline blueprint diagram from this session shows the same flow.
 |---|---|---|
 | `factory` CLI (orchestrator) | `import`, `approve <id>`, `run` (one slice), `loop` (until queue empty, quota hit or escalation), `status`, `verify-live <id>` | — |
 | Contract validation | JSON Schema check of `tasks.json` + `project.yaml` on every load; refuse to run on invalid state | `schema/*.json` |
-| Session runner | Starts one agent session in a sandboxed clone with seat-specific model, env, tools, hooks and turn cap | — |
+| Session runner | Starts one agent session in a sandboxed clone with seat-specific model, env, tools, hooks and turn cap | Claude Agent SDK (`claude-agent-sdk`): `query()` + `ClaudeAgentOptions` + `HookMatcher` |
 | Implementer prompt | One slice, red-first test, conventional commit, structured report | SoloAdventurer `.claude/agents/implementer.md`, generalised |
 | Reviewer prompt | Default FAIL, contract-vs-diff, project checklist | SoloAdventurer `.claude/agents/verifier.md`, generalised |
 | Importer prompt | Proposes `tasks.json` from planning docs; you review the diff | — |
@@ -138,7 +138,11 @@ The inline blueprint diagram from this session shows the same flow.
 
 ### D1 — Substrate: Claude Code engine, driven by a thin Python orchestrator
 - Each agent seat (implementer, reviewer, importer) is one **Claude Code session** started by the orchestrator. That reuses Claude Code's tools, hooks, sandbox and turn caps, plus your existing agent prompts, instead of writing an agent loop.
-- **v0 runs headless Claude Code** (`claude -p … --output-format json --max-turns N`) behind a `run_session()` function. **The Claude Agent SDK (Python) is the drop-in upgrade** once D2's terms question is answered. It gives in-process hooks and typed results, and drives the same engine.
+- **v0 uses the Claude Agent SDK for Python** (`claude-agent-sdk`, version pinned) behind one `run_session()` function. **Owner decision, 2026-10-16.** The SDK runs the Claude Code engine as a subprocess, so the tools, sandbox and turn caps are Claude Code's. It adds what the CLI lacks:
+  - **In-process `PreToolUse` hooks:** Python callbacks that deny edits to protected paths, and `git push`/`gh` in Bash, with no settings file to tamper with.
+  - **Typed results:** `ResultMessage` with `num_turns`, `subtype`, `is_error`, `terminal_reason` and per-model `model_usage` tokens. No JSON parsing.
+  - **Per-session options:** `env`, `cwd`, `max_turns`, `system_prompt`, allowed/disallowed tools, and `setting_sources=[]`, so a session loads none of your personal Claude settings.
+- Headless `claude -p` remains the fallback behind the same function if the SDK ever becomes a problem.
 - No agent framework, no state machine beyond the status set. Same stance as Machinecraft and Factory Missions: orchestration in prompts, bookkeeping in code.
 
 ### D2 — Models: GLM via Z.ai's Anthropic-compatible endpoint
@@ -150,9 +154,9 @@ The inline blueprint diagram from this session shows the same flow.
   Because env is set **per session**, each seat can use a different provider. The single-provider limit applies within one session, not to the factory.
 - **Model names.** Z.ai's own pages disagree: the Claude Code guide maps Opus/Sonnet to GLM-4.7, while the plan FAQ says plans cover GLM-5.3 and GLM-5.3-Flash. Don't hard-code a mapping. Run one session, check `/status`, and record the actual model in `attempts[].model`.
 - **Terms caveat (open, must resolve before unattended runs).** The Coding Plan is "strictly limited to use within officially supported tools". Claude Code is listed; the Agent SDK isn't named; unattended or automated use isn't addressed either way. Actions:
-  1. Ask Z.ai support in writing whether scheduled headless Claude Code runs are allowed under your plan.
-  2. Until they answer, v0 uses headless Claude Code (the listed tool), not the SDK.
-  3. If they say no, the fallback is Z.ai's pay-as-you-go API key on the same endpoint. Nothing else changes.
+  1. **Owner decision (2026-10-16): proceed with the Agent SDK.** Claude Code is a listed tool, and the SDK drives the Claude Code engine.
+  2. Still send the F-00 question to Z.ai and record their written answer, so the decision rests on more than our reading of the terms.
+  3. If they ever say no, the fallback is Z.ai's pay-as-you-go API key on the same endpoint. Nothing else changes.
 - **Quota contention, checked in the repo.** JobFinderOS's *product* calls GLM through Z.ai's **Coding Plan endpoint**: `backend/.env.example` sets `GLM_BASE_URL=https://api.z.ai/api/coding/paas/v4`, and CLAUDE.md calls it a "flat-rate key". Matching and tailoring in production hunts run on it. Confirm the production env on Render matches. If it does:
   - **the factory and production hunts would compete for one quota**, and a busy factory night could starve real users' hunts
   - a production backend is almost certainly not an "officially supported tool" under the plan's terms
@@ -204,7 +208,7 @@ Every contract is approved by you; every PR is merged by you; risk flags are per
 ## 8. Phased build plan
 
 **Phase 0 — Prerequisites (1–2 days)**
-- Get Z.ai's written answer on automated headless use (D2).
+- Get Z.ai's written answer on automated Claude Code / Agent SDK use (D2). The owner has already decided to proceed; the answer is for the record.
 - Move JobFinderOS's production AI off the Coding Plan endpoint (the example config uses it; confirm on Render) (D2).
 - JobFinderOS readiness run: every `project.yaml` command passes unattended on a clean clone. Fix the `TODO(verify)` lines in [`projects/jobfinderos.project.yaml`](projects/jobfinderos.project.yaml).
 - Branch protection on `main`; keychain items for the live-check secrets.
