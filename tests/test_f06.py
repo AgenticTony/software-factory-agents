@@ -27,6 +27,7 @@ from factory.session import (
     DEFAULT_BASE_URL,
     SEATS,
     SessionConfigError,
+    SessionRecord,
     bash_guard_hook,
     build_options,
     protected_path_hook,
@@ -617,3 +618,395 @@ def test_sessionrecord_round_trips_through_json():
         permission_denials=[],
     )
     assert SessionRecord.from_dict(json.loads(json.dumps(record.to_dict()))) == record
+
+
+# ===========================================================================
+# Owner review round on PR #18 — nine findings, each red-first here.
+# ===========================================================================
+
+
+# --- Finding 1: a direct run_session call leaked the orchestrator's whole
+# environment (the SDK merges ALL of os.environ into the CLI subprocess). --
+
+def test_review1_direct_call_does_not_leak_ambient_environment(monkeypatch):
+    """What the SDK's spawn would see: during the session the process env
+    is windowed to the runner allowlist + the seat names. GH_TOKEN, an AWS
+    key and a foreign Anthropic key planted in os.environ are absent for
+    the whole stream, and the ambient environment is restored afterwards.
+    """
+    planted = {
+        "GH_TOKEN": "gh-leak",
+        "AWS_SECRET_ACCESS_KEY": "aws-leak",
+        "ANTHROPIC_API_KEY": "foreign-key",
+        "ZAI_RANDOM_SECRET": "leak",
+    }
+    for key, value in planted.items():
+        monkeypatch.setenv(key, value)
+
+    seen: dict[str, str] = {}
+
+    async def probing_query(*, prompt, options, transport=None):
+        for key in list(planted) + ["PATH", "ANTHROPIC_BASE_URL"]:
+            seen[key] = os.environ.get(key)
+        yield _result()
+        # Still windowed after the first message.
+        seen["GH_TOKEN_LATE"] = os.environ.get("GH_TOKEN")
+
+    record = _run(probing_query, timeout_min=5)
+    assert record.status == "completed"
+    for key in planted:
+        assert seen[key] is None, key
+    assert seen["PATH"], "PATH must survive the window"
+    assert seen["ANTHROPIC_BASE_URL"] == DEFAULT_BASE_URL
+    assert seen["GH_TOKEN_LATE"] is None
+    # Restored: the orchestrator process continues with its own env.
+    for key, value in planted.items():
+        assert os.environ[key] == value
+
+
+# --- Finding 2: the default settings path was one level too shallow
+# (<factory>/runs/sandbox/…), so cleanup_run never removed it. ---------- --
+
+def _sandbox_stub(monkeypatch, captured):
+    """Stub run_sandboxed inside factory.session: capture the spawn args
+    (spec path = last argv element) and the written settings, and return a
+    completed-session record without spawning anything."""
+
+    from factory import session as session_mod
+
+    def fake_run_sandboxed(cmd, run_dir, settings_path, **kwargs):
+        captured["cmd"] = cmd
+        captured["run_dir"] = run_dir
+        captured["settings_path"] = settings_path
+        captured["env"] = kwargs.get("env")
+        captured["spec_path"] = cmd[-1]
+        record = SessionRecord(seat="implementer", status="completed")
+        import subprocess as sp
+
+        return sp.CompletedProcess(cmd, 0, json.dumps(record.to_dict()) + "\n", "")
+
+    monkeypatch.setattr(session_mod, "run_sandboxed", fake_run_sandboxed)
+
+
+def test_review2_default_settings_path_uses_the_factory_root(tmp_path: Path):
+    """With no explicit factory_root, settings are derived from the
+    canonical layout to <factory>/sandbox/<project>-<run-id>.json — not
+    <factory>/runs/sandbox/… — so create_run/cleanup_run and the runner
+    agree on one location."""
+    from factory import session as session_mod
+
+    factory_root = tmp_path
+    run_root = factory_root / "runs" / "proj" / "20260101T000000Z-ab12cd"
+    run_root.mkdir(parents=True)
+    captured: dict = {}
+    import pytest as _pytest
+
+    with _pytest.MonkeyPatch.context() as mp:
+        _sandbox_stub(mp, captured)
+        session_mod.run_session_sandboxed(
+            seat="implementer",
+            prompt="p",
+            run_dir=run_root,
+            profile={},
+            max_turns=1,
+            timeout_min=1,
+            token="stub-token",
+        )
+    assert captured["settings_path"] == (
+        factory_root / "sandbox" / "proj-20260101T000000Z-ab12cd.json"
+    ), captured["settings_path"]
+    assert not (factory_root / "runs" / "sandbox").exists()
+
+
+def test_review2_settings_and_runner_are_cleaned_up(tmp_path: Path):
+    """End to end with the real create_run/cleanup_run: after a session,
+    nothing remains under <factory>/sandbox for that run (settings file,
+    staged runner copy, spec)."""
+    from factory import session as session_mod
+    from factory.runs import cleanup_run, create_run
+
+    run = create_run("proj", REPO, factory_root=tmp_path)
+    captured: dict = {}
+    import pytest as _pytest
+
+    with _pytest.MonkeyPatch.context() as mp:
+        _sandbox_stub(mp, captured)
+        session_mod.run_session_sandboxed(
+            seat="implementer",
+            prompt="p",
+            run_dir=run.root,
+            profile={},
+            max_turns=1,
+            timeout_min=1,
+            token="stub-token",
+        )
+    assert captured["settings_path"] == run.settings_path
+    cleanup_run(run)
+    assert not run.settings_path.exists()
+    assert not run.settings_path.with_name(run.settings_path.name + "-runner").exists()
+
+
+# --- Finding 3: the protected-path hook missed ../, ./, case and symlink-
+# prefix forms, and Bash writes were not checked at all. ---------------- --
+
+def _deny_paths(hook, tool_inputs):
+    callback = hook.hooks[0]
+    denied = []
+    for tool, tool_input in tool_inputs:
+        decision = _decision(callback, tool, tool_input)
+        if decision == "deny":
+            denied.append((tool, tool_input))
+    return denied
+
+
+def test_review3_protected_path_traversal_and_case_are_denied(tmp_path: Path):
+    """`tests/../schema/x`, `./schema/x`, `Schema/x` (case), and an
+    absolute path that resolves through macOS's /var → /private/var symlink
+    prefix are all denied for Write/Edit."""
+    hook = protected_path_hook(["schema/**"])
+    real_root = Path(tmp_path).resolve()  # /private/var/... on macOS
+    cases = [
+        ("Write", {"file_path": "tests/../schema/tasks.schema.json"}),
+        ("Edit", {"file_path": "./schema/tasks.schema.json"}),
+        ("Write", {"file_path": "Schema/tasks.schema.json"}),
+        ("Edit", {"file_path": "schema/../schema/tasks.schema.json"}),
+    ]
+    denied = _deny_paths(hook, cases)
+    assert len(denied) == 4, denied
+
+    # Symlink prefix: the same directory reached via its unresolved path.
+    import os as _os
+
+    if _os.path.realpath(tmp_path) != str(tmp_path):  # macOS /var layout
+        unresolved = "/var" + str(real_root)[len("/private/var"):]
+        hook2 = protected_path_hook([f"{real_root}/schema/**"])
+        decision = _decision(
+            hook2.hooks[0],
+            "Write",
+            {"file_path": f"{unresolved}/schema/x.json"},
+        )
+        assert decision == "deny"
+
+
+def test_review3_bash_writes_to_protected_paths_are_denied():
+    """Redirections and the common write utilities targeting a protected
+    path are denied; ordinary commands and writes elsewhere are not."""
+    guard = bash_guard_hook(["schema/**"])
+    denied = _deny_paths(
+        guard,
+        [
+            ("Bash", {"command": "echo x > schema/tasks.schema.json"}),
+            ("Bash", {"command": "echo x >>schema/x.json"}),
+            ("Bash", {"command": "mv good.py schema/good.py"}),
+            ("Bash", {"command": "cp a schema/a"}),
+            ("Bash", {"command": "rm schema/old.json"}),
+            ("Bash", {"command": "tee schema/x.json"}),
+            ("Bash", {"command": "sed -i s/a/b/ schema/x.json"}),
+        ],
+    )
+    assert len(denied) == 7, denied
+    allowed = [
+        ("Bash", {"command": "echo x > src/app.py"}),
+        ("Bash", {"command": "cp a b"}),
+        ("Bash", {"command": "mv schema/x src/x"}),
+        ("Bash", {"command": "cat schema/x.json"}),
+    ]
+    for tool, tool_input in allowed:
+        assert _decision(guard.hooks[0], tool, tool_input) is None, tool_input
+
+
+# --- Finding 4: the bash guard missed `git -C . push`, quoted/"$(gh …)"
+# command substitutions. ------------------------------------------------- --
+
+def test_review4_bash_guard_covers_optioned_and_quoted_forms():
+    guard = bash_guard_hook()
+    denied = _deny_paths(
+        guard,
+        [
+            ("Bash", {"command": "git -C . push origin main"}),
+            ("Bash", {"command": "git --git-dir=.git push"}),
+            ("Bash", {"command": "git -c core.editor=true push --all"}),
+            ("Bash", {"command": '"gh" auth login'}),
+            ("Bash", {"command": "echo $(gh auth status)"}),
+            ("Bash", {"command": "`gh` pr list"}),
+            ("Bash", {"command": "V=$(gh pr view 1) && echo $V"}),
+        ],
+    )
+    assert len(denied) == 7, denied
+
+
+# --- Finding 5: sessions ran the auto-updating ~/.local CLI instead of
+# the CLI bundled with the pinned SDK. ----------------------------------- --
+
+def test_review5_sandboxed_sessions_use_the_sdk_bundled_cli(tmp_path: Path):
+    """The spec handed to the sandboxed entry names the CLI bundled inside
+    the pinned claude_agent_sdk package, and that binary's directory joins
+    the sandbox allowRead (toolchain) entries. ~/.local/bin/claude is
+    never auto-picked: sandboxed sessions require the pinned CLI."""
+    import claude_agent_sdk
+
+    from factory import session as session_mod
+
+    bundled = (
+        Path(claude_agent_sdk.__file__).parent / "_bundled" /
+        ("claude.exe" if sys.platform == "win32" else "claude")
+    )
+    run_root = tmp_path / "runs" / "proj" / "20260101T000000Z-ab12cd"
+    run_root.mkdir(parents=True)
+    captured: dict = {}
+    import pytest as _pytest
+
+    real_build_settings = session_mod.build_settings
+
+    def capture_settings(profile, run_dir, **kwargs):
+        captured["toolchain"] = kwargs.get("toolchain")
+        return real_build_settings(profile, run_dir, **kwargs)
+
+    with _pytest.MonkeyPatch.context() as mp:
+        _sandbox_stub(mp, captured)
+        mp.setattr(session_mod, "build_settings", capture_settings)
+        session_mod.run_session_sandboxed(
+            seat="implementer",
+            prompt="p",
+            run_dir=run_root,
+            profile={},
+            max_turns=1,
+            timeout_min=1,
+            token="stub-token",
+        )
+    spec = json.loads(Path(captured["spec_path"]).read_text())
+    assert spec["cli_path"] == str(bundled)
+    assert bundled in captured["toolchain"]
+    # The auto-updating native install is never referenced.
+    assert "~" not in spec["cli_path"]
+
+
+# --- Finding 6: .session-spec.json landed in the clone as an untracked
+# file a `git add -A` would commit. --------------------------------------- --
+
+def test_review6_spec_never_lands_in_the_clone(tmp_path: Path):
+    """After a sandboxed session is prepared, the clone's working tree is
+    byte-identical to a fresh clone: the spec lives in the staged runner
+    dir outside the run dir."""
+    import subprocess
+
+    from factory import session as session_mod
+    from factory.runs import create_run
+
+    run = create_run("proj", REPO, factory_root=tmp_path)
+    captured: dict = {}
+    import pytest as _pytest
+
+    with _pytest.MonkeyPatch.context() as mp:
+        _sandbox_stub(mp, captured)
+        session_mod.run_session_sandboxed(
+            seat="implementer",
+            prompt="p",
+            run_dir=run.root,
+            profile={},
+            max_turns=1,
+            timeout_min=1,
+            token="stub-token",
+        )
+    assert not (run.root / ".session-spec.json").exists()
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=run.root,
+        capture_output=True, text=True,
+    )
+    assert status.stdout.strip() == "", status.stdout
+    # The spec exists — outside the clone, inside the staged runner dir.
+    spec_path = Path(captured["spec_path"])
+    assert spec_path.exists()
+    assert run.root not in spec_path.parents
+
+
+# --- Finding 7: the ambient ANTHROPIC_AUTH_TOKEN fallback could send a
+# non-Z.ai key to Z.ai. --------------------------------------------------- --
+
+def test_review7_ambient_token_requires_the_zai_base_url(monkeypatch):
+    """The ambient token is only used when the ambient base URL names the
+    Z.ai endpoint — a token exported for a different provider (or with no
+    base URL at all, i.e. api.anthropic.com) is not ours to send."""
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "an-anthropic-key")
+    assert seat_token() is None
+
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", DEFAULT_BASE_URL)
+    assert seat_token() == "an-anthropic-key"
+
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    assert seat_token() is None
+
+
+# --- Finding 8: a wall-clock abort never closed the SDK stream. ----------- --
+
+def test_review8_abort_closes_the_stream():
+    """Both the wall-clock abort and the SDK-error path close the stream
+    (the SDK's aclose tears down its subprocess). The fakes are plain
+    iterators, not async generators — loop shutdown cannot auto-close
+    them — so their closed flags prove run_session itself called aclose."""
+
+    class FakeStream:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.sleep(0.01)
+            return None
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    hanging: list[FakeStream] = []
+
+    def hanging_query(*, prompt, options, transport=None):
+        stream = FakeStream()
+        hanging.append(stream)
+        return stream
+
+    record = _run(hanging_query, timeout_min=0.03)
+    assert record.status == "aborted"
+    assert hanging[0].closed, "the aborted session's stream was not closed"
+
+    class ExplodingStream(FakeStream):
+        async def __anext__(self):
+            raise CLINotFoundError("gone")
+
+    exploding: list[ExplodingStream] = []
+
+    def exploding_query(*, prompt, options, transport=None):
+        stream = ExplodingStream()
+        exploding.append(stream)
+        return stream
+
+    record = _run(exploding_query)
+    assert record.status == "failed"
+    assert exploding[0].closed, "the failed session's stream was not closed"
+
+
+# --- Finding 9: _primary_model crashed on null token counts. --------------- --
+
+def test_review9_primary_model_tolerates_null_counts():
+    """model_usage entries with null token counts (seen from the CLI) must
+    not crash the record; weight falls back to zero."""
+    message = _result(
+        model_usage={
+            "glm-5.3": {
+                "inputTokens": None,
+                "outputTokens": None,
+                "cacheReadInputTokens": 0,
+                "cacheCreationInputTokens": 0,
+                "webSearchRequests": 0,
+                "costUSD": 0.0,
+                "contextWindow": 200000,
+                "maxOutputTokens": 8192,
+            }
+        }
+    )
+    record = _run(_results_query(message))
+    assert record.status == "completed"
+    assert record.model == "glm-5.3"

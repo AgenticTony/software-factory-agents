@@ -43,9 +43,11 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import importlib.metadata
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -72,6 +74,9 @@ from factory.sandbox import (
 DEFAULT_BASE_URL = "https://api.z.ai/api/anthropic"
 DEFAULT_TIMEOUT_MS = 600_000
 KEYCHAIN_SERVICE = "factory-zai"
+# The pinned SDK version (pyproject pins claude-agent-sdk exactly); used
+# in refusal messages so the fix names the pin to reinstall.
+_SDK_VERSION = importlib.metadata.version("claude-agent-sdk")
 
 _FACTORY_PKG = Path(__file__).resolve().parent
 _REPO_ROOT = _FACTORY_PKG.parent
@@ -159,6 +164,48 @@ def _seat(seat: str) -> SeatConfig:
 
 # ------------------------------------------------------------------- env --
 
+# What a session's subprocess environment may keep from the ambient one
+# while the stream is live (see _window_environ). The SDK merges ALL of
+# os.environ into the Claude Code subprocess, so a direct (unsandboxed)
+# run_session call would otherwise hand the CLI every orchestrator secret:
+# GH_TOKEN, AWS keys, a foreign ANTHROPIC_API_KEY. The window keeps only
+# process mechanics (PATH/LANG/TZ/HOME/TMPDIR, LC_*) plus the proxy names
+# — inside the sandbox those carry srt's authenticated proxy, which is the
+# session's only network route — and the seat names ride in via options.env.
+_RUNNER_ENV_KEEP = frozenset(
+    {
+        "PATH", "LANG", "TZ", "HOME", "TMPDIR",
+        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+    }
+)
+_RUNNER_ENV_PREFIXES = ("LC_",)
+
+
+def _window_environ(seat_env: dict[str, str]) -> dict[str, str]:
+    """Replace os.environ with the runner allowlist + ``seat_env`` for the
+    session's life; returns the saved environment for restoration. The
+    orchestrator process is single-session, so windowing the process env
+    for the stream's duration is the one pin-independent way to control
+    what the SDK's spawn sees (the SDK offers no replace-env option)."""
+
+    def keep(key: str) -> bool:
+        upper = key.upper()
+        return (
+            key in _RUNNER_ENV_KEEP
+            or upper in _RUNNER_ENV_KEEP
+            or key.startswith(_RUNNER_ENV_PREFIXES)
+            or upper.startswith(_RUNNER_ENV_PREFIXES)
+        )
+
+    saved = dict(os.environ)
+    os.environ.clear()
+    for key, value in saved.items():
+        if keep(key):
+            os.environ[key] = value
+    os.environ.update(seat_env)
+    return saved
+
+
 def session_env(base_url: str, token: str, timeout_ms: int) -> dict[str, str]:
     """The session env: exactly the three Z.ai seat names.
 
@@ -177,10 +224,12 @@ def seat_token() -> str | None:
     """The Z.ai model token, or None where no credential exists.
 
     Lookup order: the macOS keychain item ``factory-zai`` (the production
-    path per DESIGN D2), then the ambient ``ANTHROPIC_AUTH_TOKEN`` (the
-    owner's current bootstrap setup — the same env the interactive Claude
-    Code uses). On the Linux CI runner neither exists and this returns
-    None, which callers must treat as "no session can authenticate here".
+    path per DESIGN D2), then the ambient ``ANTHROPIC_AUTH_TOKEN`` — but
+    only when the ambient ``ANTHROPIC_BASE_URL`` names the Z.ai endpoint:
+    a token exported for another provider (or with no base URL, i.e.
+    api.anthropic.com) belongs to that provider and must never be sent to
+    Z.ai. On the Linux CI runner neither exists and this returns None,
+    which callers must treat as "no session can authenticate here".
     """
     try:
         proc = subprocess.run(
@@ -193,17 +242,42 @@ def seat_token() -> str | None:
         proc = None  # no macOS keychain here (or it hung) — try the env
     if proc is not None and proc.returncode == 0 and proc.stdout.strip():
         return proc.stdout.strip()
+    ambient_url = os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/")
+    if ambient_url != DEFAULT_BASE_URL:
+        return None
     return os.environ.get("ANTHROPIC_AUTH_TOKEN") or None
 
 
 # ----------------------------------------------------------------- hooks --
 
-_BASH_GIT_PUSH = re.compile(r"\bgit\s+push\b")
-# The standalone word `gh` as a command: preceded by start/space/;&|/ and
-# followed by whitespace or end. `\bgh\b` alone would also hit "gh-gh-gh"
-# (a hyphen is a word boundary), and the WO bans the gh CLI, not the string.
-_BASH_GH = re.compile(r"(?:^|[\s;&|/])gh(?:\s|$)")
+_BASH_GIT = re.compile(r"\bgit\b")
+_BASH_PUSH = re.compile(r"\bpush\b")
+# The standalone word `gh` as a command, matched on a de-quoted command:
+# preceded by start/space/;&|/(` — the last two catch $(gh …) — and
+# followed by whitespace/end/)&|;. Stripping quotes/backticks first makes
+# "gh", 'gh' and `gh` indistinguishable from a bare gh. `\bgh\b` alone
+# would also hit "gh-gh-gh" (a hyphen is a word boundary), and the WO
+# bans the gh CLI, not the string.
+_BASH_GH = re.compile(r"(?:^|[\s;&|/(`])gh(?:[\s)&|;`]|$)")
+_BASH_QUOTES = str.maketrans("", "", "\"'`")
 _BASH_GH_CONFIG = ".config/gh"
+# Redirection targets: `> file`, `>> file`, `2>file` (the fd digit and any
+# spacing between the brackets is optional).
+_BASH_REDIRECT = re.compile(r"(?:^|[\s;&|)])(?:\d)?>>?\s*([^\s;&|<>]+)")
+# Utilities whose arguments write files; value = how many trailing args
+# are destinations (mv/cp/install: src… dest — only the last one writes).
+_BASH_WRITE_CMDS = {
+    "tee": "all",
+    "rm": "all",
+    "truncate": "all",
+    "shred": "all",
+    "unlink": "all",
+    "mv": "last",
+    "cp": "last",
+    "install": "last",
+    "sed": "all_after_script",  # sed -i SCRIPT files…
+}
+_BASH_OUTPUT_FLAGS = {"-o", "--output", "-O", "--output-document"}
 
 
 def _deny(reason: str) -> dict[str, Any]:
@@ -217,27 +291,69 @@ def _deny(reason: str) -> dict[str, Any]:
     }
 
 
+def _path_forms(path_text: str) -> set[str]:
+    """Every textual form worth matching: as given, normalised (``./x``,
+    ``a/../x`` collapsed) and fully resolved (symlinks — on macOS the run
+    dir's /private/var prefix vs its /var spelling). Resolution of a
+    not-yet-existing file is fine (non-strict)."""
+    forms = {path_text}
+    try:
+        forms.add(os.path.normpath(path_text))
+    except (OSError, ValueError):
+        pass
+    try:
+        forms.add(str(Path(path_text).resolve()))
+    except (OSError, ValueError):
+        pass
+    return forms
+
+
 def _path_candidates(file_path: str, cwd: str) -> set[str]:
-    """The forms a file_path is matched against: as given, absolute (cwd
-    joined), and cwd-relative (an absolute path inside the repo)."""
-    candidates = {file_path}
-    path = Path(file_path)
-    if path.is_absolute():
-        if cwd:
-            try:
-                candidates.add(str(path.relative_to(cwd)))
-            except ValueError:
-                pass
-    elif cwd:
-        candidates.add(str(Path(cwd) / path))
+    """The forms a file_path is matched against, crossed with the forms of
+    its cwd: as-given, absolute (cwd-joined, from both the given and the
+    resolved cwd), and cwd-relative (an absolute path inside the run).
+    """
+    candidates: set[str] = set()
+    raw = Path(file_path)
+    cwds = _path_forms(cwd) if cwd else set()
+    candidates |= _path_forms(file_path)
+    if raw.is_absolute():
+        for cwd_text in cwds:
+            cwd_path = Path(cwd_text)
+            for form in _path_forms(file_path):
+                try:
+                    candidates.add(str(Path(form).relative_to(cwd_path)))
+                except ValueError:
+                    pass
+    else:
+        for cwd_text in cwds:
+            candidates |= _path_forms(str(Path(cwd_text) / file_path))
     return candidates
+
+
+def _matches_protected(file_path: str, cwd: str, patterns: tuple[str, ...]) -> str | None:
+    """The first pattern the path matches, case-insensitively (macOS
+    filesystems are case-insensitive; lowercasing both sides also
+    over-denies `Schema/x` on case-sensitive Linux, which errs safe), or
+    None."""
+    if not file_path or not patterns:
+        return None
+    candidates = _path_candidates(file_path, cwd)
+    lowered = {form.lower() for form in candidates}
+    for pattern in patterns:
+        if any(fnmatch.fnmatchcase(form, pattern.lower()) for form in lowered):
+            return pattern
+    return None
 
 
 def protected_path_hook(protected: "Sequence[str]") -> HookMatcher:
     """PreToolUse hook: deny Write/Edit/NotebookEdit into ``protected``
-    globs (``paths.protected`` from the project profile). fnmatch treats
-    ``*`` as spanning ``/``, which errs on the protective side. Unprotected
-    paths get no opinion (``{}`` — the tool proceeds)."""
+    globs (``paths.protected`` from the project profile). Paths are
+    normalised (``./``, ``a/../``) and resolved (symlink prefixes such as
+    macOS's /var → /private/var) before matching, case-insensitively —
+    traversal, dot-relative, case and symlink spellings of a protected
+    path all deny. Unprotected paths get no opinion (``{}`` — the tool
+    proceeds)."""
 
     patterns = tuple(protected)
 
@@ -250,34 +366,80 @@ def protected_path_hook(protected: "Sequence[str]") -> HookMatcher:
             return {}
         tool_input = input.get("tool_input") or {}
         file_path = str(tool_input.get("file_path", ""))
-        if not file_path or not patterns:
-            return {}
         cwd = str(input.get("cwd") or "")
-        candidates = _path_candidates(file_path, cwd)
-        for pattern in patterns:
-            if any(fnmatch.fnmatch(candidate, pattern) for candidate in candidates):
-                return _deny(f"{file_path} matches protected path {pattern!r}")
+        matched = _matches_protected(file_path, cwd, patterns)
+        if matched:
+            return _deny(f"{file_path} matches protected path {matched!r}")
         return {}
 
     return HookMatcher(matcher="Write|Edit|NotebookEdit", hooks=[_hook])
 
 
-def bash_guard_hook() -> HookMatcher:
-    """PreToolUse hook over Bash: deny ``git push``, the ``gh`` CLI, and
-    anything touching ``~/.config/gh``. The orchestrator (outside the
-    sandbox, with its own credentials) pushes and opens PRs — the WO's
-    rule that a session never does."""
+def _bash_write_targets(command: str) -> list[str]:
+    """Best-effort file paths a Bash command writes to: redirection
+    targets, the argument patterns of the common write utilities, and the
+    value following an output flag (-o/--output/-O/--output-document).
+    No shell parsing — this is a deny-layer, not a parser; the
+    authoritative protected-path gate is L0's diff policy, which inspects
+    the actual diff after the session."""
+    targets = [m.group(1) for m in _BASH_REDIRECT.finditer(command)]
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    if tokens:
+        head = Path(tokens[0]).name
+        args = tokens[1:]
+        mode = _BASH_WRITE_CMDS.get(head)
+        if mode == "last" and args:
+            targets.append(args[-1])
+        elif mode == "all":
+            targets.extend(a for a in args if not a.startswith("-"))
+        elif mode == "all_after_script" and "-i" in args:
+            rest = args[args.index("-i") + 1:]
+            targets.extend(rest[1:] if rest else [])
+        elif head in {"curl", "wget"}:
+            for index, flag in enumerate(args):
+                if flag in _BASH_OUTPUT_FLAGS and index + 1 < len(args):
+                    targets.append(args[index + 1])
+                for prefix in tuple(_BASH_OUTPUT_FLAGS):
+                    if flag.startswith(prefix + "="):
+                        targets.append(flag.split("=", 1)[1])
+    return targets
+
+
+def bash_guard_hook(protected: "Sequence[str]" = ()) -> HookMatcher:
+    """PreToolUse hook over Bash: deny ``git push`` (any git options
+    between git and push), the ``gh`` CLI (quoted, backticked or in a
+    command substitution), anything touching ``~/.config/gh``, and
+    best-effort writes (redirections, tee/mv/cp/rm/sed -i/curl -o…)
+    into the protected globs. The orchestrator (outside the sandbox, with
+    its own credentials) pushes and opens PRs — the WO's rule that a
+    session never does. The structural barriers underneath: the sandbox
+    has no GitHub token and no network route to github.com; this hook is
+    the in-session policy layer on top, not the boundary."""
+
+    patterns = tuple(protected)
 
     async def _hook(
         input: dict[str, Any], tool_use_id: str | None, context: dict[str, Any]
     ) -> dict[str, Any]:
         command = str((input.get("tool_input") or {}).get("command", ""))
-        if _BASH_GIT_PUSH.search(command):
+        if _BASH_GIT.search(command) and _BASH_PUSH.search(command):
             return _deny("git push is not allowed inside a session")
-        if _BASH_GH.search(command):
+        dequoted = command.translate(_BASH_QUOTES)
+        if _BASH_GH.search(dequoted):
             return _deny("the gh CLI is not allowed inside a session")
-        if _BASH_GH_CONFIG in command:
+        if _BASH_GH_CONFIG in dequoted:
             return _deny("~/.config/gh is not accessible inside a session")
+        if patterns:
+            cwd = str(input.get("cwd") or "")
+            for target in _bash_write_targets(dequoted):
+                matched = _matches_protected(target, cwd, patterns)
+                if matched:
+                    return _deny(
+                        f"writing {target} matches protected path {matched!r}"
+                    )
         return {}
 
     return HookMatcher(matcher="Bash", hooks=[_hook])
@@ -315,7 +477,10 @@ def build_options(
         disallowed_tools=list(seat_config.disallowed_tools),
         permission_mode=seat_config.permission_mode,
         hooks={
-            "PreToolUse": [protected_path_hook(protected), bash_guard_hook()]
+            "PreToolUse": [
+                protected_path_hook(protected),
+                bash_guard_hook(protected),
+            ]
         },
     )
     if cli_path is not None:
@@ -356,15 +521,16 @@ class SessionRecord:
 
 def _primary_model(model_usage: dict[str, Any] | None) -> str | None:
     """The model name out of ``model_usage`` — the entry with the most
-    input+output tokens when the session touched several."""
-    if not model_usage:
-        return None
+    input+output tokens when the session touched several. Counts may come
+    back null from the CLI; they weigh zero rather than crash."""
 
     def weight(name: str) -> int:
-        entry = model_usage[name]
-        return int(entry.get("inputTokens", 0)) + int(entry.get("outputTokens", 0))
+        entry = model_usage.get(name) or {}
+        return int(entry.get("inputTokens") or 0) + int(
+            entry.get("outputTokens") or 0
+        )
 
-    return max(model_usage, key=weight)
+    return max(model_usage or {}, key=weight, default=None)
 
 
 def _failure_reason(message: ResultMessage) -> str:
@@ -461,6 +627,14 @@ async def run_session(
     started = time.monotonic()
     deadline = started + timeout_min * 60.0
     result_message: ResultMessage | None = None
+    stream = None
+    # Window the process env for the session's life: the SDK merges ALL of
+    # os.environ into the Claude Code subprocess, so without this a direct
+    # (unsandboxed) call hands the CLI every orchestrator secret. Restored
+    # in the finally — the orchestrator process continues unchanged. Inside
+    # the sandbox the ambient env is already scrubbed; the window is then a
+    # no-op that still holds (and keeps the proxy vars the session needs).
+    saved_env = _window_environ(options.env)
     try:
         stream = query_fn(prompt=prompt, options=options)
         iterator = stream.__aiter__()
@@ -478,7 +652,9 @@ async def run_session(
                 raise _WallClock() from exc
             if isinstance(message, ResultMessage):
                 result_message = message
+        await _close_stream(stream)
     except _WallClock:
+        await _close_stream(stream)
         return SessionRecord(
             seat=seat,
             status="aborted",
@@ -486,12 +662,16 @@ async def run_session(
             duration_ms=int((time.monotonic() - started) * 1000),
         )
     except ClaudeSDKError as exc:
+        await _close_stream(stream)
         return SessionRecord(
             seat=seat,
             status="failed",
             reason=f"{type(exc).__name__}: {exc}",
             duration_ms=int((time.monotonic() - started) * 1000),
         )
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_env)
 
     duration_ms = int((time.monotonic() - started) * 1000)
     if result_message is None:
@@ -504,18 +684,33 @@ async def run_session(
     return _record_from(result_message, seat, duration_ms)
 
 
+async def _close_stream(stream: Any) -> None:
+    """Close the SDK stream (its aclose tears down the CLI subprocess).
+    An already-closed or unwinding generator may refuse; that refusal is
+    suppressed — closing is cleanup, never the failure being reported."""
+    aclose = getattr(stream, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await asyncio.wait_for(aclose(), timeout=10)
+    except (Exception, asyncio.CancelledError):
+        pass
+
+
 # ------------------------------------------------- the sandboxed entry point --
 
-def _resolve_cli(cli_path: Path | None) -> Path | None:
-    """The Claude CLI the session will exec: explicit, on PATH, or the
-    native installer's default location."""
-    if cli_path is not None:
-        return Path(cli_path).expanduser()
-    found = shutil.which("claude")
-    if found:
-        return Path(found)
-    default = Path("~/.local/bin/claude").expanduser()
-    return default if default.exists() else None
+def _bundled_cli() -> Path | None:
+    """The Claude Code CLI bundled inside the pinned claude_agent_sdk
+    package (platform wheels ship the native binary; verified for macOS
+    and manylinux). This is THE pinned CLI: the SDK pin fixes its version,
+    unlike the auto-updating native install on PATH. Sandboxed sessions
+    run it and nothing else; an explicit ``cli_path`` still wins for
+    tests, but is never resolved from PATH or ~/.local/bin implicitly."""
+    import claude_agent_sdk
+
+    name = "claude.exe" if sys.platform == "win32" else "claude"
+    bundled = Path(claude_agent_sdk.__file__).parent / "_bundled" / name
+    return bundled if bundled.exists() else None
 
 
 def run_session_sandboxed(
@@ -540,33 +735,43 @@ def run_session_sandboxed(
     """Run one session with the whole runner process inside the F-05 sandbox.
 
     Execs the entry bootstrap (see :func:`_entry_bootstrap`) under srt —
-    the SDK's Claude Code subprocess inherits the confinement — with the
-    settings built from the project profile plus one deliberate
-    carve-out: the factory *package* dir is re-allowed for reading so the
-    entry point can import it — the rest of the repo (prompts, schemas,
-    validator docs) stays unreadable to the session.
+    the SDK's Claude Code subprocess inherits the confinement, and it is
+    the **bundled, version-pinned CLI** (finding 5): an explicit
+    ``cli_path`` wins for tests, but nothing is ever auto-discovered from
+    PATH or ~/.local/bin. The settings come from the project profile plus
+    one deliberate carve-out: the staged runner dir (holding the factory
+    package copy and the session spec) is re-allowed for reading — the
+    rest of the repo (prompts, schemas, validator docs) stays unreadable
+    to the session, and the spec never touches the clone (finding 6).
 
     Args:
         run_dir: The run dir (the F-05 clone); the session's cwd.
         profile: The project profile (docs/network allowlists).
         factory_root: Explicit factory root; when omitted it is derived
-            from the canonical ``<root>/runs/<project>/<run-id>`` layout.
+            (with the layout asserted) from
+            ``<root>/runs/<project>/<run-id>``.
         settings_path: Where the srt settings go. Default: the RunDir
-            convention ``<factory_root>/sandbox/<project>-<run-id>.json``.
+            convention ``<factory_root>/sandbox/<project>-<run-id>.json``
+            — the same path ``cleanup_run`` removes, whether factory_root
+            was passed or derived (finding 2).
         max_turns/timeout_min: Handed to the session. The *outer*
             run_sandboxed wall clock is ``timeout_min`` plus
             ``teardown_grace_sec`` so the in-session clock fires first.
         token: The Z.ai token; default :func:`seat_token`. None and no
             credential available → :class:`SessionConfigError` (refuses to
             start a session that cannot authenticate).
+        cli_path: Explicit CLI override (tests). Default: the SDK's
+            bundled binary; missing bundle → SessionConfigError rather
+            than silently running an unpinned CLI.
 
     Returns:
         The session's record (any status — completed/failed/aborted are
         all recorded outcomes).
 
     Raises:
-        SessionConfigError: No token, or the entry produced no parsable
-            record (an orchestrator-side fault that must be loud).
+        SessionConfigError: No token, no bundled CLI, an underivable
+            layout, or an entry that produced no parsable record (an
+            orchestrator-side fault that must be loud).
         subprocess.TimeoutExpired: The outer wall clock expired — the
             runner process itself hung past its teardown grace.
     """
@@ -580,8 +785,37 @@ def run_session_sandboxed(
         )
 
     run_dir = Path(run_dir)
-    cli = _resolve_cli(cli_path)
-    spec_path = run_dir / ".session-spec.json"
+    # The pinned CLI (finding 5): the SDK's bundled binary, or an explicit
+    # test override. An auto-discovered ~/.local/bin/claude is never used —
+    # it updates itself out from under the pin.
+    cli = Path(cli_path).expanduser() if cli_path is not None else _bundled_cli()
+    if cli is None:
+        raise SessionConfigError(
+            "the pinned claude-agent-sdk wheel bundles no Claude CLI for this "
+            "platform — reinstall it (`pip install --force-reinstall "
+            "claude-agent-sdk==" + _SDK_VERSION + "`). Sandboxed sessions run "
+            "the bundled, version-pinned CLI and never an auto-updating one."
+        )
+
+    if settings_path is None:
+        if factory_root is None:
+            runs_root = run_dir.parent.parent
+            if runs_root.name != "runs":
+                raise SessionConfigError(
+                    f"cannot derive the factory root from {run_dir}: its layout "
+                    "is not runs/<project>/<run-id>. Pass factory_root "
+                    "explicitly, or the settings would land in a directory "
+                    "cleanup_run never looks at."
+                )
+            factory_root = runs_root.parent
+        settings_path = (
+            Path(factory_root) / "sandbox" / f"{run_dir.parent.name}-{run_dir.name}.json"
+        )
+    runner_dir = _stage_runner(settings_path.with_name(settings_path.name + "-runner"))
+    # The spec lives inside the staged runner dir — OUTSIDE the clone
+    # (finding 6): a stray file in the run dir would ride into the PR via
+    # `git add -A`, leaking the prompt and the orchestrator's paths.
+    spec_path = runner_dir / "spec.json"
     spec_path.write_text(
         json.dumps(
             {
@@ -594,22 +828,17 @@ def run_session_sandboxed(
                 "timeout_ms": timeout_ms,
                 "protected": list(protected),
                 "model": model,
-                "cli_path": str(cli) if cli else None,
+                "cli_path": str(cli),
             }
         )
     )
-
-    if settings_path is None:
-        root = Path(factory_root) if factory_root else run_dir.parent.parent
-        settings_path = root / "sandbox" / f"{run_dir.parent.name}-{run_dir.name}.json"
-    runner_dir = _stage_runner(settings_path.with_name(settings_path.name + "-runner"))
 
     settings = build_settings(
         profile,
         run_dir,
         model_endpoint=base_url,
         factory_root=factory_root,
-        toolchain=default_toolchain(extra=[cli] if cli else None),
+        toolchain=default_toolchain(extra=[cli]),
         allow_read=[runner_dir],
     )
     write_settings(settings, settings_path)
