@@ -215,6 +215,23 @@ def _reviewer_scratch(settings_path: Path, run_dir: Path) -> tuple[Path, Path]:
     return home, tmp
 
 
+def _teardown_reviewer_scratch(run_dir: Path) -> None:
+    """Inverse of :func:`_reviewer_scratch`: replace the scratch symlinks
+    with the plain ``.home``/``.tmp`` directories the F-05 flow expects.
+
+    The links must not outlive the review: a later implementer run in the
+    same run dir would write ``$HOME``/``$TMPDIR`` through links pointing
+    OUTSIDE its sandbox — denied there, breaking pip/npm/pytest and Claude
+    Code's own state (owner review round 3). Runs on every reviewer exit
+    path, including aborts, so the run dir is always left in standard shape.
+    """
+    for name in (".home", ".tmp"):
+        path = run_dir / name
+        if path.is_symlink():
+            path.unlink()
+        path.mkdir(parents=True, exist_ok=True)
+
+
 # ------------------------------------------------------------------ seats --
 
 @dataclass(frozen=True)
@@ -1094,43 +1111,50 @@ def run_session_sandboxed(
     )
     write_settings(settings, settings_path)
 
-    proc = run_sandboxed(
-        [sys.executable, "-c", _entry_bootstrap(runner_dir), str(spec_path)],
-        run_dir,
-        settings_path,
-        env={
-            "ANTHROPIC_AUTH_TOKEN": token,
-            "ANTHROPIC_BASE_URL": base_url,
-            "API_TIMEOUT_MS": str(int(timeout_ms)),
-        },
-        timeout=timeout_min * 60.0 + teardown_grace_sec,
-        srt_bin_path=srt_bin_path,
-    )
-
-    lines = [line for line in proc.stdout.splitlines() if line.strip()]
-    if not lines:
-        raise SessionConfigError(
-            "the sandboxed session entry produced no record "
-            f"(exit {proc.returncode}): {proc.stderr.strip()[:2000]}"
-        )
+    # The reviewer's scratch symlinks come down on EVERY exit path — a
+    # run dir left with links would break the next implementer session
+    # there (round 3) — so the whole run sits inside try/finally.
     try:
-        record = SessionRecord.from_dict(json.loads(lines[-1]))
-    except (json.JSONDecodeError, TypeError) as exc:
-        raise SessionConfigError(
-            "the sandboxed session entry produced an unparsable record "
-            f"({exc}): {lines[-1][:500]}"
-        ) from exc
+        proc = run_sandboxed(
+            [sys.executable, "-c", _entry_bootstrap(runner_dir), str(spec_path)],
+            run_dir,
+            settings_path,
+            env={
+                "ANTHROPIC_AUTH_TOKEN": token,
+                "ANTHROPIC_BASE_URL": base_url,
+                "API_TIMEOUT_MS": str(int(timeout_ms)),
+            },
+            timeout=timeout_min * 60.0 + teardown_grace_sec,
+            srt_bin_path=srt_bin_path,
+        )
 
-    # The reviewer-integrity backstop: whatever happened in the session,
-    # HEAD and the working tree must be exactly what they were before. A
-    # mutation fails the review (the verdict text of a reviewer that
-    # changed the code is not evidence) and the workspace is restored, so
-    # nothing the reviewer wrote can ride the branch F-10 pushes.
-    if baseline is not None and _git_state(run_dir) != baseline:
-        _restore_workspace(run_dir, baseline[0])
-        record.status = "failed"
-        record.reason = REVIEWER_MUTATION
-    return record
+        lines = [line for line in proc.stdout.splitlines() if line.strip()]
+        if not lines:
+            raise SessionConfigError(
+                "the sandboxed session entry produced no record "
+                f"(exit {proc.returncode}): {proc.stderr.strip()[:2000]}"
+            )
+        try:
+            record = SessionRecord.from_dict(json.loads(lines[-1]))
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise SessionConfigError(
+                "the sandboxed session entry produced an unparsable record "
+                f"({exc}): {lines[-1][:500]}"
+            ) from exc
+
+        # The reviewer-integrity backstop: whatever happened in the session,
+        # HEAD and the working tree must be exactly what they were before. A
+        # mutation fails the review (the verdict text of a reviewer that
+        # changed the code is not evidence) and the workspace is restored,
+        # so nothing the reviewer wrote can ride the branch F-10 pushes.
+        if baseline is not None and _git_state(run_dir) != baseline:
+            _restore_workspace(run_dir, baseline[0])
+            record.status = "failed"
+            record.reason = REVIEWER_MUTATION
+        return record
+    finally:
+        if review_guard:
+            _teardown_reviewer_scratch(run_dir)
 
 
 # python -c <bootstrap> <spec.json> — the in-sandbox entry point (see

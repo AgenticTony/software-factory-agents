@@ -1089,3 +1089,126 @@ def test_review9_clean_review_passes_the_integrity_check(tmp_path, monkeypatch):
         capture_output=True, text=True, check=True,
     ).stdout
     assert head_after == head_before
+
+
+# ---------------------------------------- owner review round 3 (PR #19) --
+# The round-2 symlink scratch left two residues: the F-05 exclude patterns
+# (trailing slash) don't match symlinks, so `git add -A` would commit the
+# two dangling links; and the symlinks outlive the review, so a later
+# implementer run in the same run dir writes $HOME/$TMPDIR through links
+# pointing OUTSIDE its sandbox — denied.
+
+def test_review10_excludes_cover_symlinked_scratch(tmp_path):
+    # Finding 1: `/.home/` (trailing slash) matches directories only, and a
+    # symlink is a file to git — the reviewer's scratch links showed as
+    # `?? .home`/`?? .tmp` and would ride `git add -A` into the PR. The
+    # seeded patterns must match either form.
+    from factory.runs import _seed_run_excludes
+
+    repo, _ = _sandbox_repo(tmp_path)
+    scratch = tmp_path / "scratch"
+    (scratch / "home").mkdir(parents=True)
+    (scratch / "tmp").mkdir(parents=True)
+    (repo / ".home").symlink_to(scratch / "home")
+    (repo / ".tmp").symlink_to(scratch / "tmp")
+    _seed_run_excludes(repo, None)
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert status == "", f"symlinked scratch leaks into status: {status!r}"
+
+
+def test_review10_excludes_still_cover_real_scratch_dirs(tmp_path):
+    # The other form must keep working: plain .home/.tmp directories (the
+    # F-05 shape, and the post-review shape after round 3's teardown).
+    from factory.runs import _seed_run_excludes
+
+    repo, _ = _sandbox_repo(tmp_path)
+    (repo / ".home").mkdir()
+    (repo / ".tmp").mkdir()
+    (repo / ".home" / "pip-cache").write_text("cache")
+    (repo / ".tmp" / "scratch").write_text("tmp")
+    _seed_run_excludes(repo, None)
+    status = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert status == "", f"real scratch dirs leak into status: {status!r}"
+
+
+def test_review10_review_leaves_real_scratch_dirs(tmp_path, monkeypatch):
+    # Finding 2: the symlinks must not outlive the review — a later
+    # implementer run in the same run dir would write $HOME/$TMPDIR through
+    # links pointing outside its sandbox. The review leaves the plain
+    # directories the F-05 flow expects.
+    import factory.session as session_module
+
+    repo, profile = _sandbox_repo(tmp_path)
+    head_before = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+
+    def quiet_run(cmd, run_dir, settings_path, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd, 0,
+            stdout=json.dumps({"seat": "reviewer", "status": "completed"}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(session_module, "run_sandboxed", quiet_run)
+    record = session_module.run_session_sandboxed(
+        "reviewer", "review it", repo, profile,
+        settings_path=tmp_path / "s.json", factory_root=tmp_path,
+        max_turns=5, timeout_min=1,
+        token="t", cli_path=Path("/bin/echo"),
+    )
+    assert record.status == "completed"
+    assert (repo / ".home").is_dir() and not (repo / ".home").is_symlink()
+    assert (repo / ".tmp").is_dir() and not (repo / ".tmp").is_symlink()
+    head_after = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert head_after == head_before
+
+
+def test_review10_implementer_scratch_writable_after_a_review(tmp_path, monkeypatch):
+    # The owner's exact repro shape: after a reviewer session leaves real
+    # dirs, an implementer-style sandboxed write to $HOME and $TMPDIR inside
+    # the same run dir must succeed (source writes stay the implementer's to
+    # make — that seat keeps allowWrite=[run_dir]).
+    import factory.session as session_module
+    from factory.sandbox import build_settings, run_sandboxed, write_settings
+
+    repo, profile = _sandbox_repo(tmp_path)
+
+    def quiet_run(cmd, run_dir, settings_path, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd, 0,
+            stdout=json.dumps({"seat": "reviewer", "status": "completed"}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(session_module, "run_sandboxed", quiet_run)
+    session_module.run_session_sandboxed(
+        "reviewer", "review it", repo, profile,
+        settings_path=tmp_path / "s.json", factory_root=tmp_path,
+        max_turns=5, timeout_min=1,
+        token="t", cli_path=Path("/bin/echo"),
+    )
+    # The next run in the same dir is an implementer: writable run dir.
+    settings = build_settings(
+        profile, repo, model_endpoint="api.z.ai",
+        toolchain=[], factory_root=tmp_path,
+    )
+    settings_path = tmp_path / "implementer.json"
+    write_settings(settings, settings_path)
+    proc = run_sandboxed(
+        ["sh", "-c", "echo state > .home/cc.json && echo t > .tmp/build"],
+        repo, settings_path, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert (repo / ".home" / "cc.json").read_text().strip() == "state"
+    assert (repo / ".tmp" / "build").read_text().strip() == "t"
