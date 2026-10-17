@@ -187,6 +187,34 @@ def _restore_workspace(run_dir: Path, head: str) -> None:
     )
 
 
+def _reviewer_scratch(settings_path: Path, run_dir: Path) -> tuple[Path, Path]:
+    """Create the reviewer's writable scratch OUTSIDE the run dir and point
+    ``run/.home``/``run/.tmp`` at it as symlinks.
+
+    Why outside: on Linux, the runs_root read-deny makes srt mount a
+    read-only bind of the run dir AFTER the writable sub-directory binds,
+    burying them — scratch inside the run dir is read-only there (proven on
+    bwrap 0.8.0). Outside the run dir the scratch's own writable bind stays
+    live; the symlinks keep HOME/TMPDIR spellings (and the F-05 git
+    excludes `/.home/`+`/.tmp/`) unchanged. Both spellings ride in
+    ``allowWrite`` so macOS, whose backend doesn't stack that way, accepts
+    either.
+    """
+    scratch = settings_path.with_name(settings_path.name + "-scratch")
+    home = scratch / "home"
+    tmp = scratch / "tmp"
+    home.mkdir(parents=True, exist_ok=True)
+    tmp.mkdir(parents=True, exist_ok=True)
+    for name, target in ((".home", home), (".tmp", tmp)):
+        link = run_dir / name
+        if link.is_dir() and not link.is_symlink():
+            shutil.rmtree(link)  # a previous non-symlink scratch dir
+        elif link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(target)
+    return home, tmp
+
+
 # ------------------------------------------------------------------ seats --
 
 @dataclass(frozen=True)
@@ -992,28 +1020,8 @@ def run_session_sandboxed(
         )
 
     run_dir = Path(run_dir)
-    # Reviewer integrity (owner review round 2): the reviewer gets a
-    # read-only sandbox and a HEAD/tree guard. The scratch dirs exist
-    # BEFORE the baseline so their (untracked) presence can never look
-    # like a mutation between the two snapshots.
-    review_guard = seat == "reviewer"
-    baseline: tuple[str, str] | None = None
-    if review_guard:
-        for scratch in (run_dir / ".home", run_dir / ".tmp"):
-            scratch.mkdir(parents=True, exist_ok=True)
-        baseline = _git_state(run_dir)
-    # The pinned CLI (finding 5): the SDK's bundled binary, or an explicit
-    # test override. An auto-discovered ~/.local/bin/claude is never used —
-    # it updates itself out from under the pin.
-    cli = Path(cli_path).expanduser() if cli_path is not None else _bundled_cli()
-    if cli is None:
-        raise SessionConfigError(
-            "the pinned claude-agent-sdk wheel bundles no Claude CLI for this "
-            "platform — reinstall it (`pip install --force-reinstall "
-            "claude-agent-sdk==" + _SDK_VERSION + "`). Sandboxed sessions run "
-            "the bundled, version-pinned CLI and never an auto-updating one."
-        )
-
+    # Settings path first (derived once): the reviewer's scratch sibling and
+    # the staged runner both hang off its name.
     if settings_path is None:
         if factory_root is None:
             runs_root = run_dir.parent.parent
@@ -1028,6 +1036,29 @@ def run_session_sandboxed(
         settings_path = (
             Path(factory_root) / "sandbox" / f"{run_dir.parent.name}-{run_dir.name}.json"
         )
+
+    # Reviewer integrity (owner review round 2): the reviewer gets a
+    # read-only sandbox and a HEAD/tree guard. The scratch links exist
+    # BEFORE the baseline so their (untracked) presence can never look
+    # like a mutation between the two snapshots.
+    review_guard = seat == "reviewer"
+    reviewer_writable: tuple[Path, Path] = ()
+    baseline: tuple[str, str] | None = None
+    if review_guard:
+        reviewer_writable = _reviewer_scratch(Path(settings_path), run_dir)
+        baseline = _git_state(run_dir)
+    # The pinned CLI (finding 5): the SDK's bundled binary, or an explicit
+    # test override. An auto-discovered ~/.local/bin/claude is never used —
+    # it updates itself out from under the pin.
+    cli = Path(cli_path).expanduser() if cli_path is not None else _bundled_cli()
+    if cli is None:
+        raise SessionConfigError(
+            "the pinned claude-agent-sdk wheel bundles no Claude CLI for this "
+            "platform — reinstall it (`pip install --force-reinstall "
+            "claude-agent-sdk==" + _SDK_VERSION + "`). Sandboxed sessions run "
+            "the bundled, version-pinned CLI and never an auto-updating one."
+        )
+
     runner_dir = _stage_runner(settings_path.with_name(settings_path.name + "-runner"))
     # The spec lives inside the staged runner dir — OUTSIDE the clone
     # (finding 6): a stray file in the run dir would ride into the PR via
@@ -1059,6 +1090,7 @@ def run_session_sandboxed(
         toolchain=default_toolchain(extra=[cli]),
         allow_read=[runner_dir],
         read_only=review_guard,
+        writable_roots=reviewer_writable,
     )
     write_settings(settings, settings_path)
 

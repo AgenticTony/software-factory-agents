@@ -892,10 +892,19 @@ def _sandbox_repo(tmp_path: Path) -> tuple[Path, dict]:
 def test_review9_reviewer_sandbox_is_read_only(tmp_path):
     # The owner's repro list, at the sandbox layer: with read_only settings
     # the reviewer's Bash cannot overwrite source, edit tests, write via
-    # python, or commit — and scratch still works in .home/.tmp.
+    # python, or commit — and scratch still works in .home/.tmp. The
+    # writable scratch lives OUTSIDE the run dir (run/.home and run/.tmp
+    # are symlinks to it): on Linux the runs_root read-deny makes srt
+    # re-bind the run dir read-only AFTER the writable sub-directory binds,
+    # burying them — only the outside spellings stay live there.
     from factory.sandbox import build_settings, run_sandboxed, write_settings
 
     repo, profile = _sandbox_repo(tmp_path)
+    from factory.session import _reviewer_scratch
+
+    scratch_home, scratch_tmp = _reviewer_scratch(
+        tmp_path / "reviewer-settings.json", repo
+    )
     settings = build_settings(
         profile,
         repo,
@@ -903,12 +912,11 @@ def test_review9_reviewer_sandbox_is_read_only(tmp_path):
         toolchain=[],
         factory_root=tmp_path,
         read_only=True,
+        writable_roots=(scratch_home, scratch_tmp),
     )
     settings_path = tmp_path / "reviewer-settings.json"
     write_settings(settings, settings_path)
-    assert sorted(settings["filesystem"]["allowWrite"]) == sorted(
-        [str(repo / ".home"), str(repo / ".tmp")]
-    )
+    assert (repo / ".home").is_symlink() and (repo / ".tmp").is_symlink()
 
     head_before = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],

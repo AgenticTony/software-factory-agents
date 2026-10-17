@@ -265,6 +265,7 @@ def build_settings(
     toolchain: "Sequence[Path] | None" = None,
     allow_read: "Sequence[Path]" = (),
     read_only: bool = False,
+    writable_roots: "Sequence[Path]" = (),
 ) -> dict:
     """Build the srt settings dict for one run from the project profile.
 
@@ -361,17 +362,24 @@ def build_settings(
             + [str(entry) for entry in toolchain_reads]
             + [str(Path(entry).resolve()) for entry in allow_read],
             # Read-only mode (the reviewer seat): the run dir itself is NOT
-            # writable — only the .home/.tmp scratch dirs, which are
-            # git-excluded. A reviewer that can write the repo it reviews
-            # can "fix" the code, watch its own fix pass, and report PASS
-            # on a diff that isn't the implementer's; its commit would ride
-            # the branch F-10 pushes. The denyWrite .git entries below stay
-            # for both modes (defence in depth). Cache writes tools make in
-            # the tree (__pycache__, .pytest_cache) fail closed: Python and
-            # pytest degrade to warnings on unwritable caches, so read-only
-            # checks still run.
+            # writable — only scratch. A reviewer that can write the repo it
+            # reviews can "fix" the code, watch its own fix pass, and report
+            # PASS on a diff that isn't the implementer's; its commit would
+            # ride the branch F-10 pushes. The writable roots are the
+            # run-dir .home/.tmp spellings PLUS the caller's outside-the-run
+            # scratch dirs (the session runner symlinks run/.home and
+            # run/.tmp at them): on Linux, srt mounts a read-only bind of
+            # the run dir AFTER the writable sub-directory binds — the
+            # runs_root read-deny forces that restore — burying them, so
+            # only the outside spellings stay live there; macOS is happy
+            # with either. The denyWrite .git entries below stay for both
+            # modes (defence in depth). Cache writes tools make in the tree
+            # (__pycache__, .pytest_cache) fail closed: Python and pytest
+            # degrade to warnings on unwritable caches, so read-only checks
+            # still run.
             "allowWrite": (
                 [str(run_dir / ".home"), str(run_dir / ".tmp")]
+                + [str(Path(root)) for root in writable_roots]
                 if read_only
                 else [str(run_dir)]
             ),
