@@ -33,7 +33,10 @@ Mechanics (the caller — F-10 — passes a clean clone of the slice's branch):
 Between phases the tree is ``git clean``-ed: a stale ``__pycache__``
 written by the red run survives a same-size checkout (Python's mtime+size
 check has one-second granularity) and would make green run base's
-bytecode. The per-ref command comes from ``commands.test_ref`` — a shell
+bytecode. Each red run is also classified (``red_reason``: assertion,
+collection or unknown) for the L2 reviewer's test-quality pass — the
+verdict never depends on the classification.
+The per-ref command comes from ``commands.test_ref`` — a shell
 template whose ``{ref}``/``{path}``/``{name}``/``{python}`` placeholders
 are substituted by literal replacement (shell braces like ``${VAR}`` pass
 through untouched), defaulting to pytest via ``python -m`` so the repo
@@ -56,7 +59,7 @@ import re
 import shlex
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar
 
@@ -90,12 +93,80 @@ _NOT_FOUND = (
     re.compile(r"^no tests ran in \d", re.MULTILINE),
 )
 
+# How a red run went red (F-09, VALIDATOR-SPEC L1 "red for the wrong
+# reason"). The epistemic class that matters downstream is "red only
+# because a name was missing" — the case the L2 reviewer is told to
+# scrutinise, because the red phase proved name-absence, not behaviour.
+# Two pytest shapes land in it: a module-level import of a missing module
+# (file-level ``ERROR`` short-summary lines, no ``::test_id``) and a
+# missing name hit at RUNTIME inside the test body (NameError,
+# module-has-no-attribute, ModuleNotFoundError, cannot-import-name — the
+# most common red-first shape for a brand-new function). Assertion
+# failures are ``FAILED`` lines naming assert/AssertionError; anything
+# else red is ``unknown``. The reason rides in the report for the L2
+# reviewer's test-quality pass; the verdict never depends on it.
+_RED_COLLECTION = (
+    re.compile(r"(?m)^errors during collection"),
+    re.compile(r"(?m)^ERROR collecting "),
+    re.compile(r"ImportError while importing test module"),
+    re.compile(r"(?m)^ERROR \S+$"),
+)
+_RED_NAME_MISSING = (
+    re.compile(r"NameError: name '"),
+    re.compile(r"AttributeError: module '"),
+    re.compile(r"ModuleNotFoundError: No module named"),
+    re.compile(r"ImportError: cannot import name"),
+)
+_RED_ASSERTION = (
+    re.compile(r"(?m)^FAILED .*assert"),
+    re.compile(r"AssertionError"),
+)
+
+
+def red_reason(result: CommandResult) -> str | None:
+    """Classify how a red run went red: ``assertion``, ``collection`` or
+    ``unknown`` — or None when the run wasn't red (green, or timed out
+    before producing a verdict).
+
+    ``collection`` covers both name-missing shapes: collection-time import
+    errors and runtime NameError/AttributeError/ModuleNotFoundError/
+    cannot-import-name failures, which prove the same thing — a name was
+    absent — and so deserve the same reviewer scrutiny. Assertion is
+    checked before name-missing so an assert whose *message* quotes a
+    ``NameError:`` still counts as an assertion red.
+
+    Args:
+        result: The red-phase :class:`~factory.gates.CommandResult` for one
+            contract test ref.
+
+    Returns:
+        The red reason, or None when no red verdict exists to classify.
+    """
+    if result.exit_code is None or result.exit_code == 0:
+        return None
+    if any(pattern.search(result.output) for pattern in _RED_COLLECTION):
+        return "collection"
+    if any(pattern.search(result.output) for pattern in _RED_ASSERTION):
+        return "assertion"
+    if any(pattern.search(result.output) for pattern in _RED_NAME_MISSING):
+        return "collection"
+    return "unknown"
+
 
 @dataclass
 class L1Report(GateReport):
-    """The L1 verdict plus everything F-09/F-10 consume downstream."""
+    """The L1 verdict plus everything F-09/F-10 consume downstream.
+
+    ``red_reasons`` maps each provable contract test ref to how its red run
+    went red — ``assertion``, ``collection`` or ``unknown`` — or None when
+    the ref never produced a red verdict (green on base, or a timeout).
+    The verdict itself never depends on it; the L2 reviewer's test-quality
+    pass reads it (a ref red only by ``collection`` proved just that a name
+    was missing, and deserves the closest scrutiny).
+    """
 
     layer: ClassVar[str] = "L1"
+    red_reasons: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -103,6 +174,7 @@ class L1Report(GateReport):
             "verdict": self.verdict,
             "findings": self.findings_as_dicts(),
             "commands": self.commands_as_dicts(),
+            "red_reasons": dict(self.red_reasons),
         }
 
 
@@ -229,6 +301,7 @@ def run_l1(
     ]
 
     provable: list[str] = []
+    reasons: dict[str, str | None] = {}
     for ref in refs:
         path = ref_path(ref)
         if path is None:
@@ -255,6 +328,7 @@ def run_l1(
         for ref in provable:
             result = run_command(f"red:{ref}", _ref_command(template, ref), repo, timeout_sec)
             results.append(result)
+            reasons[ref] = red_reason(result)
             if result.timed_out:
                 findings.append(
                     Finding("command_timeout", f"red run of {ref} exceeded {timeout_sec}s")
@@ -309,4 +383,5 @@ def run_l1(
         verdict="fail" if findings else "pass",
         findings=findings,
         command_results=results,
+        red_reasons=reasons,
     )

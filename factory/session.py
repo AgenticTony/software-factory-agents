@@ -11,14 +11,25 @@ Code's own permission prompts bypassed (``bypassPermissions``) — prompts
 are meaningless unattended, the run dir is the only writable path, and
 the in-process PreToolUse hooks below are the in-session policy layer.
 A deny hook still blocks under ``bypassPermissions``; the reviewer seat
-additionally gets the edit tools disallowed outright.
+additionally gets the edit tools disallowed outright. The reviewer runs
+headless too, so it shares the same permission bypass: with nobody to
+answer permission prompts, a default-mode reviewer could never run the
+read-only Bash checks its spec promises — its read-only-ness comes from
+the disallowed edit tools, the PreToolUse hooks and the sandbox, not from
+prompts.
 
 Seats:
 
 * ``implementer`` — writes code. Prompt-bypassed, sandbox-confined, hooks
   enforce protected paths and the push/gh ban.
-* ``reviewer`` — reads, never writes: ``Write``/``Edit``/``NotebookEdit``
-  are disallowed at the options layer on top of the same hooks.
+* ``reviewer`` — reads, never writes, enforced three ways: the edit tools
+  are disallowed at the options layer; its sandbox is **read-only**
+  (``build_settings(read_only=True)`` — Bash writes land only in the
+  git-excluded ``.home``/``.tmp`` scratch, never the repo); and the
+  orchestrator verifies HEAD and the working tree after every review,
+  restoring and failing the review on any change. Headless, so
+  prompt-bypassed like the implementer (a default-mode Bash call would
+  wait forever for an approval nobody can give).
 
 Clock: the wall clock (:func:`asyncio.wait_for` around each message
 receive, budgeted by the remaining deadline) covers **only** the message
@@ -64,6 +75,7 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk import query as sdk_query
 
+from factory.runs import GIT_HARDENING
 from factory.sandbox import (
     build_settings,
     default_toolchain,
@@ -123,12 +135,112 @@ class _WallClock(Exception):
     """Internal: the session's wall-clock budget ran out."""
 
 
+# --------------------------------------------------- reviewer integrity --
+# The reviewer must never change what it reviews (owner review round 2 on
+# F-09): a reviewer that can write the repo can "fix" the code, watch its
+# own fix pass, and report PASS on a diff that isn't the implementer's —
+# and its commit would ride the branch F-10 pushes. Two layers hold that
+# line: the reviewer's sandbox is read-only (build_settings(read_only=True)
+# — writes confined to the git-excluded .home/.tmp scratch), and this
+# orchestrator-side guard verifies HEAD and the working tree after every
+# reviewer session regardless, restoring them and failing the review if
+# anything moved. The guard is the backstop for any future path that lets
+# a write through (a settings bug, an srt regression); the verdict text of
+# a mutating review is never trusted.
+
+REVIEWER_MUTATION = "reviewer_mutated_workspace"
+
+
+def _git_state(run_dir: Path) -> tuple[str, str]:
+    """(HEAD sha, porcelain status) of the run dir, via hardened git."""
+    def run(*args: str) -> str:
+        proc = subprocess.run(
+            ["git", *GIT_HARDENING, "-C", str(run_dir), *args],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            raise SessionConfigError(
+                f"cannot read the run dir's git state (git {args[0]}): "
+                f"{proc.stderr.strip()[:300]}"
+            )
+        return proc.stdout
+
+    return run("rev-parse", "HEAD").strip(), run("status", "--porcelain")
+
+
+def _restore_workspace(run_dir: Path, head: str) -> None:
+    """Put the run dir back on ``head`` with a clean tracked tree, dropping
+    untracked non-ignored files the mutation left (excluded scratch —
+    .home/.tmp — survives; ``clean`` skips ignored paths without -x)."""
+    subprocess.run(
+        ["git", *GIT_HARDENING, "-C", str(run_dir), "reset", "--hard", head],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    subprocess.run(
+        ["git", *GIT_HARDENING, "-C", str(run_dir), "clean", "-fd"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+
+def _reviewer_scratch(settings_path: Path, run_dir: Path) -> tuple[Path, Path]:
+    """Create the reviewer's writable scratch OUTSIDE the run dir and point
+    ``run/.home``/``run/.tmp`` at it as symlinks.
+
+    Why outside: on Linux, the runs_root read-deny makes srt mount a
+    read-only bind of the run dir AFTER the writable sub-directory binds,
+    burying them — scratch inside the run dir is read-only there (proven on
+    bwrap 0.8.0). Outside the run dir the scratch's own writable bind stays
+    live; the symlinks keep HOME/TMPDIR spellings (and the F-05 git
+    excludes `/.home/`+`/.tmp/`) unchanged. Both spellings ride in
+    ``allowWrite`` so macOS, whose backend doesn't stack that way, accepts
+    either.
+    """
+    scratch = settings_path.with_name(settings_path.name + "-scratch")
+    home = scratch / "home"
+    tmp = scratch / "tmp"
+    home.mkdir(parents=True, exist_ok=True)
+    tmp.mkdir(parents=True, exist_ok=True)
+    for name, target in ((".home", home), (".tmp", tmp)):
+        link = run_dir / name
+        if link.is_dir() and not link.is_symlink():
+            shutil.rmtree(link)  # a previous non-symlink scratch dir
+        elif link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(target)
+    return home, tmp
+
+
+def _teardown_reviewer_scratch(run_dir: Path) -> None:
+    """Inverse of :func:`_reviewer_scratch`: replace the scratch symlinks
+    with the plain ``.home``/``.tmp`` directories the F-05 flow expects.
+
+    The links must not outlive the review: a later implementer run in the
+    same run dir would write ``$HOME``/``$TMPDIR`` through links pointing
+    OUTSIDE its sandbox — denied there, breaking pip/npm/pytest and Claude
+    Code's own state (owner review round 3). Runs on every reviewer exit
+    path, including aborts, so the run dir is always left in standard shape.
+    """
+    for name in (".home", ".tmp"):
+        path = run_dir / name
+        if path.is_symlink():
+            path.unlink()
+        path.mkdir(parents=True, exist_ok=True)
+
+
 # ------------------------------------------------------------------ seats --
 
 @dataclass(frozen=True)
 class SeatConfig:
-    """Per-seat options. ``system_prompt`` is the seat prompt; F-09 supplies
-    the real ones, so it is empty until then."""
+    """Per-seat options. ``system_prompt`` stays empty on the seat itself:
+    the real prompts are assembled per run from ``factory.prompts`` (F-09)
+    and passed in — the prompt files live in the repo, which is unreadable
+    inside the sandbox, so the orchestrator reads and assembles them
+    outside and hands over the text."""
 
     name: str
     system_prompt: str | None = None
@@ -149,6 +261,15 @@ SEATS: dict[str, SeatConfig] = {
         # WO: "the reviewer gets no Write/Edit". NotebookEdit is the same
         # class of tool, so it goes too — a reviewer that cannot mutate.
         disallowed_tools=("Write", "Edit", "NotebookEdit"),
+        # Review round finding 8: the default permission mode asks someone
+        # to approve each Bash call, and a headless session has nobody to
+        # ask — the reviewer could never run the read-only checks its spec
+        # promises. Same D3 reasoning as the implementer: the srt sandbox
+        # is the permission system; read-only-ness comes from the
+        # disallowed edit tools above plus the PreToolUse hooks (protected
+        # paths, push/gh ban) and the sandbox's own write/network
+        # confinement — not from prompts no one can answer.
+        permission_mode="bypassPermissions",
     ),
 }
 
@@ -546,6 +667,7 @@ def build_options(
     protected: "Sequence[str]" = (),
     cli_path: Path | None = None,
     model: str | None = None,
+    system_prompt: str | None = None,
 ) -> ClaudeAgentOptions:
     """Build the per-seat ClaudeAgentOptions (WO F-06 options list).
 
@@ -553,13 +675,19 @@ def build_options(
     session can't pick up personal config. ``env`` is exactly the three
     session names (see :func:`session_env`). Hooks: protected-path +
     bash-guard PreToolUse callbacks, in-process via HookMatcher.
+    ``system_prompt`` is the assembled seat prompt (F-09's
+    ``factory.prompts``); it overrides the seat's static default, which
+    stays empty because the prompt *files* are unreadable inside the
+    sandbox — the orchestrator assembles them outside and passes the text.
     """
     seat_config = _seat(seat)
     options = ClaudeAgentOptions(
         cwd=str(Path(cwd)),
         env=session_env(base_url, token, timeout_ms),
         max_turns=max_turns,
-        system_prompt=seat_config.system_prompt,
+        system_prompt=system_prompt
+        if system_prompt is not None
+        else seat_config.system_prompt,
         setting_sources=[],
         allowed_tools=list(seat_config.allowed_tools),
         disallowed_tools=list(seat_config.disallowed_tools),
@@ -669,13 +797,15 @@ async def run_session(
     protected: "Sequence[str]" = (),
     cli_path: Path | None = None,
     model: str | None = None,
+    system_prompt: str | None = None,
 ) -> SessionRecord:
     """Run one seat's session and return what it recorded.
 
     Args:
         seat: Seat name (see :data:`SEATS`).
         prompt: The task prompt (the user message). The seat's *system*
-            prompt comes from the seat config (F-09 supplies those).
+            prompt is the assembled seat prompt (F-09) via ``system_prompt``,
+            falling back to the (empty) seat config default.
         cwd: The run dir — the session's working directory.
         max_turns: Turn cap handed to the SDK.
         timeout_min: Wall-clock budget in minutes, enforced around the
@@ -692,6 +822,8 @@ async def run_session(
         cli_path: Explicit Claude Code CLI path (inside the sandbox the
             ambient PATH can't be relied on).
         model: Optional model override.
+        system_prompt: The assembled seat prompt (F-09), overriding the
+            seat's static default.
 
     Returns:
         The record: ``completed`` / ``failed`` (with reason) / ``aborted``
@@ -710,6 +842,7 @@ async def run_session(
         protected=protected,
         cli_path=cli_path,
         model=model,
+        system_prompt=system_prompt,
     )
 
     result_message: ResultMessage | None = None
@@ -838,6 +971,7 @@ def run_session_sandboxed(
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
     protected: "Sequence[str]" = (),
     model: str | None = None,
+    system_prompt: str | None = None,
     token: str | None = None,
     cli_path: Path | None = None,
     srt_bin_path: Path | None = None,
@@ -868,6 +1002,9 @@ def run_session_sandboxed(
         max_turns/timeout_min: Handed to the session. The *outer*
             run_sandboxed wall clock is ``timeout_min`` plus
             ``teardown_grace_sec`` so the in-session clock fires first.
+        system_prompt: The assembled seat prompt (F-09) — text, never a
+            path: the repo (prompts included) is unreadable inside the
+            sandbox, so the orchestrator assembles it outside.
         token: The Z.ai token; default :func:`seat_token`. None and no
             credential available → :class:`SessionConfigError` (refuses to
             start a session that cannot authenticate).
@@ -877,12 +1014,16 @@ def run_session_sandboxed(
 
     Returns:
         The session's record (any status — completed/failed/aborted are
-        all recorded outcomes).
+        all recorded outcomes). For the reviewer seat the record is forced
+        to ``failed`` with reason :data:`REVIEWER_MUTATION` if HEAD or the
+        working tree changed during the session (the workspace is restored
+        first, so nothing the reviewer wrote survives).
 
     Raises:
         SessionConfigError: No token, no bundled CLI, an underivable
-            layout, or an entry that produced no parsable record (an
-            orchestrator-side fault that must be loud).
+            layout, an unreadable run-dir git state (reviewer seat), or an
+            entry that produced no parsable record (an orchestrator-side
+            fault that must be loud).
         subprocess.TimeoutExpired: The outer wall clock expired — the
             runner process itself hung past its teardown grace.
     """
@@ -896,18 +1037,8 @@ def run_session_sandboxed(
         )
 
     run_dir = Path(run_dir)
-    # The pinned CLI (finding 5): the SDK's bundled binary, or an explicit
-    # test override. An auto-discovered ~/.local/bin/claude is never used —
-    # it updates itself out from under the pin.
-    cli = Path(cli_path).expanduser() if cli_path is not None else _bundled_cli()
-    if cli is None:
-        raise SessionConfigError(
-            "the pinned claude-agent-sdk wheel bundles no Claude CLI for this "
-            "platform — reinstall it (`pip install --force-reinstall "
-            "claude-agent-sdk==" + _SDK_VERSION + "`). Sandboxed sessions run "
-            "the bundled, version-pinned CLI and never an auto-updating one."
-        )
-
+    # Settings path first (derived once): the reviewer's scratch sibling and
+    # the staged runner both hang off its name.
     if settings_path is None:
         if factory_root is None:
             runs_root = run_dir.parent.parent
@@ -922,6 +1053,29 @@ def run_session_sandboxed(
         settings_path = (
             Path(factory_root) / "sandbox" / f"{run_dir.parent.name}-{run_dir.name}.json"
         )
+
+    # Reviewer integrity (owner review round 2): the reviewer gets a
+    # read-only sandbox and a HEAD/tree guard. The scratch links exist
+    # BEFORE the baseline so their (untracked) presence can never look
+    # like a mutation between the two snapshots.
+    review_guard = seat == "reviewer"
+    reviewer_writable: tuple[Path, Path] = ()
+    baseline: tuple[str, str] | None = None
+    if review_guard:
+        reviewer_writable = _reviewer_scratch(Path(settings_path), run_dir)
+        baseline = _git_state(run_dir)
+    # The pinned CLI (finding 5): the SDK's bundled binary, or an explicit
+    # test override. An auto-discovered ~/.local/bin/claude is never used —
+    # it updates itself out from under the pin.
+    cli = Path(cli_path).expanduser() if cli_path is not None else _bundled_cli()
+    if cli is None:
+        raise SessionConfigError(
+            "the pinned claude-agent-sdk wheel bundles no Claude CLI for this "
+            "platform — reinstall it (`pip install --force-reinstall "
+            "claude-agent-sdk==" + _SDK_VERSION + "`). Sandboxed sessions run "
+            "the bundled, version-pinned CLI and never an auto-updating one."
+        )
+
     runner_dir = _stage_runner(settings_path.with_name(settings_path.name + "-runner"))
     # The spec lives inside the staged runner dir — OUTSIDE the clone
     # (finding 6): a stray file in the run dir would ride into the PR via
@@ -939,6 +1093,7 @@ def run_session_sandboxed(
                 "timeout_ms": timeout_ms,
                 "protected": list(protected),
                 "model": model,
+                "system_prompt": system_prompt,
                 "cli_path": str(cli),
             }
         )
@@ -951,35 +1106,55 @@ def run_session_sandboxed(
         factory_root=factory_root,
         toolchain=default_toolchain(extra=[cli]),
         allow_read=[runner_dir],
+        read_only=review_guard,
+        writable_roots=reviewer_writable,
     )
     write_settings(settings, settings_path)
 
-    proc = run_sandboxed(
-        [sys.executable, "-c", _entry_bootstrap(runner_dir), str(spec_path)],
-        run_dir,
-        settings_path,
-        env={
-            "ANTHROPIC_AUTH_TOKEN": token,
-            "ANTHROPIC_BASE_URL": base_url,
-            "API_TIMEOUT_MS": str(int(timeout_ms)),
-        },
-        timeout=timeout_min * 60.0 + teardown_grace_sec,
-        srt_bin_path=srt_bin_path,
-    )
-
-    lines = [line for line in proc.stdout.splitlines() if line.strip()]
-    if not lines:
-        raise SessionConfigError(
-            "the sandboxed session entry produced no record "
-            f"(exit {proc.returncode}): {proc.stderr.strip()[:2000]}"
-        )
+    # The reviewer's scratch symlinks come down on EVERY exit path — a
+    # run dir left with links would break the next implementer session
+    # there (round 3) — so the whole run sits inside try/finally.
     try:
-        return SessionRecord.from_dict(json.loads(lines[-1]))
-    except (json.JSONDecodeError, TypeError) as exc:
-        raise SessionConfigError(
-            "the sandboxed session entry produced an unparsable record "
-            f"({exc}): {lines[-1][:500]}"
-        ) from exc
+        proc = run_sandboxed(
+            [sys.executable, "-c", _entry_bootstrap(runner_dir), str(spec_path)],
+            run_dir,
+            settings_path,
+            env={
+                "ANTHROPIC_AUTH_TOKEN": token,
+                "ANTHROPIC_BASE_URL": base_url,
+                "API_TIMEOUT_MS": str(int(timeout_ms)),
+            },
+            timeout=timeout_min * 60.0 + teardown_grace_sec,
+            srt_bin_path=srt_bin_path,
+        )
+
+        lines = [line for line in proc.stdout.splitlines() if line.strip()]
+        if not lines:
+            raise SessionConfigError(
+                "the sandboxed session entry produced no record "
+                f"(exit {proc.returncode}): {proc.stderr.strip()[:2000]}"
+            )
+        try:
+            record = SessionRecord.from_dict(json.loads(lines[-1]))
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise SessionConfigError(
+                "the sandboxed session entry produced an unparsable record "
+                f"({exc}): {lines[-1][:500]}"
+            ) from exc
+
+        # The reviewer-integrity backstop: whatever happened in the session,
+        # HEAD and the working tree must be exactly what they were before. A
+        # mutation fails the review (the verdict text of a reviewer that
+        # changed the code is not evidence) and the workspace is restored,
+        # so nothing the reviewer wrote can ride the branch F-10 pushes.
+        if baseline is not None and _git_state(run_dir) != baseline:
+            _restore_workspace(run_dir, baseline[0])
+            record.status = "failed"
+            record.reason = REVIEWER_MUTATION
+        return record
+    finally:
+        if review_guard:
+            _teardown_reviewer_scratch(run_dir)
 
 
 # python -c <bootstrap> <spec.json> — the in-sandbox entry point (see
@@ -1012,6 +1187,7 @@ def _main(argv: list[str] | None = None) -> int:
                 timeout_ms=spec.get("timeout_ms") or DEFAULT_TIMEOUT_MS,
                 protected=spec.get("protected") or (),
                 model=spec.get("model"),
+                system_prompt=spec.get("system_prompt"),
                 cli_path=Path(spec["cli_path"]) if spec.get("cli_path") else None,
             )
         )
