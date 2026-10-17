@@ -180,6 +180,14 @@ _RUNNER_ENV_KEEP = frozenset(
 )
 _RUNNER_ENV_PREFIXES = ("LC_",)
 
+# Whether a session's environment window is currently open in this process
+# (review round 2). One window at a time, ever: os.environ is a single
+# process-wide resource, so overlapping windows would restore each other's
+# stripped copies and permanently delete the orchestrator's credentials.
+# The orchestrator is single-threaded asyncio; the flag is checked and set
+# at non-await points, so no interleaving can race it within one loop.
+_WINDOW_OPEN = False
+
 
 def _window_environ(seat_env: dict[str, str]) -> dict[str, str]:
     """Replace os.environ with the runner allowlist + ``seat_env`` for the
@@ -259,7 +267,11 @@ _BASH_PUSH = re.compile(r"\bpush\b")
 # would also hit "gh-gh-gh" (a hyphen is a word boundary), and the WO
 # bans the gh CLI, not the string.
 _BASH_GH = re.compile(r"(?:^|[\s;&|/(`])gh(?:[\s)&|;`]|$)")
-_BASH_QUOTES = str.maketrans("", "", "\"'`")
+# De-quoting for the guard's checks: strip quotes, backticks AND
+# backslashes before matching, so `"gh"`, `` `gh` ``, `$()` forms and
+# backslash-split words (`g\it pu\sh`, round 2) are all seen as their
+# bare selves. Over-matching is the safe direction for a deny-layer.
+_BASH_QUOTES = str.maketrans("", "", "\"'`\\")
 _BASH_GH_CONFIG = ".config/gh"
 # Redirection targets: `> file`, `>> file`, `2>file` (the fd digit and any
 # spacing between the brackets is optional).
@@ -425,9 +437,12 @@ def bash_guard_hook(protected: "Sequence[str]" = ()) -> HookMatcher:
         input: dict[str, Any], tool_use_id: str | None, context: dict[str, Any]
     ) -> dict[str, Any]:
         command = str((input.get("tool_input") or {}).get("command", ""))
-        if _BASH_GIT.search(command) and _BASH_PUSH.search(command):
-            return _deny("git push is not allowed inside a session")
+        # All checks run on the de-quoted command (round 2): backslash-split
+        # and quote-concatenated spellings (`g\it push`, `sh -c 'git pu''sh'`)
+        # must be seen as their bare selves.
         dequoted = command.translate(_BASH_QUOTES)
+        if _BASH_GIT.search(dequoted) and _BASH_PUSH.search(dequoted):
+            return _deny("git push is not allowed inside a session")
         if _BASH_GH.search(dequoted):
             return _deny("the gh CLI is not allowed inside a session")
         if _BASH_GH_CONFIG in dequoted:
@@ -624,54 +639,77 @@ async def run_session(
         model=model,
     )
 
-    started = time.monotonic()
-    deadline = started + timeout_min * 60.0
     result_message: ResultMessage | None = None
     stream = None
-    # Window the process env for the session's life: the SDK merges ALL of
-    # os.environ into the Claude Code subprocess, so without this a direct
-    # (unsandboxed) call hands the CLI every orchestrator secret. Restored
-    # in the finally — the orchestrator process continues unchanged. Inside
-    # the sandbox the ambient env is already scrubbed; the window is then a
-    # no-op that still holds (and keeps the proxy vars the session needs).
-    saved_env = _window_environ(options.env)
+    # One window per process, ever (review round 2): a second session
+    # opening while the first's window is live would save the first's
+    # STRIPPED environment and restore it last — permanently deleting the
+    # orchestrator's credentials. Refuse loudly instead; sessions in one
+    # process are serial (the F-10 loop is).
+    global _WINDOW_OPEN  # noqa: PLW0603 — module-level window ownership
+    if _WINDOW_OPEN:
+        raise SessionConfigError(
+            "another session's environment window is already open in this "
+            "process — sessions must run serially in one process (the F-10 "
+            "loop does); overlapping them would corrupt the orchestrator "
+            "environment."
+        )
+    _WINDOW_OPEN = True
     try:
-        stream = query_fn(prompt=prompt, options=options)
-        iterator = stream.__aiter__()
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise _WallClock()
+        # Window the process env for the session's life: the SDK merges ALL
+        # of os.environ into the Claude Code subprocess, so without this a
+        # direct (unsandboxed) call hands the CLI every orchestrator secret.
+        # Restored in the finally — the orchestrator process continues
+        # unchanged. Inside the sandbox the ambient env is already scrubbed;
+        # the window is then a no-op that still holds (and keeps the proxy
+        # vars the session needs).
+        saved_env = _window_environ(options.env)
+        try:
+            started = time.monotonic()
+            deadline = started + timeout_min * 60.0
             try:
-                message = await asyncio.wait_for(
-                    iterator.__anext__(), timeout=remaining
+                stream = query_fn(prompt=prompt, options=options)
+                iterator = stream.__aiter__()
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise _WallClock()
+                    try:
+                        message = await asyncio.wait_for(
+                            iterator.__anext__(), timeout=remaining
+                        )
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.TimeoutError as exc:
+                        raise _WallClock() from exc
+                    if isinstance(message, ResultMessage):
+                        result_message = message
+            except _WallClock:
+                return SessionRecord(
+                    seat=seat,
+                    status="aborted",
+                    reason="wall_clock",
+                    duration_ms=int((time.monotonic() - started) * 1000),
                 )
-            except StopAsyncIteration:
-                break
-            except asyncio.TimeoutError as exc:
-                raise _WallClock() from exc
-            if isinstance(message, ResultMessage):
-                result_message = message
-        await _close_stream(stream)
-    except _WallClock:
-        await _close_stream(stream)
-        return SessionRecord(
-            seat=seat,
-            status="aborted",
-            reason="wall_clock",
-            duration_ms=int((time.monotonic() - started) * 1000),
-        )
-    except ClaudeSDKError as exc:
-        await _close_stream(stream)
-        return SessionRecord(
-            seat=seat,
-            status="failed",
-            reason=f"{type(exc).__name__}: {exc}",
-            duration_ms=int((time.monotonic() - started) * 1000),
-        )
+            except ClaudeSDKError as exc:
+                return SessionRecord(
+                    seat=seat,
+                    status="failed",
+                    reason=f"{type(exc).__name__}: {exc}",
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                )
+            finally:
+                # Every exit path closes the stream (review round 2): the
+                # three explicit calls missed non-SDK raises, which
+                # propagate by design — a bug must not also leak the CLI
+                # subprocess. The close runs while the window is still up;
+                # a refusal from an unwinding generator is suppressed.
+                await _close_stream(stream)
+        finally:
+            os.environ.clear()
+            os.environ.update(saved_env)
     finally:
-        os.environ.clear()
-        os.environ.update(saved_env)
+        _WINDOW_OPEN = False
 
     duration_ms = int((time.monotonic() - started) * 1000)
     if result_message is None:

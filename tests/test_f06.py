@@ -1010,3 +1010,124 @@ def test_review9_primary_model_tolerates_null_counts():
     record = _run(_results_query(message))
     assert record.status == "completed"
     assert record.model == "glm-5.3"
+
+
+# ===========================================================================
+# Owner review round 2 on PR #18 — concurrent-window strip, close-on-any-exit,
+# guard residue, commit-subject convention.
+# ===========================================================================
+
+
+def test_review10_overlapping_sessions_refuse_and_keep_the_env(monkeypatch):
+    """Round 2, new bug: two overlapping sessions in one process corrupted
+    the environment — the second window saved the first's STRIPPED copy and
+    restored it last, permanently deleting the orchestrator's GH_TOKEN. The
+    fix refuses a second window while one is open (sessions in one process
+    are serial; the F-10 loop is), so the refusal is loud and the env
+    survives intact."""
+    monkeypatch.setenv("GH_TOKEN", "precious")
+
+    class GatedStream:
+        def __init__(self, gate: asyncio.Event) -> None:
+            self.gate = gate
+            self.closed = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await self.gate.wait()
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    first_window_open = asyncio.Event()
+    gate_a = asyncio.Event()
+    gate_b = asyncio.Event()
+
+    def first_query(*, prompt, options, transport=None):
+        first_window_open.set()  # the window is open by the time query runs
+        return GatedStream(gate_a)
+
+    def second_query(*, prompt, options, transport=None):
+        return GatedStream(gate_b)
+
+    async def first():
+        return await run_session(
+            "implementer", "p", REPO, 5, 10, query_fn=first_query
+        )
+
+    async def second():
+        await first_window_open.wait()
+        try:
+            await run_session(
+                "implementer", "p", REPO, 5, 10, query_fn=second_query
+            )
+            return "ran"
+        except SessionConfigError:
+            return "refused"
+
+    async def main():
+        first_task = asyncio.create_task(first())
+        await first_window_open.wait()  # first's window is open, parked
+        second_task = asyncio.create_task(second())
+        await asyncio.sleep(0.02)
+        # First finishes BEFORE the second's window would close — the exact
+        # ordering that used to restore the stripped copy last.
+        gate_a.set()
+        await first_task
+        gate_b.set()  # no-op once the second session was refused
+        second_outcome = await second_task
+        return second_outcome
+
+    second_outcome = asyncio.run(main())
+    assert second_outcome == "refused"
+    assert os.environ.get("GH_TOKEN") == "precious"
+
+
+def test_review11_non_sdk_errors_still_close_the_stream():
+    """Round 2: the close lived on three exit paths; a non-SDK error (a
+    bug propagating by design) skipped it. The close now belongs to the
+    finally, so every exit path — completion, abort, SDK error, and
+    unexpected raises — closes the stream and restores the env."""
+
+    class BugStream:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise RuntimeError("runner bug")
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    streams: list[BugStream] = []
+
+    def bug_query(*, prompt, options, transport=None):
+        stream = BugStream()
+        streams.append(stream)
+        return stream
+
+    with pytest.raises(RuntimeError, match="runner bug"):
+        asyncio.run(run_session("implementer", "p", REPO, 5, 5, query_fn=bug_query))
+    assert streams[0].closed, "a propagating error must still close the stream"
+
+
+def test_review12_bash_guard_backslash_and_sh_c_quoting():
+    """Round 2 residue: `sh -c 'git pu''sh'` and `g\\it push` passed. Both
+    are caught by running the git/push check on the de-quoted command with
+    backslashes stripped, like the gh check already did."""
+    guard = bash_guard_hook()
+    denied = _deny_paths(
+        guard,
+        [
+            ("Bash", {"command": "sh -c 'git pu''sh' origin main"}),
+            ("Bash", {"command": "g\\it push"}),
+            ("Bash", {"command": "echo ok > /tmp/f && g\\h pr create"}),
+        ],
+    )
+    assert len(denied) == 3, denied
