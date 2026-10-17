@@ -11,14 +11,21 @@ Code's own permission prompts bypassed (``bypassPermissions``) — prompts
 are meaningless unattended, the run dir is the only writable path, and
 the in-process PreToolUse hooks below are the in-session policy layer.
 A deny hook still blocks under ``bypassPermissions``; the reviewer seat
-additionally gets the edit tools disallowed outright.
+additionally gets the edit tools disallowed outright. The reviewer runs
+headless too, so it shares the same permission bypass: with nobody to
+answer permission prompts, a default-mode reviewer could never run the
+read-only Bash checks its spec promises — its read-only-ness comes from
+the disallowed edit tools, the PreToolUse hooks and the sandbox, not from
+prompts.
 
 Seats:
 
 * ``implementer`` — writes code. Prompt-bypassed, sandbox-confined, hooks
   enforce protected paths and the push/gh ban.
 * ``reviewer`` — reads, never writes: ``Write``/``Edit``/``NotebookEdit``
-  are disallowed at the options layer on top of the same hooks.
+  are disallowed at the options layer on top of the same hooks; headless,
+  so prompt-bypassed like the implementer (a default-mode Bash call would
+  wait forever for an approval nobody can give).
 
 Clock: the wall clock (:func:`asyncio.wait_for` around each message
 receive, budgeted by the remaining deadline) covers **only** the message
@@ -152,6 +159,15 @@ SEATS: dict[str, SeatConfig] = {
         # WO: "the reviewer gets no Write/Edit". NotebookEdit is the same
         # class of tool, so it goes too — a reviewer that cannot mutate.
         disallowed_tools=("Write", "Edit", "NotebookEdit"),
+        # Review round finding 8: the default permission mode asks someone
+        # to approve each Bash call, and a headless session has nobody to
+        # ask — the reviewer could never run the read-only checks its spec
+        # promises. Same D3 reasoning as the implementer: the srt sandbox
+        # is the permission system; read-only-ness comes from the
+        # disallowed edit tools above plus the PreToolUse hooks (protected
+        # paths, push/gh ban) and the sandbox's own write/network
+        # confinement — not from prompts no one can answer.
+        permission_mode="bypassPermissions",
     ),
 }
 

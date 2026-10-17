@@ -110,9 +110,11 @@ for one:
 }
 ```
 
-- Every finding carries its `axis` — exactly `spec` or `standards`. A
-  finding without a valid axis makes the whole verdict invalid, and an
-  invalid verdict is treated as a FAIL.
+- Every finding carries its `axis` — exactly `spec` or `standards` — and a
+  `severity` that is exactly one of `blocking`, `major`, `minor` or
+  `note`. A finding without either, or with any other severity value,
+  makes the whole verdict invalid, and an invalid verdict is treated as a
+  FAIL.
 - A `blocking` finding on **either** axis means FAIL, whatever the other
   axis says.
 - `verdict: "fail"` stands even without a blocking finding — use it when

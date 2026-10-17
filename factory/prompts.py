@@ -62,13 +62,45 @@ def load_prompt(name: str) -> str:
         raise PromptError(f"seat prompt {path} cannot be read: {exc}") from exc
 
 
-def _standards_path(profile: dict, rel: str) -> Path:
-    """Resolve one ``standards`` entry against the project's repo path."""
-    candidate = Path(rel)
-    if candidate.is_absolute():
-        return candidate
+def _repo_root(profile: dict) -> Path:
+    """The project's repo root: ``repo.path`` expanded (real profiles write
+    ``~/Desktop/...``) and resolved, so containment checks compare real
+    filesystem locations, not spellings."""
     repo_path = (profile.get("repo") or {}).get("path") or "."
-    return Path(repo_path) / rel
+    return Path(repo_path).expanduser().resolve()
+
+
+def _standards_path(profile: dict, rel: str) -> Path:
+    """Resolve one ``standards`` entry to a path INSIDE the project repo.
+
+    Standards are repo-relative (TASK-CONTRACT §5). An absolute entry is a
+    contract violation, and an entry that escapes the repo — directly via
+    ``..`` or through a symlink — would let a profile read any file on the
+    machine into a prompt sent to the model provider. Both refuse.
+
+    Args:
+        profile: The loaded ``project.yaml`` mapping.
+        rel: The repo-relative standards path.
+
+    Returns:
+        The resolved path, guaranteed inside the repo root.
+
+    Raises:
+        PromptError: If the entry is absolute or resolves outside the repo.
+    """
+    if Path(rel).is_absolute():
+        raise PromptError(
+            f"standards entry {rel!r} must be repo-relative, not absolute — "
+            "fix project.yaml's 'standards' list"
+        )
+    root = _repo_root(profile)
+    resolved = (root / rel).resolve()
+    if not resolved.is_relative_to(root):
+        raise PromptError(
+            f"standards entry {rel!r} resolves outside the project repo "
+            f"({root}) — fix project.yaml's 'standards' list"
+        )
+    return resolved
 
 
 def assemble_implementer_prompt(profile: dict | None = None) -> str:
@@ -114,9 +146,11 @@ def assemble_reviewer_prompt(profile: dict | None = None) -> str:
         The assembled system prompt text.
 
     Raises:
-        PromptError: If a ``standards`` entry names a file that doesn't
-            exist under the project's repo path. A reviewer silently
-            judging without its standards is worse than a loud refusal.
+        PromptError: If a ``standards`` entry is absolute, resolves outside
+            the project repo, or names a file that doesn't exist or can't
+            be read. A reviewer silently judging without its standards is
+            worse than a loud refusal — and a standards list that can reach
+            arbitrary files would put them in a prompt sent to the model.
     """
     prompt = load_prompt(REVIEWER_FILE)
     standards = (profile or {}).get("standards") or []
@@ -133,10 +167,15 @@ def assemble_reviewer_prompt(profile: dict | None = None) -> str:
         if not path.is_file():
             raise PromptError(
                 f"standards file {rel!r} does not exist under the project repo "
-                f"({_standards_path(profile, '.')}): fix project.yaml's "
-                "'standards' list"
+                f"({_repo_root(profile)}): fix project.yaml's 'standards' list"
             )
-        sections.append(f"### {rel}\n\n{path.read_text().rstrip()}\n")
+        try:
+            text = path.read_text()
+        except OSError as exc:
+            raise PromptError(
+                f"standards file {rel!r} cannot be read: {exc}"
+            ) from exc
+        sections.append(f"### {rel}\n\n{text.rstrip()}\n")
     return prompt + "\n\n## Project standards\n\n" + "\n".join(sections)
 
 

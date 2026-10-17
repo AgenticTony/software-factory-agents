@@ -94,19 +94,28 @@ _NOT_FOUND = (
 )
 
 # How a red run went red (F-09, VALIDATOR-SPEC L1 "red for the wrong
-# reason"): a collection error means the run never reached an assertion, so
-# the red phase proved only that a name was missing — not that behaviour
-# was checked. The reason rides in the report for the L2 reviewer's
-# test-quality pass; the verdict never depends on it. Best-effort text
-# classification over the runner's output: collection errors surface as
-# file-level ``ERROR`` short-summary lines (no ``::test_id``), assertion
-# failures as ``FAILED`` lines naming assert/AssertionError, and anything
-# else red is ``unknown``.
+# reason"). The epistemic class that matters downstream is "red only
+# because a name was missing" — the case the L2 reviewer is told to
+# scrutinise, because the red phase proved name-absence, not behaviour.
+# Two pytest shapes land in it: a module-level import of a missing module
+# (file-level ``ERROR`` short-summary lines, no ``::test_id``) and a
+# missing name hit at RUNTIME inside the test body (NameError,
+# module-has-no-attribute, ModuleNotFoundError, cannot-import-name — the
+# most common red-first shape for a brand-new function). Assertion
+# failures are ``FAILED`` lines naming assert/AssertionError; anything
+# else red is ``unknown``. The reason rides in the report for the L2
+# reviewer's test-quality pass; the verdict never depends on it.
 _RED_COLLECTION = (
     re.compile(r"(?m)^errors during collection"),
     re.compile(r"(?m)^ERROR collecting "),
     re.compile(r"ImportError while importing test module"),
     re.compile(r"(?m)^ERROR \S+$"),
+)
+_RED_NAME_MISSING = (
+    re.compile(r"NameError: name '"),
+    re.compile(r"AttributeError: module '"),
+    re.compile(r"ModuleNotFoundError: No module named"),
+    re.compile(r"ImportError: cannot import name"),
 )
 _RED_ASSERTION = (
     re.compile(r"(?m)^FAILED .*assert"),
@@ -118,6 +127,13 @@ def red_reason(result: CommandResult) -> str | None:
     """Classify how a red run went red: ``assertion``, ``collection`` or
     ``unknown`` — or None when the run wasn't red (green, or timed out
     before producing a verdict).
+
+    ``collection`` covers both name-missing shapes: collection-time import
+    errors and runtime NameError/AttributeError/ModuleNotFoundError/
+    cannot-import-name failures, which prove the same thing — a name was
+    absent — and so deserve the same reviewer scrutiny. Assertion is
+    checked before name-missing so an assert whose *message* quotes a
+    ``NameError:`` still counts as an assertion red.
 
     Args:
         result: The red-phase :class:`~factory.gates.CommandResult` for one
@@ -132,6 +148,8 @@ def red_reason(result: CommandResult) -> str | None:
         return "collection"
     if any(pattern.search(result.output) for pattern in _RED_ASSERTION):
         return "assertion"
+    if any(pattern.search(result.output) for pattern in _RED_NAME_MISSING):
+        return "collection"
     return "unknown"
 
 

@@ -50,7 +50,7 @@ def _sha(text: str) -> str:
 # prompt edit can never ride a green run.
 PROMPT_PINS = {
     IMPLEMENTER_FILE: "15f5a0206c3016334173471786af4a4efbd28b1cd0b3b3981cb29b39dca316d6",
-    REVIEWER_FILE: "4bbd3cf891684e8b6dccbf6cc63c864451284bea01ca07c382eee3acb79d5a0c",
+    REVIEWER_FILE: "829ba5a377e0d6be1e231c38b69b86ed252c0600b4ad69899db5aa366c0c3bb8",
 }
 
 
@@ -388,7 +388,12 @@ def test_fenced_json_is_extracted():
     report = parse_verdict(
         "Verdict follows.\n```json\n"
         + json.dumps(
-            {"verdict": "fail", "findings": [{"id": "F", "axis": "spec", "text": "x"}]}
+            {
+                "verdict": "fail",
+                "findings": [
+                    {"id": "F", "axis": "spec", "severity": "note", "text": "x"}
+                ],
+            }
         )
         + "\n```"
     )
@@ -411,7 +416,12 @@ def test_uppercase_verdict_is_normalised():
 
 def test_declared_fail_stays_fail():
     report = parse_verdict(
-        json.dumps({"verdict": "fail", "findings": [{"axis": "spec", "text": "wrong"}]})
+        json.dumps(
+            {
+                "verdict": "fail",
+                "findings": [{"axis": "spec", "severity": "major", "text": "wrong"}],
+            }
+        )
     )
     assert report.verdict == "fail"
     assert report.parse_error is None
@@ -610,3 +620,237 @@ def test_run_session_forwards_the_system_prompt(tmp_path):
     )
     assert record.status == "completed"
     assert captured["system_prompt"] == "ASSEMBLED"
+
+
+# ------------------------------------------------- owner review round (PR #19) --
+# Eight findings, 7 reproduced locally against bededb4 + 1 confirmed by
+# code-reading; each fixed on this PR with its red test below.
+
+def test_review1_standards_load_when_repo_path_uses_a_tilde(tmp_path, monkeypatch):
+    # Finding 1: every real project.yaml writes repo.path as ~/Desktop/...,
+    # and assembly never expanded the ~ — the first real project with
+    # standards failed every L2 review. The tests passed only because they
+    # used absolute temp paths.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo = tmp_path / "proj"
+    (repo / "docs").mkdir(parents=True)
+    (repo / "docs" / "STANDARDS.md").write_text("# tilde-loaded standards\n")
+    profile = _fixture_profile(tmp_path / "raw" / "f1", standards=("docs/STANDARDS.md",))
+    profile["repo"]["path"] = "~/proj"
+    prompt = assemble_reviewer_prompt(profile)
+    assert "# tilde-loaded standards" in prompt
+
+
+def test_review2_standards_cannot_read_outside_the_repo(tmp_path):
+    # Finding 2: an absolute or ../ standards entry read ANY file and sent
+    # it to the model — a secrets file landed in the reviewer prompt both
+    # ways. Standards are repo-relative paths (TASK-CONTRACT §5); anything
+    # resolving outside the repo (including via a symlink) refuses.
+    repo = tmp_path / "proj"
+    (repo / "docs").mkdir(parents=True)
+    (repo / "docs" / "STANDARDS.md").write_text("# in-repo standards\n")
+    secret = tmp_path / "SECRET.md"
+    secret.write_text("SEKRIT-KEY-12345")
+    outside_dir = tmp_path / "elsewhere"
+    outside_dir.mkdir()
+    (outside_dir / "payload.md").write_text("OUTSIDE-PAYLOAD")
+    (repo / "docs" / "link.md").symlink_to(outside_dir / "payload.md")
+
+    def profile_with(entry: str) -> dict:
+        profile = _fixture_profile(
+            tmp_path / "raw" / "f2", standards=("docs/STANDARDS.md",)
+        )
+        profile["repo"]["path"] = str(repo)
+        profile["standards"] = [entry]
+        return profile
+
+    prompt = assemble_reviewer_prompt(profile_with("docs/STANDARDS.md"))
+    assert "# in-repo standards" in prompt  # the legit entry still loads
+    for entry in (str(secret), "../SECRET.md", "docs/link.md"):
+        with pytest.raises(PromptError):
+            assemble_reviewer_prompt(profile_with(entry))
+
+
+def test_review3_parse_verdict_none_is_a_fail_not_a_crash():
+    # Finding 3: a failed or timed-out reviewer session records
+    # result=None; parse_verdict(None) crashed with AttributeError, taking
+    # the orchestrator down instead of stopping the change.
+    report = parse_verdict(None)  # type: ignore[arg-type]
+    assert report.verdict == "fail"
+    assert report.parse_error
+    assert any(f.id == "invalid_verdict_json" for f in report.findings)
+
+
+@pytest.mark.parametrize("severity", ["blocker", "critical", "high", "urgent"])
+def test_review4_unknown_severities_are_invalid_verdicts(severity):
+    # Finding 4: a declared pass with a "blocker"/"critical"/"high" finding
+    # passed — only the exact word "blocking" blocked. The prompt lists
+    # four allowed values; the parser now enforces them (and requires the
+    # field: the documented output shape always carries it).
+    report = parse_verdict(
+        json.dumps(
+            {
+                "verdict": "pass",
+                "findings": [
+                    {"id": "F1", "axis": "spec", "severity": severity, "text": "x"}
+                ],
+            }
+        )
+    )
+    assert report.verdict == "fail"
+    assert report.parse_error
+
+
+def test_review4_missing_severity_is_invalid_too():
+    report = parse_verdict(
+        json.dumps(
+            {"verdict": "pass", "findings": [{"id": "F1", "axis": "spec", "text": "x"}]}
+        )
+    )
+    assert report.verdict == "fail"
+    assert report.parse_error
+
+
+def test_review4_severity_case_is_normalised():
+    report = parse_verdict(
+        json.dumps(
+            {
+                "verdict": "pass",
+                "findings": [
+                    {"id": "F1", "axis": "spec", "severity": "BLOCKING", "text": "x"}
+                ],
+            }
+        )
+    )
+    assert report.verdict == "fail"  # BLOCKING still blocks
+    assert report.parse_error is None
+
+
+def test_review5_runtime_missing_name_reds_are_collection(tmp_path):
+    # Finding 5: the most common red-first shape — a test that imports or
+    # calls a function that doesn't exist yet — failed at RUNTIME (not at
+    # collection), so red_reason said "unknown". Epistemically it is the
+    # same class as a collection error: red only because a name was
+    # missing, exactly the case the reviewer is told to scrutinise.
+    task = _task_with_ref("tests/test_answer.py::test_answer")
+    repo = _repo(
+        tmp_path,
+        "missing-name",
+        {
+            "tests/test_answer.py": (
+                "def test_answer():\n"
+                "    from impl import answer\n"
+                "    assert answer() == 42\n"
+            )
+        },
+    )
+    _change(repo, files={"impl.py": "def answer():\n    return 42\n"})
+    report = run_l1(L1_PROFILE, repo, "main", "feature", task)
+    assert report.verdict == "pass"
+    assert report.red_reasons["tests/test_answer.py::test_answer"] == "collection"
+
+
+def test_review5_missing_name_classification_matrix():
+    from factory.gates import CommandResult
+    from factory.l1 import red_reason
+
+    shapes = {
+        "NameError": "E   NameError: name 'answer' is not defined\n"
+        "FAILED tests/test_a.py::test_answer - NameError: name 'answer' is "
+        "not defined\n1 failed in 0.02s\n",
+        "AttributeError": "E   AttributeError: module 'impl' has no attribute "
+        "'answer'\nFAILED tests/test_a.py::test_answer - AttributeError: "
+        "module 'impl' has no attribute 'answer'\n1 failed in 0.02s\n",
+        "ModuleNotFoundError": "E   ModuleNotFoundError: No module named "
+        "'helpers'\nFAILED tests/test_a.py::test_answer - "
+        "ModuleNotFoundError: No module named 'helpers'\n1 failed in 0.02s\n",
+        "ImportError": "E   ImportError: cannot import name 'answer' from "
+        "'impl'\nFAILED tests/test_a.py::test_answer - ImportError: cannot "
+        "import name 'answer' from 'impl'\n1 failed in 0.02s\n",
+    }
+    for label, output in shapes.items():
+        result = CommandResult("red:r", "pytest", 1, output)
+        assert red_reason(result) == "collection", label
+
+    # A genuine runtime failure is still unknown, and an assertion failure
+    # quoting a NameError in its message stays an assertion red.
+    genuine = CommandResult(
+        "red:r",
+        "pytest",
+        1,
+        "E   TypeError: boom\nFAILED tests/test_a.py::t - TypeError: boom\n",
+    )
+    assert red_reason(genuine) == "unknown"
+    quoted = CommandResult(
+        "red:r",
+        "pytest",
+        1,
+        "E   AssertionError: assert 'NameError: name ' in out\n"
+        "FAILED tests/test_a.py::t - AssertionError: assert ...\n",
+    )
+    assert red_reason(quoted) == "assertion"
+
+
+def test_review6_the_real_verdict_wins_over_an_earlier_example():
+    # Finding 6: a JSON snippet quoted earlier in the output (an example,
+    # or restating the format) parsed before the real verdict at the end —
+    # a false FAIL. Extraction now prefers the LAST candidate.
+    example = json.dumps(
+        {
+            "verdict": "fail",
+            "findings": [
+                {"id": "EX", "axis": "spec", "severity": "note", "text": "example"}
+            ],
+        }
+    )
+    real = json.dumps({"verdict": "pass", "findings": []})
+
+    report = parse_verdict(
+        f"An example verdict looks like:\n```json\n{example}\n```\n\n"
+        f"The actual review:\n```json\n{real}\n```"
+    )
+    assert report.verdict == "pass"
+    assert report.parse_error is None
+
+    # And symmetrically: an example pass quoted early must not mask a real
+    # fail (nor a raw trailing object an earlier real one).
+    report = parse_verdict(
+        f"```json\n{real}\n```\nthe diff is wrong, so:\n{example}"
+    )
+    assert report.verdict == "fail"
+
+
+def test_review7_duplicate_keys_are_an_invalid_verdict():
+    # Finding 7: json.loads keeps the LAST duplicate key, so
+    # {"verdict":"fail", ..., "verdict":"pass"} silently parsed as pass.
+    report = parse_verdict(
+        '{"verdict": "fail", "findings": [], "verdict": "pass"}'
+    )
+    assert report.verdict == "fail"
+    assert report.parse_error
+    assert any(f.id == "invalid_verdict_json" for f in report.findings)
+
+    dup_in_finding = parse_verdict(
+        '{"verdict": "pass", "findings": [{"axis": "spec", "axis": "spec", '
+        '"severity": "note", "text": "x"}]}'
+    )
+    assert dup_in_finding.verdict == "fail"
+    assert dup_in_finding.parse_error
+
+
+def test_review8_reviewer_seat_runs_headless():
+    # Finding 8 (code-reading): the reviewer kept the default permission
+    # mode, but a headless session has nobody to answer Bash permission
+    # prompts — the seat could never run the checks its spec promises.
+    # Same D3 reasoning as the implementer: the srt sandbox is the
+    # permission system; read-only-ness comes from the disallowed edit
+    # tools + the PreToolUse hooks, not from prompts nobody can answer.
+    from factory.session import SEATS, build_options
+
+    assert SEATS["reviewer"].permission_mode == "bypassPermissions"
+    assert SEATS["reviewer"].disallowed_tools == ("Write", "Edit", "NotebookEdit")
+    options = build_options(
+        "reviewer", REPO, 10, base_url="https://x", token="t"
+    )
+    assert options.permission_mode == "bypassPermissions"
+    assert set(options.disallowed_tools) == {"Write", "Edit", "NotebookEdit"}

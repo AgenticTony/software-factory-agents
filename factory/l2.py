@@ -10,16 +10,25 @@ verdict.
 The rules, enforced here rather than trusted from the model:
 
 * Output that isn't valid verdict JSON is **treated as FAIL** — a reviewer
-  that cannot speak the verdict protocol has not reviewed anything.
-* Every finding carries ``axis`` — exactly ``spec`` or ``standards``. A
-  finding without a valid axis makes the whole output invalid (the AC-1
-  rule): the two axes are the review's structure, so a finding that doesn't
-  know its axis can't be acted on.
+  that cannot speak the verdict protocol has not reviewed anything. That
+  includes a session that produced no text at all (``result=None`` from a
+  failed or timed-out reviewer): the orchestrator must stop the change,
+  not crash on it.
+* Every finding carries ``axis`` — exactly ``spec`` or ``standards`` — and
+  ``severity`` — exactly ``blocking``, ``major``, ``minor`` or ``note``
+  (the four values the seat prompt documents). A finding without either
+  makes the whole output invalid (the AC-1 rule): the two axes are the
+  review's structure, and an unlisted severity is the model inventing a
+  scale the factory doesn't act on.
 * A ``blocking`` finding on **either** axis means FAIL, whatever the other
   axis says and whatever the declared verdict says — neither axis is
   allowed to mask the other.
 * A declared ``fail`` stands even without blocking findings; a declared
   ``pass`` with only non-blocking findings passes.
+* Duplicate JSON keys are invalid: ``json.loads`` silently keeps the last
+  duplicate, so ``{"verdict": "fail", ..., "verdict": "pass"}`` would flip
+  the verdict. A dup anywhere in the object makes that candidate
+  malformed.
 
 Running the reviewer session itself is F-10's wiring; everything here is
 pure parsing and judgement over the text a session produced.
@@ -35,6 +44,7 @@ from typing import Any, ClassVar
 from factory.gates import Finding, GateReport
 
 VALID_AXES = ("spec", "standards")
+VALID_SEVERITIES = ("blocking", "major", "minor", "note")
 
 # A fenced block (with or without the json tag) around the verdict object —
 # models habitually wrap their JSON; the fence is extracted before parsing.
@@ -45,8 +55,9 @@ _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 class L2Finding:
     """One reviewer finding. Same shape as the deterministic layers'
     :class:`~factory.gates.Finding` plus the two L2-only fields: ``axis``
-    (``spec`` | ``standards``) and free-form ``severity`` (only the exact
-    value ``blocking`` carries verdict weight)."""
+    (``spec`` | ``standards``) and ``severity`` (one of the four values
+    the seat prompt documents; only the exact value ``blocking`` carries
+    verdict weight)."""
 
     id: str
     text: str
@@ -82,11 +93,60 @@ class _InvalidVerdict(Exception):
     """Internal: the output is not valid verdict JSON (reason in the str)."""
 
 
-def _extract_json(output: str) -> Any:
+class _DuplicateKey(ValueError):
+    """Internal: a JSON object repeated a key (json.loads would have kept
+    the last one silently)."""
+
+
+def _no_duplicate_keys(pairs: list) -> dict:
+    """``object_pairs_hook`` rejecting repeated keys at any depth."""
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateKey(f"duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+def _balanced_objects(text: str) -> list:
+    """The top-level ``{...}`` spans in ``text``, outermost-first per
+    position, braces inside JSON strings respected. A verdict object with
+    nested finding dicts yields ONE span (the outer object)."""
+    spans = []
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+            if depth == 0:
+                spans.append(text[start : index + 1])
+    return spans
+
+
+def _extract_json(output: Any) -> Any:
     """Find the verdict JSON in the reviewer's output.
 
-    Tries the whole text, then each fenced block, then the outermost brace
-    span — in that order, first parse wins.
+    Candidates, tried in order: the whole text (a pure-JSON reply), then
+    every fenced block and balanced object **from last to first** — a
+    model that quotes an example verdict earlier and states the real one
+    at the end must have the real one win. A candidate with repeated keys
+    is malformed and skipped like any parse failure.
 
     Args:
         output: The reviewer session's result text.
@@ -95,19 +155,30 @@ def _extract_json(output: str) -> Any:
         The parsed JSON value.
 
     Raises:
-        _InvalidVerdict: If no candidate parses as JSON.
+        _InvalidVerdict: If no candidate parses as JSON (the last error is
+            carried as the reason).
     """
     text = output.strip()
-    candidates = [text, *_FENCE.findall(text)]
-    start, end = text.find("{"), text.rfind("}")
-    if start != -1 and end > start:
-        candidates.append(text[start : end + 1])
+    candidates: list[str] = [text]
+    positioned: list[tuple[int, str]] = []
+    for match in _FENCE.finditer(text):
+        positioned.append((match.start(1), match.group(1)))
+    for span in _balanced_objects(text):
+        positioned.append((text.find(span), span))
+    candidates.extend(text for _, text in sorted(positioned, reverse=True))
+
+    last_error: Exception | None = None
     for candidate in candidates:
         try:
-            return json.loads(candidate)
-        except (json.JSONDecodeError, ValueError):
-            continue
-    raise _InvalidVerdict("no JSON object found in the reviewer output")
+            return json.loads(candidate, object_pairs_hook=_no_duplicate_keys)
+        except (json.JSONDecodeError, _DuplicateKey, ValueError) as exc:
+            last_error = exc
+    reason = (
+        f"no valid verdict JSON in the reviewer output ({last_error})"
+        if last_error is not None
+        else "empty reviewer output"
+    )
+    raise _InvalidVerdict(reason)
 
 
 def _invalid(reason: str) -> L2Report:
@@ -150,8 +221,14 @@ def _validated_report(data: Any) -> L2Report:
         if not isinstance(text, str) or not text.strip():
             raise _InvalidVerdict(f"finding {index} carries no text")
         severity = item.get("severity")
-        if severity is not None and not isinstance(severity, str):
-            raise _InvalidVerdict(f"finding {index} has a non-string severity")
+        if (
+            not isinstance(severity, str)
+            or severity.strip().lower() not in VALID_SEVERITIES
+        ):
+            raise _InvalidVerdict(
+                f"finding {index} severity must be one of {VALID_SEVERITIES}, "
+                f"got {severity!r}"
+            )
         line = item.get("line")
         if line is not None and not isinstance(line, int):
             raise _InvalidVerdict(f"finding {index} has a non-integer line")
@@ -165,29 +242,36 @@ def _validated_report(data: Any) -> L2Report:
                 line=line,
             )
         )
-        if (severity or "").strip().lower() == "blocking":
+        if severity.strip().lower() == "blocking":
             blocking = True
 
     verdict = "fail" if declared.strip().lower() == "fail" or blocking else "pass"
     return L2Report(verdict=verdict, findings=findings)
 
 
-def parse_verdict(output: str) -> L2Report:
+def parse_verdict(output: Any) -> L2Report:
     """Parse and enforce the reviewer's verdict output.
 
     Args:
-        output: The reviewer session's result text (raw, possibly with
-            prose or fences around the JSON object).
+        output: The reviewer session's result — a string, or ``None`` /
+            non-text when the session failed, aborted or timed out before
+            producing one.
 
     Returns:
         The :class:`L2Report`. Verdict ``fail`` whenever the output is not
-        valid verdict JSON, the declared verdict is ``fail``, or any
-        finding is ``blocking`` on either axis.
+        text, is not valid verdict JSON, the declared verdict is ``fail``,
+        or any finding is ``blocking`` on either axis.
 
     Raises:
         Nothing — invalid output is a returned FAIL, never an exception:
         a bad reviewer must stop the line, not the orchestrator.
     """
+    if not isinstance(output, str):
+        return _invalid(
+            f"the reviewer produced no verdict text "
+            f"({type(output).__name__}): a failed or aborted session is a "
+            "FAIL, not a crash"
+        )
     try:
         return _validated_report(_extract_json(output))
     except _InvalidVerdict as exc:
