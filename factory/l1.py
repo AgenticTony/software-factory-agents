@@ -33,7 +33,10 @@ Mechanics (the caller — F-10 — passes a clean clone of the slice's branch):
 Between phases the tree is ``git clean``-ed: a stale ``__pycache__``
 written by the red run survives a same-size checkout (Python's mtime+size
 check has one-second granularity) and would make green run base's
-bytecode. The per-ref command comes from ``commands.test_ref`` — a shell
+bytecode. Each red run is also classified (``red_reason``: assertion,
+collection or unknown) for the L2 reviewer's test-quality pass — the
+verdict never depends on the classification.
+The per-ref command comes from ``commands.test_ref`` — a shell
 template whose ``{ref}``/``{path}``/``{name}``/``{python}`` placeholders
 are substituted by literal replacement (shell braces like ``${VAR}`` pass
 through untouched), defaulting to pytest via ``python -m`` so the repo
@@ -56,7 +59,7 @@ import re
 import shlex
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar
 
@@ -90,12 +93,62 @@ _NOT_FOUND = (
     re.compile(r"^no tests ran in \d", re.MULTILINE),
 )
 
+# How a red run went red (F-09, VALIDATOR-SPEC L1 "red for the wrong
+# reason"): a collection error means the run never reached an assertion, so
+# the red phase proved only that a name was missing — not that behaviour
+# was checked. The reason rides in the report for the L2 reviewer's
+# test-quality pass; the verdict never depends on it. Best-effort text
+# classification over the runner's output: collection errors surface as
+# file-level ``ERROR`` short-summary lines (no ``::test_id``), assertion
+# failures as ``FAILED`` lines naming assert/AssertionError, and anything
+# else red is ``unknown``.
+_RED_COLLECTION = (
+    re.compile(r"(?m)^errors during collection"),
+    re.compile(r"(?m)^ERROR collecting "),
+    re.compile(r"ImportError while importing test module"),
+    re.compile(r"(?m)^ERROR \S+$"),
+)
+_RED_ASSERTION = (
+    re.compile(r"(?m)^FAILED .*assert"),
+    re.compile(r"AssertionError"),
+)
+
+
+def red_reason(result: CommandResult) -> str | None:
+    """Classify how a red run went red: ``assertion``, ``collection`` or
+    ``unknown`` — or None when the run wasn't red (green, or timed out
+    before producing a verdict).
+
+    Args:
+        result: The red-phase :class:`~factory.gates.CommandResult` for one
+            contract test ref.
+
+    Returns:
+        The red reason, or None when no red verdict exists to classify.
+    """
+    if result.exit_code is None or result.exit_code == 0:
+        return None
+    if any(pattern.search(result.output) for pattern in _RED_COLLECTION):
+        return "collection"
+    if any(pattern.search(result.output) for pattern in _RED_ASSERTION):
+        return "assertion"
+    return "unknown"
+
 
 @dataclass
 class L1Report(GateReport):
-    """The L1 verdict plus everything F-09/F-10 consume downstream."""
+    """The L1 verdict plus everything F-09/F-10 consume downstream.
+
+    ``red_reasons`` maps each provable contract test ref to how its red run
+    went red — ``assertion``, ``collection`` or ``unknown`` — or None when
+    the ref never produced a red verdict (green on base, or a timeout).
+    The verdict itself never depends on it; the L2 reviewer's test-quality
+    pass reads it (a ref red only by ``collection`` proved just that a name
+    was missing, and deserves the closest scrutiny).
+    """
 
     layer: ClassVar[str] = "L1"
+    red_reasons: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -103,6 +156,7 @@ class L1Report(GateReport):
             "verdict": self.verdict,
             "findings": self.findings_as_dicts(),
             "commands": self.commands_as_dicts(),
+            "red_reasons": dict(self.red_reasons),
         }
 
 
@@ -229,6 +283,7 @@ def run_l1(
     ]
 
     provable: list[str] = []
+    reasons: dict[str, str | None] = {}
     for ref in refs:
         path = ref_path(ref)
         if path is None:
@@ -255,6 +310,7 @@ def run_l1(
         for ref in provable:
             result = run_command(f"red:{ref}", _ref_command(template, ref), repo, timeout_sec)
             results.append(result)
+            reasons[ref] = red_reason(result)
             if result.timed_out:
                 findings.append(
                     Finding("command_timeout", f"red run of {ref} exceeded {timeout_sec}s")
@@ -309,4 +365,5 @@ def run_l1(
         verdict="fail" if findings else "pass",
         findings=findings,
         command_results=results,
+        red_reasons=reasons,
     )

@@ -127,8 +127,11 @@ class _WallClock(Exception):
 
 @dataclass(frozen=True)
 class SeatConfig:
-    """Per-seat options. ``system_prompt`` is the seat prompt; F-09 supplies
-    the real ones, so it is empty until then."""
+    """Per-seat options. ``system_prompt`` stays empty on the seat itself:
+    the real prompts are assembled per run from ``factory.prompts`` (F-09)
+    and passed in — the prompt files live in the repo, which is unreadable
+    inside the sandbox, so the orchestrator reads and assembles them
+    outside and hands over the text."""
 
     name: str
     system_prompt: str | None = None
@@ -546,6 +549,7 @@ def build_options(
     protected: "Sequence[str]" = (),
     cli_path: Path | None = None,
     model: str | None = None,
+    system_prompt: str | None = None,
 ) -> ClaudeAgentOptions:
     """Build the per-seat ClaudeAgentOptions (WO F-06 options list).
 
@@ -553,13 +557,19 @@ def build_options(
     session can't pick up personal config. ``env`` is exactly the three
     session names (see :func:`session_env`). Hooks: protected-path +
     bash-guard PreToolUse callbacks, in-process via HookMatcher.
+    ``system_prompt`` is the assembled seat prompt (F-09's
+    ``factory.prompts``); it overrides the seat's static default, which
+    stays empty because the prompt *files* are unreadable inside the
+    sandbox — the orchestrator assembles them outside and passes the text.
     """
     seat_config = _seat(seat)
     options = ClaudeAgentOptions(
         cwd=str(Path(cwd)),
         env=session_env(base_url, token, timeout_ms),
         max_turns=max_turns,
-        system_prompt=seat_config.system_prompt,
+        system_prompt=system_prompt
+        if system_prompt is not None
+        else seat_config.system_prompt,
         setting_sources=[],
         allowed_tools=list(seat_config.allowed_tools),
         disallowed_tools=list(seat_config.disallowed_tools),
@@ -669,13 +679,15 @@ async def run_session(
     protected: "Sequence[str]" = (),
     cli_path: Path | None = None,
     model: str | None = None,
+    system_prompt: str | None = None,
 ) -> SessionRecord:
     """Run one seat's session and return what it recorded.
 
     Args:
         seat: Seat name (see :data:`SEATS`).
         prompt: The task prompt (the user message). The seat's *system*
-            prompt comes from the seat config (F-09 supplies those).
+            prompt is the assembled seat prompt (F-09) via ``system_prompt``,
+            falling back to the (empty) seat config default.
         cwd: The run dir — the session's working directory.
         max_turns: Turn cap handed to the SDK.
         timeout_min: Wall-clock budget in minutes, enforced around the
@@ -692,6 +704,8 @@ async def run_session(
         cli_path: Explicit Claude Code CLI path (inside the sandbox the
             ambient PATH can't be relied on).
         model: Optional model override.
+        system_prompt: The assembled seat prompt (F-09), overriding the
+            seat's static default.
 
     Returns:
         The record: ``completed`` / ``failed`` (with reason) / ``aborted``
@@ -710,6 +724,7 @@ async def run_session(
         protected=protected,
         cli_path=cli_path,
         model=model,
+        system_prompt=system_prompt,
     )
 
     result_message: ResultMessage | None = None
@@ -838,6 +853,7 @@ def run_session_sandboxed(
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
     protected: "Sequence[str]" = (),
     model: str | None = None,
+    system_prompt: str | None = None,
     token: str | None = None,
     cli_path: Path | None = None,
     srt_bin_path: Path | None = None,
@@ -868,6 +884,9 @@ def run_session_sandboxed(
         max_turns/timeout_min: Handed to the session. The *outer*
             run_sandboxed wall clock is ``timeout_min`` plus
             ``teardown_grace_sec`` so the in-session clock fires first.
+        system_prompt: The assembled seat prompt (F-09) — text, never a
+            path: the repo (prompts included) is unreadable inside the
+            sandbox, so the orchestrator assembles it outside.
         token: The Z.ai token; default :func:`seat_token`. None and no
             credential available → :class:`SessionConfigError` (refuses to
             start a session that cannot authenticate).
@@ -939,6 +958,7 @@ def run_session_sandboxed(
                 "timeout_ms": timeout_ms,
                 "protected": list(protected),
                 "model": model,
+                "system_prompt": system_prompt,
                 "cli_path": str(cli),
             }
         )
@@ -1012,6 +1032,7 @@ def _main(argv: list[str] | None = None) -> int:
                 timeout_ms=spec.get("timeout_ms") or DEFAULT_TIMEOUT_MS,
                 protected=spec.get("protected") or (),
                 model=spec.get("model"),
+                system_prompt=spec.get("system_prompt"),
                 cli_path=Path(spec["cli_path"]) if spec.get("cli_path") else None,
             )
         )

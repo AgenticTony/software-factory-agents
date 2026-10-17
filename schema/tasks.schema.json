@@ -91,6 +91,7 @@
         "priority": { "enum": ["P1", "P2", "P3"] },
         "status": { "$ref": "#/$defs/status" },
         "depends_on": { "type": "array", "items": { "type": "string", "description": "Task id, or repo:id for cross-repo" } },
+        "out_of_scope": { "type": "array", "items": { "type": "string" }, "description": "Things this task must not change or add. Written at approval; gives the L2 spec axis something concrete to check scope creep against. Not part of acceptance_hash." },
         "risk": { "type": "array", "items": { "$ref": "#/$defs/risk_flag" }, "uniqueItems": true },
         "gates": {
           "type": "object",

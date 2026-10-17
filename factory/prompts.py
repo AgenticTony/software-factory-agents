@@ -1,0 +1,158 @@
+"""Seat prompts — BUILD-ORDER F-09.
+
+The factory's two agent seats run project-agnostic prompt *files* assembled
+with per-run project specifics. The files adapt mattpocock/skills @
+``49dd158`` (MIT — vendored under ``prompts/vendor/mattpocock-skills/`` with
+the license and the source SHA); they are pinned by content hash in
+``tests/test_f09.py`` (the JobFinderOS pattern), never loaded as live skills.
+
+Assembly rules (VALIDATOR-SPEC L2):
+
+* The **implementer** gets the project's mechanics (test command, protected
+  paths) and *never* the project's ``standards`` files — standards live with
+  the reviewer, who judges the diff with the least context pressure, not with
+  the implementer, who has the most.
+* The **reviewer** gets the base prompt — axes, smell baseline, mandatory
+  checklist, test-quality checks — plus every ``standards`` file's content,
+  or an explicit "baseline only" statement when the project documents none.
+
+Prompts are read orchestrator-side only: inside the sandbox the repo
+(including ``prompts/``) is unreadable by design (F-06), so the orchestrator
+assembles, hashes and hands the text to the session via its options — never
+a path.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
+IMPLEMENTER_FILE = "implementer.md"
+REVIEWER_FILE = "reviewer.md"
+
+
+class PromptError(Exception):
+    """A seat prompt cannot be assembled: missing file, or a ``standards``
+    entry naming a file that doesn't exist in the project repo."""
+
+
+def prompt_hash(text: str) -> str:
+    """The prompt content hash (sha256 hex) recorded per attempt in
+    ``prompt_versions`` and pinned per file in the tests."""
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def load_prompt(name: str) -> str:
+    """Read a prompt file from ``prompts/``.
+
+    Args:
+        name: File name, e.g. ``IMPLEMENTER_FILE``.
+
+    Returns:
+        The file's text.
+
+    Raises:
+        PromptError: If the file is missing or unreadable.
+    """
+    path = PROMPTS_DIR / name
+    try:
+        return path.read_text()
+    except OSError as exc:
+        raise PromptError(f"seat prompt {path} cannot be read: {exc}") from exc
+
+
+def _standards_path(profile: dict, rel: str) -> Path:
+    """Resolve one ``standards`` entry against the project's repo path."""
+    candidate = Path(rel)
+    if candidate.is_absolute():
+        return candidate
+    repo_path = (profile.get("repo") or {}).get("path") or "."
+    return Path(repo_path) / rel
+
+
+def assemble_implementer_prompt(profile: dict | None = None) -> str:
+    """The implementer's system prompt: the base file plus this project's
+    mechanics. Deliberately excludes the project's ``standards`` files
+    (VALIDATOR-SPEC L2: standards live with the reviewer) — the task
+    specifics reach the implementer through the contract (the user prompt),
+    not the system prompt.
+
+    Args:
+        profile: The loaded ``project.yaml`` mapping (optional in tests).
+
+    Returns:
+        The assembled system prompt text.
+    """
+    prompt = load_prompt(IMPLEMENTER_FILE)
+    profile = profile or {}
+    commands = profile.get("commands") or {}
+    protected = (profile.get("paths") or {}).get("protected") or []
+    lines: list[str] = []
+    if commands.get("test"):
+        lines.append(f"- The project's tests run with: `{commands['test']}`")
+    if commands.get("test_ref"):
+        lines.append(f"- One named test runs with: `{commands['test_ref']}`")
+    if protected:
+        joined = ", ".join(f"`{pattern}`" for pattern in protected)
+        lines.append(f"- Protected paths, never to be modified: {joined}")
+    if lines:
+        prompt += "\n\n## This project\n\n" + "\n".join(lines) + "\n"
+    return prompt
+
+
+def assemble_reviewer_prompt(profile: dict | None = None) -> str:
+    """The reviewer's system prompt: the base file (two axes, smell
+    baseline, mandatory checklist, test-quality checks) plus the content of
+    every project ``standards`` file — or an explicit statement that the
+    project documents none, so the baseline runs alone (VALIDATOR-SPEC L2).
+
+    Args:
+        profile: The loaded ``project.yaml`` mapping (optional in tests).
+
+    Returns:
+        The assembled system prompt text.
+
+    Raises:
+        PromptError: If a ``standards`` entry names a file that doesn't
+            exist under the project's repo path. A reviewer silently
+            judging without its standards is worse than a loud refusal.
+    """
+    prompt = load_prompt(REVIEWER_FILE)
+    standards = (profile or {}).get("standards") or []
+    if not standards:
+        return (
+            prompt
+            + "\n\n## Project standards\n\n"
+            "This project documents no standards files: the smell baseline "
+            "above applies alone, and the report must say so.\n"
+        )
+    sections: list[str] = []
+    for rel in standards:
+        path = _standards_path(profile, rel)
+        if not path.is_file():
+            raise PromptError(
+                f"standards file {rel!r} does not exist under the project repo "
+                f"({_standards_path(profile, '.')}): fix project.yaml's "
+                "'standards' list"
+            )
+        sections.append(f"### {rel}\n\n{path.read_text().rstrip()}\n")
+    return prompt + "\n\n## Project standards\n\n" + "\n".join(sections)
+
+
+def prompt_versions(profile: dict | None = None) -> dict[str, str]:
+    """Seat -> content hash of the assembled prompt, for the attempt record
+    (``prompt_versions``, BUILD-ORDER F-10 AC-6) and credit assignment in
+    F-19. Hashing the *assembled* prompt means a change to the base file or
+    to what assembly injects both show up as a new version.
+
+    Args:
+        profile: The loaded ``project.yaml`` mapping (optional in tests).
+
+    Returns:
+        ``{"implementer": <sha256>, "reviewer": <sha256>}``.
+    """
+    return {
+        "implementer": prompt_hash(assemble_implementer_prompt(profile)),
+        "reviewer": prompt_hash(assemble_reviewer_prompt(profile)),
+    }

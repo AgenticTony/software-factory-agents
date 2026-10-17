@@ -83,6 +83,7 @@
       }
     },
     "docs_allowlist": { "type": "array", "items": { "type": "string" } },
+    "standards": { "type": "array", "items": { "type": "string" }, "description": "Repo-relative paths of the project's coding-standards docs. Read by the L2 reviewer only, never pushed to the implementer (VALIDATOR-SPEC L2)." },
     "network_allowlist": { "type": "array", "items": { "type": "string" }, "description": "Extra domains (package registries) beyond docs_allowlist and the model endpoint" },
     "cross_repo": {
       "type": "array",
