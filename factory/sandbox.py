@@ -56,9 +56,12 @@ _FORBIDDEN_ENV_PREFIXES = ("GH_", "GITHUB_")
 #   exec-capable git config arriving unasked).
 # * SESSION_* — allowed ONLY from the caller's explicit ``env=``: the model
 #   seat (base URL, the one secret the sandbox holds, API timeout) and the
-#   git identity (the sandbox can't read ~/.gitconfig). GIT_CONFIG_* is not
-#   on any list — env-injected git config is exec-capable; `git -c` on the
-#   command line is the controlled route.
+#   git identity (the sandbox can't read ~/.gitconfig).
+#   GIT_CONFIG_* is not on any list — env-injected git config is
+#   exec-capable; `git -c` on the command line is the controlled route.
+#   PYTHONPATH is deliberately NOT on any list either: the session runner
+#   bootstraps its imports with an explicit ``sys.path`` insert instead, so
+#   no path-injection surface exists at all.
 #
 # Adding a name to either list is a deliberate, reviewable act.
 AMBIENT_ENV_ALLOWLIST = frozenset({"PATH", "LANG", "TZ"})
@@ -235,6 +238,23 @@ def sandbox_env(
     return scrub_env(env, forbidden)
 
 
+def default_toolchain(extra: "Sequence[Path] | None" = None) -> list[Path]:
+    """The binaries :func:`build_settings` re-allows for reading by default:
+    this interpreter, the real interpreters behind ``python3``/``python``,
+    and the standard toolchain names found on PATH — plus caller ``extra``
+    entries (the session runner adds the resolved Claude CLI, which is not
+    necessarily on the orchestrator's non-login PATH).
+    """
+    toolchain: list[Path] = [sys.executable, *_python_toolchain()]
+    toolchain += [
+        Path(found) for name in TOOLCHAIN_BINS if (found := shutil.which(name))
+    ]
+    for path in extra or ():
+        if path and Path(path) not in toolchain:
+            toolchain.append(Path(path))
+    return toolchain
+
+
 def build_settings(
     profile: dict,
     run_dir: Path,
@@ -243,6 +263,7 @@ def build_settings(
     forbidden_env: tuple[str, ...] = (),
     factory_root: Path | None = None,
     toolchain: "Sequence[Path] | None" = None,
+    allow_read: "Sequence[Path]" = (),
 ) -> dict:
     """Build the srt settings dict for one run from the project profile.
 
@@ -266,8 +287,15 @@ def build_settings(
             pythons, nvm node. Each gets its resolved install dir, the
             sibling ``lib/`` of a ``bin/`` install dir, and the symlink
             files on the way re-allowed for reading — never ancestor
-            directories (see :func:`_toolchain_allowread`). Default: this
-            Python plus :data:`TOOLCHAIN_BINS` found on PATH.
+            directories (see :func:`_toolchain_allowread`). Default:
+            :func:`default_toolchain` (this Python plus the standard names
+            on PATH).
+        allow_read: Extra paths re-allowed for reading on top of the run dir
+            and the toolchain. The session runner passes exactly the factory
+            package dir here — the in-sandbox entry point
+            (``python -m factory.session``) imports it. Deliberately narrow:
+            the wider repo (prompts, schemas, validator docs) stays
+            unreadable to the session.
 
     Returns:
         A settings dict accepted by ``srt --settings``.
@@ -289,9 +317,7 @@ def build_settings(
     else:
         factory_root = Path(factory_root).resolve()
     if toolchain is None:
-        toolchain = [sys.executable, *_python_toolchain()]
-        toolchain += [Path(found) for name in TOOLCHAIN_BINS
-                      if (found := shutil.which(name))]
+        toolchain = default_toolchain()
     allowed_domains = [
         _endpoint_host(model_endpoint),
         *profile.get("docs_allowlist", []),
@@ -325,7 +351,8 @@ def build_settings(
                 str(runs_root),
             ],
             "allowRead": [str(run_dir), str(srt_package)]
-            + [str(entry) for entry in toolchain_reads],
+            + [str(entry) for entry in toolchain_reads]
+            + [str(Path(entry).resolve()) for entry in allow_read],
             "allowWrite": [str(run_dir)],
             # The run's git control files are not the agent's to edit: a hook
             # or core.hooksPath/fsmonitor redirect planted here executes later,
