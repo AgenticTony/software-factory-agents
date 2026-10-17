@@ -8,6 +8,19 @@ Entries record evidence, not claims. Each criterion is marked proven, pending, o
 
 ---
 
+## F-00 — Phase 0 owner prerequisites
+
+- **Kind:** `owner_only` (no acceptance criteria; six owner steps). Recorded 2026-10-16.
+- **Step 1, Z.ai support email** (unattended Agent SDK runs on the Coding Plan; legacy Max renewal and quota): owner-confirmed, 2026-10-16.
+- **Step 2, legacy term end date** checked on Z.ai's "My plan" page: owner-confirmed, 2026-10-16.
+- **Step 3, JobFinderOS production `GLM_BASE_URL`** not on the Coding Plan endpoint before F-13: owner-confirmed, 2026-10-16.
+- **Step 4, JobFinderOS `main` branch protection:** verified 2026-10-16 by reading `GET repos/AgenticTony/JobFinderOS/branches/main/protection`. PRs are required (0 approvals; solo owner can't approve their own PRs). 7 status checks are required, all pinned to GitHub Actions (`app_id` 15368), with strict up-to-date. `enforce_admins` is on, so the admin token the factory pushes with can't bypass. Force-push and deletion are blocked. The protection was absent before this date (the classic API returned 404, and there were no rulesets); the owner applied it.
+- **Step 5, keychain items `JFO_PROBE_PASS` / `JFO_SUPABASE_ANON_KEY`:** owner-confirmed, 2026-10-16. Not inspected; the factory doesn't read the keychain outside a run.
+- **Step 6, private GitHub repo for the factory:** verified 2026-10-16. `gh repo view AgenticTony/software-factory-agents` reports `PRIVATE`.
+- **Why this entry has no reconcile status:** `factory approve` refuses `owner_only` kinds, and no command yet ticks owner steps in `tasks.json`. A reconcile status marker (the bold line other entries end with) would make every reconcile run fail on F-00, so this section is deliberately prose the parser skips. The gap is that F-00 can't reach `done` through the state machine, and F-13 depends on it. That needs a mechanism (an owner-step tick command, or reconcile support for owner-only entries) before F-13.
+
+---
+
 ## F-01 — Repo scaffold
 
 - **Commits:**
