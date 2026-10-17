@@ -22,9 +22,13 @@ Seats:
 
 * ``implementer`` — writes code. Prompt-bypassed, sandbox-confined, hooks
   enforce protected paths and the push/gh ban.
-* ``reviewer`` — reads, never writes: ``Write``/``Edit``/``NotebookEdit``
-  are disallowed at the options layer on top of the same hooks; headless,
-  so prompt-bypassed like the implementer (a default-mode Bash call would
+* ``reviewer`` — reads, never writes, enforced three ways: the edit tools
+  are disallowed at the options layer; its sandbox is **read-only**
+  (``build_settings(read_only=True)`` — Bash writes land only in the
+  git-excluded ``.home``/``.tmp`` scratch, never the repo); and the
+  orchestrator verifies HEAD and the working tree after every review,
+  restoring and failing the review on any change. Headless, so
+  prompt-bypassed like the implementer (a default-mode Bash call would
   wait forever for an approval nobody can give).
 
 Clock: the wall clock (:func:`asyncio.wait_for` around each message
@@ -71,6 +75,7 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk import query as sdk_query
 
+from factory.runs import GIT_HARDENING
 from factory.sandbox import (
     build_settings,
     default_toolchain,
@@ -128,6 +133,58 @@ class SessionConfigError(Exception):
 
 class _WallClock(Exception):
     """Internal: the session's wall-clock budget ran out."""
+
+
+# --------------------------------------------------- reviewer integrity --
+# The reviewer must never change what it reviews (owner review round 2 on
+# F-09): a reviewer that can write the repo can "fix" the code, watch its
+# own fix pass, and report PASS on a diff that isn't the implementer's —
+# and its commit would ride the branch F-10 pushes. Two layers hold that
+# line: the reviewer's sandbox is read-only (build_settings(read_only=True)
+# — writes confined to the git-excluded .home/.tmp scratch), and this
+# orchestrator-side guard verifies HEAD and the working tree after every
+# reviewer session regardless, restoring them and failing the review if
+# anything moved. The guard is the backstop for any future path that lets
+# a write through (a settings bug, an srt regression); the verdict text of
+# a mutating review is never trusted.
+
+REVIEWER_MUTATION = "reviewer_mutated_workspace"
+
+
+def _git_state(run_dir: Path) -> tuple[str, str]:
+    """(HEAD sha, porcelain status) of the run dir, via hardened git."""
+    def run(*args: str) -> str:
+        proc = subprocess.run(
+            ["git", *GIT_HARDENING, "-C", str(run_dir), *args],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            raise SessionConfigError(
+                f"cannot read the run dir's git state (git {args[0]}): "
+                f"{proc.stderr.strip()[:300]}"
+            )
+        return proc.stdout
+
+    return run("rev-parse", "HEAD").strip(), run("status", "--porcelain")
+
+
+def _restore_workspace(run_dir: Path, head: str) -> None:
+    """Put the run dir back on ``head`` with a clean tracked tree, dropping
+    untracked non-ignored files the mutation left (excluded scratch —
+    .home/.tmp — survives; ``clean`` skips ignored paths without -x)."""
+    subprocess.run(
+        ["git", *GIT_HARDENING, "-C", str(run_dir), "reset", "--hard", head],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    subprocess.run(
+        ["git", *GIT_HARDENING, "-C", str(run_dir), "clean", "-fd"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
 
 
 # ------------------------------------------------------------------ seats --
@@ -912,12 +969,16 @@ def run_session_sandboxed(
 
     Returns:
         The session's record (any status — completed/failed/aborted are
-        all recorded outcomes).
+        all recorded outcomes). For the reviewer seat the record is forced
+        to ``failed`` with reason :data:`REVIEWER_MUTATION` if HEAD or the
+        working tree changed during the session (the workspace is restored
+        first, so nothing the reviewer wrote survives).
 
     Raises:
         SessionConfigError: No token, no bundled CLI, an underivable
-            layout, or an entry that produced no parsable record (an
-            orchestrator-side fault that must be loud).
+            layout, an unreadable run-dir git state (reviewer seat), or an
+            entry that produced no parsable record (an orchestrator-side
+            fault that must be loud).
         subprocess.TimeoutExpired: The outer wall clock expired — the
             runner process itself hung past its teardown grace.
     """
@@ -931,6 +992,16 @@ def run_session_sandboxed(
         )
 
     run_dir = Path(run_dir)
+    # Reviewer integrity (owner review round 2): the reviewer gets a
+    # read-only sandbox and a HEAD/tree guard. The scratch dirs exist
+    # BEFORE the baseline so their (untracked) presence can never look
+    # like a mutation between the two snapshots.
+    review_guard = seat == "reviewer"
+    baseline: tuple[str, str] | None = None
+    if review_guard:
+        for scratch in (run_dir / ".home", run_dir / ".tmp"):
+            scratch.mkdir(parents=True, exist_ok=True)
+        baseline = _git_state(run_dir)
     # The pinned CLI (finding 5): the SDK's bundled binary, or an explicit
     # test override. An auto-discovered ~/.local/bin/claude is never used —
     # it updates itself out from under the pin.
@@ -987,6 +1058,7 @@ def run_session_sandboxed(
         factory_root=factory_root,
         toolchain=default_toolchain(extra=[cli]),
         allow_read=[runner_dir],
+        read_only=review_guard,
     )
     write_settings(settings, settings_path)
 
@@ -1010,12 +1082,23 @@ def run_session_sandboxed(
             f"(exit {proc.returncode}): {proc.stderr.strip()[:2000]}"
         )
     try:
-        return SessionRecord.from_dict(json.loads(lines[-1]))
+        record = SessionRecord.from_dict(json.loads(lines[-1]))
     except (json.JSONDecodeError, TypeError) as exc:
         raise SessionConfigError(
             "the sandboxed session entry produced an unparsable record "
             f"({exc}): {lines[-1][:500]}"
         ) from exc
+
+    # The reviewer-integrity backstop: whatever happened in the session,
+    # HEAD and the working tree must be exactly what they were before. A
+    # mutation fails the review (the verdict text of a reviewer that
+    # changed the code is not evidence) and the workspace is restored, so
+    # nothing the reviewer wrote can ride the branch F-10 pushes.
+    if baseline is not None and _git_state(run_dir) != baseline:
+        _restore_workspace(run_dir, baseline[0])
+        record.status = "failed"
+        record.reason = REVIEWER_MUTATION
+    return record
 
 
 # python -c <bootstrap> <spec.json> — the in-sandbox entry point (see

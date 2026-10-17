@@ -854,3 +854,230 @@ def test_review8_reviewer_seat_runs_headless():
     )
     assert options.permission_mode == "bypassPermissions"
     assert set(options.disallowed_tools) == {"Write", "Edit", "NotebookEdit"}
+
+
+# ---------------------------------------- owner review round 2 (PR #19) --
+# Fixing finding 8 (reviewer bypassPermissions for headless Bash) exposed
+# that the reviewer's Bash could WRITE the repo under review: overwrite
+# source, edit tests, commit. The fix is two-layered — a read-only sandbox
+# for the reviewer seat (writes confined to .home/.tmp) plus an
+# orchestrator-side workspace-integrity check after every review.
+
+def _sandbox_repo(tmp_path: Path) -> tuple[Path, dict]:
+    """A fixture run dir (git repo with tracked source + test) + profile."""
+    repo = tmp_path / "run-repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "fixture@example.com")
+    _git(repo, "config", "user.name", "Fixture")
+    (repo / "src").mkdir()
+    (repo / "src" / "app.py").write_text('def app():\n    return "ok"\n')
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_a.py").write_text("def test_a():\n    assert True\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "base")
+    profile = {
+        "name": "fixture",
+        "repo": {"path": str(repo)},
+        "commands": {},
+        "paths": {"risk": {}, "protected": []},
+        "deploy": {"mechanism": "none", "auto_on_merge": False},
+        "live_checks": {},
+        "docs_allowlist": [],
+        "network_allowlist": [],
+    }
+    return repo, profile
+
+
+def test_review9_reviewer_sandbox_is_read_only(tmp_path):
+    # The owner's repro list, at the sandbox layer: with read_only settings
+    # the reviewer's Bash cannot overwrite source, edit tests, write via
+    # python, or commit — and scratch still works in .home/.tmp.
+    from factory.sandbox import build_settings, run_sandboxed, write_settings
+
+    repo, profile = _sandbox_repo(tmp_path)
+    settings = build_settings(
+        profile,
+        repo,
+        model_endpoint="api.z.ai",
+        toolchain=[],
+        factory_root=tmp_path,
+        read_only=True,
+    )
+    settings_path = tmp_path / "reviewer-settings.json"
+    write_settings(settings, settings_path)
+    assert sorted(settings["filesystem"]["allowWrite"]) == sorted(
+        [str(repo / ".home"), str(repo / ".tmp")]
+    )
+
+    head_before = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    probes = [
+        (["sh", "-c", "echo broken > src/app.py"], repo / "src" / "app.py"),
+        (["sed", "-i", "s/True/False/", "tests/test_a.py"], repo / "tests" / "test_a.py"),
+        (["python3", "-c", "open('src/new.py', 'w').write('x')"], repo / "src" / "new.py"),
+        (["sh", "-c", "git add -A; git commit -qm reviewer-edit"], None),
+    ]
+    for cmd, guarded in probes:
+        proc = run_sandboxed(cmd, repo, settings_path, timeout=60)
+        assert proc.returncode != 0, f"write probe was allowed: {cmd}"
+        if guarded is not None and guarded.name != "new.py":
+            assert "ok" in guarded.read_text() or "True" in guarded.read_text(), (
+                f"{guarded} was modified"
+            )
+    assert not (repo / "src" / "new.py").exists()
+    head_after = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert head_after == head_before, "the reviewer committed inside the run dir"
+
+    scratch = run_sandboxed(
+        ["sh", "-c", "echo note > .tmp/scratch && echo saved > .home/saved"],
+        repo, settings_path, timeout=60,
+    )
+    assert scratch.returncode == 0, "scratch writes in .home/.tmp must still work"
+
+
+def test_review9_implementer_sandbox_still_writes(tmp_path):
+    # The other direction: the implementer's settings keep the run dir
+    # writable — the read-only mode is the reviewer's, not a global change.
+    from factory.sandbox import build_settings, run_sandboxed, write_settings
+
+    repo, profile = _sandbox_repo(tmp_path)
+    settings = build_settings(
+        profile, repo, model_endpoint="api.z.ai", toolchain=[], factory_root=tmp_path
+    )
+    assert str(repo) in settings["filesystem"]["allowWrite"]
+    settings_path = tmp_path / "implementer-settings.json"
+    write_settings(settings, settings_path)
+    proc = run_sandboxed(
+        ["sh", "-c", "echo written > src/app.py"], repo, settings_path, timeout=60
+    )
+    assert proc.returncode == 0
+    assert (repo / "src" / "app.py").read_text().strip() == "written"
+def test_review9_session_builds_read_only_settings_for_the_reviewer(
+    tmp_path, monkeypatch
+):
+    # Wiring: run_session_sandboxed passes read_only=True to build_settings
+    # exactly for the reviewer seat (and not for the implementer).
+    import factory.session as session_module
+
+    repo, profile = _sandbox_repo(tmp_path)
+    calls: list[bool | None] = []
+
+    def fake_build(settings_profile, run_dir, **kwargs):
+        calls.append(kwargs.get("read_only"))
+        return {}
+
+    def fake_run_sandboxed(cmd, run_dir, settings_path, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps({"seat": "x", "status": "completed"}), stderr=""
+        )
+
+    monkeypatch.setattr(session_module, "build_settings", fake_build)
+    monkeypatch.setattr(session_module, "run_sandboxed", fake_run_sandboxed)
+    settings_path = tmp_path / "s.json"
+
+    session_module.run_session_sandboxed(
+        "reviewer", "review it", repo, profile,
+        settings_path=settings_path, max_turns=5, timeout_min=1,
+        token="t", cli_path=Path("/bin/echo"),
+    )
+    session_module.run_session_sandboxed(
+        "implementer", "build it", repo, profile,
+        settings_path=settings_path, max_turns=5, timeout_min=1,
+        token="t", cli_path=Path("/bin/echo"),
+    )
+    assert calls == [True, False]
+
+
+def test_review9_workspace_integrity_checked_after_review(tmp_path, monkeypatch):
+    # The orchestrator-side backstop: even if some future path lets the
+    # reviewer write (a settings bug, an srt regression), HEAD and the
+    # working tree are verified unchanged after every reviewer session — a
+    # mutation fails the review (reason reviewer_mutated_workspace), the
+    # verdict text is not trusted, and the workspace is restored.
+    import factory.session as session_module
+
+    repo, profile = _sandbox_repo(tmp_path)
+    head_before = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+
+    def mutating_run(cmd, run_dir, settings_path, **kwargs):
+        # "The reviewer session": edits a tracked file, commits it, and
+        # drops an untracked file — the owner-reproduced capability.
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-qam", "reviewer fix"],
+            capture_output=True,
+        )
+        (repo / "src" / "smuggled.py").write_text("injected = True\n")
+        return subprocess.CompletedProcess(
+            cmd, 0,
+            stdout=json.dumps(
+                {"seat": "reviewer", "status": "completed",
+                 "result": '{"verdict": "pass", "findings": []}'}
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(session_module, "run_sandboxed", mutating_run)
+    record = session_module.run_session_sandboxed(
+        "reviewer", "review it", repo, profile,
+        settings_path=tmp_path / "s.json", factory_root=tmp_path,
+        max_turns=5, timeout_min=1,
+        token="t", cli_path=Path("/bin/echo"),
+    )
+    assert record.status == "failed"
+    assert record.reason == "reviewer_mutated_workspace"
+
+    head_after = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert head_after == head_before, "the workspace must be restored"
+    porcelain = subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert porcelain == "", f"tree not clean after restore: {porcelain!r}"
+    assert not (repo / "src" / "smuggled.py").exists()
+
+
+def test_review9_clean_review_passes_the_integrity_check(tmp_path, monkeypatch):
+    # The quiet path: a review that only reads returns its record
+    # untouched, and the implementer is never subjected to the check.
+    import factory.session as session_module
+
+    repo, profile = _sandbox_repo(tmp_path)
+    head_before = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+
+    def quiet_run(cmd, run_dir, settings_path, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd, 0,
+            stdout=json.dumps({"seat": "x", "status": "completed", "num_turns": 2}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(session_module, "run_sandboxed", quiet_run)
+    for seat in ("reviewer", "implementer"):
+        record = session_module.run_session_sandboxed(
+            seat, "do it", repo, profile,
+            settings_path=tmp_path / "s.json", factory_root=tmp_path,
+            max_turns=5, timeout_min=1,
+            token="t", cli_path=Path("/bin/echo"),
+        )
+        assert record.status == "completed"
+        assert record.reason is None
+    head_after = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert head_after == head_before

@@ -264,6 +264,7 @@ def build_settings(
     factory_root: Path | None = None,
     toolchain: "Sequence[Path] | None" = None,
     allow_read: "Sequence[Path]" = (),
+    read_only: bool = False,
 ) -> dict:
     """Build the srt settings dict for one run from the project profile.
 
@@ -336,6 +337,12 @@ def build_settings(
     # would die at startup. Re-allow exactly the runtime's own package dir;
     # the factory's source (and everything else in the repo) stays denied.
     srt_package = _REPO_ROOT / "node_modules" / "@anthropic-ai" / "sandbox-runtime"
+    if read_only:
+        # The scratch dirs must exist for the reviewer's tooling (TMPDIR/
+        # HOME land here); sandbox_env also creates them, but settings
+        # built read-only are self-sufficient either way.
+        for scratch in (run_dir / ".home", run_dir / ".tmp"):
+            scratch.mkdir(parents=True, exist_ok=True)
     home = Path("~").expanduser()
     toolchain_reads = sorted(
         _toolchain_allowread(home, toolchain), key=str
@@ -353,7 +360,21 @@ def build_settings(
             "allowRead": [str(run_dir), str(srt_package)]
             + [str(entry) for entry in toolchain_reads]
             + [str(Path(entry).resolve()) for entry in allow_read],
-            "allowWrite": [str(run_dir)],
+            # Read-only mode (the reviewer seat): the run dir itself is NOT
+            # writable — only the .home/.tmp scratch dirs, which are
+            # git-excluded. A reviewer that can write the repo it reviews
+            # can "fix" the code, watch its own fix pass, and report PASS
+            # on a diff that isn't the implementer's; its commit would ride
+            # the branch F-10 pushes. The denyWrite .git entries below stay
+            # for both modes (defence in depth). Cache writes tools make in
+            # the tree (__pycache__, .pytest_cache) fail closed: Python and
+            # pytest degrade to warnings on unwritable caches, so read-only
+            # checks still run.
+            "allowWrite": (
+                [str(run_dir / ".home"), str(run_dir / ".tmp")]
+                if read_only
+                else [str(run_dir)]
+            ),
             # The run's git control files are not the agent's to edit: a hook
             # or core.hooksPath/fsmonitor redirect planted here executes later,
             # OUTSIDE the sandbox, when the orchestrator commits and pushes
