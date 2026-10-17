@@ -1131,3 +1131,58 @@ def test_review12_bash_guard_backslash_and_sh_c_quoting():
         ],
     )
     assert len(denied) == 3, denied
+
+
+# ===========================================================================
+# Owner review round 3 on PR #18 — the word-anywhere guard was too broad.
+# ===========================================================================
+
+
+def test_review13_push_or_gh_mentions_in_ordinary_commands_pass():
+    """Round 3: the git/push word-anywhere check blocked truthful work — a
+    commit message about push notifications, --grep=push, code search, even
+    `echo gh is the cli`. The guard now splits the command into its
+    invocations (after de-quoting, on ;, |, &&, (), redirections) and
+    denies only when an invocation's program actually runs `git push` or
+    `gh` — so these all pass:"""
+    guard = bash_guard_hook()
+    allowed = [
+        ("Bash", {"command": "git commit -m 'fix push notification retry'"}),
+        ("Bash", {"command": "git log --grep=push"}),
+        ("Bash", {"command": "grep -rn push src/"}),
+        ("Bash", {"command": "echo gh is the cli"}),
+        ("Bash", {"command": "rg 'def push' src/ && git commit -m 'add push()'"}),
+        ("Bash", {"command": "git help push"}),
+        ("Bash", {"command": "grep gh README.md"}),
+    ]
+    for tool, tool_input in allowed:
+        assert _decision(guard.hooks[0], tool, tool_input) is None, tool_input
+
+
+def test_review13_real_invocations_still_deny():
+    """The narrower scan keeps every evasion form from rounds 1–2 denied:
+    optioned git push, wrapped gh (quoted, backticked, $()), sh -c with
+    quote-split or backslash-split words, env/command/xargs prefixes."""
+    guard = bash_guard_hook()
+    denied = _deny_paths(
+        guard,
+        [
+            ("Bash", {"command": "git push origin main"}),
+            ("Bash", {"command": "git -C . push origin main"}),
+            ("Bash", {"command": "git --git-dir=.git push"}),
+            ("Bash", {"command": "git -c core.editor=true push --all"}),
+            ("Bash", {"command": "/usr/bin/git push"}),
+            ("Bash", {"command": "gh pr create"}),
+            ("Bash", {"command": "/usr/bin/gh auth login"}),
+            ("Bash", {"command": '"gh" auth login'}),
+            ("Bash", {"command": "echo $(gh auth status)"}),
+            ("Bash", {"command": "V=$(gh pr view 1) && echo $V"}),
+            ("Bash", {"command": "sh -c 'git pu''sh' origin main"}),
+            ("Bash", {"command": "g\\it push"}),
+            ("Bash", {"command": "g\\h pr create"}),
+            ("Bash", {"command": "env git push"}),
+            ("Bash", {"command": "command gh auth login"}),
+            ("Bash", {"command": "bash -c 'gh auth login'"}),
+        ],
+    )
+    assert len(denied) == 16, denied

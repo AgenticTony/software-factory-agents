@@ -258,20 +258,29 @@ def seat_token() -> str | None:
 
 # ----------------------------------------------------------------- hooks --
 
-_BASH_GIT = re.compile(r"\bgit\b")
-_BASH_PUSH = re.compile(r"\bpush\b")
-# The standalone word `gh` as a command, matched on a de-quoted command:
-# preceded by start/space/;&|/(` — the last two catch $(gh …) — and
-# followed by whitespace/end/)&|;. Stripping quotes/backticks first makes
-# "gh", 'gh' and `gh` indistinguishable from a bare gh. `\bgh\b` alone
-# would also hit "gh-gh-gh" (a hyphen is a word boundary), and the WO
-# bans the gh CLI, not the string.
-_BASH_GH = re.compile(r"(?:^|[\s;&|/(`])gh(?:[\s)&|;`]|$)")
 # De-quoting for the guard's checks: strip quotes, backticks AND
 # backslashes before matching, so `"gh"`, `` `gh` ``, `$()` forms and
 # backslash-split words (`g\it pu\sh`, round 2) are all seen as their
 # bare selves. Over-matching is the safe direction for a deny-layer.
 _BASH_QUOTES = str.maketrans("", "", "\"'`\\")
+# Command separators: a new invocation starts after each of these —
+# statement ends, pipes, &&, subshells/command substitutions (() and
+# backticks are already stripped), and redirections (their targets are
+# not programs).
+_BASH_SEPARATORS = re.compile(r"[\n;&|()<>]")
+# Shell programs whose `-c` payload is itself a command to scan.
+_BASH_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash", "fish"})
+# Wrappers that prefix a real command (their own flags / VAR=val tokens
+# are skipped before recursing).
+_BASH_PREFIX_RUNNERS = frozenset(
+    {"env", "command", "exec", "xargs", "nice", "nohup"}
+)
+# git global options that consume the NEXT token as their value when it
+# is not attached with '=' (attached forms are single '-…' tokens).
+_GIT_VALUE_OPTS = frozenset(
+    {"-C", "--git-dir", "--work-tree", "--namespace", "--exec-path",
+     "--super-prefix", "-c"}
+)
 _BASH_GH_CONFIG = ".config/gh"
 # Redirection targets: `> file`, `>> file`, `2>file` (the fd digit and any
 # spacing between the brackets is optional).
@@ -420,16 +429,78 @@ def _bash_write_targets(command: str) -> list[str]:
     return targets
 
 
+def _bash_invocations(dequoted: str) -> list[list[str]]:
+    """The command's invocations as token lists: the de-quoted command
+    split on shell separators (;, |, &, newlines, subshells/command
+    substitutions, redirections), each part whitespace-tokenised. Empty
+    parts (between adjacent separators) drop out."""
+    return [
+        part.split()
+        for part in _BASH_SEPARATORS.split(dequoted)
+        if part.split()
+    ]
+
+
+def _invocation_violation(tokens: list[str]) -> str | None:
+    """What an invocation actually runs: "git push", "gh", or None.
+
+    Denies only when the invocation's *program* is git with `push` as its
+    subcommand (global options like ``-C .``/``-c k=v`` skipped first), or
+    gh itself — so a commit message about push notifications, ``git log
+    --grep=push`` or ``grep -rn push src/`` pass (round 3). Shells'
+    ``-c`` payloads and prefix wrappers (env/command/exec/xargs…) are
+    recursed into, and the de-quoted token stream already merges
+    quote-split and backslash-split words (round 2)."""
+    if not tokens:
+        return None
+    program = Path(tokens[0]).name
+    if program == "git":
+        index = 1
+        while index < len(tokens):
+            token = tokens[index]
+            if token in _GIT_VALUE_OPTS:
+                index += 2  # the option and its separate value
+                continue
+            if token.startswith("-"):
+                index += 1  # a flag; '='-attached values are one token
+                continue
+            return "git push" if token == "push" else None
+        return None
+    if program == "gh":
+        return "gh"
+    if program in _BASH_SHELLS:
+        try:
+            payload = tokens.index("-c", 1) + 1
+        except ValueError:
+            return None
+        return _invocation_violation(tokens[payload:])
+    if program in _BASH_PREFIX_RUNNERS:
+        rest = [
+            token
+            for token in tokens[1:]
+            if not token.startswith("-") and "=" not in token
+        ]
+        return _invocation_violation(rest)
+    return None
+
+
 def bash_guard_hook(protected: "Sequence[str]" = ()) -> HookMatcher:
-    """PreToolUse hook over Bash: deny ``git push`` (any git options
-    between git and push), the ``gh`` CLI (quoted, backticked or in a
-    command substitution), anything touching ``~/.config/gh``, and
-    best-effort writes (redirections, tee/mv/cp/rm/sed -i/curl -o…)
-    into the protected globs. The orchestrator (outside the sandbox, with
-    its own credentials) pushes and opens PRs — the WO's rule that a
-    session never does. The structural barriers underneath: the sandbox
-    has no GitHub token and no network route to github.com; this hook is
-    the in-session policy layer on top, not the boundary."""
+    """PreToolUse hook over Bash: deny invocations that actually run
+    ``git push`` (any git global options first) or the ``gh`` CLI —
+    including quoted, backticked, ``$(…)``, ``sh -c`` and backslash-split
+    spellings, reached by de-quoting and splitting the command into its
+    invocations (round 3's fix: a command that merely *mentions* push or
+    gh — commit messages, ``--grep=push``, code search — passes). Also
+    denies anything touching ``~/.config/gh`` and best-effort writes
+    (redirections, tee/mv/cp/rm/sed -i/curl -o…) into the protected
+    globs. The orchestrator (outside the sandbox, with its own
+    credentials) pushes and opens PRs — the WO's rule that a session
+    never does. Residual (documented, best-effort deny-layer — NOT an
+    evasion-proof boundary): pipes feeding a shell's stdin
+    (``echo git push | sh``), git aliases, and unenumerated wrappers
+    still slip through; the structural barriers underneath are that the
+    sandbox holds no GitHub token and has no network route to
+    github.com."""
 
     patterns = tuple(protected)
 
@@ -441,10 +512,12 @@ def bash_guard_hook(protected: "Sequence[str]" = ()) -> HookMatcher:
         # and quote-concatenated spellings (`g\it push`, `sh -c 'git pu''sh'`)
         # must be seen as their bare selves.
         dequoted = command.translate(_BASH_QUOTES)
-        if _BASH_GIT.search(dequoted) and _BASH_PUSH.search(dequoted):
-            return _deny("git push is not allowed inside a session")
-        if _BASH_GH.search(dequoted):
-            return _deny("the gh CLI is not allowed inside a session")
+        for invocation in _bash_invocations(dequoted):
+            violation = _invocation_violation(invocation)
+            if violation == "git push":
+                return _deny("git push is not allowed inside a session")
+            if violation == "gh":
+                return _deny("the gh CLI is not allowed inside a session")
         if _BASH_GH_CONFIG in dequoted:
             return _deny("~/.config/gh is not accessible inside a session")
         if patterns:
