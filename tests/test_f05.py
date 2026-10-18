@@ -1298,3 +1298,34 @@ def test_python_toolchain_follows_shims_to_the_real_interpreter(tmp_path: Path, 
     found = _python_toolchain()
     assert Path(os.path.realpath(sys.executable)) in found, found
     assert shim not in found, "the shim script itself must not stand in for python"
+
+
+# --- rehearsal blocker (JobFinderOS readiness, 2026-10-18) --------------------
+
+
+def test_rehearsal_ambient_path_drops_home_entries(tmp_path, monkeypatch):
+    """The sandbox denies reads under $HOME, but the ambient PATH starts
+    with home dirs (~/.local/bin, ~/.pyenv/shims, ...). A PATH search that
+    probes a denied dir first fails with EPERM (npm's lifecycle spawn died
+    this way). Inherited PATH entries under home, or literal `~`, are
+    dropped; the rest keep their order."""
+    home = str(Path.home())
+    monkeypatch.setenv(
+        "PATH", f"{home}/.local/bin:~/.npm-global/bin:/usr/local/bin:{home}/bin:/usr/bin:/bin"
+    )
+    env = sandbox_env(tmp_path / "run")
+    assert env["PATH"] == "/usr/local/bin:/usr/bin:/bin"
+
+
+def test_rehearsal_sandboxed_child_sees_no_home_path_entries(tmp_path, monkeypatch):
+    """End to end: the PATH a real sandboxed child sees has no home dir."""
+    home = str(Path.home())
+    monkeypatch.setenv("PATH", f"{home}/.local/bin:{os.environ['PATH']}")
+    run, _, _ = _make_run(tmp_path)
+    proc = run_sandboxed(
+        _child("import os; print('PATH=' + os.environ['PATH'])", []),
+        run.root, run.settings_path, timeout=60,
+    )
+    line = next(ln for ln in proc.stdout.splitlines() if ln.startswith("PATH="))
+    entries = line[len("PATH="):].split(":")
+    assert entries and not [e for e in entries if e.startswith(home) or e.startswith("~")], line

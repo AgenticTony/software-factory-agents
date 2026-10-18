@@ -208,14 +208,31 @@ def _merge_base(repo: Path, base_ref: str, head_ref: str) -> str:
     return out
 
 
-def _clean(repo: Path) -> None:
+def _clean(repo: Path, keep: tuple[str, ...] = ()) -> None:
     """Drop untracked files (bytecode, caches) the phases leave behind.
 
     A red-phase ``__pycache__`` can survive into green when source size
     and mtime second are unchanged, and Python would then import base's
     bytecode. Only safe on the documented clean-clone checkout.
+
+    ``keep`` names the profile's ``paths.setup_outputs`` (an installed
+    venv, ``node_modules``): without them every ref fails with "command
+    not found" in both phases, and a healthy test reads as red-and-not-
+    green. Each is excluded as an anchored path, so only that directory
+    survives; its contents came from setup, not from either phase.
     """
-    git(repo, "clean", "-fdx")
+    excludes = [arg for path in keep for arg in ("-e", "/" + path.strip("/"))]
+    git(repo, "clean", "-fdx", *excludes)
+
+
+def _setup_outputs(profile: dict) -> tuple[str, ...]:
+    """The profile's declared setup outputs, validated as plain repo paths."""
+    outputs = (profile.get("paths") or {}).get("setup_outputs") or []
+    for path in outputs:
+        parts = Path(path).parts
+        if not path or Path(path).is_absolute() or ".." in parts or path.startswith("~"):
+            raise GateError(f"paths.setup_outputs entry {path!r} must be a repo-relative path")
+    return tuple(outputs)
 
 
 def _file_on_ref(repo: Path, ref: str, path: str) -> bool:
@@ -291,6 +308,7 @@ def run_l1(
     repo = Path(repo)
     task = task or {}
     runner = runner or run_command
+    keep = _setup_outputs(profile)
     template = (profile.get("commands") or {}).get("test_ref") or DEFAULT_TEST_REF
 
     refs = contract_test_refs(task)
@@ -298,7 +316,7 @@ def run_l1(
     results: list[CommandResult] = []
 
     git(repo, "checkout", "--force", head_ref)
-    _clean(repo)
+    _clean(repo, keep)
     base = _merge_base(repo, base_ref, head_ref)
     ref_files = contract_test_files(task)
     test_changes = [
@@ -352,7 +370,7 @@ def run_l1(
                 )
 
         git(repo, "checkout", "--force", head_ref)
-        _clean(repo)
+        _clean(repo, keep)
         for ref in provable:
             result = runner(f"green:{ref}", _ref_command(template, ref), repo, timeout_sec)
             results.append(result)
@@ -383,7 +401,7 @@ def run_l1(
         # restore failure never masks the gate's own error.
         with contextlib.suppress(GateError):
             git(repo, "checkout", "--force", head_ref)
-            _clean(repo)
+            _clean(repo, keep)
 
     findings.sort(key=lambda f: (f.id, f.file or "", f.text))
     return L1Report(

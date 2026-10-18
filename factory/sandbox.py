@@ -229,6 +229,8 @@ def sandbox_env(
         for key, value in os.environ.items()
         if key in AMBIENT_ENV_ALLOWLIST or key.startswith(AMBIENT_ENV_PREFIXES)
     }
+    if "PATH" in env:
+        env["PATH"] = _path_outside_home(env["PATH"])
     if extra:
         for key, value in extra.items():
             if key in SESSION_ENV_ALLOWLIST or key.startswith(SESSION_ENV_PREFIXES):
@@ -236,6 +238,31 @@ def sandbox_env(
     env["HOME"] = str(home)
     env["TMPDIR"] = str(tmp)
     return scrub_env(env, forbidden)
+
+
+def _path_outside_home(path: str) -> str:
+    """The inherited PATH minus every entry under the owner's home.
+
+    The sandbox denies reads under ``$HOME``, but an interactive PATH
+    starts with home dirs (``~/.local/bin``, ``~/.pyenv/shims``, ...). A
+    search that probes a denied dir first can fail outright with EPERM
+    instead of moving on: npm's lifecycle-script spawn died this way in
+    the JobFinderOS readiness run (2026-10-18). Entries under home (by
+    either spelling of it) and literal ``~`` entries are dropped; order is
+    kept. A caller's explicit ``env={"PATH": ...}`` is left as given:
+    it's a deliberate choice, e.g. a symlinked toolchain re-allowed by
+    ``build_settings``.
+    """
+    homes = {str(Path.home())}
+    with suppress(OSError):
+        homes.add(str(Path.home().resolve()))
+
+    def under_home(entry: str) -> bool:
+        return entry.startswith("~") or any(
+            entry == home or entry.startswith(home.rstrip("/") + "/") for home in homes
+        )
+
+    return ":".join(entry for entry in path.split(":") if entry and not under_home(entry))
 
 
 def default_toolchain(extra: "Sequence[Path] | None" = None) -> list[Path]:
