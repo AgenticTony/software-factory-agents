@@ -639,6 +639,20 @@ class TaskQueue:
             lease.__exit__(None, None, None)
 
     @contextlib.contextmanager
+    def idle_lease(self):
+        """Hold the run lease for orchestrator housekeeping between runs.
+
+        While held, no session can start (``begin_run`` refuses), so work
+        that must never race a live run — reclaiming orphaned run dirs
+        (F-10) — is safe inside the block.
+
+        Raises:
+            RunInProgressError: If a live run holds the lease.
+        """
+        with self._run_lease(holder="housekeeping"):
+            yield
+
+    @contextlib.contextmanager
     def _run_lease(self, holder: str):
         """Hold the non-blocking exclusive run lease on ``<queue>.run.lock``.
 

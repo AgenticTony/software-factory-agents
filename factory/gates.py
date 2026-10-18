@@ -12,7 +12,9 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import ClassVar
+from typing import Callable, ClassVar
+
+from factory.runs import GIT_HARDENING
 
 # Conventional test-path globs, matched with fnmatch semantics (``*``
 # crosses ``/``). ``conftest.py`` at any depth is test infrastructure:
@@ -176,9 +178,13 @@ def contract_test_files(task: dict) -> set:
 
 
 def git(repo: Path, *args: str) -> str:
-    """Run git in the repo, raising GateError on any failure."""
+    """Run hardened git in the repo, raising GateError on any failure.
+
+    ``GIT_HARDENING`` (no hooks, no fsmonitor) on every call: the gates
+    run on a clone whose history an agent wrote.
+    """
     proc = subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=True
+        ["git", *GIT_HARDENING, "-C", str(repo), *args], capture_output=True, text=True
     )
     if proc.returncode != 0:
         raise GateError(
@@ -198,7 +204,12 @@ def _text(data) -> str:
 
 
 def run_command(name: str, command: str, repo: Path, timeout_sec: int):
-    """Run one shell command in the repo with a wall-clock cap."""
+    """Run one shell command in the repo with a wall-clock cap.
+
+    Unconfined: the orchestrator's own environment. Fixture tests use it;
+    F-10 passes the gates a sandboxed :data:`CommandRunner` instead, because
+    a project's commands execute the agent's code (``conftest.py``).
+    """
     try:
         proc = subprocess.run(
             command,
@@ -213,6 +224,11 @@ def run_command(name: str, command: str, repo: Path, timeout_sec: int):
     except subprocess.TimeoutExpired as exc:
         output = _text(exc.stdout) + _text(exc.stderr)
         return CommandResult(name, command, None, output, timed_out=True)
+
+
+# (name, shell command, repo, timeout_sec) -> CommandResult. The seam L0 and
+# L1 run every project command through; F-10 injects the sandboxed one.
+CommandRunner = Callable[[str, str, Path, int], "CommandResult"]
 
 
 def _name_status_rows(status_out: str, head_ref: str) -> list:

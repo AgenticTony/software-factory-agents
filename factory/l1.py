@@ -65,6 +65,7 @@ from typing import ClassVar
 
 from factory.gates import (
     CommandResult,
+    CommandRunner,
     Finding,
     GateError,
     GateReport,
@@ -76,6 +77,7 @@ from factory.gates import (
     ref_path,
     run_command,
 )
+from factory.runs import GIT_HARDENING
 
 # Runs one named test. {ref} = the whole node id, {path}/{name} = its two
 # halves (jest-style runners take them as separate arguments), {python} =
@@ -219,7 +221,7 @@ def _clean(repo: Path) -> None:
 def _file_on_ref(repo: Path, ref: str, path: str) -> bool:
     """True when ``path`` exists in ``ref``'s tree."""
     proc = subprocess.run(
-        ["git", "-C", str(repo), "cat-file", "-e", f"{ref}:{path}"],
+        ["git", *GIT_HARDENING, "-C", str(repo), "cat-file", "-e", f"{ref}:{path}"],
         capture_output=True,
     )
     return proc.returncode == 0
@@ -257,6 +259,7 @@ def run_l1(
     head_ref: str,
     task: dict | None = None,
     timeout_sec: int = 600,
+    runner: CommandRunner | None = None,
 ) -> L1Report:
     """Run the L1 red-first proof on a checkout of the slice's branch.
 
@@ -275,6 +278,9 @@ def run_l1(
         task: The task record whose ``check.type: test`` acceptance
             items name the tests to prove red-first.
         timeout_sec: Per-run wall-clock cap.
+        runner: Executes each per-ref command. Default: unconfined
+            :func:`~factory.gates.run_command`; F-10 passes the sandboxed
+            runner (the refs execute the agent's test code).
 
     Returns:
         The ``L1Report``; verdict is ``"fail"`` iff any finding exists.
@@ -284,6 +290,7 @@ def run_l1(
     """
     repo = Path(repo)
     task = task or {}
+    runner = runner or run_command
     template = (profile.get("commands") or {}).get("test_ref") or DEFAULT_TEST_REF
 
     refs = contract_test_refs(task)
@@ -326,7 +333,7 @@ def run_l1(
         git(repo, "checkout", "--detach", base)
         _apply_test_changes(repo, head_ref, test_changes, ref_files)
         for ref in provable:
-            result = run_command(f"red:{ref}", _ref_command(template, ref), repo, timeout_sec)
+            result = runner(f"red:{ref}", _ref_command(template, ref), repo, timeout_sec)
             results.append(result)
             reasons[ref] = red_reason(result)
             if result.timed_out:
@@ -347,7 +354,7 @@ def run_l1(
         git(repo, "checkout", "--force", head_ref)
         _clean(repo)
         for ref in provable:
-            result = run_command(f"green:{ref}", _ref_command(template, ref), repo, timeout_sec)
+            result = runner(f"green:{ref}", _ref_command(template, ref), repo, timeout_sec)
             results.append(result)
             if result.timed_out:
                 findings.append(

@@ -76,6 +76,7 @@ from typing import ClassVar
 
 from factory.gates import (
     CommandResult,
+    CommandRunner,
     Finding,
     GateError,
     GateReport,
@@ -482,6 +483,7 @@ def run_l0(
     task: dict | None = None,
     baseline: dict | None = None,
     timeout_sec: int = 600,
+    runner: CommandRunner | None = None,
 ) -> L0Report:
     """Run the full L0 gate on a checkout of the slice's branch.
 
@@ -490,8 +492,9 @@ def run_l0(
     a checkout at any other commit, or with uncommitted or untracked
     files, raises ``GateError`` instead of gating code nobody reviewed.
     Commands are shell strings from
-    ``project.yaml`` and run with the orchestrator's environment — the
-    F-05 sandbox is what confines them in production.
+    ``project.yaml`` and run through ``runner``: unconfined by default
+    (fixture tests); F-10 passes the F-05 sandboxed runner, because the
+    commands execute the agent's code.
 
     Args:
         profile: The loaded ``project.yaml`` mapping.
@@ -502,6 +505,9 @@ def run_l0(
         baseline: Baseline mapping; when ``None``, loaded from the
             profile's ``baselines`` path as committed at ``base_ref``.
         timeout_sec: Per-command wall-clock cap.
+        runner: Executes each profile command. Default: unconfined
+            :func:`~factory.gates.run_command`; F-10 passes the sandboxed
+            runner (the commands execute the agent's code).
 
     Returns:
         The ``L0Report``; verdict is ``"fail"`` iff any finding exists.
@@ -537,7 +543,7 @@ def run_l0(
     for name, command in ordered:
         if not command:
             continue
-        result = _run_command(name, command, repo, timeout_sec)
+        result = (runner or _run_command)(name, command, repo, timeout_sec)
         results.append(result)
         if name == "setup" and (result.timed_out or result.exit_code != 0):
             findings.append(
