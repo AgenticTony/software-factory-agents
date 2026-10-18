@@ -1212,3 +1212,169 @@ def test_review10_implementer_scratch_writable_after_a_review(tmp_path, monkeypa
     assert proc.returncode == 0, proc.stderr
     assert (repo / ".home" / "cc.json").read_text().strip() == "state"
     assert (repo / ".tmp" / "build").read_text().strip() == "t"
+
+
+# --- review round 4 (backstop on every exit path; refs, branch, ignored) ---
+
+
+def _rev(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def _commit_and_break(repo: Path) -> None:
+    """What a mutating reviewer does: edit a tracked file and commit it."""
+    (repo / "src" / "app.py").write_text("BROKEN\n")
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qam", "reviewer tweak"],
+        capture_output=True, check=True,
+    )
+
+
+def _review(session_module, repo, profile, tmp_path):
+    return session_module.run_session_sandboxed(
+        "reviewer", "review it", repo, profile,
+        settings_path=tmp_path / "s.json", factory_root=tmp_path,
+        max_turns=5, timeout_min=1, token="t", cli_path=Path("/bin/echo"),
+    )
+
+
+def test_review11_backstop_restores_when_the_review_times_out(tmp_path, monkeypatch):
+    # The backstop must hold on the exits a misbehaving reviewer is most
+    # likely to take: an outer timeout still propagates, but only after
+    # HEAD and the tree are restored.
+    import factory.session as session_module
+
+    repo, profile = _sandbox_repo(tmp_path)
+    head = _rev(repo, "rev-parse", "HEAD")
+
+    def mutate_then_hang(cmd, run_dir, settings_path, **kwargs):
+        _commit_and_break(repo)
+        raise subprocess.TimeoutExpired(cmd, 1)
+
+    monkeypatch.setattr(session_module, "run_sandboxed", mutate_then_hang)
+    with pytest.raises(subprocess.TimeoutExpired):
+        _review(session_module, repo, profile, tmp_path)
+    assert _rev(repo, "rev-parse", "HEAD") == head
+    assert (repo / "src" / "app.py").read_text() == 'def app():\n    return "ok"\n'
+
+
+def test_review11_backstop_restores_when_the_entry_returns_no_record(
+    tmp_path, monkeypatch
+):
+    import factory.session as session_module
+
+    repo, profile = _sandbox_repo(tmp_path)
+    head = _rev(repo, "rev-parse", "HEAD")
+
+    def mutate_then_crash(cmd, run_dir, settings_path, **kwargs):
+        _commit_and_break(repo)
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="crash")
+
+    monkeypatch.setattr(session_module, "run_sandboxed", mutate_then_crash)
+    with pytest.raises(session_module.SessionConfigError):
+        _review(session_module, repo, profile, tmp_path)
+    assert _rev(repo, "rev-parse", "HEAD") == head
+    assert (repo / "src" / "app.py").read_text() == 'def app():\n    return "ok"\n'
+
+
+def test_review11_scratch_torn_down_when_setup_fails(tmp_path, monkeypatch):
+    # The scratch symlinks are created before settings are built; a setup
+    # failure after them must still leave plain .home/.tmp directories.
+    import factory.session as session_module
+
+    repo, profile = _sandbox_repo(tmp_path)
+
+    def broken_settings(*args, **kwargs):
+        raise session_module.SessionConfigError("settings exploded")
+
+    monkeypatch.setattr(session_module, "build_settings", broken_settings)
+    with pytest.raises(session_module.SessionConfigError):
+        _review(session_module, repo, profile, tmp_path)
+    for name in (".home", ".tmp"):
+        assert (repo / name).is_dir() and not (repo / name).is_symlink(), name
+
+
+def _quiet_record(cmd):
+    return subprocess.CompletedProcess(
+        cmd, 0, stdout=json.dumps({"seat": "reviewer", "status": "completed"}),
+        stderr="",
+    )
+
+
+def test_review11_new_branch_counts_as_mutation(tmp_path, monkeypatch):
+    # HEAD and porcelain alone miss a new ref: a branch or tag the reviewer
+    # creates is a mutation, and the restore removes it.
+    import factory.session as session_module
+
+    repo, profile = _sandbox_repo(tmp_path)
+
+    def make_branch(cmd, run_dir, settings_path, **kwargs):
+        subprocess.run(["git", "-C", str(repo), "branch", "smuggled"], check=True)
+        subprocess.run(["git", "-C", str(repo), "tag", "smuggled-tag"], check=True)
+        return _quiet_record(cmd)
+
+    monkeypatch.setattr(session_module, "run_sandboxed", make_branch)
+    record = _review(session_module, repo, profile, tmp_path)
+    assert (record.status, record.reason) == ("failed", "reviewer_mutated_workspace")
+    assert "smuggled" not in _rev(repo, "branch", "--list", "smuggled")
+    assert _rev(repo, "tag", "--list", "smuggled-tag") == ""
+
+
+def test_review11_branch_switch_counts_as_mutation(tmp_path, monkeypatch):
+    # Same commit, different branch: HEAD's sha is unchanged, but the run
+    # is no longer on the branch the orchestrator pushes.
+    import factory.session as session_module
+
+    repo, profile = _sandbox_repo(tmp_path)
+
+    def switch(cmd, run_dir, settings_path, **kwargs):
+        subprocess.run(["git", "-C", str(repo), "checkout", "-qb", "other"], check=True)
+        return _quiet_record(cmd)
+
+    monkeypatch.setattr(session_module, "run_sandboxed", switch)
+    record = _review(session_module, repo, profile, tmp_path)
+    assert (record.status, record.reason) == ("failed", "reviewer_mutated_workspace")
+    assert _rev(repo, "symbolic-ref", "--short", "HEAD") == "main"
+    assert _rev(repo, "branch", "--list", "other") == ""
+
+
+def test_review11_ignored_artifact_counts_as_mutation(tmp_path, monkeypatch):
+    # A file written into a gitignored dir is invisible to plain porcelain.
+    # It counts as a mutation and is removed, while ignored files that
+    # existed before the review (a warm cache) survive the restore.
+    import factory.session as session_module
+
+    repo, profile = _sandbox_repo(tmp_path)
+    (repo / ".git" / "info" / "exclude").write_text("/build/\n")
+    (repo / "build").mkdir()
+    (repo / "build" / "keep.txt").write_text("warm cache")
+
+    def drop_artifact(cmd, run_dir, settings_path, **kwargs):
+        (repo / "build" / "out.bin").write_text("smuggled")
+        return _quiet_record(cmd)
+
+    monkeypatch.setattr(session_module, "run_sandboxed", drop_artifact)
+    record = _review(session_module, repo, profile, tmp_path)
+    assert (record.status, record.reason) == ("failed", "reviewer_mutated_workspace")
+    assert not (repo / "build" / "out.bin").exists()
+    assert (repo / "build" / "keep.txt").read_text() == "warm cache"
+
+
+def test_review11_quiet_review_with_preexisting_ignored_files_passes(
+    tmp_path, monkeypatch
+):
+    # The guard must not flag the warm cache or scratch as a mutation.
+    import factory.session as session_module
+
+    repo, profile = _sandbox_repo(tmp_path)
+    (repo / ".git" / "info" / "exclude").write_text("/build/\n")
+    (repo / "build").mkdir()
+    (repo / "build" / "keep.txt").write_text("warm cache")
+    monkeypatch.setattr(
+        session_module, "run_sandboxed",
+        lambda cmd, run_dir, settings_path, **kw: _quiet_record(cmd),
+    )
+    record = _review(session_module, repo, profile, tmp_path)
+    assert record.status == "completed"
