@@ -25,7 +25,7 @@ The factory's own build plan, written in the format the factory will consume: on
 | **F-10** | `factory run` / `factory loop` + PR creation | 1 | F-03, F-04, F-06, F-07, F-08, F-09 | deploy | M |
 | **F-11** | `factory status`: daily summary + metrics | 1 | F-03 | — | S |
 | **F-12** | Importer (`factory import`) | 1 | F-06, F-02 | — | M |
-| **F-13** | Onboard JobFinderOS (pilot) | 1 | F-00, F-10, F-11, F-12 | cross_repo | owner |
+| **F-13** | Onboard JobFinderOS (pilot) | 1 | F-00, F-10, F-11, F-12, F-22 | cross_repo | owner |
 | **F-14** | L4 `verify-live` + merged/deployed tracking | 2 | F-10 | deploy | M |
 | **F-15** | L3 holdout runner | 2 | F-10 | — | M |
 | **F-16** | Seeded-bug validator eval | 2 | F-07, F-08, F-09 | — | M |
@@ -34,8 +34,9 @@ The factory's own build plan, written in the format the factory will consume: on
 | **F-19** | Meta loop (delta edits to prompts) | 4 | F-11, F-16 | — | M |
 | **F-20** | Cross-provider reviewer | 4 | F-09 | external_service | S |
 | **F-21** | Per-category auto-merge | 4 | F-16, F-20 | deploy | M |
+| **F-22** | Vetted agent toolkit (skills, plugins, MCP servers) | 1 | F-06, F-09, F-10 | factory_control | M |
 
-Order to build in: **F-00 (in parallel) → F-01 → F-02 → F-03 → F-04 → F-07 → F-08 → F-05 → F-06 → F-09 → F-10 → F-11 → F-12 → F-13.** The deterministic core (F-02–F-04, F-07, F-08) goes first: it's pure Python and testable without any model. The parts that touch Z.ai come after, so F-00's answers are in before anything runs against the plan.
+Order to build in: **F-00 (in parallel) → F-01 → F-02 → F-03 → F-04 → F-07 → F-08 → F-05 → F-06 → F-09 → F-10 → F-11 → F-12 → F-22 → F-13.** The deterministic core (F-02–F-04, F-07, F-08) goes first: it's pure Python and testable without any model. The parts that touch Z.ai come after, so F-00's answers are in before anything runs against the plan.
 
 ---
 
@@ -283,3 +284,19 @@ A per-seat provider config. Risk-flagged tasks get a second L2 review from a dif
 Enable `merge: auto` for a task category only when DESIGN §3's trigger is met: catch rate ≥ 90%, revert rate < 5%, over 30 merges.
 - AC-1 The schema still rejects auto-merge on any risk-flagged task.
 - AC-2 Auto-merge switches off automatically if the category's revert rate crosses the threshold.
+
+### F-22 — Vetted agent toolkit (skills, plugins, MCP servers)
+Agents today get only Claude Code's built-in tools: `setting_sources=[]` (F-06) rightly keeps the owner's personal Claude setup out of the sandbox, because it holds Gmail, production databases, deploy tools and app connectors. But it left agents with no skills at all, while F-10 AC-6 records `skills` and F-19 improves them. This work order adds the missing middle: a factory-owned, version-pinned toolkit, vetted before admission and chosen per project at onboarding.
+
+Candidate sources (discovery only; admission pins the upstream repo): `anthropics/skills` (licence is per skill: some Apache-2.0, the document skills proprietary), `alirezarezvani/claude-skills` (MIT), `Jeffallan/claude-skills` (MIT), `punkpeye/awesome-mcp-servers`, the GitHub MCP Registry, mcpmarket.com.
+
+Acceptance:
+- AC-1 A toolkit index (`toolkit/index.yaml`, schema-validated on every load) lists each admitted item: kind (`skill`, `plugin` or `mcp_server`), name, upstream repo, pinned commit SHA (or package version plus integrity hash), SPDX licence, content hash, and the path of its vetting report. Vendored files live under `toolkit/` next to their upstream LICENSE. A vendored file whose content no longer matches its index hash is refused at load.
+- AC-2 Licence gate: only allowlisted licences (MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC) are admitted. A skill whose licence is missing or proprietary (for example "All rights reserved", as on Anthropic's document skills) is refused, with the reason named.
+- AC-3 `factory toolkit vet <path>` scans every file of a candidate, prompts and scripts alike, and fails on each of these classes: outbound network calls or URLs outside the project's allowlists; shell execution, eval or exec; encoded blobs above a size threshold; reads of credential locations (`~/.ssh`, `~/.aws`, `.env`, the macOS keychain via `security`); environment-variable harvesting; hidden characters (zero-width, bidi overrides, Unicode tag characters); prompt-injection phrasing (instructions to ignore earlier instructions, to hide actions from the user, or to exfiltrate); self-modification or auto-update. A seeded fixture for each class is flagged, and a clean fixture passes.
+- AC-4 Admission is human: an item enters the index only through a PR carrying its vetting report, approved by the owner. A clean scan never admits on its own, and any version bump repeats the full vet. Aggregators (awesome lists, mcpmarket, the GitHub MCP Registry) are discovery sources only: the index always pins the real upstream repo.
+- AC-5 MCP servers are admitted only when read-only (no tool that writes, sends or deploys), with no credentials in their environment, every network domain they need inside the project's allowlists, and a pinned version with an integrity hash. They run inside the session's sandbox, and their tools are enabled one by one through `allowed_tools`. A descriptor that needs a credential or exposes a write tool is refused.
+- AC-6 Each project chooses its toolkit in `project.yaml` (`toolkit: {skills, plugins, mcp_servers}`, optionally narrowed per seat, so the reviewer can get a read-only subset). Every name must be an index entry, and an unknown or unvetted name refuses the profile at load, as F-02 does for invalid state.
+- AC-7 A session gets exactly its project's toolkit and nothing from the owner's personal Claude setup. The test plants a skill and an MCP server in a fake personal config and asserts neither is visible, while every listed item is. The toolkit is loaded from a read-only staged copy outside the clone (the F-06 runner-staging pattern).
+- AC-8 Every attempt's `skills` records what actually loaded, as `<name>@<content-hash>` (replacing the hardcoded empty list), so F-19 can attribute failures to toolkit versions.
+- AC-9 The first JobFinderOS toolkit goes through the whole process end to end: at least one skill and one read-only documentation MCP server, vetted, admitted by owner-approved PR, with reports committed. A JobFinderOS session test shows both available.
