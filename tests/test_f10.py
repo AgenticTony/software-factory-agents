@@ -571,13 +571,14 @@ def test_ac_7(tmp_path: Path, monkeypatch):
     )
     env2 = Env(tmp_path / "second")
     result2 = env2.run(Seats())
-    assert result2.outcome == "error"  # recorded, bounded by the budget
-    assert result2.escalation == "orchestrator_error"
+    # A refused body can't pass on retry: escalate at once (review round 2).
+    assert result2.outcome == "needs_human"
+    assert result2.escalation == "publish_refused"
     assert env2.prs == []
     assert env2.remote_branches() == {"refs/heads/main"}
     task2 = env2.task()
-    assert task2["status"] == "ready"  # re-queued, with the attempt spent
-    assert task2["attempts"][-1]["escalation"] == "orchestrator_error"
+    assert task2["status"] == "needs_human"
+    assert task2["attempts"][-1]["escalation"] == "publish_refused"
     assert env2.runs_left() == []
 
 
@@ -1188,9 +1189,11 @@ def test_review2_orchestrator_error_records_attempts_and_bounds_the_loop(
         raise RuntimeError("sandbox exploded")
 
     monkeypatch.setattr(orch, "run_l1", boom)
-    result = env.loop(Seats())
+    # Review round 2: each loop stops at the first error, so a persistent
+    # crash is bounded across invocations by the attempt budget (3 here).
+    stops = [env.loop(Seats()).stop_reason for _ in range(4)]
 
-    assert result.stop_reason == "escalation"
+    assert stops == ["error", "error", "error", "escalation"]
     task = env.task()
     assert task["status"] == "needs_human"
     attempts = task["attempts"]
@@ -1273,3 +1276,121 @@ def test_review4_reviewer_not_started_when_the_budget_is_spent(tmp_path, monkeyp
     assert seats.prompts("reviewer") == []  # no session past the budget
     attempts = env.task()["attempts"]
     assert attempts[-1]["escalation"] == "budget_exhausted"
+
+
+# --- review round 2 (PR #22) ------------------------------------------------
+
+
+def test_review5_bookkeeping_failure_after_pr_never_opens_a_second_pr(
+    tmp_path, monkeypatch
+):
+    """Once a PR is open, a failure recording it must not re-queue the task.
+
+    The pass attempt (with the PR URL) is saved before the in_review
+    transition; if that transition fails, the next run must finish the
+    bookkeeping instead of running both seats again and opening a second
+    PR for the same task.
+    """
+    from factory.state import StateError, TaskQueue
+
+    env = Env(tmp_path)
+    real_transition = TaskQueue.transition
+    fail_once = {"left": 1}
+
+    def flaky(self, task_id, new_status):
+        if new_status == "in_review" and fail_once["left"]:
+            fail_once["left"] -= 1
+            raise StateError("disk full")
+        return real_transition(self, task_id, new_status)
+
+    monkeypatch.setattr(TaskQueue, "transition", flaky)
+    seats = Seats()
+    with pytest.raises(StateError):
+        env.run(seats)
+    first_url = env.prs and "https://github.com/fixture/fixture/pull/1"
+    assert len(env.prs) == 1
+
+    result = env.run(seats)
+
+    assert len(env.prs) == 1, "a second PR was opened for the same task"
+    assert len(seats.calls) == 2, "the seats ran again after the PR was open"
+    assert result.outcome == "pr_opened"
+    assert result.pr == first_url
+    task = env.task()
+    assert task["status"] == "in_review"
+    assert task["links"]["pr"] == first_url
+
+
+def test_review6_push_fence_refusal_escalates_immediately(tmp_path, monkeypatch):
+    """A fence refusal is deterministic: retrying can't make it pass, so it
+    escalates on the first occurrence instead of spending the budget."""
+    from factory import orchestrator as orch
+    from factory.publish import PushRefused
+
+    env = Env(tmp_path)
+
+    def refuse(*args, **kwargs):
+        raise PushRefused("refusing to push: fence")
+
+    monkeypatch.setattr(orch, "push_branch", refuse)
+    seats = Seats()
+    result = env.run(seats)
+
+    assert result.outcome == "needs_human"
+    assert result.escalation == "publish_refused"
+    task = env.task()
+    assert task["status"] == "needs_human"
+    assert [a["escalation"] for a in task["attempts"]] == ["publish_refused"]
+    assert "fence" in task["attempts"][0]["note"]
+    assert len(seats.calls) == 2
+
+
+def test_review6_pr_body_refusal_escalates_immediately(tmp_path, monkeypatch):
+    from factory import orchestrator as orch
+    from factory.prbody import PRBodyError
+
+    env = Env(tmp_path)
+
+    def refuse(body):
+        raise PRBodyError("missing section: Evidence")
+
+    monkeypatch.setattr(orch, "check_pr_body", refuse)
+    result = env.run(Seats())
+
+    assert (result.outcome, result.escalation) == ("needs_human", "publish_refused")
+    assert env.task()["status"] == "needs_human"
+    assert not env.prs
+
+
+def test_review6_loop_stops_on_an_orchestrator_error(tmp_path, monkeypatch):
+    """A broken orchestrator must not drain the budget unattended: loop
+    stops on the first error, with the attempt recorded."""
+    from factory import orchestrator as orch
+
+    env = Env(tmp_path)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("sandbox exploded")
+
+    monkeypatch.setattr(orch, "run_l1", boom)
+    seats = Seats()
+    result = env.loop(seats)
+
+    assert result.stop_reason == "error"
+    assert len(result.results) == 1
+    assert len(seats.calls) == 1  # implementer only; L1 crashed before review
+    task = env.task()
+    assert task["status"] == "ready"
+    assert [a["escalation"] for a in task["attempts"]] == ["orchestrator_error"]
+
+
+def test_review7_task_contract_lists_every_escalation_reason():
+    """Mechanical sweep: every escalation the schema allows is documented
+    in TASK-CONTRACT.md's escalation-reasons line."""
+    repo = Path(__file__).resolve().parent.parent
+    schema = json.loads((repo / "schema" / "tasks.schema.json").read_text())
+    reasons = schema["$defs"]["escalation"]["enum"]
+    doc = (repo / "TASK-CONTRACT.md").read_text()
+    line = next(ln for ln in doc.splitlines() if ln.startswith("Escalation reasons"))
+    missing = [r for r in reasons if f"`{r}`" not in line]
+    assert not missing, f"TASK-CONTRACT.md doesn't list: {missing}"

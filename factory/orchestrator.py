@@ -62,14 +62,14 @@ from factory.gates import git as hardened_git
 from factory.l0 import run_l0
 from factory.l1 import run_l1
 from factory.l2 import parse_verdict
-from factory.prbody import build_pr_body, check_pr_body
+from factory.prbody import PRBodyError, build_pr_body, check_pr_body
 from factory.progress import ProgressLog
 from factory.prompts import (
     assemble_implementer_prompt,
     assemble_reviewer_prompt,
     prompt_versions,
 )
-from factory.publish import PullRequest, gh_pr_create, push_branch
+from factory.publish import PullRequest, PushRefused, gh_pr_create, push_branch
 from factory.runs import (
     FACTORY_ROOT_DEFAULT,
     GIT_HARDENING,
@@ -471,15 +471,51 @@ def run_once(
     )
     with queue.begin_run(task_id):
         try:
+            recovered = _finish_unrecorded_publish(queue, task_id, pick.slice)
+            if recovered is not None:
+                return recovered
             return _run_task(ctx, pick.slice)
         except BaseException:
-            # No outcome was recorded for this run: re-queue it (the aborted-
-            # run edge) so the queue isn't wedged until the next reclaim.
+            # The run didn't reach a recorded end state: re-queue it (the
+            # aborted-run edge) so the queue isn't wedged until the next
+            # reclaim. If a PR was already opened, its pass attempt is on
+            # disk and the next run's _finish_unrecorded_publish completes
+            # the bookkeeping instead of opening a second PR.
             with contextlib.suppress(Exception):
                 fresh = TaskQueue(queue_path)
                 if fresh.get(task_id).get("status") == "in_progress":
                     fresh.transition(task_id, "ready")
             raise
+
+
+def _finish_unrecorded_publish(
+    queue: TaskQueue, task_id: str, slice_: dict | None
+) -> RunResult | None:
+    """Complete a publish whose PR opened but whose bookkeeping didn't land.
+
+    The pass attempt, carrying the PR URL, is saved before the task's links
+    and its ``in_review`` transition. If that second save failed, the task
+    was re-queued with a PR already open. Its signature on disk: the slice's
+    latest attempt is a ``pass`` with a ``pr`` that ``links.pr`` doesn't
+    match. (A fix round after a rejected PR has ``links.pr`` equal to the
+    attempt's, so it isn't caught here.)
+
+    Returns:
+        A ``pr_opened`` result after moving the task to ``in_review``, or
+        None when there is nothing to recover.
+    """
+    task = queue.get(task_id)
+    slice_id = slice_["id"] if slice_ else task_id
+    ours = [a for a in task.get("attempts") or [] if a.get("slice_id") == slice_id]
+    if not ours:
+        return None
+    last = ours[-1]
+    url = last.get("pr")
+    if last.get("outcome") != "pass" or not url or (task.get("links") or {}).get("pr") == url:
+        return None
+    task["links"] = {**(task.get("links") or {}), "pr": url}
+    queue.transition(task_id, "in_review")
+    return RunResult("pr_opened", task_id, pr=url)
 
 
 def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
@@ -761,12 +797,24 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                 # review finding 2). Once the branch is public the failure is
                 # the owner's to resolve: needs_human with the branch kept.
                 if opened:
-                    raise  # the PR is open; post-success bookkeeping isn't ours to bound
+                    # The PR is open and its pass attempt is saved; run_once
+                    # re-queues and the next run finishes the bookkeeping
+                    # (_finish_unrecorded_publish) without a second PR.
+                    raise
+                deterministic = not pushed and isinstance(exc, (PushRefused, PRBodyError))
                 path = None
                 with contextlib.suppress(Exception):
                     path = _store(reports_dir, work.run_id, attempt_no, reports)
                 note = f"{type(exc).__name__}: {exc}"[:500]
-                escalation = "pr_create_failed" if pushed else "orchestrator_error"
+                # A fence or PR-body refusal can't pass on retry (like L0's
+                # protected-path class): escalate at once instead of
+                # spending the budget re-running both seats.
+                if pushed:
+                    escalation = "pr_create_failed"
+                elif deterministic:
+                    escalation = "publish_refused"
+                else:
+                    escalation = "orchestrator_error"
                 attempt = attempt_record(attempt_no, started, "escalated", records, path,
                                          escalation=escalation, note=note)
                 findings = _numbered_findings(reports, [f"[{escalation}] {note}"])
@@ -780,6 +828,10 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                     queue.transition(task_id, "needs_human")
                     return RunResult("needs_human", task_id,
                                      escalation="pr_create_failed", reports=reports)
+                if deterministic:
+                    queue.transition(task_id, "needs_human")
+                    return RunResult("needs_human", task_id,
+                                     escalation="publish_refused", reports=reports)
                 queue.transition(task_id, "ready")
                 return RunResult("error", task_id,
                                  escalation="orchestrator_error", reports=reports)
@@ -805,7 +857,10 @@ def run_loop(queue_path: Path | str, profile_path: Path | str | None = None,
     """
     results: list[RunResult] = []
     stops = {"idle": "queue_empty", "quota_exhausted": "quota_exhausted",
-             "peak_window": "peak_window", "needs_human": "escalation"}
+             "peak_window": "peak_window", "needs_human": "escalation",
+             # A broken orchestrator stops the loop: it must not drain the
+             # attempt budget unattended (each error round spends a session).
+             "error": "error"}
     while True:
         result = run_once(queue_path, profile_path, **kwargs)
         results.append(result)
