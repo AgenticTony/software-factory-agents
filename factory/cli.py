@@ -31,7 +31,7 @@ from factory.state import TaskQueue
 # 1 = an escalation needs you; 3 = the quota stop; 2 = the orchestrator
 # itself failed (the task was re-queued, every run dir removed).
 _EXIT = {"pr_opened": 0, "idle": 0, "peak_window": 0, "queue_empty": 0,
-         "needs_human": 1, "escalation": 1, "quota_exhausted": 3}
+         "needs_human": 1, "escalation": 1, "quota_exhausted": 3, "error": 2}
 _RUN_ERRORS = (ConfigError, ContractError, GateError, PRBodyError, ProgressLogError,
                PublishError, PushRefused, RunError, SandboxError, SessionConfigError)
 

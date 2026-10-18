@@ -570,11 +570,14 @@ def test_ac_7(tmp_path: Path, monkeypatch):
         lambda *a, **k: real(*a, **k).replace("## Evidence\n", "## Evidenc\n"),
     )
     env2 = Env(tmp_path / "second")
-    with pytest.raises(PRBodyError):
-        env2.run(Seats())
+    result2 = env2.run(Seats())
+    assert result2.outcome == "error"  # recorded, bounded by the budget
+    assert result2.escalation == "orchestrator_error"
     assert env2.prs == []
     assert env2.remote_branches() == {"refs/heads/main"}
-    assert env2.task()["status"] == "ready"  # the aborted run re-queues
+    task2 = env2.task()
+    assert task2["status"] == "ready"  # re-queued, with the attempt spent
+    assert task2["attempts"][-1]["escalation"] == "orchestrator_error"
     assert env2.runs_left() == []
 
 
@@ -787,7 +790,10 @@ def test_ac_12(tmp_path: Path):
         return SessionRecord(seat="implementer", status="failed", reason="api_error_429")
 
     def crash(prompt, run_dir, kwargs):
-        raise RuntimeError("orchestrator-side bug")
+        # BaseException: an ordinary Exception is now caught, recorded as an
+        # orchestrator_error attempt and returned (review finding 2) — the
+        # exception-path cleanup proof uses the class that still escapes.
+        raise KeyboardInterrupt("orchestrator-side bug")
 
     for name, seats, expected in (
         ("pr", Seats(), "pr_opened"),
@@ -800,7 +806,7 @@ def test_ac_12(tmp_path: Path):
         assert env.sandbox_left() == [], name
 
     env = Env(tmp_path / "crash")
-    with pytest.raises(RuntimeError, match="orchestrator-side bug"):
+    with pytest.raises(KeyboardInterrupt, match="orchestrator-side bug"):
         env.run(Seats(implementer=crash))
     assert env.runs_left() == [] and env.sandbox_left() == []
     assert env.task()["status"] == "ready"
@@ -889,16 +895,17 @@ def test_ac_13(tmp_path: Path, monkeypatch):
     ]
     for branch, created in refusals:
         with pytest.raises(PushRefused):
-            push_branch(work.root, str(env.remote), branch, created=created,
-                        default_branch="main")
+            push_branch(work.root, str(env.remote), branch, sha="0" * 40,
+                        created=created, default_branch="main")
     assert spawned == [], "a refused push must not start any git process"
 
     main_before = _git(env.remote, "rev-parse", "refs/heads/main")
-    push_branch(work.root, str(env.remote), "factory/t-1-x", created={"factory/t-1-x"},
-                default_branch="main")
+    head = _git(work.root, "rev-parse", "HEAD")
+    push_branch(work.root, str(env.remote), "factory/t-1-x", sha=head,
+                created={"factory/t-1-x"}, default_branch="main")
     (push,) = [argv for argv in spawned if "push" in argv]
     assert list(push[1:5]) == list(GIT_HARDENING)
-    assert push[-1] == "refs/heads/factory/t-1-x:refs/heads/factory/t-1-x"
+    assert push[-1] == f"{head}:refs/heads/factory/t-1-x"  # the object, not the branch
     assert not any(a.startswith("+") or a in ("--force", "-f", "--mirror", "--all",
                                                "--tags", "--follow-tags") for a in push)
     assert env.remote_branches() == {"refs/heads/main", "refs/heads/factory/t-1-x"}
@@ -915,7 +922,11 @@ def test_ac_13(tmp_path: Path, monkeypatch):
     assert unhardened == []
     pushes = [argv for argv in gits if "push" in argv]
     assert len(pushes) == 1
-    assert pushes[0][-1] == f"refs/heads/{env2.prs[0].head}:refs/heads/{env2.prs[0].head}"
+    refspec = pushes[0][-1]
+    src, dst = refspec.split(":", 1)
+    assert dst == f"refs/heads/{env2.prs[0].head}"
+    assert re.fullmatch(r"[0-9a-f]{40}", src)  # the object, not the branch
+    assert _git(env2.remote, "rev-parse", dst) == src  # remote holds exactly it
     assert env2.prs[0].head != "main"
 
 
@@ -1060,3 +1071,205 @@ def test_nothing_to_run_is_idle(tmp_path: Path):
     result = env.run(Seats())
     assert result.outcome == "idle"
     assert env.runs_left() == []
+
+
+# --- F-10 owner review round (PR #22; 5 findings; red before each fix) ------
+
+
+def test_review1_push_publishes_the_validated_sha_not_the_branch(tmp_path, monkeypatch):
+    """Finding 1: the branch can move between validation and push.
+
+    A surviving implementer process (F-06 documents setsid escapees)
+    commits to the work clone after L0/L1/L2 validated head_sha. What the
+    remote receives must be the validated commit, not whatever the branch
+    points at now.
+    """
+    from factory import orchestrator as orch
+
+    env = Env(tmp_path)
+    real_push = orch.push_branch
+
+    def sneaky_push(repo, remote_url, branch, **kwargs):
+        repo = Path(repo)
+        (repo / "impl.py").write_text("def answer():\n    return 'UNVALIDATED'\n")
+        _git(repo, "add", "-A")
+        _git(repo, "-c", "user.name=sneaky", "-c", "user.email=s@x",
+             "commit", "-q", "-m", "escapee moves the branch")
+        # committing on the current branch already moves it — no -f needed
+        return real_push(repo, remote_url, branch, **kwargs)
+
+    monkeypatch.setattr(orch, "push_branch", sneaky_push)
+    env.run(Seats())
+
+    branch = env.task()["links"]["branch"]
+    assert f"refs/heads/{branch}" in env.remote_branches()
+    published = _git(env.remote, "show", f"refs/heads/{branch}:impl.py")
+    assert "return 42" in published, "the remote holds the validated change"
+    assert "UNVALIDATED" not in published, "the remote holds the escapee's rewrite"
+
+
+def test_review1_push_confirms_the_remote_ref_or_refuses(tmp_path, monkeypatch):
+    """Finding 1 (transport half): after the push, ls-remote must agree.
+
+    If the remote ref does not read back as the validated sha, publishing
+    is a PublishError — never a PR about an unconfirmed commit.
+    """
+    from factory import publish as pub
+    from factory.publish import PublishError
+
+    env = Env(tmp_path)
+    work = create_run("fixture", env.repo, factory_root=env.root, ref="main")
+    try:
+        _git(work.root, "checkout", "-q", "-b", "factory/t-1-x")
+        _git(work.root, "-c", "user.name=t", "-c", "user.email=t@x",
+             "commit", "--allow-empty", "-q", "-m", "x")
+        sha = _git(work.root, "rev-parse", "HEAD")
+        real_run = subprocess.run
+
+        def lying_ls_remote(argv, **kwargs):
+            if "ls-remote" in argv:
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout=f"{'0' * 40}\trefs/heads/factory/t-1-x\n", stderr=""
+                )
+            return real_run(argv, **kwargs)
+
+        monkeypatch.setattr(pub.subprocess, "run", lying_ls_remote)
+        with pytest.raises(PublishError):
+            push_branch(work.root, str(env.remote), "factory/t-1-x", sha=sha,
+                        created={"factory/t-1-x"}, default_branch="main")
+    finally:
+        from factory.runs import cleanup_run
+        cleanup_run(work)
+
+
+def test_review2_pr_failure_after_push_escalates_instead_of_requeueing(tmp_path):
+    """Finding 2 (pushed half): gh failing after the push must not loop.
+
+    The branch is already public; re-queueing to `ready` with no attempt
+    spends two more sessions per loop invocation forever and orphans
+    branches. It is `needs_human` with the attempt and branch recorded.
+    """
+    from factory.publish import PublishError
+
+    env = Env(tmp_path)
+
+    def failing_open_pr(pr):
+        raise PublishError("gh pr create failed: HTTP 422")
+
+    result = run_once(env.queue_path, factory_root=env.root, session_runner=Seats(),
+                      open_pr=failing_open_pr, now=lambda: OFF_PEAK)
+
+    assert result.outcome == "needs_human"
+    assert result.escalation == "pr_create_failed"
+    task = env.task()
+    assert task["status"] == "needs_human"
+    attempts = task["attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["outcome"] == "escalated"
+    assert attempts[0]["escalation"] == "pr_create_failed"
+    assert "HTTP 422" in attempts[0]["note"]
+    assert f"refs/heads/{task['links']['branch']}" in env.remote_branches()  # kept, named
+
+
+def test_review2_orchestrator_error_records_attempts_and_bounds_the_loop(
+    tmp_path, monkeypatch
+):
+    """Finding 2 (general half): a mid-round error must spend the budget.
+
+    A persistent L1 crash used to propagate with no attempt recorded, so
+    every loop invocation re-ran both seats forever. With the attempt
+    recorded, the loop is bounded by attempts_exhausted.
+    """
+    from factory import orchestrator as orch
+
+    env = Env(tmp_path)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("sandbox exploded")
+
+    monkeypatch.setattr(orch, "run_l1", boom)
+    result = env.loop(Seats())
+
+    assert result.stop_reason == "escalation"
+    task = env.task()
+    assert task["status"] == "needs_human"
+    attempts = task["attempts"]
+    assert attempts[-1]["escalation"] == "attempts_exhausted"
+    assert any(a.get("escalation") == "orchestrator_error" for a in attempts)
+    assert all(a.get("escalation") != "quota_exhausted" for a in attempts)
+    # nothing was ever pushed: the remote still holds only its cloned main
+    assert not any(b.startswith("refs/heads/factory/")
+                   for b in env.remote_branches())
+
+
+def test_review2_new_escalations_are_schema_valid(tmp_path):
+    """Finding 2: `pr_create_failed`/`orchestrator_error` join the enum.
+
+    Red against the pre-round schema, which rejects both values (the
+    F-09 schema-change pattern: the test is the proof the enum grew).
+    """
+    base = _task()
+    for escalation in ("pr_create_failed", "orchestrator_error"):
+        doc = {"version": 1, "project": "fixture",
+               "tasks": [dict(base, attempts=[{
+                   "run_id": "r1", "slice_id": "T-1", "started": "2026-10-18T10:00:00Z",
+                   "ended": "2026-10-18T10:01:00Z", "outcome": "escalated",
+                   "escalation": escalation,
+                   "prompt_versions": {"implementer": "0" * 64}, "skills": [],
+               }])]}
+        path = tmp_path / f"queue-{escalation}.json"
+        path.write_text(json.dumps(doc))
+        TaskQueue(path).get("T-1")  # loads and validates
+
+
+def test_review3_peak_window_before_review_records_the_aborted_round(tmp_path):
+    """Finding 3: a validated round stopped by the window is accounted.
+
+    The implementer's tokens and the attempt must be recorded (aborted —
+    the window is nobody's fault), and the next session must be told the
+    change existed, passed L0 and L1, and was discarded.
+    """
+    env = Env(tmp_path)
+    clock = iter([OFF_PEAK, OFF_PEAK] + [datetime(2026, 10, 19, 9, 0, tzinfo=STOCKHOLM)] * 50)
+    seats = Seats()  # a CORRECT change: validation passes, reviewer is next
+    result = env.run(seats, now=lambda: next(clock))
+
+    assert result.outcome == "peak_window"
+    assert len(seats.prompts("implementer")) == 1
+    assert seats.prompts("reviewer") == []
+    task = env.task()
+    assert task["status"] == "ready"
+    attempts = task["attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["outcome"] == "aborted"
+    assert attempts[0]["input_tokens"] == 120  # the implementer's spend, kept
+    assert "passed L0 and L1" in attempts[0]["note"]
+    log = ProgressLog.for_task(env.root, "fixture", "T-1")
+    rendered = log.render()
+    assert "passed L0 and L1" in rendered  # the next session learns it
+
+
+def test_review4_reviewer_not_started_when_the_budget_is_spent(tmp_path, monkeypatch):
+    """Finding 4: a spent wall clock escalates before the reviewer runs.
+
+    The old `max(remaining, 1.0)` floor let the reviewer start (and run a
+    minute past the budget) whenever the implementer had used it all.
+    """
+    from factory import orchestrator as orch
+
+    env = Env(tmp_path, tasks=[_task(budget={"size": "S", "max_attempts": 3,
+                                             "max_turns": 20, "wall_clock_min": 1})])
+    ticks = [0.0, 61.0]
+
+    def fake_monotonic():
+        return ticks.pop(0) if ticks else 62.0
+
+    monkeypatch.setattr(orch.time, "monotonic", fake_monotonic)
+    seats = Seats()
+    result = env.run(seats)
+
+    assert result.outcome == "needs_human"
+    assert result.escalation == "budget_exhausted"
+    assert seats.prompts("reviewer") == []  # no session past the budget
+    attempts = env.task()["attempts"]
+    assert attempts[-1]["escalation"] == "budget_exhausted"

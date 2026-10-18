@@ -3,11 +3,18 @@
 These are the only two places the factory acts on the outside world with
 the orchestrator's credentials, so both are fenced in code:
 
-* :func:`push_branch` pushes exactly one ref — the run's own branch, by an
-  explicit ``refs/heads/X:refs/heads/X`` refspec, to the profile's remote
-  URL (never a configured remote name, so no ``remote.*.push``/``mirror``
-  config applies), with no force and no tags. It refuses — **before any
-  git process starts** — the default branch, any branch outside the
+* :func:`push_branch` pushes exactly one ref — the run's own branch,
+  pointed at **the validated commit**, by an explicit
+  ``<sha>:refs/heads/X`` refspec, to the profile's remote URL (never a
+  configured remote name, so no ``remote.*.push``/``mirror`` config
+  applies), with no force and no tags. The source is the object name, not
+  the branch: the branch lives in the agent-owned work clone and a
+  surviving implementer process (F-06 documents setsid escapees) could
+  move it after L0/L1/L2 validated the head — pushing the sha publishes
+  the validated tree whatever the branch points at now. After the push,
+  ``ls-remote`` must read the ref back as exactly that sha, or the
+  publish fails before any PR opens. It refuses — **before any git
+  process starts** — the default branch, any branch outside the
   ``factory/`` namespace, any branch the run did not create, and anything
   that isn't a plain branch name (refspec syntax, ``+`` force, ``HEAD``).
   The factory's own repo can't have branch protection on a free private
@@ -32,6 +39,7 @@ from factory.runs import GIT_HARDENING
 
 BRANCH_PREFIX = "factory/"
 _BRANCH_RE = re.compile(r"^factory/[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$")
+_SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
 _GITHUB_REMOTE = re.compile(
     r"^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
     r"(?P<slug>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
@@ -89,33 +97,61 @@ def push_branch(
     remote_url: str,
     branch: str,
     *,
+    sha: str,
     created: set[str] | frozenset[str],
     default_branch: str,
 ) -> None:
-    """Push the run's own branch, and nothing else, to the remote URL.
+    """Push the validated commit, and nothing else, to the remote URL.
 
     Args:
-        repo: The clone holding ``refs/heads/<branch>``.
+        repo: The clone holding the validated ``sha``.
         remote_url: The profile's ``repo.remote`` URL (or a path, in tests).
         branch: The branch to publish (``factory/...``).
+        sha: The commit L0/L1/L2 validated — the object actually pushed;
+            the branch name is only the remote label it lands on.
         created: Branch names this run created; anything else is refused.
         default_branch: ``repo.default_branch`` — never pushed.
 
     Raises:
-        PushRefused: See :func:`check_branch`; raised before git runs.
-        PublishError: The push itself failed.
+        PushRefused: See :func:`check_branch`, or ``sha`` isn't a full
+            object name; raised before git runs.
+        PublishError: The push failed, or the remote ref did not read
+            back as exactly ``sha`` (the publish is unconfirmed and no
+            PR may be opened about it).
     """
     ref = check_branch(branch, created=created, default_branch=default_branch)
+    if not _SHA_RE.match(sha or ""):
+        raise PushRefused(
+            f"refusing to push {branch!r}: the validated commit must be a full "
+            f"sha, got {sha!r}"
+        )
     proc = subprocess.run(
         [
             "git", *GIT_HARDENING, "-C", str(repo), "push", "--no-follow-tags",
-            "--porcelain", remote_url, f"{ref}:{ref}",
+            "--porcelain", remote_url, f"{sha}:{ref}",
         ],
         capture_output=True,
         text=True,
     )
     if proc.returncode != 0:
         raise PublishError(f"git push of {ref} failed: {proc.stderr.strip()[:1000]}")
+    probe = subprocess.run(
+        ["git", *GIT_HARDENING, "-C", str(repo), "ls-remote", remote_url, ref],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        raise PublishError(
+            f"could not confirm {ref} on the remote (ls-remote failed): "
+            f"{probe.stderr.strip()[:500]}"
+        )
+    fields = probe.stdout.split()
+    got = fields[0] if fields else ""
+    if got != sha:
+        raise PublishError(
+            f"remote {ref} reads {got or 'absent'}, not the validated commit "
+            f"{sha}: refusing to open a PR about an unconfirmed publish"
+        )
 
 
 def github_slug(remote_url: str) -> str:

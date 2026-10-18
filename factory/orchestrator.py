@@ -119,8 +119,10 @@ class RunResult:
     """The outcome of one ``run``.
 
     ``outcome``: ``idle`` (nothing eligible), ``pr_opened``, ``needs_human``,
-    ``quota_exhausted``, or ``peak_window`` (no session was started, or the
-    run stopped before its next session).
+    ``quota_exhausted``, ``peak_window`` (no session was started, or the
+    run stopped before its next session), or ``error`` (the orchestrator
+    itself failed mid-round; the attempt is recorded, the task is
+    re-queued, and a persistent failure escalates via the budget).
     """
 
     outcome: str
@@ -566,152 +568,221 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                 queue.transition(task_id, "ready")
                 return RunResult("peak_window", task_id)
 
-            # ---- implementer
-            prompt = _implementer_prompt(task, slice_, branch, log.render(),
-                                         attempt_no, max_attempts)
-            t0 = time.monotonic()
-            impl = ctx.session_runner(
-                "implementer", prompt, work.root, profile,
-                factory_root=ctx.factory_root, max_turns=budget["max_turns"],
-                timeout_min=remaining_min, protected=protected,
-                system_prompt=implementer_system, srt_bin_path=ctx.srt_bin_path,
-            )
-            session_seconds += time.monotonic() - t0
-            records = [impl]
-            if _is_quota(impl):
-                attempt = attempt_record(attempt_no, started, "aborted", records, None,
-                                         escalation="quota_exhausted", note=impl.reason)
-                finish(attempt, "ready", [f"1. quota: {impl.reason}"])
-                return RunResult("quota_exhausted", task_id, escalation="quota_exhausted")
-
+            # This round's state, initialised before anything can raise: the
+            # error path below records its attempt from whatever exists.
+            records: list = []
             reports: dict = {"L0": None, "L1": None, "L2": None}
             extra_findings: list[str] = []
             l0 = l1 = l2 = None
             head_sha = None
-            if impl.status != "completed":
-                extra_findings.append(
-                    f"[session {impl.status}] the implementer session ended: {impl.reason}"
+            changed: list[str] = []
+            path = None
+            pushed = False
+            opened = False
+            try:
+                # ---- implementer
+                prompt = _implementer_prompt(task, slice_, branch, log.render(),
+                                             attempt_no, max_attempts)
+                t0 = time.monotonic()
+                impl = ctx.session_runner(
+                    "implementer", prompt, work.root, profile,
+                    factory_root=ctx.factory_root, max_turns=budget["max_turns"],
+                    timeout_min=remaining_min, protected=protected,
+                    system_prompt=implementer_system, srt_bin_path=ctx.srt_bin_path,
                 )
-            else:
-                head_sha, void = _commit_work(
-                    work, branch, base_sha, f"{task_id}: attempt {attempt_no}"
-                )
-                if void:
-                    extra_findings.append(void)
+                session_seconds += time.monotonic() - t0
+                records = [impl]
+                if _is_quota(impl):
+                    attempt = attempt_record(attempt_no, started, "aborted", records, None,
+                                             escalation="quota_exhausted", note=impl.reason)
+                    finish(attempt, "ready", [f"1. quota: {impl.reason}"])
+                    return RunResult("quota_exhausted", task_id, escalation="quota_exhausted")
 
-            if head_sha is not None:
-                clean = create_run(project, work.root, factory_root=ctx.factory_root,
-                                   ref=head_sha)
-                try:
-                    _gate_settings(profile, clean, ctx.factory_root)
-                    runner = sandboxed_runner(clean.root, clean.settings_path,
-                                              srt_bin_path=ctx.srt_bin_path)
-                    l0 = run_l0(profile, clean.root, base_sha, head_sha, task=task,
-                                runner=runner, timeout_sec=ctx.gate_timeout_sec)
-                    reports["L0"] = l0.to_dict()
-                    if l0.escalations:
-                        escalation = next(e for e in _L0_ESCALATION_ORDER
-                                          if e in l0.escalations)
-                        if l0.risk_flags_added:
-                            task["risk"] = sorted(set(task.get("risk") or [])
-                                                  | set(l0.risk_flags_added))
-                            task["gates"]["merge"] = "human"
-                        path = _store(reports_dir, work.run_id, attempt_no, reports)
-                        attempt = attempt_record(
-                            attempt_no, started, "escalated", records, path,
-                            escalation=escalation,
-                            note="L0 escalations: " + ", ".join(l0.escalations),
-                        )
-                        finish(attempt, "needs_human",
-                               _numbered_findings(reports, [f"[L0 escalation] {escalation}"]))
-                        return RunResult("needs_human", task_id, escalation=escalation,
-                                         reports=reports)
-                    if l0.verdict == "pass":
-                        l1 = run_l1(profile, clean.root, base_sha, head_sha, task=task,
-                                    runner=runner, timeout_sec=ctx.gate_timeout_sec)
-                        reports["L1"] = l1.to_dict()
-                    if l1 is not None and l1.verdict == "pass":
-                        # ---- reviewer (a session start: the window applies)
-                        if in_peak_window(ctx.now(), ctx.config.peak_window):
-                            queue.transition(task_id, "ready")
-                            return RunResult("peak_window", task_id, reports=reports)
-                        diff = hardened_git(clean.root, "diff", "--no-color", "--no-ext-diff",
-                                            f"{base_sha}...{head_sha}")
-                        t0 = time.monotonic()
-                        review = ctx.session_runner(
-                            "reviewer", _review_prompt(task, diff, reports["L0"], reports["L1"]),
-                            clean.root, profile, factory_root=ctx.factory_root,
-                            max_turns=budget["max_turns"],
-                            timeout_min=max(budget["wall_clock_min"] - session_seconds / 60.0,
-                                            1.0),
-                            protected=protected, system_prompt=reviewer_system,
-                            srt_bin_path=ctx.srt_bin_path,
-                        )
-                        session_seconds += time.monotonic() - t0
-                        records.append(review)
-                        if _is_quota(review):
-                            attempt = attempt_record(
-                                attempt_no, started, "aborted", records, None,
-                                escalation="quota_exhausted", note=review.reason,
-                            )
-                            finish(attempt, "ready", [f"1. quota: {review.reason}"])
-                            return RunResult("quota_exhausted", task_id,
-                                             escalation="quota_exhausted", reports=reports)
-                        l2 = parse_verdict(review.result if review.status == "completed"
-                                           else None)
-                        if review.status != "completed":
-                            extra_findings.append(
-                                f"[session {review.status}] the reviewer session ended: "
-                                f"{review.reason}"
-                            )
-                        reports["L2"] = l2.to_dict()
-                    changed = [c.path for c in diff_name_status(clean.root, base_sha, head_sha)]
-                finally:
-                    cleanup_run(clean)
-
-            path = _store(reports_dir, work.run_id, attempt_no, reports)
-            findings = _numbered_findings(reports, extra_findings)
-            passed = all(x is not None and x.verdict == "pass" for x in (l0, l1, l2))
-
-            if passed:
-                task = queue.get(task_id)
-                for tail in (_PR_OUTPUT_TAIL, 200, 0):  # shrink outputs to fit GitHub
-                    body = build_pr_body(
-                        task, profile, branch=branch, base_sha=base_sha, head_sha=head_sha,
-                        changed_paths=changed,
-                        reports={k: _compact(v, tail) for k, v in reports.items()},
-                        l1_report=l1, extra_flags=l0.risk_flags_added,
-                        implementer_notes=(impl.result or "")[:_PR_NOTES_CAP],
-                        attempt=attempt_no,
+                if impl.status != "completed":
+                    extra_findings.append(
+                        f"[session {impl.status}] the implementer session ended: {impl.reason}"
                     )
-                    if len(body) <= _PR_BODY_LIMIT:
-                        break
-                check_pr_body(body)  # no PR without every section
-                push_branch(work.root, repo_cfg["remote"], branch, created=created,
-                            default_branch=default_branch)
-                url = ctx.open_pr(PullRequest(
-                    remote=repo_cfg["remote"], base=default_branch, head=branch,
-                    title=f"{task_id}: {task.get('title', '')}", body=body,
-                ))
-                attempt = attempt_record(attempt_no, started, "pass", records, path, pr=url)
-                queue.append_attempt(task_id, attempt)
-                log.append({"run_id": work.run_id, "attempt": attempt_no, "outcome": "pass",
-                            "pr": url, "findings": findings})
-                task = queue.get(task_id)
-                task["links"] = {**(task.get("links") or {}), "pr": url, "branch": branch}
-                queue.transition(task_id, "in_review")
-                return RunResult("pr_opened", task_id, pr=url, reports=reports)
+                else:
+                    head_sha, void = _commit_work(
+                        work, branch, base_sha, f"{task_id}: attempt {attempt_no}"
+                    )
+                    if void:
+                        extra_findings.append(void)
 
-            used += 1
-            if attempt_no >= max_attempts:
+                if head_sha is not None:
+                    clean = create_run(project, work.root, factory_root=ctx.factory_root,
+                                       ref=head_sha)
+                    try:
+                        _gate_settings(profile, clean, ctx.factory_root)
+                        runner = sandboxed_runner(clean.root, clean.settings_path,
+                                                  srt_bin_path=ctx.srt_bin_path)
+                        l0 = run_l0(profile, clean.root, base_sha, head_sha, task=task,
+                                    runner=runner, timeout_sec=ctx.gate_timeout_sec)
+                        reports["L0"] = l0.to_dict()
+                        if l0.escalations:
+                            escalation = next(e for e in _L0_ESCALATION_ORDER
+                                              if e in l0.escalations)
+                            if l0.risk_flags_added:
+                                task["risk"] = sorted(set(task.get("risk") or [])
+                                                      | set(l0.risk_flags_added))
+                                task["gates"]["merge"] = "human"
+                            path = _store(reports_dir, work.run_id, attempt_no, reports)
+                            attempt = attempt_record(
+                                attempt_no, started, "escalated", records, path,
+                                escalation=escalation,
+                                note="L0 escalations: " + ", ".join(l0.escalations),
+                            )
+                            finish(attempt, "needs_human",
+                                   _numbered_findings(reports, [f"[L0 escalation] {escalation}"]))
+                            return RunResult("needs_human", task_id, escalation=escalation,
+                                             reports=reports)
+                        if l0.verdict == "pass":
+                            l1 = run_l1(profile, clean.root, base_sha, head_sha, task=task,
+                                        runner=runner, timeout_sec=ctx.gate_timeout_sec)
+                            reports["L1"] = l1.to_dict()
+                        if l1 is not None and l1.verdict == "pass":
+                            # ---- reviewer (a session start: the checks apply)
+                            if in_peak_window(ctx.now(), ctx.config.peak_window):
+                                # The round is validated but the window stops the
+                                # next session start. The tokens and the attempt
+                                # are recorded (aborted — the window is nobody's
+                                # fault) and the next session is told the change
+                                # existed and was discarded with the run.
+                                path = _store(reports_dir, work.run_id, attempt_no, reports)
+                                attempt = attempt_record(
+                                    attempt_no, started, "aborted", records, path,
+                                    note=f"peak window before the L2 review; the change "
+                                         f"(head {head_sha[:12]}, passed L0 and L1) was "
+                                         f"discarded with the run",
+                                )
+                                finish(attempt, "ready", [
+                                    f"1. peak window stopped attempt {attempt_no} before "
+                                    f"the L2 review: its change (head {head_sha[:12]}) had "
+                                    f"passed L0 and L1 and was discarded with the run — "
+                                    f"redo it",
+                                ])
+                                return RunResult("peak_window", task_id, reports=reports)
+                            remaining_review = budget["wall_clock_min"] - session_seconds / 60.0
+                            if remaining_review <= 0:
+                                path = _store(reports_dir, work.run_id, attempt_no, reports)
+                                attempt = attempt_record(
+                                    attempt_no, started, "escalated", records, path,
+                                    escalation="budget_exhausted",
+                                    note="wall-clock budget spent before the L2 review",
+                                )
+                                finish(attempt, "needs_human",
+                                       ["1. wall-clock budget spent before the L2 review"])
+                                return RunResult("needs_human", task_id,
+                                                 escalation="budget_exhausted", reports=reports)
+                            diff = hardened_git(clean.root, "diff", "--no-color", "--no-ext-diff",
+                                                f"{base_sha}...{head_sha}")
+                            t0 = time.monotonic()
+                            review_prompt = _review_prompt(
+                                task, diff, reports["L0"], reports["L1"])
+                            review = ctx.session_runner(
+                                "reviewer", review_prompt,
+                                clean.root, profile, factory_root=ctx.factory_root,
+                                max_turns=budget["max_turns"], timeout_min=remaining_review,
+                                protected=protected, system_prompt=reviewer_system,
+                                srt_bin_path=ctx.srt_bin_path,
+                            )
+                            session_seconds += time.monotonic() - t0
+                            records.append(review)
+                            if _is_quota(review):
+                                attempt = attempt_record(
+                                    attempt_no, started, "aborted", records, None,
+                                    escalation="quota_exhausted", note=review.reason,
+                                )
+                                finish(attempt, "ready", [f"1. quota: {review.reason}"])
+                                return RunResult("quota_exhausted", task_id,
+                                                 escalation="quota_exhausted", reports=reports)
+                            l2 = parse_verdict(review.result if review.status == "completed"
+                                               else None)
+                            if review.status != "completed":
+                                extra_findings.append(
+                                    f"[session {review.status}] the reviewer session ended: "
+                                    f"{review.reason}"
+                                )
+                            reports["L2"] = l2.to_dict()
+                        changed = [c.path for c in diff_name_status(clean.root, base_sha, head_sha)]
+                    finally:
+                        cleanup_run(clean)
+
+                path = _store(reports_dir, work.run_id, attempt_no, reports)
+                findings = _numbered_findings(reports, extra_findings)
+                passed = all(x is not None and x.verdict == "pass" for x in (l0, l1, l2))
+
+                if passed:
+                    task = queue.get(task_id)
+                    for tail in (_PR_OUTPUT_TAIL, 200, 0):  # shrink outputs to fit GitHub
+                        body = build_pr_body(
+                            task, profile, branch=branch, base_sha=base_sha, head_sha=head_sha,
+                            changed_paths=changed,
+                            reports={k: _compact(v, tail) for k, v in reports.items()},
+                            l1_report=l1, extra_flags=l0.risk_flags_added,
+                            implementer_notes=(impl.result or "")[:_PR_NOTES_CAP],
+                            attempt=attempt_no,
+                        )
+                        if len(body) <= _PR_BODY_LIMIT:
+                            break
+                    check_pr_body(body)  # no PR without every section
+                    push_branch(work.root, repo_cfg["remote"], branch, sha=head_sha,
+                                created=created, default_branch=default_branch)
+                    pushed = True
+                    url = ctx.open_pr(PullRequest(
+                        remote=repo_cfg["remote"], base=default_branch, head=branch,
+                        title=f"{task_id}: {task.get('title', '')}", body=body,
+                    ))
+                    opened = True
+                    attempt = attempt_record(attempt_no, started, "pass", records, path, pr=url)
+                    queue.append_attempt(task_id, attempt)
+                    log.append({"run_id": work.run_id, "attempt": attempt_no, "outcome": "pass",
+                                "pr": url, "findings": findings})
+                    task = queue.get(task_id)
+                    task["links"] = {**(task.get("links") or {}), "pr": url, "branch": branch}
+                    queue.transition(task_id, "in_review")
+                    return RunResult("pr_opened", task_id, pr=url, reports=reports)
+
+                used += 1
+                if attempt_no >= max_attempts:
+                    attempt = attempt_record(attempt_no, started, "escalated", records, path,
+                                             escalation="attempts_exhausted")
+                    finish(attempt, "needs_human", findings)
+                    return RunResult("needs_human", task_id, escalation="attempts_exhausted",
+                                     reports=reports)
+                attempt = attempt_record(attempt_no, started, "fail", records, path)
+                finish(attempt, None, findings)
+                task = queue.get(task_id)
+            except Exception as exc:
+                # The orchestrator itself failed mid-round (gh after the push,
+                # a gate crash, a reviewer timeout, ...). The attempt is
+                # recorded so the budget is spent and a persistent failure
+                # escalates instead of re-running both seats forever (PR #22
+                # review finding 2). Once the branch is public the failure is
+                # the owner's to resolve: needs_human with the branch kept.
+                if opened:
+                    raise  # the PR is open; post-success bookkeeping isn't ours to bound
+                path = None
+                with contextlib.suppress(Exception):
+                    path = _store(reports_dir, work.run_id, attempt_no, reports)
+                note = f"{type(exc).__name__}: {exc}"[:500]
+                escalation = "pr_create_failed" if pushed else "orchestrator_error"
                 attempt = attempt_record(attempt_no, started, "escalated", records, path,
-                                         escalation="attempts_exhausted")
-                finish(attempt, "needs_human", findings)
-                return RunResult("needs_human", task_id, escalation="attempts_exhausted",
-                                 reports=reports)
-            attempt = attempt_record(attempt_no, started, "fail", records, path)
-            finish(attempt, None, findings)
-            task = queue.get(task_id)
+                                         escalation=escalation, note=note)
+                findings = _numbered_findings(reports, [f"[{escalation}] {note}"])
+                queue.append_attempt(task_id, attempt)
+                log.append({"run_id": work.run_id, "attempt": attempt_no,
+                            "outcome": attempt["outcome"], "escalation": escalation,
+                            "findings": findings})
+                if pushed:
+                    task = queue.get(task_id)
+                    task["links"] = {**(task.get("links") or {}), "branch": branch}
+                    queue.transition(task_id, "needs_human")
+                    return RunResult("needs_human", task_id,
+                                     escalation="pr_create_failed", reports=reports)
+                queue.transition(task_id, "ready")
+                return RunResult("error", task_id,
+                                 escalation="orchestrator_error", reports=reports)
     finally:
         cleanup_run(work)
 
