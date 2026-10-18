@@ -76,7 +76,13 @@ Recovery and continuation edges (same allowed-transition table, kept out of the 
 | `deploying → ready` | the previous slice merged and live-verified and more slices remain. Owner-step and `done` evaluation waits until the last slice merges; a task can only be `done`/`awaiting_owner` with every slice merged. |
 | `ready → blocked` | a dependency regressed (its task was reopened or demoted). `sync_readiness` reconciles both directions. |
 
-Escalation reasons (enum): `attempts_exhausted`, `budget_exhausted`, `risk_path_touched`, `new_dependency`, `protected_path_touched`, `contract_ambiguous`, `quota_exhausted`, `live_check_failed`, `cross_repo`.
+Escalation reasons (enum): `attempts_exhausted`, `budget_exhausted`, `risk_path_touched`, `new_dependency`, `protected_path_touched`, `contract_ambiguous`, `quota_exhausted`, `live_check_failed`, `cross_repo`, `pr_create_failed`, `orchestrator_error`, `publish_refused`.
+
+The three orchestrator-side reasons (F-10):
+
+- `pr_create_failed`: the validated branch was pushed but `gh pr create` failed. The task is `needs_human` and `links.branch` names the pushed branch. Open the PR by hand from that branch, or delete it and re-queue.
+- `orchestrator_error`: the orchestrator itself failed mid-round (a gate crash, a reviewer timeout). The attempt counts against the budget, the task re-queues, and `loop` stops. Look at the attempt's `note` before running again.
+- `publish_refused`: the push fence or the PR-body gate refused, which retrying can't change. The task is `needs_human`; the attempt's `note` says which rule fired.
 
 ## 4. Picking the next task
 
