@@ -65,7 +65,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, NamedTuple, Sequence
 
 from claude_agent_sdk import (
     ClaudeAgentOptions,
@@ -151,40 +151,78 @@ class _WallClock(Exception):
 REVIEWER_MUTATION = "reviewer_mutated_workspace"
 
 
-def _git_state(run_dir: Path) -> tuple[str, str]:
-    """(HEAD sha, porcelain status) of the run dir, via hardened git."""
-    def run(*args: str) -> str:
-        proc = subprocess.run(
-            ["git", *GIT_HARDENING, "-C", str(run_dir), *args],
-            capture_output=True,
-            text=True,
+class _GitState(NamedTuple):
+    """Everything a reviewer could change that F-10 might later ship.
+
+    HEAD's sha and ``status --porcelain`` alone miss a new branch or tag,
+    a branch switch onto the same commit, a stash, and files written into
+    gitignored paths. All of those are compared here (review round 4).
+    """
+
+    symref: str  # the branch HEAD points at, or "" when detached
+    head: str
+    porcelain: str
+    refs: tuple[tuple[str, str], ...]  # (refname, sha), stash included
+    ignored: tuple[str, ...]  # ignored files present, listed individually
+
+
+def _git(run_dir: Path, *args: str, check_exit: bool = True) -> subprocess.CompletedProcess:
+    proc = subprocess.run(
+        ["git", *GIT_HARDENING, "-C", str(run_dir), *args],
+        capture_output=True,
+        text=True,
+    )
+    if check_exit and proc.returncode != 0:
+        raise SessionConfigError(
+            f"git {args[0]} failed in the run dir: {proc.stderr.strip()[:300]}"
         )
-        if proc.returncode != 0:
-            raise SessionConfigError(
-                f"cannot read the run dir's git state (git {args[0]}): "
-                f"{proc.stderr.strip()[:300]}"
-            )
-        return proc.stdout
-
-    return run("rev-parse", "HEAD").strip(), run("status", "--porcelain")
+    return proc
 
 
-def _restore_workspace(run_dir: Path, head: str) -> None:
-    """Put the run dir back on ``head`` with a clean tracked tree, dropping
-    untracked non-ignored files the mutation left (excluded scratch —
-    .home/.tmp — survives; ``clean`` skips ignored paths without -x)."""
-    subprocess.run(
-        ["git", *GIT_HARDENING, "-C", str(run_dir), "reset", "--hard", head],
-        capture_output=True,
-        text=True,
-        check=True,
+def _git_state(run_dir: Path) -> _GitState:
+    """Snapshot the run dir's git state via hardened git."""
+    symref = _git(run_dir, "symbolic-ref", "-q", "HEAD", check_exit=False)
+    refs = _git(run_dir, "for-each-ref", "--format=%(refname) %(objectname)").stdout
+    ignored = _git(
+        run_dir, "ls-files", "--others", "--ignored", "--exclude-standard", "-z"
+    ).stdout
+    return _GitState(
+        symref=symref.stdout.strip() if symref.returncode == 0 else "",
+        head=_git(run_dir, "rev-parse", "HEAD").stdout.strip(),
+        porcelain=_git(run_dir, "status", "--porcelain").stdout,
+        refs=tuple(
+            tuple(line.split(" ", 1)) for line in refs.splitlines() if line.strip()
+        ),
+        ignored=tuple(sorted(name for name in ignored.split("\0") if name)),
     )
-    subprocess.run(
-        ["git", *GIT_HARDENING, "-C", str(run_dir), "clean", "-fd"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+
+
+def _restore_workspace(run_dir: Path, baseline: _GitState) -> None:
+    """Undo everything :class:`_GitState` can see changing.
+
+    Refs are put back first (created ones deleted, moved or deleted ones
+    restored), then HEAD is re-pointed at its branch (or its detached sha),
+    then the tracked tree is reset and untracked non-ignored files cleaned.
+    Ignored files are removed only if they are new since the baseline, so a
+    warm cache or other pre-existing ignored content survives.
+    """
+    before = dict(baseline.refs)
+    after = dict(_git_state(run_dir).refs)
+    for ref in after.keys() - before.keys():
+        _git(run_dir, "update-ref", "-d", ref)
+    for ref, sha in before.items():
+        if after.get(ref) != sha:
+            _git(run_dir, "update-ref", ref, sha)
+    if baseline.symref:
+        _git(run_dir, "symbolic-ref", "HEAD", baseline.symref)
+    else:
+        _git(run_dir, "update-ref", "--no-deref", "HEAD", baseline.head)
+    _git(run_dir, "reset", "--hard", baseline.head)
+    _git(run_dir, "clean", "-fd")
+    kept = set(baseline.ignored)
+    for name in _git_state(run_dir).ignored:
+        if name not in kept:
+            (Path(run_dir) / name).unlink(missing_ok=True)
 
 
 def _reviewer_scratch(settings_path: Path, run_dir: Path) -> tuple[Path, Path]:
@@ -195,8 +233,9 @@ def _reviewer_scratch(settings_path: Path, run_dir: Path) -> tuple[Path, Path]:
     read-only bind of the run dir AFTER the writable sub-directory binds,
     burying them — scratch inside the run dir is read-only there (proven on
     bwrap 0.8.0). Outside the run dir the scratch's own writable bind stays
-    live; the symlinks keep HOME/TMPDIR spellings (and the F-05 git
-    excludes `/.home/`+`/.tmp/`) unchanged. Both spellings ride in
+    live; the symlinks keep the HOME/TMPDIR spellings unchanged, and the
+    F-05 git excludes (`/.home`, `/.tmp`, no trailing slash) cover a link
+    as well as a directory. Both spellings ride in
     ``allowWrite`` so macOS, whose backend doesn't stack that way, accepts
     either.
     """
@@ -1054,16 +1093,76 @@ def run_session_sandboxed(
             Path(factory_root) / "sandbox" / f"{run_dir.parent.name}-{run_dir.name}.json"
         )
 
-    # Reviewer integrity (owner review round 2): the reviewer gets a
-    # read-only sandbox and a HEAD/tree guard. The scratch links exist
+    # Reviewer integrity (owner review rounds 2 and 4): the reviewer gets a
+    # read-only sandbox and a workspace guard (branch, HEAD, tree, refs,
+    # ignored files; see _GitState). The scratch links exist
     # BEFORE the baseline so their (untracked) presence can never look
     # like a mutation between the two snapshots.
     review_guard = seat == "reviewer"
     reviewer_writable: tuple[Path, Path] = ()
-    baseline: tuple[str, str] | None = None
-    if review_guard:
-        reviewer_writable = _reviewer_scratch(Path(settings_path), run_dir)
-        baseline = _git_state(run_dir)
+    baseline: _GitState | None = None
+    record: SessionRecord | None = None
+    # Everything from the scratch symlinks on sits inside try/finally (review
+    # round 4): a setup failure must still tear the links down, and the
+    # integrity backstop must run on EVERY exit path, timeouts and missing
+    # records included, not only after a record parses.
+    try:
+        if review_guard:
+            reviewer_writable = _reviewer_scratch(Path(settings_path), run_dir)
+            baseline = _git_state(run_dir)
+        record = _run_prepared(
+            seat, prompt, run_dir, profile, settings_path,
+            factory_root=factory_root, max_turns=max_turns,
+            timeout_min=timeout_min, base_url=base_url, timeout_ms=timeout_ms,
+            protected=protected, model=model, system_prompt=system_prompt,
+            token=token, cli_path=cli_path, srt_bin_path=srt_bin_path,
+            teardown_grace_sec=teardown_grace_sec,
+            read_only=review_guard, writable_roots=reviewer_writable,
+        )
+    finally:
+        try:
+            # The reviewer-integrity backstop: whatever happened in the
+            # session, the workspace must be exactly what it was before. A
+            # mutation fails the review (the verdict text of a reviewer that
+            # changed the code is not evidence) and is undone, so nothing it
+            # wrote can ride the branch F-10 pushes. On an exception path
+            # the restore runs and the original exception still propagates.
+            if baseline is not None and _git_state(run_dir) != baseline:
+                _restore_workspace(run_dir, baseline)
+                if record is not None:
+                    record.status = "failed"
+                    record.reason = REVIEWER_MUTATION
+        finally:
+            if review_guard:
+                _teardown_reviewer_scratch(run_dir)
+    return record
+
+
+def _run_prepared(
+    seat: str,
+    prompt: str,
+    run_dir: Path,
+    profile: dict,
+    settings_path: Path,
+    *,
+    factory_root: Path | None,
+    max_turns: int,
+    timeout_min: float,
+    base_url: str,
+    timeout_ms: int,
+    protected: "Sequence[str]",
+    model: str | None,
+    system_prompt: str | None,
+    token: str,
+    cli_path: Path | None,
+    srt_bin_path: Path | None,
+    teardown_grace_sec: float,
+    read_only: bool,
+    writable_roots: "Sequence[Path]",
+) -> SessionRecord:
+    """Stage the runner, write settings, run the sandboxed entry and parse
+    its record. :func:`run_session_sandboxed` wraps this in the reviewer
+    guard; this function knows nothing about seats beyond ``read_only``."""
     # The pinned CLI (finding 5): the SDK's bundled binary, or an explicit
     # test override. An auto-discovered ~/.local/bin/claude is never used —
     # it updates itself out from under the pin.
@@ -1106,55 +1205,39 @@ def run_session_sandboxed(
         factory_root=factory_root,
         toolchain=default_toolchain(extra=[cli]),
         allow_read=[runner_dir],
-        read_only=review_guard,
-        writable_roots=reviewer_writable,
+        read_only=read_only,
+        writable_roots=writable_roots,
     )
     write_settings(settings, settings_path)
 
-    # The reviewer's scratch symlinks come down on EVERY exit path — a
-    # run dir left with links would break the next implementer session
-    # there (round 3) — so the whole run sits inside try/finally.
-    try:
-        proc = run_sandboxed(
-            [sys.executable, "-c", _entry_bootstrap(runner_dir), str(spec_path)],
-            run_dir,
-            settings_path,
-            env={
-                "ANTHROPIC_AUTH_TOKEN": token,
-                "ANTHROPIC_BASE_URL": base_url,
-                "API_TIMEOUT_MS": str(int(timeout_ms)),
-            },
-            timeout=timeout_min * 60.0 + teardown_grace_sec,
-            srt_bin_path=srt_bin_path,
+    proc = run_sandboxed(
+        [sys.executable, "-c", _entry_bootstrap(runner_dir), str(spec_path)],
+        run_dir,
+        settings_path,
+        env={
+            "ANTHROPIC_AUTH_TOKEN": token,
+            "ANTHROPIC_BASE_URL": base_url,
+            "API_TIMEOUT_MS": str(int(timeout_ms)),
+        },
+        timeout=timeout_min * 60.0 + teardown_grace_sec,
+        srt_bin_path=srt_bin_path,
+    )
+
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    if not lines:
+        raise SessionConfigError(
+            "the sandboxed session entry produced no record "
+            f"(exit {proc.returncode}): {proc.stderr.strip()[:2000]}"
         )
+    try:
+        record = SessionRecord.from_dict(json.loads(lines[-1]))
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise SessionConfigError(
+            "the sandboxed session entry produced an unparsable record "
+            f"({exc}): {lines[-1][:500]}"
+        ) from exc
 
-        lines = [line for line in proc.stdout.splitlines() if line.strip()]
-        if not lines:
-            raise SessionConfigError(
-                "the sandboxed session entry produced no record "
-                f"(exit {proc.returncode}): {proc.stderr.strip()[:2000]}"
-            )
-        try:
-            record = SessionRecord.from_dict(json.loads(lines[-1]))
-        except (json.JSONDecodeError, TypeError) as exc:
-            raise SessionConfigError(
-                "the sandboxed session entry produced an unparsable record "
-                f"({exc}): {lines[-1][:500]}"
-            ) from exc
-
-        # The reviewer-integrity backstop: whatever happened in the session,
-        # HEAD and the working tree must be exactly what they were before. A
-        # mutation fails the review (the verdict text of a reviewer that
-        # changed the code is not evidence) and the workspace is restored,
-        # so nothing the reviewer wrote can ride the branch F-10 pushes.
-        if baseline is not None and _git_state(run_dir) != baseline:
-            _restore_workspace(run_dir, baseline[0])
-            record.status = "failed"
-            record.reason = REVIEWER_MUTATION
-        return record
-    finally:
-        if review_guard:
-            _teardown_reviewer_scratch(run_dir)
+    return record
 
 
 # python -c <bootstrap> <spec.json> — the in-sandbox entry point (see
