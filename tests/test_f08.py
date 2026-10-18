@@ -540,3 +540,32 @@ def test_schema_accepts_test_ref(tmp_path):
     )
     loaded = load_profile(profile)
     assert loaded["commands"]["test_ref"] == "{python} -m pytest -q {ref}"
+
+
+# --- rehearsal blocker (JobFinderOS readiness, 2026-10-18) --------------------
+
+
+def test_rehearsal_clean_keeps_declared_setup_outputs(tmp_path):
+    """L1's inter-phase `git clean -fdx` used to delete what setup installed
+    (backend/.venv, frontend/node_modules), so every ref failed with exit
+    127 and a healthy test read as test_not_green. Directories the profile
+    declares as setup outputs survive the clean; everything else untracked
+    is still removed."""
+    import sys as _sys
+
+    repo = _red_first_repo(tmp_path, "setup-outputs")
+    deps = repo / ".deps"
+    deps.mkdir()
+    shim = deps / "py"
+    shim.write_text(f'#!/bin/sh\nexec "{_sys.executable}" -m pytest -p no:cacheprovider "$@"\n')
+    shim.chmod(0o755)
+    profile = {
+        "name": "fixture",
+        "commands": {"test_ref": "./.deps/py -q {ref}"},
+        "paths": {"setup_outputs": [".deps"]},
+    }
+    report = _run(repo, _task("tests/test_feature.py::test_answer"), profile=profile)
+    green = _result(report, "green:tests/test_feature.py::test_answer")
+    assert green.exit_code == 0, green.output[-500:]
+    assert report.verdict == "pass", [f.id for f in report.findings]
+    assert shim.exists(), "a declared setup output was cleaned away"

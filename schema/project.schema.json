@@ -45,7 +45,8 @@
           "propertyNames": { "enum": ["auth", "payments", "rls", "migration", "safety", "privacy", "new_dependency", "deploy", "cross_repo", "external_service", "factory_control"] },
           "additionalProperties": { "type": "array", "items": { "type": "string" } }
         },
-        "protected": { "type": "array", "items": { "type": "string" } }
+        "protected": { "type": "array", "items": { "type": "string" } },
+        "setup_outputs": { "type": "array", "items": { "type": "string" }, "description": "Repo-relative directories the setup command creates (a venv, node_modules). L1 keeps them through its between-phase git clean, so the red and green runs have the installed tools; everything else untracked is still removed." }
       }
     },
     "dependency_manifests": { "type": "array", "items": { "type": "string" } },

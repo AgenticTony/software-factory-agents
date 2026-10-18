@@ -1394,3 +1394,44 @@ def test_review7_task_contract_lists_every_escalation_reason():
     line = next(ln for ln in doc.splitlines() if ln.startswith("Escalation reasons"))
     missing = [r for r in reasons if f"`{r}`" not in line]
     assert not missing, f"TASK-CONTRACT.md doesn't list: {missing}"
+
+
+# --- rehearsal blocker (JobFinderOS readiness, 2026-10-18) --------------------
+
+
+def test_rehearsal_run_builds_on_the_remote_default_branch(tmp_path):
+    """The run used to clone the local checkout's `main`, which can be days
+    behind GitHub; the agent then built on stale code and the PR's base was
+    wrong. The run now fetches the remote's default branch and builds on it."""
+    env = Env(tmp_path)
+    scratch = tmp_path / "scratch"
+    subprocess.run(["git", "clone", "-q", str(env.remote), str(scratch)], check=True)
+    (scratch / "remote_only.txt").write_text("landed on GitHub, not pulled locally\n")
+    _git(scratch, "-c", "user.email=x@x", "-c", "user.name=x", "add", "-A")
+    _git(scratch, "-c", "user.email=x@x", "-c", "user.name=x", "commit", "-qm", "remote moves on")
+    _git(scratch, "push", "-q", "origin", "HEAD:main")
+    remote_main = _git(env.remote, "rev-parse", "refs/heads/main").strip()
+
+    result = env.run(Seats())
+
+    assert result.outcome == "pr_opened", result
+    head = env.prs[0].head
+    subprocess.run(
+        ["git", "-C", str(env.remote), "merge-base", "--is-ancestor", remote_main,
+         f"refs/heads/{head}"],
+        check=True,
+    )
+
+
+def test_rehearsal_run_refuses_when_the_remote_is_unreachable(tmp_path):
+    """No fetch, no run: building on an unknown base is worse than not
+    running. Nothing starts a session."""
+    env = Env(tmp_path, profile_extra={})
+    profile = yaml.safe_load(env.profile_path.read_text())
+    profile["repo"]["remote"] = str(tmp_path / "does-not-exist.git")
+    env.profile_path.write_text(yaml.safe_dump(profile))
+    seats = Seats()
+    with pytest.raises(Exception, match="(?i)fetch"):
+        env.run(seats)
+    assert seats.calls == []
+    assert env.task()["status"] == "ready"

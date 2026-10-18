@@ -74,6 +74,7 @@ from factory.runs import (
     FACTORY_ROOT_DEFAULT,
     GIT_HARDENING,
     RunDir,
+    RunError,
     cleanup_run,
     create_run,
 )
@@ -518,6 +519,34 @@ def _finish_unrecorded_publish(
     return RunResult("pr_opened", task_id, pr=url)
 
 
+def _build_on_remote_default(work: RunDir, remote: str, default_branch: str) -> None:
+    """Point the work clone at the remote's default branch before anything runs.
+
+    The clone comes from the local checkout, whose ``main`` can be days
+    behind the remote (JobFinderOS readiness run, 2026-10-18: local
+    ``b0e2417`` against remote ``9daedd1``). Building on it would give the
+    agent stale code and the PR a wrong base. So the run fetches the
+    remote's default branch with hardened git and detaches there. If the
+    remote can't be fetched, the run refuses: an unknown base is worse
+    than no run.
+
+    Raises:
+        RunError: The fetch failed. Raised before any session starts.
+    """
+    proc = subprocess.run(
+        ["git", *GIT_HARDENING, "-C", str(work.root), "fetch", "--quiet",
+         "--no-tags", "--filter=blob:none", remote, default_branch],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RunError(
+            f"cannot fetch {default_branch!r} from {remote}: {proc.stderr.strip()[:500]}. "
+            "The run refuses to build on a possibly stale local checkout."
+        )
+    hardened_git(work.root, "checkout", "-q", "--detach", "FETCH_HEAD")
+
+
 def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
     profile, queue, task_id = ctx.profile, ctx.queue, ctx.task_id
     project = profile["name"]
@@ -541,6 +570,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
 
     work = create_run(project, source, factory_root=ctx.factory_root, ref=default_branch)
     try:
+        _build_on_remote_default(work, repo_cfg["remote"], default_branch)
         branch = _branch_name(task_id, work.run_id)
         created = frozenset({branch})
         hardened_git(work.root, "checkout", "-q", "-b", branch)
