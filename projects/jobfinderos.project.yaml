@@ -1,7 +1,9 @@
-# DRAFT adapter for JobFinderOS — the pilot project.
-# Destination: JobFinderOS/.factory/project.yaml. Validate against schema/project.schema.json.
-# Commands are copied from CLAUDE.md "Stack & run commands" and .github/workflows/ci.yml (2026-10-15).
-# Lines marked TODO(verify) are my inference, not read from the repo — confirm before onboarding.
+# Adapter for JobFinderOS, the pilot project. DRAFT for owner approval (2026-10-18).
+# Destination: JobFinderOS/.factory/project.yaml (lands by PR; main is branch-protected).
+# Validated against schema/project.schema.json.
+# Every value below was read from the repo at origin/main 9daedd1 (2026-10-18): CLAUDE.md,
+# .github/workflows/ci.yml, the scripts and services named. The earlier TODO(verify) lines are
+# resolved; the "Not used until" notes mark fields no built work order reads yet.
 
 name: jobfinderos
 
@@ -9,20 +11,31 @@ repo:
   path: ~/Desktop/JobFinderOS
   default_branch: main
   remote: https://github.com/AgenticTony/JobFinderOS.git
-  merge_method: squash            # TODO(verify)
+  merge_method: merge   # the repo's history merges PRs with merge commits ("Merge pull request #138 ...")
 
 commands:
+  # CI pins Python 3.12 and Node 24; the venv and node_modules land inside the clean clone.
   setup: >-
-    cd backend && python3.12 -m venv .venv && .venv/bin/pip install -r requirements.dev.lock
+    cd backend && python3.12 -m venv .venv && .venv/bin/pip install -q -r requirements.dev.lock
     && cd ../frontend && npm install --no-audit --no-fund
-  lint: cd backend && .venv/bin/ruff check --select I,F app/ tests/ scripts/   # CI's ruleset; default ruleset has ~590 pre-existing hits
+  lint: cd backend && .venv/bin/ruff check --select I,F app/ tests/ scripts/   # CI's exact ruleset
   typecheck: cd frontend && npx tsc --noEmit --noUnusedLocals --noUnusedParameters
-  test: cd backend && PYTHONPATH=. .venv/bin/python -m pytest tests/ -q          # 437 tests must be green (CLAUDE.md)
-  build: cd frontend && npm run build
+  # SQLite leg of CI. The Postgres leg (and the prod drift read) stay in JobFinderOS CI, which
+  # branch protection requires before any merge.
+  test: cd backend && PYTHONPATH=. .venv/bin/python -m pytest tests/ -q
+  # No `build` gate in the factory (readiness 2026-10-18): Turbopack's next/font fetch does not
+  # use srt's authenticated proxy, so the production build can't reach Google Fonts inside the
+  # sandbox. The build stays enforced before merge by JobFinderOS CI ("Frontend (type-check +
+  # build)", a required status check on main). `typecheck` above still gates every slice here.
+  # One contract test. Refs are repo-relative (backend/tests/...); pytest runs from backend/
+  # (no pytest config, so rootdir = backend). The shell strips the backend/ prefix.
+  test_ref: cd backend && r='{ref}' && PYTHONPATH=. .venv/bin/python -m pytest -q "${r#backend/}"
   extra:
     frontend_unit: cd frontend && node --test 'tests/**/*.test.ts'
     flow: cd backend && PYTHONPATH=. .venv/bin/python tests/test_flow.py
-    migration_single_head: cd backend && .venv/bin/python scripts/check_migration_drift.py --single-head-only   # TODO(verify) flag name; CI runs the full script with a prod reader role
+    # No URL and DRIFT_CHECK_OPTIONAL=true: the single-head check runs, the prod drift read is
+    # skipped (the sandbox has no prod credential, by design).
+    migration_single_head: cd backend && DRIFT_CHECK_OPTIONAL=true .venv/bin/python scripts/check_migration_drift.py
     dev_lock: cd backend && .venv/bin/python scripts/check_dev_lock.py
 
 # CLAUDE.md standard 8: the test database must NEVER be the live database.
@@ -30,20 +43,31 @@ commands:
 
 paths:
   risk:
-    migration: ["backend/alembic/**", "backend/app/core/database.py"]
-    auth: ["backend/app/users.py", "backend/app/core/*auth*", "frontend/**/auth/**"]   # TODO(verify) frontend auth path
-    payments: ["**/billing/**", "**/*paddle*"]                                          # WO-13/WO-16 will create these
+    migration: ["backend/alembic/**", "backend/app/core/database.py", "backend/app/core/dburl.py"]
+    auth:
+      - "backend/app/users.py"
+      - "backend/app/core/*auth*"
+      - "frontend/src/app/login/**"
+      - "frontend/src/app/sv/login/**"
+      - "frontend/src/components/LoginView.tsx"
+      - "frontend/src/lib/supabase.ts"
+    payments: ["**/billing/**", "**/*paddle*"]          # WO-13/WO-16 will create these
     deploy: ["render.yaml", "ops/**", ".github/workflows/**", "backend/Dockerfile*"]
-    external_service: ["backend/app/services/*composio*", "backend/app/services/*gmail*"]  # TODO(verify) send-from-Gmail path; fill-never-submit invariant
-    privacy: ["backend/app/core/*sentry*", "backend/app/models/**"]                     # TODO(verify)
+    # Employer-facing email: _send_with_pdfs in draft_service.py dispatches through Resend.
+    external_service: ["backend/app/services/draft_service.py", "backend/app/services/pdf_service.py"]
+    privacy: ["backend/app/core/telemetry.py", "backend/app/models/**"]   # Sentry init + PII-bearing models
   protected:
     - ".factory/**"
     - ".github/workflows/**"
     - "backend/tests/test_calibration.py"        # pins prompt versions; silent edits must fail CI
     - "backend/tests/**/conftest.py"
     - "CLAUDE.md"
-    # Per-task: the orchestrator adds the test files named in the task's acceptance checks
-    # once the contract is approved, so workers cannot weaken the tests that define "done".
+    # Per task, the orchestrator also protects the test files named in the approved contract.
+  # What `setup` installs. L1 keeps these through its between-phase clean, so the red and green
+  # runs of each contract test still have the venv and node_modules.
+  setup_outputs:
+    - backend/.venv
+    - frontend/node_modules
 
 dependency_manifests:
   - backend/requirements.lock
@@ -52,13 +76,16 @@ dependency_manifests:
   - frontend/package.json
   - frontend/package-lock.json
 
+baselines: .factory/baselines.json
+
 deploy:
   mechanism: render (backend api + hunt cron) + cloudflare-pages direct upload (frontend)
   auto_on_merge: false           # render.yaml autoDeploy: false; Pages is NOT git-integrated
-  command: bash ops/deploy_frontend.sh   # backend: Render deploy via API — TODO(verify) the exact command the owner uses
+  command: bash ops/deploy_frontend.sh   # frontend only. Not used until F-14 (L4); the factory never deploys in v0.
   notes: >-
     Merging does not ship. Deploy debt can accumulate silently (#120/#121 were merged but not deployed).
     The orchestrator must record "merged" and "deployed" separately and never infer one from the other.
+    The backend deploys through Render; no factory step triggers it before F-14.
 
 live_checks:
   verify_deployment:
@@ -70,20 +97,21 @@ live_checks:
     when: risk:migration
 
 holdouts:
-  dir: ~/factory/holdouts/jobfinderos      # outside the repo; agents' sandbox denies reads here
-  runner: "TODO — start with 3 scenarios: signup→first hunt; draft generated with zero fabrication flags; landing renders in /sv"
+  dir: ~/factory/holdouts/jobfinderos      # outside the repo; the sandbox denies reads here
+  runner: "Not used until F-15 (L3 is not built). Planned first scenarios: signup -> first hunt; draft with zero fabrication flags; landing renders in /sv."
 
 docs_allowlist:
   - fastapi.tiangolo.com
   - docs.sqlalchemy.org
   - alembic.sqlalchemy.org
   - docs.pydantic.dev
+  - pypdf.readthedocs.io
   - supabase.com
   - nextjs.org
   - react.dev
   - tailwindcss.com
   - docs.z.ai
-  - docs.composio.dev
+  - resend.com
   - developers.cloudflare.com
   - render.com
 
@@ -91,5 +119,7 @@ network_allowlist:
   - pypi.org
   - files.pythonhosted.org
   - registry.npmjs.org
+  - fonts.googleapis.com   # next/font/google fetches at build time
+  - fonts.gstatic.com
 
 cross_repo: []
