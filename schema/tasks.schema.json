@@ -113,7 +113,15 @@
             "type": "object",
             "required": ["text", "done"],
             "additionalProperties": false,
-            "properties": { "text": { "type": "string" }, "done": { "type": "boolean" } }
+            "properties": {
+              "text": { "type": "string" },
+              "done": { "type": "boolean" },
+              "done_at": { "type": "string", "format": "date-time" },
+              "done_by": { "type": "string", "minLength": 1 },
+              "evidence": { "type": "string", "pattern": "\\S", "description": "What the owner checked; required with done: true (F-29)" }
+            },
+            "if": { "properties": { "done": { "const": true } } },
+            "then": { "required": ["done_at", "done_by", "evidence"] }
           }
         },
         "slices": { "type": "array", "items": { "$ref": "#/$defs/slice" } },
@@ -146,8 +154,16 @@
           "then": { "properties": { "gates": { "properties": { "merge": { "const": "human" } } } } }
         },
         {
-          "if": { "properties": { "status": { "enum": ["ready", "in_progress", "in_review", "deploying", "awaiting_owner", "done"] } } },
+          "if": {
+            "properties": { "status": { "enum": ["ready", "in_progress", "in_review", "deploying", "awaiting_owner", "done"] } },
+            "not": { "properties": { "kind": { "const": "owner_only" }, "status": { "const": "done" } }, "required": ["kind", "status"] }
+          },
           "then": { "required": ["acceptance_hash", "approved_at"], "properties": { "acceptance": { "minItems": 1 } } }
+        },
+        {
+          "$comment": "F-29: an owner_only task has no contract to freeze; it is done when it has owner steps and every one is ticked.",
+          "if": { "properties": { "kind": { "const": "owner_only" }, "status": { "const": "done" } }, "required": ["kind", "status"] },
+          "then": { "required": ["owner_steps"], "properties": { "owner_steps": { "minItems": 1, "items": { "properties": { "done": { "const": true } } } } } }
         },
         {
           "if": { "properties": { "kind": { "enum": ["decision", "research", "owner_only"] } } },

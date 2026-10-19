@@ -1786,7 +1786,8 @@
         "F-23",
         "F-24",
         "F-25",
-        "F-26"
+        "F-26",
+        "F-29"
       ],
       "risk": [],
       "gates": {
@@ -1825,6 +1826,76 @@
           "done": false
         }
       ]
+    },
+    {
+      "id": "F-29",
+      "title": "Owner-step tick (factory tick)",
+      "source": "BUILD-ORDER.md#f-29--owner-step-tick-factory-tick",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-03",
+        "F-04"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "`factory tick <id> <step> [<step> ...] --evidence <text>` shows each named owner step (1-based) and asks for confirmation per step. A confirmed step gets `done: true`, `done_at`, `done_by` and `evidence` (additive schema fields; `done: true` without the other three is refused at load). `--evidence` is required and non-blank; there is no `--yes`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f29.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "An unknown task, a step number out of range, an already-ticked step, a blank evidence string, or a declined confirmation each leaves `tasks.json` byte-identical and exits non-zero with a message naming the problem. One tick call is one atomic save: a refusal on any named step writes none of them.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f29.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "Ticking the last open step of an `awaiting_owner` task moves it to `done` in the same save. Ticking a step of a task in any other status records the tick and never changes the status.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f29.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "An `owner_only` task whose last step is ticked moves `draft → not_buildable → done` through two new table edges. Both are guarded: only a non-executable kind may enter `not_buildable` from `draft`, and only an `owner_only` task with at least one step and every step ticked may go `not_buildable → done`. A `build` or `docs` task taking either edge raises (one test per edge).",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f29.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "Reconcile leaves `owner_only` tasks untouched: the real-files reconcile tests assert F-00 is unchanged by the run, not that it is `draft`, so they keep passing after F-00 is ticked to `done`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f29.py::test_ac_5"
+          }
+        }
+      ],
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 120,
+        "wall_clock_min": 90
+      },
+      "attempts": [],
+      "links": {}
     }
   ]
 }

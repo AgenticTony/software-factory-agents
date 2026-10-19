@@ -534,9 +534,11 @@ def test_reconcile_on_this_repos_real_files(tmp_path):
     # fully-proven prefix F-01..F-03 reconciles to done in dependency
     # order. Entries beyond that depend on where the bootstrap stands
     # (their PR may not be merged yet), so their outcomes aren't pinned;
-    # F-00 (owner_only, never in the ledger) must stay draft regardless.
+    # F-00 (owner_only, never in the ledger) is left exactly as it was —
+    # draft before its steps are ticked, done after (F-29).
     queue_path = tmp_path / "tasks.json"
     shutil.copy(REPO / ".factory" / "tasks.json", queue_path)
+    f00_before = next(t for t in json.loads(queue_path.read_text())["tasks"] if t["id"] == "F-00")
     ledger = tmp_path / "BOOTSTRAP.md"
     shutil.copy(REPO / ".factory" / "BOOTSTRAP.md", ledger)
     results = reconcile_bootstrap(
@@ -554,7 +556,7 @@ def test_reconcile_on_this_repos_real_files(tmp_path):
     assert on_disk["F-01"]["status"] == "done"
     assert on_disk["F-02"]["status"] == "done"
     assert on_disk["F-03"]["status"] == "done"
-    assert on_disk["F-00"]["status"] == "draft"
+    assert on_disk["F-00"] == f00_before
 
 
 # --- Extra: CLI ------------------------------------------------------------
@@ -582,6 +584,7 @@ def test_cli_reconcile_bootstrap(tmp_path, capsys, monkeypatch):
     shutil.copy(REPO / ".factory" / "tasks.json", queue_path)
     ledger = tmp_path / "BOOTSTRAP.md"
     shutil.copy(REPO / ".factory" / "BOOTSTRAP.md", ledger)
+    f00_before = next(t for t in json.loads(queue_path.read_text())["tasks"] if t["id"] == "F-00")
     monkeypatch.setattr("builtins.input", lambda _prompt: "y")
     code = main(
         [
@@ -596,9 +599,9 @@ def test_cli_reconcile_bootstrap(tmp_path, capsys, monkeypatch):
     # Exit is 0 unless some entry failed; entries beyond the merged
     # F-01..F-03 prefix depend on bootstrap state, so only the prefix
     # and the never-reconciled owner task are pinned.
-    statuses = {t["id"]: t["status"] for t in json.loads(queue_path.read_text())["tasks"]}
-    assert statuses["F-01"] == "done" and statuses["F-03"] == "done"
-    assert statuses["F-00"] == "draft"
+    tasks = {t["id"]: t for t in json.loads(queue_path.read_text())["tasks"]}
+    assert tasks["F-01"]["status"] == "done" and tasks["F-03"]["status"] == "done"
+    assert tasks["F-00"] == f00_before
     out = capsys.readouterr().out
     for tid in ("F-01", "F-03"):
         assert f"{tid}: reconciled" in out or f"{tid}: skipped — already done" in out

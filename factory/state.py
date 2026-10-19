@@ -45,6 +45,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from factory.contract import (
+    NON_EXECUTABLE_KINDS,
     POST_APPROVAL_STATUSES,
     ContractError,
     acceptance_hash,
@@ -93,6 +94,8 @@ ALLOWED_TRANSITIONS: dict[tuple[str, str], str] = {
     ("deploying", "ready"): "previous slice merged; more slices remain",
     ("deploying", "draft"): "contract changed",
     ("awaiting_owner", "done"): "owner steps ticked",
+    ("draft", "not_buildable"): "non-executable kind surfaced to the owner (F-29)",
+    ("not_buildable", "done"): "owner-only task: every owner step ticked (F-29)",
     ("awaiting_owner", "draft"): "contract changed",
     ("needs_human", "draft"): "contract changed",
     ("done", "draft"): "contract changed (human reopen)",
@@ -390,6 +393,78 @@ def _check_slice_rules(task: dict, new_status: str) -> None:
         )
 
 
+def check_tick(task: dict, step_numbers: list, *, evidence: str, done_by: str) -> None:
+    """Refusals for ticking owner steps, checked before anything changes (F-29).
+
+    Args:
+        task: The task record.
+        step_numbers: 1-based owner-step numbers.
+        evidence: What the owner checked.
+        done_by: Who is ticking.
+
+    Raises:
+        StateError: Blank evidence or done_by, no steps, a duplicate step,
+            a step out of range, or a step already ticked.
+    """
+    task_id = task.get("id")
+    steps = task.get("owner_steps") or []
+    if not evidence or not evidence.strip():
+        raise StateError(f"{task_id}: evidence must say what you checked; it is blank")
+    if not done_by or not done_by.strip():
+        raise StateError(f"{task_id}: done_by is blank")
+    if not step_numbers:
+        raise StateError(f"{task_id}: name at least one owner step to tick")
+    if len(set(step_numbers)) != len(step_numbers):
+        raise StateError(f"{task_id}: a step is named twice")
+    for number in step_numbers:
+        if not 1 <= number <= len(steps):
+            raise StateError(
+                f"{task_id}: owner step {number} is out of range "
+                f"(the task has {len(steps)})"
+            )
+        if steps[number - 1].get("done"):
+            raise StateError(f"{task_id}: owner step {number} is already ticked")
+
+
+def _check_kind_rules(task: dict, current: str, new_status: str) -> None:
+    """Guard the two edges that only non-executable kinds may take (F-29).
+
+    ``draft -> not_buildable`` is how a decision, research or owner-only
+    task is parked as "surfaced to you, never run"; an executable kind
+    (``build``, ``docs``) parked there could never be picked. And
+    ``not_buildable -> done`` closes an owner-only task, whose whole
+    content is its owner steps — so it needs at least one step, all
+    ticked. Without the guard a build task could skip validation
+    entirely by going ``draft -> not_buildable -> done``.
+
+    Args:
+        task: The task record.
+        current: The status the edge starts from.
+        new_status: The status the edge goes to.
+
+    Raises:
+        TransitionError: If the task's kind or owner steps forbid the edge.
+    """
+    tid = task.get("id")
+    kind = task.get("kind")
+    if new_status == "not_buildable" and kind not in NON_EXECUTABLE_KINDS:
+        raise TransitionError(
+            f"{tid}: kind={kind} is executable; only decision, research or "
+            "owner_only tasks may be not_buildable"
+        )
+    if current == "not_buildable" and new_status == "done":
+        if kind != "owner_only":
+            raise TransitionError(
+                f"{tid}: not_buildable -> done closes owner_only tasks only; "
+                f"this one is kind={kind}"
+            )
+        if not task.get("owner_steps"):
+            raise TransitionError(
+                f"{tid}: an owner_only task needs at least one owner step to "
+                "be done — there is nothing to show it was"
+            )
+
+
 def _check_owner_step_rules(task: dict, new_status: str) -> None:
     """Enforce the owner-step semantics of ``done`` / ``awaiting_owner``.
 
@@ -482,6 +557,7 @@ class TaskQueue:
         """
         task = self.get(task_id)
         check_transition(task.get("status"), new_status)
+        _check_kind_rules(task, task.get("status"), new_status)
         _check_slice_rules(task, new_status)
         _check_owner_step_rules(task, new_status)
         task["status"] = new_status
@@ -517,11 +593,68 @@ class TaskQueue:
         current = task.get("status")
         for new_status in statuses:
             check_transition(current, new_status)
+            _check_kind_rules(task, current, new_status)
             current = new_status
         _check_slice_rules(task, statuses[-1])
         _check_owner_step_rules(task, statuses[-1])
         task["status"] = statuses[-1]
         self.save()
+
+    def tick_owner_steps(
+        self, task_id: str, step_numbers: list, *, evidence: str, done_by: str
+    ) -> str:
+        """Tick owner steps and close the task if that was the last one (F-29).
+
+        Every step is checked before anything changes, and the ticks plus
+        any resulting status change go out in one save: a refusal on any
+        step writes nothing. The last open step of an ``awaiting_owner``
+        task moves it to ``done``; an ``owner_only`` task closes through
+        ``draft -> not_buildable -> done``. A task in any other status
+        records the tick and keeps its status.
+
+        Args:
+            task_id: Task id.
+            step_numbers: 1-based owner-step numbers, in any order.
+            evidence: What the owner checked; must not be blank.
+            done_by: Who ticked the steps.
+
+        Returns:
+            The task's status after the save.
+
+        Raises:
+            StateError: Unknown task, step out of range, step already
+                ticked, duplicate step, or blank evidence/done_by.
+            TransitionError: If the closing transition is refused.
+            ContractError: If the resulting queue wouldn't validate.
+            ConcurrentWriteError: If another writer changed the file.
+        """
+        task = self.get(task_id)
+        check_tick(task, step_numbers, evidence=evidence, done_by=done_by)
+        candidate = copy.deepcopy(task)
+        stamp = now_iso()
+        for number in step_numbers:
+            candidate["owner_steps"][number - 1].update(
+                done=True, done_at=stamp, done_by=done_by, evidence=evidence.strip()
+            )
+        current = candidate.get("status")
+        path: list = []
+        if not open_owner_steps(candidate):
+            if current == "awaiting_owner":
+                path = ["done"]
+            elif candidate.get("kind") == "owner_only" and current in ("draft", "not_buildable"):
+                path = ["not_buildable", "done"] if current == "draft" else ["done"]
+        for new_status in path:
+            check_transition(current, new_status)
+            _check_kind_rules(candidate, current, new_status)
+            current = new_status
+        if path:
+            _check_slice_rules(candidate, current)
+            _check_owner_step_rules(candidate, current)
+            candidate["status"] = current
+        task.clear()
+        task.update(candidate)
+        self.save()
+        return current
 
     def append_attempt(self, task_id: str, attempt: dict) -> None:
         """Append one attempt record to a task's append-only log.
