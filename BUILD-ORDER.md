@@ -2,7 +2,7 @@
 
 The factory's own build plan, written in the format the factory will consume: one work order (F-xx) per task, with checkable acceptance criteria, risk flags and owner steps. The machine-readable copy is [`.factory/tasks.json`](.factory/tasks.json). It validates against [`schema/tasks.schema.json`](schema/tasks.schema.json), and every task starts in `draft` until you approve it, per [TASK-CONTRACT.md](TASK-CONTRACT.md) §6.
 
-**Bootstrapping:** the factory can't build itself before it exists. F-01 to F-11 are built **interactively**, by you plus a Claude Code session (GLM or Claude), one WO per session. Once F-10 works end to end, the factory takes over its own remaining WOs (F-14 onward). That's the first real test, on a repo where a mistake only hurts the factory itself.
+**Bootstrapping:** the factory can't build itself before it exists. F-01 to F-10 were built **interactively**, by you plus a Claude Code session, one WO per session. The hardening WOs (F-23 to F-27) are built the same way, because they change what judges agents. Then F-28 hands the factory its own safe WOs (F-11, F-12) as the first real loop, on a repo where a mistake only hurts the factory itself. Outside projects (F-13 onward) come only after that loop has a measured record.
 
 **Stack:** Python ≥ 3.11 (CI: 3.11 + 3.13), `pytest`, `ruff`, JSON Schema validation, Claude Agent SDK (`claude-agent-sdk`, pinned) for agent sessions, `gh` for PRs, `srt` / Claude Code sandbox for isolation. No web framework; it's a CLI.
 
@@ -23,9 +23,9 @@ The factory's own build plan, written in the format the factory will consume: on
 | **F-08** | L1 red-first proof | 1 | F-07 | — | S |
 | **F-09** | Agent prompts + L2 review | 1 | F-06 | — | M |
 | **F-10** | `factory run` / `factory loop` + PR creation | 1 | F-03, F-04, F-06, F-07, F-08, F-09 | deploy | M |
-| **F-11** | `factory status`: daily summary + metrics | 1 | F-03 | — | S |
-| **F-12** | Importer (`factory import`) | 1 | F-06, F-02 | — | M |
-| **F-13** | Onboard JobFinderOS (pilot) | 1 | F-00, F-10, F-11, F-12, F-22 | cross_repo | owner |
+| **F-11** | `factory status`: daily summary + metrics | 1 | F-03, F-23, F-24, F-25, F-26 | — | S |
+| **F-12** | Importer (`factory import`) | 1 | F-06, F-02, F-23, F-24, F-25, F-26 | — | M |
+| **F-13** | Onboard JobFinderOS (pilot) | 1 | F-00, F-11, F-12, F-16, F-22, F-27, F-28 | cross_repo | owner |
 | **F-14** | L4 `verify-live` + merged/deployed tracking | 2 | F-10 | deploy | M |
 | **F-15** | L3 holdout runner | 2 | F-10 | — | M |
 | **F-16** | Seeded-bug validator eval | 2 | F-07, F-08, F-09 | — | M |
@@ -33,10 +33,18 @@ The factory's own build plan, written in the format the factory will consume: on
 | **F-18** | Triage quarantine + first watcher | 3 | F-14 | external_service | M |
 | **F-19** | Meta loop (delta edits to prompts) | 4 | F-11, F-16 | — | M |
 | **F-20** | Cross-provider reviewer | 4 | F-09 | external_service | S |
-| **F-21** | Per-category auto-merge | 4 | F-16, F-20 | deploy | M |
+| **F-21** | Per-category auto-merge | 4 | F-11, F-14, F-16, F-20 | deploy | M |
 | **F-22** | Vetted agent toolkit (skills, plugins, MCP servers) | 1 | F-06, F-09, F-10 | factory_control | M |
+| **F-23** | Review convergence | 1b | F-09, F-10 | factory_control | M |
+| **F-24** | Realistic rehearsal fixture in CI | 1b | F-05, F-07, F-08, F-10 | factory_control | M |
+| **F-25** | Sensitive-path sentinels | 1b | F-07 | factory_control | M |
+| **F-26** | Merges in order | 1b | F-10 | factory_control | S |
+| **F-27** | Vent tool | 1b | F-06, F-10 | factory_control | S |
+| **F-28** | Dogfood pilot: the factory builds its own safe WOs | 1b | F-23, F-24, F-25, F-26 | — | owner |
 
-Order to build in: **F-00 (in parallel) → F-01 → F-02 → F-03 → F-04 → F-07 → F-08 → F-05 → F-06 → F-09 → F-10 → F-11 → F-12 → F-22 → F-13.** The deterministic core (F-02–F-04, F-07, F-08) goes first: it's pure Python and testable without any model. The parts that touch Z.ai come after, so F-00's answers are in before anything runs against the plan.
+Order to build in: **F-00 (in parallel) → F-01 → F-02 → F-03 → F-04 → F-07 → F-08 → F-05 → F-06 → F-09 → F-10** (done), **then F-24 → F-23 → F-25 → F-26 → F-27 → F-28 → F-11 → F-12 → F-16 → F-22 → F-13.** The deterministic core (F-02–F-04, F-07, F-08) went first: it's pure Python and testable without any model. Hardening comes next, rehearsal fixture first so every later change is checked against a realistic repo. F-28 then runs the factory on its own F-11 and F-12. F-16 measures how much each layer catches before any outside project depends on it.
+
+F-14 (live checks) and F-15 (holdouts) need a deployed project with real users, which the factory itself is not, so they arrive with the first outside project (Phase 2). F-21 stays last: it unlocks only on numbers F-11, F-14 and F-16 produce from real merges.
 
 ---
 
@@ -57,7 +65,7 @@ Owner steps:
 
 ---
 
-## Phase 1 — v0 on JobFinderOS
+## Phase 1 — v0 core
 
 ### F-01 — Repo scaffold
 Turn this folder into the factory repo: `git init`; Python package `factory/` with a `factory` CLI entry point; `pyproject.toml`; `pytest`, `ruff`; GitHub Actions CI; a `CLAUDE.md` for the repo; schemas under `schema/`; this repo's own `.factory/project.yaml`.
@@ -212,6 +220,7 @@ Write a markdown summary per project:
 Acceptance:
 - AC-1 For a fixture `tasks.json`, the summary lists every `needs_human` task with its escalation reason.
 - AC-2 Metrics computed from `attempts` match hand-computed values for the fixture.
+- AC-3 The summary reports outcome measures only (RESEARCH-SOFTWARE-FACTORY §9): interventions per task, review rounds per attempt, tokens per merged PR, time from approval to merge, and the share of merged factory PRs later reverted (a revert commit naming the PR's merge commit). It never reports lines of code or PR counts as a measure of success.
 
 ### F-12 — Importer (`factory import`)
 An importer session reads a project's planning docs and proposes `tasks.json`. Every task is `draft`. The orchestrator shows the full diff; nothing is written without confirmation.
@@ -222,8 +231,59 @@ Acceptance:
 - AC-3 Running it twice with no doc changes proposes no diff for existing tasks. Status and attempts are preserved.
 - AC-4 The importer reads `.factory/out-of-scope/` (TASK-CONTRACT §5). A proposed task that resembles a record is listed in the import summary with the record's path. It's still proposed as `draft` and is never dropped or rejected on its own: you confirm the match.
 
+## Phase 1b — Harden, then dogfood
+
+The research's rollout order (RESEARCH-SOFTWARE-FACTORY §12; RESEARCH-AI-LAB-INTERNAL-FACTORIES §8) is: get ready, build the control plane, add verification depth, then let the loop run — on something narrow where a mistake is cheap. The 2026-10-18 JobFinderOS readiness rehearsal found three factory bugs no toy-repo test could catch (PR #24), before any agent ran. So before any outside project goes through the factory: harden what exists (F-23 to F-27, built interactively, because they touch what judges agents), then prove the loop on the factory's own safe work orders (F-28). Outside projects come after (F-13).
+
+### F-23 — Review convergence
+Rounds are already capped by `max_attempts`, but every L2 round re-reviews the whole diff from scratch. Findings drift to pre-existing code, repeat, or chase the last fix's regression. Our own review record: F-05 took 5 rounds, F-09 4, F-10 3, several finding bugs the previous round's fix introduced. The Claude Code team reports one PR that went through 50+ overnight rounds before they changed the loop: re-review only the delta, never repeat a finding, fix the class not the instance.
+- AC-1 Every L2 finding is stored per attempt with a stable key (file, rule or category, normalised summary). A finding whose key was raised in an earlier round and is unchanged in the diff since is not re-raised; the reviewer's verdict lists it as carried, not new.
+- AC-2 Rounds after the first give the reviewer the delta since the last reviewed sha as primary scope, with the full diff for reference only. A new finding outside the delta must say why it was missed earlier, or it is dropped as out of scope.
+- AC-3 The implementer's fix prompt carries each finding with an instruction to find and fix sibling sites of the same defect class, and the next round's reviewer checks for siblings explicitly.
+- AC-4 No-progress stop: if a round's FAIL contains only findings whose keys were already raised and claimed fixed, the task escalates `review_not_converging` (added to the schema enum, red-first) instead of spending another round.
+
+### F-24 — Realistic rehearsal fixture in CI
+Every factory test today uses a toy repo: nothing installed, a short `PATH`, a remote that never moves. That is why L1 wiping setup outputs, the home-dir `PATH` leaking into the sandbox (npm `spawn EPERM`) and building on stale local `main` all passed CI. The labs' practice: every incident becomes a standing eval, and each review of an incident asks which layer should have caught it.
+- AC-1 A fixture project (built by the test, no network) has a setup that installs a Python venv and a `node_modules` tree, declared as `setup_outputs`; a remote whose default branch is ahead of the local clone; and an ambient `PATH` that includes home-dir entries.
+- AC-2 A rehearsal test runs setup, L0 and L1 over a one-criterion contract against that fixture, end to end through the real sandbox, and passes on `main`.
+- AC-3 Reverting each PR #24 fix in turn (L1 `_clean` keeping setup outputs, `_path_outside_home`, `_build_on_remote_default`) makes the rehearsal fail. Proven by three tests that monkeypatch the old behaviour back in.
+- AC-4 CI runs the rehearsal on every PR (it is not marked slow or optional).
+- AC-5 `docs/incidents.md` records the three incidents, and for each: what broke, which layer should have caught it, and the test that now does. Every future factory incident adds an entry and a test in the same PR (checked by a test that every entry names an existing test).
+
+### F-25 — Sensitive-path sentinels
+Risk paths today force a human merge but nothing checks what the diff does there. Cursor runs about ten standing "security sentinel" invariants over sensitive PRs before a human looks; agents also cheat by weakening the tests that judge them.
+- AC-1 L0 runs built-in sentinels on every diff and fails with the sentinel's name: a credential-shaped string added (key, token, private-key patterns); a new skip, xfail or `only` marker on an existing test; an assertion removed from an existing test without a replacement; a `# noqa`, `type: ignore` or lint-disable added on a line the diff also changed in a risk path.
+- AC-2 `project.yaml` may add project sentinels under `sentinels.<risk flag>` (a list of command plus description), validated by the schema; `paths.risk` keeps its current shape. They run only when the diff touches that risk flag's globs, and a failure escalates `sentinel_failed` (schema enum, red-first).
+- AC-3 Each built-in sentinel has a seeded fixture diff that it flags and a clean diff that it passes.
+- AC-4 Sentinel results appear in the PR body and in the attempt record, pass or fail, so the human merge sees what was checked.
+
+### F-26 — Merges in order
+Two factory PRs that each pass on their own base can break `main` together. The labs solve it with merge queues; the small-scale version is "branch must be up to date before merging" plus re-validation on the new base. The research also says scale serially before scaling out.
+- AC-1 `factory run` and `factory loop` refuse to start on a repo whose default-branch protection does not require status checks with `strict` (up to date) enabled, naming the missing setting (checked via `gh api`, faked in tests).
+- AC-2 The loop keeps at most one open factory PR per repo by default (`concurrency: 1` in `project.yaml`, schema-validated). A ready task waits while one is open.
+- AC-3 When the default branch has moved past an open factory PR's base, `factory run` re-runs L0 and L1 on the PR merged onto the new base before reporting it ready; a failure moves the task to `needs_human` with escalation `stale_base` (schema enum, red-first).
+
+### F-27 — Vent tool
+Lovable's pattern, via Cursor: give agents a tool to complain. The complaints became their best harness bug tracker. Agents push through friction that never shows up as a failure (F-19 AC-4); this records it at the moment it happens.
+- AC-1 Implementer and reviewer sessions have one extra tool, `vent(category, text)`, an in-process SDK tool listed in `allowed_tools`. Categories: missing_tool, unclear_contract, flaky_check, environment, other.
+- AC-2 Each call appends one record (run id, task id, seat, turn, category, text) to the run's progress log outside the clone. The tool can write nothing else, and text is length-capped.
+- AC-3 Venting never changes a run's outcome or budget (a test vents mid-run and asserts the attempt record is otherwise identical).
+- AC-4 `factory status` (F-11) lists the week's vents grouped by category, and F-19's review reads them.
+
+### F-28 — Dogfood pilot: the factory builds its own safe work orders
+**Kind:** owner_only. The first real loop runs on the factory itself, where a mistake only hurts the factory. Principle 5 still holds: agents never edit what judges them.
+
+Owner steps:
+1. Extend `paths.protected` in this repo's `.factory/project.yaml` (by PR) to cover what judges agents: `factory/l0.py`, `factory/l1.py`, `factory/l2.py`, `factory/gates.py`, `factory/sandbox.py`, `factory/session.py`, `factory/publish.py`, `factory/orchestrator.py`, `factory/prompts.py`, `prompts/**` and every existing `tests/test_f*.py`, on top of today's `.factory/**`, `.github/workflows/**`, `schema/**`, the two spec files and `CLAUDE.md`. Turn on branch protection for this repo's `main` with up-to-date status checks (F-26 refuses to run without it).
+2. Readiness run on a clean clone: every profile command passes unattended (the F-24 rehearsal covers the mechanics).
+3. Approve F-11 and F-12 only. Their code (`factory/cli.py` status and import commands, new modules) is outside every protected path; the orchestrator adds their own contract tests to the protected set at approval.
+4. `factory run` once, watching; review and merge or reject the PR yourself. Then `factory loop` for the second.
+5. Record per attempt: rounds, your review time, findings you raised that L2 missed, and whether the merged change needed a fix later. That is the baseline F-11 then reports automatically.
+
+## Phase 1c — First outside project
+
 ### F-13 — Onboard JobFinderOS (pilot)
-**Kind:** owner_only. This is the onboarding steps in TASK-CONTRACT §6, run on the real repo.
+**Kind:** owner_only. This is the onboarding steps in TASK-CONTRACT §6, run on the real repo. It starts only after F-28 has a measured record on the factory's own queue. A readiness rehearsal already ran on 2026-10-18 (L0 passed; it found the three bugs fixed in PR #24); draft profile, baseline and contracts are in `projects/`, unapproved.
 
 Owner steps:
 1. Readiness run: every `project.yaml` command passes unattended on a clean clone.
