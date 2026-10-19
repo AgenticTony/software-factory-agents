@@ -145,7 +145,7 @@ def default_approver() -> str:
     return name or getpass.getuser()
 
 
-def _input_confirm(question: str) -> bool:
+def input_confirm(question: str) -> bool:
     """Ask a yes/no question on the terminal; anything but y/yes declines.
 
     EOF (no TTY, stdin closed or piped) also declines: approval without
@@ -200,7 +200,7 @@ def approve_task(
     *,
     approved_by: str,
     assume_yes: bool = False,
-    confirm: Callable[[str], bool] = _input_confirm,
+    confirm: Callable[[str], bool] = input_confirm,
     echo: Callable[[str], None] = print,
 ) -> str:
     """Print a draft task's contract, confirm, freeze it, and route it.
@@ -422,7 +422,7 @@ def reconcile_bootstrap(
     ledger_path: Path | str,
     *,
     approved_by: str,
-    confirm: Callable[[str], bool] = _input_confirm,
+    confirm: Callable[[str], bool] = input_confirm,
     echo: Callable[[str], None] = print,
 ) -> list:
     """Approve and advance the tasks named by the bootstrap ledger (AC-4).

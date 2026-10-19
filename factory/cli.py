@@ -1,6 +1,6 @@
 """Factory CLI — the control-plane entry point.
 
-``approve`` (F-04), ``run`` and ``loop`` (F-10) are real. Every other
+``approve`` (F-04), ``run`` and ``loop`` (F-10) and ``tick`` (F-29) are real. Every other
 subcommand is a stub naming the work order that implements it
 (BUILD-ORDER.md).
 """
@@ -26,6 +26,7 @@ from factory.runs import RunError
 from factory.sandbox import SandboxError
 from factory.session import SessionConfigError
 from factory.state import TaskQueue
+from factory.tick import TickError, tick_steps
 
 # run/loop exit codes: 0 = a PR opened, nothing to do, or the peak window;
 # 1 = an escalation needs you; 3 = the quota stop; 2 = the orchestrator
@@ -76,6 +77,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--approved-by", default=None, help="approver name (default: git user.name)"
     )
 
+    tick = sub.add_parser("tick", help="tick owner steps of a task (F-29)")
+    tick.add_argument("task_id", help="task id, e.g. F-00")
+    tick.add_argument("steps", nargs="+", type=int, help="1-based owner-step numbers")
+    tick.add_argument("--evidence", required=True,
+                      help="what you checked; recorded on every ticked step")
+    tick.add_argument("--queue", default=".factory/tasks.json",
+                      help="queue path (default: %(default)s)")
+    tick.add_argument("--done-by", default=None, help="your name (default: git user.name)")
+
     for name, text in (
         ("run", "pick the next ready task and take it to a PR (F-10)"),
         ("loop", "run until the queue is empty, quota, peak window or escalation (F-10)"),
@@ -120,6 +130,23 @@ def _run_approve(args: argparse.Namespace) -> int:
         return 130
 
 
+def _run_tick(args: argparse.Namespace) -> int:
+    """Dispatch the tick subcommand; refusals exit 1, never a traceback."""
+    try:
+        status = tick_steps(
+            TaskQueue(args.queue), args.task_id, args.steps,
+            evidence=args.evidence, done_by=args.done_by or default_approver(),
+        )
+    except (TickError, ContractError) as exc:
+        print(f"factory tick: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("factory tick: interrupted", file=sys.stderr)
+        return 130
+    print(f"{args.task_id}: ticked step(s) {', '.join(map(str, args.steps))} -> {status}")
+    return 0
+
+
 def _run_orchestrator(args: argparse.Namespace) -> int:
     """Dispatch run/loop; known failures exit 2 with a message, not a traceback."""
     try:
@@ -154,7 +181,7 @@ def main(argv: list | None = None) -> int:
 
     Returns:
         Process exit code. Stubs return 2 (not implemented); approve
-        returns 0 on success and 1 on any refusal or decline; run/loop
+        and tick return 0 on success and 1 on any refusal or decline; run/loop
         per ``_EXIT`` (2 when the orchestrator itself failed).
     """
     parser = build_parser()
@@ -172,6 +199,8 @@ def main(argv: list | None = None) -> int:
         return _run_approve(args)
     if args.command in ("run", "loop"):
         return _run_orchestrator(args)
+    if args.command == "tick":
+        return _run_tick(args)
     print(
         f"factory {args.command}: not implemented yet (scheduled in {STUBS[args.command]})",
         file=sys.stderr,

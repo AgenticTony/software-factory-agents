@@ -134,10 +134,12 @@ ILLEGAL_EDGE_CLASSES = {
         ("needs_human", "in_review"),
         ("needs_human", "done"),
     ],
+    # not_buildable -> done exists since F-29, guarded to owner_only tasks
+    # with every step ticked (tests/test_f29.py); every other exit is illegal.
     "exit_from_not_buildable": [
         ("not_buildable", "draft"),
         ("not_buildable", "ready"),
-        ("not_buildable", "done"),
+        ("not_buildable", "in_progress"),
     ],
 }
 
@@ -191,7 +193,9 @@ def test_l4_branches_from_deploying(tmp_path):
     )
     queue = TaskQueue(path)
     queue.transition("T-OWNER", "awaiting_owner")
-    queue.get("T-OWNER")["owner_steps"][0]["done"] = True  # you tick the step
+    queue.get("T-OWNER")["owner_steps"][0].update(
+        done=True, done_at="2026-10-19T00:00:00Z", done_by="Tester", evidence="ticked"
+    )  # F-29: a tick carries its audit fields
     queue.transition("T-OWNER", "done")
     assert TaskQueue(path).get("T-OWNER")["status"] == "done"
 
@@ -216,7 +220,9 @@ def test_owner_step_guards(tmp_path):
     queue.transition("T-OPEN", "awaiting_owner")  # legal: a step is open
     with pytest.raises(TransitionError, match="never done"):
         TaskQueue(path).transition("T-OPEN", "done")
-    queue.get("T-OPEN")["owner_steps"][0]["done"] = True
+    queue.get("T-OPEN")["owner_steps"][0].update(
+        done=True, done_at="2026-10-19T00:00:00Z", done_by="Tester", evidence="ticked"
+    )  # F-29: a tick carries its audit fields
     queue.transition("T-OPEN", "done")
     assert TaskQueue(path).get("T-OPEN")["status"] == "done"
 

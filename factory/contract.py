@@ -131,7 +131,15 @@ def _check_semantics(tasks: Any, origin: str) -> None:
                 f"{origin}: task {tid} is kind={kind} but status={shown}; "
                 f"{kind} tasks are never executable — allowed statuses: {allowed}"
             )
-        if status in POST_APPROVAL_STATUSES:
+        if kind == "owner_only" and status == "done":
+            # F-29: no contract to freeze; done means every owner step ticked.
+            steps = task.get("owner_steps") or []
+            if not steps or not all(step.get("done") for step in steps):
+                raise ContractError(
+                    f"{origin}: task {tid} is an owner_only task marked done, but "
+                    "it needs at least one owner step and every one ticked (factory tick)"
+                )
+        elif status in POST_APPROVAL_STATUSES:
             missing = [k for k in ("acceptance_hash", "approved_at") if not task.get(k)]
             if missing:
                 raise ContractError(

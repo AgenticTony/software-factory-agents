@@ -40,9 +40,10 @@ The factory's own build plan, written in the format the factory will consume: on
 | **F-25** | Sensitive-path sentinels | 1b | F-07 | factory_control | M |
 | **F-26** | Merges in order | 1b | F-10 | factory_control | S |
 | **F-27** | Vent tool | 1b | F-06, F-10 | factory_control | S |
-| **F-28** | Dogfood pilot: the factory builds its own safe WOs | 1b | F-23, F-24, F-25, F-26 | — | owner |
+| **F-28** | Dogfood pilot: the factory builds its own safe WOs | 1b | F-23, F-24, F-25, F-26, F-29 | — | owner |
+| **F-29** | Owner-step tick (`factory tick`) | 1b | F-03, F-04 | factory_control | S |
 
-Order to build in: **F-00 (in parallel) → F-01 → F-02 → F-03 → F-04 → F-07 → F-08 → F-05 → F-06 → F-09 → F-10** (done), **then F-24 → F-23 → F-25 → F-26 → F-27 → F-28 → F-11 → F-12 → F-16 → F-22 → F-13.** The deterministic core (F-02–F-04, F-07, F-08) went first: it's pure Python and testable without any model. Hardening comes next, rehearsal fixture first so every later change is checked against a realistic repo. F-28 then runs the factory on its own F-11 and F-12. F-16 measures how much each layer catches before any outside project depends on it.
+Order to build in: **F-00 (in parallel) → F-01 → F-02 → F-03 → F-04 → F-07 → F-08 → F-05 → F-06 → F-09 → F-10** (done), **then F-29 → F-24 → F-23 → F-25 → F-26 → F-27 → F-28 → F-11 → F-12 → F-16 → F-22 → F-13.** The deterministic core (F-02–F-04, F-07, F-08) went first: it's pure Python and testable without any model. F-29 comes first because nothing else can close without it: F-00 and F-06 are stuck on owner steps no command can tick, and F-09/F-10 can't reconcile until F-06 is done. Hardening comes next, rehearsal fixture first so every later change is checked against a realistic repo. F-28 then runs the factory on its own F-11 and F-12. F-16 measures how much each layer catches before any outside project depends on it.
 
 F-14 (live checks) and F-15 (holdouts) need a deployed project with real users, which the factory itself is not, so they arrive with the first outside project (Phase 2). F-21 stays last: it unlocks only on numbers F-11, F-14 and F-16 produce from real merges.
 
@@ -234,6 +235,14 @@ Acceptance:
 ## Phase 1b — Harden, then dogfood
 
 The research's rollout order (RESEARCH-SOFTWARE-FACTORY §12; RESEARCH-AI-LAB-INTERNAL-FACTORIES §8) is: get ready, build the control plane, add verification depth, then let the loop run — on something narrow where a mistake is cheap. The 2026-10-18 JobFinderOS readiness rehearsal found three factory bugs no toy-repo test could catch (PR #24), before any agent ran. So before any outside project goes through the factory: harden what exists (F-23 to F-27, built interactively, because they touch what judges agents), then prove the loop on the factory's own safe work orders (F-28). Outside projects come after (F-13).
+
+### F-29 — Owner-step tick (`factory tick`)
+Owner steps can be recorded but never ticked: no command writes `done: true`, so F-06 sits at `awaiting_owner` after reconcile (its step is confirmed in the ledger), F-09/F-10 can't reconcile behind it, and F-00 (`owner_only`) has no path to `done` at all. F-13 and F-28 depend on both. The tick is a human action, so it is interactive and leaves evidence, like approval.
+- AC-1 `factory tick <id> <step> [<step> ...] --evidence <text>` shows each named owner step (1-based) and asks for confirmation per step. A confirmed step gets `done: true`, `done_at`, `done_by` and `evidence` (additive schema fields; `done: true` without the other three is refused at load). `--evidence` is required and non-blank; there is no `--yes`.
+- AC-2 An unknown task, a step number out of range, an already-ticked step, a blank evidence string, or a declined confirmation each leaves `tasks.json` byte-identical and exits non-zero with a message naming the problem. One tick call is one atomic save: a refusal on any named step writes none of them.
+- AC-3 Ticking the last open step of an `awaiting_owner` task moves it to `done` in the same save. Ticking a step of a task in any other status records the tick and never changes the status.
+- AC-4 An `owner_only` task whose last step is ticked moves `draft → not_buildable → done` through two new table edges. Both are guarded: only a non-executable kind may enter `not_buildable` from `draft`, and only an `owner_only` task with at least one step and every step ticked may go `not_buildable → done`. A `build` or `docs` task taking either edge raises (one test per edge).
+- AC-5 Reconcile leaves `owner_only` tasks untouched: the real-files reconcile tests assert F-00 is unchanged by the run, not that it is `draft`, so they keep passing after F-00 is ticked to `done`.
 
 ### F-23 — Review convergence
 Rounds are already capped by `max_attempts`, but every L2 round re-reviews the whole diff from scratch. Findings drift to pre-existing code, repeat, or chase the last fix's regression. Our own review record: F-05 took 5 rounds, F-09 4, F-10 3, several finding bugs the previous round's fix introduced. The Claude Code team reports one PR that went through 50+ overnight rounds before they changed the loop: re-review only the delta, never repeat a finding, fix the class not the instance.
