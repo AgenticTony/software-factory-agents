@@ -23,9 +23,10 @@ The fixture is realistic on the three axes that broke that day:
   ~/.local/bin, …) first, plus a literal ``~`` entry. The sandbox drops
   inherited home entries (either spelling) and literal ``~`` entries
   (PR #24, incident 2); the fixture's ``tools/env-guard.sh`` — a plain
-  toolchain precondition — refuses an unexpanded PATH entry, so a
-  reverted filter fails setup inside the sandbox, deterministically on
-  every platform.
+  toolchain precondition with the host's home paths baked in — refuses a
+  PATH entry under the home (either spelling) or an unexpanded ``~``
+  entry, so a reverted *or simplified* filter fails setup inside the
+  sandbox, deterministically on every platform.
 * **A remote ahead of the local clone.** The bare remote's ``main``
   carries a commit the local repo has never pulled, so a run that clones
   the local checkout without fetching the remote builds on stale code —
@@ -48,6 +49,7 @@ from pathlib import Path
 import yaml
 
 from factory.contract import acceptance_hash
+from factory.gates import git as hardened_git
 from factory.orchestrator import run_once
 from factory.publish import PullRequest
 from factory.session import SessionRecord
@@ -114,20 +116,40 @@ if __name__ == "__main__":
 
 # A plain toolchain precondition, the kind real setups carry: command
 # resolution through an unexpanded PATH entry is broken for every tool
-# downstream (the shell never expanded it), so the setup refuses to start.
-# Inside the sandbox this is the deterministic canary for incident (2):
-# the sanitised child PATH never carries a literal `~` entry, a leaked one
-# always does — on every platform, with no dependence on how a given
-# execvp treats a denied candidate.
-_ENV_GUARD = '''#!/bin/sh
-# Refuse an unexpanded PATH: tooling cannot resolve commands through a
-# literal `~` entry the shell never expanded.
-case ":$PATH:" in
-  *":~:"*|*":~/"*)
-    echo "env-guard: PATH carries an unexpanded ~ entry" >&2
-    exit 1
-    ;;
-esac
+# downstream (the shell never expanded it), and so is resolution through
+# the owner's home, which the sandbox denies reading. Inside the sandbox
+# this is the deterministic canary for incident (2) on BOTH leak classes:
+# the sanitised child PATH never carries a literal `~` entry or anything
+# under the real home, and a leaked one of either kind always does — on
+# every platform, with no dependence on how a given execvp treats a
+# denied candidate. The home paths are baked in at fixture-build time
+# (both spellings of the home, the same set `_path_outside_home` drops).
+_ENV_GUARD_TEMPLATE = '''#!/bin/sh
+# Refuse a PATH that leaks the owner's home (either spelling) or carries
+# an unexpanded `~` entry. Home paths are baked in by factory.rehearsal.
+homes='{homes}'
+rest=$PATH:
+while [ -n "$rest" ]; do
+  entry=${{rest%%:*}}
+  rest=${{rest#*:}}
+  case $entry in
+    "~"|"~/"*)
+      echo "env-guard: PATH carries an unexpanded ~ entry: $entry" >&2
+      exit 1
+      ;;
+  esac
+  scan=$homes:
+  while [ -n "$scan" ]; do
+    home=${{scan%%:*}}
+    scan=${{scan#*:}}
+    case $entry in
+      "$home"|"$home"/*)
+        echo "env-guard: PATH leaks a home-dir entry ($home): $entry" >&2
+        exit 1
+        ;;
+    esac
+  done
+done
 '''
 
 _LINT_JS = '''#!/usr/bin/env node
@@ -168,24 +190,28 @@ def ambient_path_with_home_entries() -> str:
     """The ambient PATH of the owner's interactive shell, the incident's
     environment: home dirs first (both spellings the fix drops), then the
     real PATH. ``~/.local/bin`` and friends need not exist on the host —
-    the leaked literal ``~`` entry is the deterministic canary."""
+    the leaked literal ``~`` entry is the deterministic canary. Empty
+    entries are dropped everywhere: an empty PATH entry means the current
+    directory, a leak class of its own that AC-3 could not attribute."""
     home = Path.home()
+    inherited = [entry for entry in os.environ.get("PATH", "").split(":") if entry]
     return ":".join(
         [
             f"{home}/.pyenv/shims",
             f"{home}/.local/bin",
             f"{home}/.npm-global/bin",
             "~/.local/bin",
-            os.environ.get("PATH", ""),
+            *inherited,
         ]
     )
 
 
-def _git(repo: Path, *args: str) -> str:
-    proc = subprocess.run(
-        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
-    )
-    return proc.stdout.strip()
+def _env_guard_source() -> str:
+    """The guard script with this host's home paths baked in (both
+    spellings, the same set ``_path_outside_home`` drops)."""
+    homes = {str(Path.home())}
+    homes.add(str(Path.home().resolve()))
+    return _ENV_GUARD_TEMPLATE.format(homes=":".join(sorted(homes)))
 
 
 def _write(path: Path, text: str, executable: bool = False) -> None:
@@ -261,13 +287,13 @@ def build_rehearsal_fixture(dest: Path) -> RehearsalFixture:
     """
     dest = Path(dest)
     dest.mkdir(parents=True)
-    _git(dest, "init", "-q", "-b", "main")
-    _git(dest, "config", "user.email", "rehearsal@example.com")
-    _git(dest, "config", "user.name", "Rehearsal")
+    hardened_git(dest, "init", "-q", "-b", "main")
+    hardened_git(dest, "config", "user.email", "rehearsal@example.com")
+    hardened_git(dest, "config", "user.name", "Rehearsal")
 
     _write(dest / "impl.py", "def answer():\n    return 0\n")
     _write(dest / "tools" / "run_ref.py", _RUN_REF)
-    _write(dest / "tools" / "env-guard.sh", _ENV_GUARD, executable=True)
+    _write(dest / "tools" / "env-guard.sh", _env_guard_source(), executable=True)
     _write(dest / "tests" / "test_base.py", "def test_base():\n    assert True\n")
     _write(dest / "package.json", '{"name": "rehearsal-fixture", "private": true}\n')
     _write(dest / "lint-manifest.txt", "rehearsal fixture lint manifest\n")
@@ -283,11 +309,14 @@ def build_rehearsal_fixture(dest: Path) -> RehearsalFixture:
         )
         + "\n",
     )
-    _write(dest / ".gitignore", ".factory/*.lock\n")
+    # A real project ignores what setup installs: the orchestrator commits
+    # with `git add -A`, so a session that ran setup would otherwise put
+    # the whole .venv and node_modules tree into its PR.
+    _write(dest / ".gitignore", ".factory/*.lock\n/.venv/\n/node_modules/\n")
 
-    _git(dest, "add", "-A")
-    _git(dest, "commit", "-qm", "base")
-    local_main = _git(dest, "rev-parse", "refs/heads/main")
+    hardened_git(dest, "add", "-A")
+    hardened_git(dest, "commit", "-qm", "base")
+    local_main = hardened_git(dest, "rev-parse", "refs/heads/main").strip()
 
     subprocess.run(
         ["git", "clone", "--bare", "-q", str(dest), str(remote)], check=True
@@ -302,12 +331,14 @@ def build_rehearsal_fixture(dest: Path) -> RehearsalFixture:
             scratch / "REMOTE-ONLY.md",
             "Landed on the remote's default branch; the local clone never pulled it.\n",
         )
-        _git(scratch, *identity, "add", "-A")
-        _git(scratch, *identity, "commit", "-qm", "advance the default branch on the remote")
-        _git(scratch, "push", "-q", "origin", "HEAD:main")
+        hardened_git(scratch, *identity, "add", "-A")
+        hardened_git(
+            scratch, *identity, "commit", "-qm", "advance the default branch on the remote"
+        )
+        hardened_git(scratch, "push", "-q", "origin", "HEAD:main")
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
-    remote_main = _git(remote, "rev-parse", "refs/heads/main")
+    remote_main = hardened_git(remote, "rev-parse", "refs/heads/main").strip()
 
     return RehearsalFixture(
         repo=dest,
@@ -347,14 +378,33 @@ class _RehearsalSeats:
         )
 
 
+class RehearsalError(RuntimeError):
+    """The rehearsal failed a property the run's outcome alone doesn't show.
+
+    F-28's readiness flow treats a raised rehearsal exactly like a failed
+    one: the run is not ready.
+    """
+
+
 def run_rehearsal(
     fixture: RehearsalFixture, factory_root: Path, *, now=None
 ) -> tuple:
     """One full ``factory run`` over the fixture's one-criterion contract.
 
+    Beyond the run's own outcome, the rehearsal proves the property the
+    outcome cannot show on its own (incident INC-003): a ``pr_opened``
+    result whose PR head does not contain the remote's default-branch
+    commit was built on a stale local checkout, and raises instead of
+    returning. A readiness run (F-28 step 2) is green only when this
+    returns without raising.
+
     Returns:
         ``(RunResult, prs)`` — the run's outcome and the PRs the recorder
         captured (empty unless one was opened).
+
+    Raises:
+        RehearsalError: the run reported ``pr_opened`` with no recorded
+            PR, or the PR head lacks the remote's default-branch commit.
     """
     prs: list[PullRequest] = []
 
@@ -370,4 +420,24 @@ def run_rehearsal(
         open_pr=open_pr,
         now=now or (lambda: datetime.now(timezone.utc)),
     )
+    if result.outcome == "pr_opened":
+        if not prs:
+            raise RehearsalError("run_once reported pr_opened but no PR was recorded")
+        # rc 0 = the remote's advanced main is in the PR head; anything
+        # else (rc 1 = not an ancestor, or a git error, with stderr
+        # surfaced in the message) means the run built on a stale or
+        # unknown base: not ready, by construction.
+        proc = subprocess.run(
+            ["git", "-C", str(fixture.remote), "merge-base", "--is-ancestor",
+             fixture.remote_main, f"refs/heads/{prs[-1].head}"],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            raise RehearsalError(
+                f"the PR head {prs[-1].head} does not contain the remote's "
+                f"default-branch commit {fixture.remote_main[:12]}: the run built "
+                f"on a stale local checkout (git rc={proc.returncode}, "
+                f"stderr: {proc.stderr.strip()[:200]})"
+            )
     return result, prs
