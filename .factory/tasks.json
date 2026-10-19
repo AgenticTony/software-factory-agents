@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-18T00:00:00Z",
+  "updated_at": "2026-10-19T08:44:17Z",
   "tasks": [
     {
       "id": "F-00",
@@ -59,7 +59,7 @@
       "source": "BUILD-ORDER.md#f-01--repo-scaffold",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [],
       "risk": [],
       "gates": {
@@ -100,7 +100,10 @@
         "wall_clock_min": 60
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "acceptance_hash": "8790d17b773ced21b62ff003bc4b4f324dd2c0b19d82bc091011b67314926442",
+      "approved_at": "2026-10-19T08:44:03Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-02",
@@ -108,7 +111,7 @@
       "source": "BUILD-ORDER.md#f-02--contract-loading-and-validation",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-01"
       ],
@@ -151,7 +154,10 @@
         "wall_clock_min": 60
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "acceptance_hash": "0ba9ead75ddbd053e59556894a9fd6db9851251dc7a0a49a4ee071e9f0f434db",
+      "approved_at": "2026-10-19T08:44:07Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-03",
@@ -159,7 +165,7 @@
       "source": "BUILD-ORDER.md#f-03--state-machine-and-picker",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-02"
       ],
@@ -226,7 +232,10 @@
         "wall_clock_min": 150
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "acceptance_hash": "23ce6b375da2de7632b8f3d21f4cd1700ab7285348f4f83e1d45b73ff3c43922",
+      "approved_at": "2026-10-19T08:44:09Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-04",
@@ -234,7 +243,7 @@
       "source": "BUILD-ORDER.md#f-04--factory-approve-id",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-03"
       ],
@@ -285,7 +294,10 @@
         "wall_clock_min": 60
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "acceptance_hash": "8331df627b0fe55edaf96480d5723a2205cfabf399b3ed2a2262562f9f36c945",
+      "approved_at": "2026-10-19T08:44:10Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-05",
@@ -293,7 +305,7 @@
       "source": "BUILD-ORDER.md#f-05--clone-manager-and-sandbox",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-01"
       ],
@@ -346,7 +358,10 @@
         "wall_clock_min": 150
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "acceptance_hash": "7a97cfe9e1102aa20e814c0b26a894d745ff42e632a6ae0eb0434d7fead2c14e",
+      "approved_at": "2026-10-19T08:44:15Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-06",
@@ -354,7 +369,7 @@
       "source": "BUILD-ORDER.md#f-06--session-runner",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "awaiting_owner",
       "depends_on": [
         "F-05"
       ],
@@ -421,7 +436,10 @@
           "text": "F-00 step 1 answered before AC-4 is run repeatedly or on a schedule.",
           "done": false
         }
-      ]
+      ],
+      "acceptance_hash": "2ff6017acda5d586366072188de0c80cfbfcd67dda517c60ad019c128c10d6cd",
+      "approved_at": "2026-10-19T08:44:17Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-07",
@@ -429,7 +447,7 @@
       "source": "BUILD-ORDER.md#f-07--l0-deterministic-gates",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-02"
       ],
@@ -488,7 +506,10 @@
         "wall_clock_min": 150
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "acceptance_hash": "2af9ecd2c5bda0f5c1c5e7f182d6ecfa5c85f8ef652e8abaf6234253f7471c8f",
+      "approved_at": "2026-10-19T08:44:12Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-08",
@@ -496,7 +517,7 @@
       "source": "BUILD-ORDER.md#f-08--l1-red-first-proof",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-07"
       ],
@@ -539,7 +560,10 @@
         "wall_clock_min": 60
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "acceptance_hash": "83f2767229583d5254599eec5e42a2391db999d812f24f4b8f58cd209e95e332",
+      "approved_at": "2026-10-19T08:44:13Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-09",
