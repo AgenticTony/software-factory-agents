@@ -35,7 +35,10 @@ The fixture is realistic on the three axes that broke that day:
 The rehearsal itself (:func:`run_rehearsal`) is one ``run_once`` over a
 one-criterion contract: real clone manager, real srt-sandboxed L0 and L1,
 real push and PR (via a recording ``open_pr``), stub seats. F-28's
-readiness-run mechanics are this same path.
+readiness-run mechanics are this same path, and its verdict is the
+function's control flow: ready only when it returns — every other
+outcome, and a stale-base PR, raises :class:`RehearsalError` carrying
+the run's result.
 """
 
 import json
@@ -52,6 +55,7 @@ from factory.contract import acceptance_hash
 from factory.gates import git as hardened_git
 from factory.orchestrator import run_once
 from factory.publish import PullRequest
+from factory.runs import GIT_HARDENING
 from factory.session import SessionRecord
 
 REHEARSAL_TEST_REF = "tests/test_feature.py::test_ac_1"
@@ -91,7 +95,13 @@ def main(argv):
     path, _, name = argv[1].partition("::")
     module = _load(path)
     if name:
-        functions = [(name, getattr(module, name))]
+        # A typo'd name is a not-found signal (exit 2), never an
+        # AttributeError traceback that reads as an ordinary failure.
+        func = getattr(module, name, None)
+        if not callable(func):
+            print("no test named %s in %s" % (name, path), file=sys.stderr)
+            return 2
+        functions = [(name, func)]
     else:
         functions = sorted((n, f) for n, f in vars(module).items()
                            if n.startswith("test") and callable(f))
@@ -126,29 +136,32 @@ if __name__ == "__main__":
 # (both spellings of the home, the same set `_path_outside_home` drops).
 _ENV_GUARD_TEMPLATE = '''#!/bin/sh
 # Refuse a PATH that leaks the owner's home (either spelling) or carries
-# an unexpanded `~` entry. Home paths are baked in by factory.rehearsal.
-homes='{homes}'
+# an unexpanded `~` entry. Home paths are baked in by factory.rehearsal,
+# one per line in the quoted heredoc below: with a quoted delimiter the
+# body is literal, so paths with quotes, spaces or shell metacharacters
+# stay data, never syntax. (No str.format anywhere near this template —
+# the shell braces must survive verbatim.)
 rest=$PATH:
 while [ -n "$rest" ]; do
-  entry=${{rest%%:*}}
-  rest=${{rest#*:}}
+  entry=${rest%%:*}
+  rest=${rest#*:}
   case $entry in
     "~"|"~/"*)
       echo "env-guard: PATH carries an unexpanded ~ entry: $entry" >&2
       exit 1
       ;;
   esac
-  scan=$homes:
-  while [ -n "$scan" ]; do
-    home=${{scan%%:*}}
-    scan=${{scan#*:}}
+  while IFS= read -r home; do
+    [ -n "$home" ] || continue
     case $entry in
       "$home"|"$home"/*)
         echo "env-guard: PATH leaks a home-dir entry ($home): $entry" >&2
         exit 1
         ;;
     esac
-  done
+  done <<'HOMES'
+__HOMES__
+HOMES
 done
 '''
 
@@ -208,10 +221,23 @@ def ambient_path_with_home_entries() -> str:
 
 def _env_guard_source() -> str:
     """The guard script with this host's home paths baked in (both
-    spellings, the same set ``_path_outside_home`` drops)."""
+    spellings, the same set ``_path_outside_home`` drops).
+
+    The paths ride one per line inside a quoted heredoc, so any character
+    short of a newline is literal to the shell. A newline in a home path
+    cannot be represented that way and is rejected here, at build time —
+    a fixture that cannot be built correctly is better than one whose
+    guard silently matches nothing.
+    """
     homes = {str(Path.home())}
     homes.add(str(Path.home().resolve()))
-    return _ENV_GUARD_TEMPLATE.format(homes=":".join(sorted(homes)))
+    for home in homes:
+        if "\n" in home:
+            raise RehearsalError(
+                f"cannot bake a home path containing a newline into env-guard.sh: {home!r}"
+            )
+    lines = "\n".join(sorted(homes))
+    return _ENV_GUARD_TEMPLATE.replace("__HOMES__", lines)
 
 
 def _write(path: Path, text: str, executable: bool = False) -> None:
@@ -318,11 +344,18 @@ def build_rehearsal_fixture(dest: Path) -> RehearsalFixture:
     hardened_git(dest, "commit", "-qm", "base")
     local_main = hardened_git(dest, "rev-parse", "refs/heads/main").strip()
 
+    # Clones carry GIT_HARDENING like every other git call in the module
+    # (review round 2, finding 7): a host's global insteadOf/hooks config
+    # must not reach the fixture's remotes. check=True stays — a failed
+    # clone is a build failure, not a verdict.
     subprocess.run(
-        ["git", "clone", "--bare", "-q", str(dest), str(remote)], check=True
+        ["git", *GIT_HARDENING, "clone", "--bare", "-q", str(dest), str(remote)],
+        check=True,
     )
     scratch = dest.parent / f"{dest.name}-scratch"
-    subprocess.run(["git", "clone", "-q", str(remote), str(scratch)], check=True)
+    subprocess.run(
+        ["git", *GIT_HARDENING, "clone", "-q", str(remote), str(scratch)], check=True
+    )
     identity = (
         "-c", "user.email=rehearsal@example.com", "-c", "user.name=Rehearsal",
     )
@@ -379,11 +412,27 @@ class _RehearsalSeats:
 
 
 class RehearsalError(RuntimeError):
-    """The rehearsal failed a property the run's outcome alone doesn't show.
+    """The rehearsal did not come back ready.
 
     F-28's readiness flow treats a raised rehearsal exactly like a failed
-    one: the run is not ready.
+    one: the run is not ready. The exception carries the run's
+    :class:`~factory.orchestrator.RunResult` (``result``) and the recorded
+    PRs (``prs``) so callers can inspect what happened.
     """
+
+    def __init__(self, message: str, result=None, prs=()) -> None:
+        super().__init__(message)
+        self.result = result
+        self.prs = list(prs)
+
+
+def _finding_ids(reports: dict) -> str:
+    """One line of L0/L1/L2 finding ids, for error messages."""
+    ids = []
+    for layer in ("L0", "L1", "L2"):
+        for finding in (reports.get(layer) or {}).get("findings") or []:
+            ids.append(f"{layer}:{finding.get('id')}")
+    return ", ".join(ids) or "no findings recorded"
 
 
 def run_rehearsal(
@@ -391,20 +440,22 @@ def run_rehearsal(
 ) -> tuple:
     """One full ``factory run`` over the fixture's one-criterion contract.
 
-    Beyond the run's own outcome, the rehearsal proves the property the
-    outcome cannot show on its own (incident INC-003): a ``pr_opened``
-    result whose PR head does not contain the remote's default-branch
-    commit was built on a stale local checkout, and raises instead of
-    returning. A readiness run (F-28 step 2) is green only when this
-    returns without raising.
+    A readiness run (F-28 step 2) is ready **only** when this returns:
+    every outcome other than ``pr_opened`` raises, and so does a
+    ``pr_opened`` whose PR head lacks the remote's default-branch commit
+    (incident INC-003, a stale-base build). "Returns without raising" is
+    the whole readiness verdict.
 
     Returns:
         ``(RunResult, prs)`` — the run's outcome and the PRs the recorder
-        captured (empty unless one was opened).
+        captured (exactly one when all went well).
 
     Raises:
-        RehearsalError: the run reported ``pr_opened`` with no recorded
-            PR, or the PR head lacks the remote's default-branch commit.
+        RehearsalError: the outcome is anything but ``pr_opened``
+            (escalated, failed, quota/window/error), or a ``pr_opened``
+            run recorded no PR, or the PR head does not contain the
+            remote's default-branch commit. The exception carries the
+            run's ``result`` and ``prs``.
     """
     prs: list[PullRequest] = []
 
@@ -420,24 +471,39 @@ def run_rehearsal(
         open_pr=open_pr,
         now=now or (lambda: datetime.now(timezone.utc)),
     )
-    if result.outcome == "pr_opened":
-        if not prs:
-            raise RehearsalError("run_once reported pr_opened but no PR was recorded")
-        # rc 0 = the remote's advanced main is in the PR head; anything
-        # else (rc 1 = not an ancestor, or a git error, with stderr
-        # surfaced in the message) means the run built on a stale or
-        # unknown base: not ready, by construction.
-        proc = subprocess.run(
-            ["git", "-C", str(fixture.remote), "merge-base", "--is-ancestor",
-             fixture.remote_main, f"refs/heads/{prs[-1].head}"],
-            capture_output=True,
-            text=True,
+    if result.outcome != "pr_opened":
+        detail = f"escalation {result.escalation}" if result.escalation else "no escalation"
+        raise RehearsalError(
+            f"rehearsal outcome {result.outcome!r} ({detail}; "
+            f"{_finding_ids(result.reports)})",
+            result=result,
+            prs=prs,
         )
-        if proc.returncode != 0:
-            raise RehearsalError(
-                f"the PR head {prs[-1].head} does not contain the remote's "
-                f"default-branch commit {fixture.remote_main[:12]}: the run built "
-                f"on a stale local checkout (git rc={proc.returncode}, "
-                f"stderr: {proc.stderr.strip()[:200]})"
-            )
+    if not prs:
+        raise RehearsalError(
+            "run_once reported pr_opened but no PR was recorded",
+            result=result,
+            prs=prs,
+        )
+    # rc 0 = the remote's advanced main is in the PR head; anything
+    # else (rc 1 = not an ancestor, or a git error, with stderr
+    # surfaced in the message) means the run built on a stale or
+    # unknown base: not ready, by construction. GIT_HARDENING matches
+    # factory.gates.git; raw subprocess only because the rc IS the answer
+    # here and gates.git raises on any non-zero exit.
+    proc = subprocess.run(
+        ["git", *GIT_HARDENING, "-C", str(fixture.remote), "merge-base", "--is-ancestor",
+         fixture.remote_main, f"refs/heads/{prs[-1].head}"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RehearsalError(
+            f"the PR head {prs[-1].head} does not contain the remote's "
+            f"default-branch commit {fixture.remote_main[:12]}: the run built "
+            f"on a stale local checkout (git rc={proc.returncode}, "
+            f"stderr: {proc.stderr.strip()[:200]})",
+            result=result,
+            prs=prs,
+        )
     return result, prs

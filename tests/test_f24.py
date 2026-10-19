@@ -40,6 +40,7 @@ from factory.gates import git as hardened_git
 from factory.rehearsal import (
     RehearsalError,
     RehearsalFixture,
+    _env_guard_source,
     ambient_path_with_home_entries,
     build_rehearsal_fixture,
     run_rehearsal,
@@ -239,26 +240,42 @@ def test_ac_3(rehearsal, monkeypatch):
         hardened_git(repo, "clean", "-fdx")  # PR #24's pre-fix behaviour
 
     # (1) _clean without the setup-output keeps: the venv is wiped between
-    # L1's phases, every ref exits 127, the round never passes.
+    # L1's phases, every ref exits 127, the round never passes. A failed
+    # rehearsal raises (review round 2, finding 1: F-28 readiness is
+    # "returns without raising", so needs_human must raise too), carrying
+    # the run's result for inspection.
     with monkeypatch.context() as m:
         m.setattr(l1_module, "_clean", old_clean)
         fixture, root = rehearsal()
-        result, prs = run_rehearsal(fixture, root, now=lambda: OFF_PEAK)
+        with pytest.raises(RehearsalError) as exc:
+            run_rehearsal(fixture, root, now=lambda: OFF_PEAK)
+    result = exc.value.result
     assert result.outcome == "needs_human", result
-    assert not prs
+    assert not exc.value.prs
     findings = [f["id"] for f in (result.reports.get("L1") or {}).get("findings") or []]
     assert "test_not_green" in findings, result.reports["L1"]
 
     # (2) _path_outside_home as identity: the sandboxed child inherits the
-    # home/literal-~ PATH entries, the fixture's env guard fails setup.
+    # home/literal-~ PATH entries, the fixture's env guard fails setup —
+    # and the guard's own message must be the recorded cause (review round
+    # 2, finding 3: on macOS a leaked PATH can fail setup via the real
+    # npm EPERM instead, so only the guard message attributes the failure
+    # to the canary rather than to whatever else the leak breaks).
     with monkeypatch.context() as m:
         m.setattr(sandbox_module, "_path_outside_home", lambda path: path)
         fixture, root = rehearsal()
-        result, prs = run_rehearsal(fixture, root, now=lambda: OFF_PEAK)
+        with pytest.raises(RehearsalError) as exc:
+            run_rehearsal(fixture, root, now=lambda: OFF_PEAK)
+    result = exc.value.result
     assert result.outcome == "needs_human", result
-    assert not prs
+    assert not exc.value.prs
     findings = [f["id"] for f in (result.reports.get("L0") or {}).get("findings") or []]
     assert "setup_failed" in findings, result.reports["L0"]
+    setup = next(c for c in result.reports["L0"]["commands"] if c["name"] == "setup")
+    assert "env-guard:" in setup["output"], (
+        "the failure must be attributed to the env guard, not to whatever "
+        "else a leaked PATH happens to break on this host"
+    )
 
     # (3) _build_on_remote_default as a no-op: the run builds on the stale
     # local main, and run_rehearsal itself raises on the stale-base PR —
@@ -317,14 +334,26 @@ def test_ac_4():
         test = getattr(module, name)
         assert not test.__dict__.get("pytestmark"), f"{name} must not carry pytest markers"
         assert not hasattr(test, "__unittest_skip__"), f"{name} must not be skipped"
+    # Alternative pytest config files take precedence over pyproject and
+    # could carry addopts; the repo's config lives in pyproject.toml only
+    # (review round 2, finding 5), so none of them may appear at all.
+    for rogue in ("pytest.ini", "tox.ini", "setup.cfg"):
+        assert not (REPO_ROOT / rogue).exists(), (
+            f"pytest config belongs in pyproject.toml; {rogue} would override it"
+        )
     for conftest in (REPO_ROOT / "conftest.py", REPO_ROOT / "tests" / "conftest.py"):
         if not conftest.exists():
             continue
         for node in ast.walk(ast.parse(conftest.read_text())):
-            assert not (
-                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and node.name == "pytest_collection_modifyitems"
-            ), f"{conftest} must not deselect tests at collection time"
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                assert node.name not in (
+                    "pytest_collection_modifyitems", "pytest_ignore_collect",
+                ), f"{conftest} must not deselect or ignore tests at collection time"
+            if isinstance(node, ast.Assign):
+                assigned = {t.id for t in node.targets if isinstance(t, ast.Name)}
+                assert not (assigned & {"collect_ignore", "collect_ignore_glob"}), (
+                    f"{conftest} must not drop test files from collection"
+                )
     ini = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
     ini_options = ini.get("tool", {}).get("pytest", {}).get("ini_options", {})
     assert "addopts" not in ini_options, "pytest must run with no addopts filters"
@@ -366,23 +395,34 @@ def test_ac_5():
 
 
 def test_review1_path_leak_covers_absolute_home_entries(rehearsal, monkeypatch):
-    """Review finding 1: the PATH revert must catch the absolute-$HOME
-    leak class too, not only literal `~` entries — a `_path_outside_home`
-    simplified to startswith('~') would leak `/<home>/.pyenv/shims` back
-    into the sandboxed PATH. The fixture's env guard bakes the host's home
-    paths in and refuses entries under them, so the rehearsal still fails."""
+    """Review round 1, finding 1: the PATH revert must catch the
+    absolute-$HOME leak class too, not only literal `~` entries — a
+    `_path_outside_home` simplified to startswith('~') would leak
+    `/<home>/.pyenv/shims` back into the sandboxed PATH. The fixture's
+    env guard bakes the host's home paths in and refuses entries under
+    them, so the rehearsal still fails. The guard's own message is
+    asserted (round 2, finding 3): on this Mac the leaked entries also
+    trigger the real npm EPERM (ledger correction, e2357a9), so without
+    the message check a broken guard would pass unnoticed wherever EPERM
+    happens to strike; with it, the guard itself is the proven canary on
+    every host, Linux CI included."""
     def tilde_only_filter(path):
         return ":".join(e for e in path.split(":") if e and not e.startswith("~"))
 
     with monkeypatch.context() as m:
         m.setattr(sandbox_module, "_path_outside_home", tilde_only_filter)
         fixture, root = rehearsal()
-        result, prs = run_rehearsal(fixture, root, now=lambda: OFF_PEAK)
-    assert result.outcome != "pr_opened" or not prs, (
-        "a tilde-only PATH filter must still fail the rehearsal"
-    )
+        with pytest.raises(RehearsalError) as exc:
+            run_rehearsal(fixture, root, now=lambda: OFF_PEAK)
+    result = exc.value.result
+    assert result.outcome == "needs_human", result
+    assert not exc.value.prs
     findings = [f["id"] for f in (result.reports.get("L0") or {}).get("findings") or []]
     assert "setup_failed" in findings, result.reports["L0"]
+    setup = next(c for c in result.reports["L0"]["commands"] if c["name"] == "setup")
+    assert "env-guard:" in setup["output"], (
+        "the guard, not incidental EPERM, must be the recorded cause"
+    )
 
 
 def test_review3_fixture_ignores_install_trees(rehearsal):
@@ -420,3 +460,64 @@ def test_review7_incident_refs_resolve_without_executing(tmp_path):
         "def test_ok():\n    pass\n"
     )
     assert "test_ok" in _test_names_in(poison)
+
+
+def test_review8_run_ref_missing_name_exits_two(fixture_template):
+    """Review round 2, finding 6: the fixture runner's documented contract
+    is exit 2 when nothing ran. A typo'd test name used to raise
+    AttributeError outside the try and exit 1 with a traceback — reading
+    as an ordinary test_not_green failure instead of a not-found signal."""
+    runner = fixture_template.repo / "tools" / "run_ref.py"
+    proc = subprocess.run(
+        [sys.executable, str(runner), "tests/test_base.py::no_such_test"],
+        cwd=fixture_template.repo,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 2, (proc.returncode, proc.stderr[-400:])
+    assert "no test named" in proc.stderr, proc.stderr[-400:]
+    # And the honest exit codes are unchanged: 0 pass, 1 failure.
+    ok = subprocess.run(
+        [sys.executable, str(runner), "tests/test_base.py::test_base"],
+        cwd=fixture_template.repo,
+        capture_output=True,
+        text=True,
+    )
+    assert ok.returncode == 0, ok.stderr[-300:]
+
+
+def test_review9_env_guard_survives_odd_home_paths(tmp_path, monkeypatch):
+    """Review round 2, finding 8: the home paths are pasted into a shell
+    script. A home containing a single quote used to make env-guard.sh a
+    syntax error — setup would fail on every rehearsal for a reason
+    unrelated to any incident. The baked paths now live one per line in a
+    quoted heredoc (literal, whatever the characters), and a newline in a
+    home path is rejected at build time."""
+    odd = "/tmp/fa'ke"
+    monkeypatch.setenv("HOME", odd)
+    script = _env_guard_source()
+    guard = tmp_path / "env-guard.sh"
+    guard.write_text(script)
+    guard.chmod(0o755)
+
+    syntax = subprocess.run(
+        ["/bin/sh", "-n", str(guard)], capture_output=True, text=True
+    )
+    assert syntax.returncode == 0, syntax.stderr
+
+    leak = subprocess.run(
+        ["/bin/sh", str(guard)],
+        env={"PATH": f"{odd}/bin:/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+    )
+    assert leak.returncode == 1, leak.stderr + leak.stdout
+    assert "env-guard:" in leak.stderr, leak.stderr
+
+    clean = subprocess.run(
+        ["/bin/sh", str(guard)],
+        env={"PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+    )
+    assert clean.returncode == 0, clean.stderr
