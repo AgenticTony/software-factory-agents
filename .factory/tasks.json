@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-19T08:44:17Z",
+  "updated_at": "2026-10-19T10:12:08Z",
   "tasks": [
     {
       "id": "F-00",
@@ -9,7 +9,7 @@
       "source": "BUILD-ORDER.md#f-00--owner-prerequisites",
       "kind": "owner_only",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [],
       "risk": [],
       "gates": {
@@ -29,27 +29,45 @@
       "owner_steps": [
         {
           "text": "Email Z.ai support with two questions:",
-          "done": false
+          "done": true,
+          "done_at": "2026-10-19T10:11:30Z",
+          "done_by": "Anthony",
+          "evidence": "BOOTSTRAP.md F-00 entry, all six steps confirmed 2026-10-16"
         },
         {
           "text": "Check the legacy term's end date on Z.ai's \"My plan\" page.",
-          "done": false
+          "done": true,
+          "done_at": "2026-10-19T10:11:30Z",
+          "done_by": "Anthony",
+          "evidence": "BOOTSTRAP.md F-00 entry, all six steps confirmed 2026-10-16"
         },
         {
           "text": "Check JobFinderOS's **production** env on Render for `GLM_BASE_URL`. If it's the Coding Plan endpoint (`api/coding/paas/v4`), move production to a metered key, or the Mistral-hosted path (MIG-WO5), **before F-13**.",
-          "done": false
+          "done": true,
+          "done_at": "2026-10-19T10:11:30Z",
+          "done_by": "Anthony",
+          "evidence": "BOOTSTRAP.md F-00 entry, all six steps confirmed 2026-10-16"
         },
         {
           "text": "Turn on branch protection on JobFinderOS `main`: PRs required, CI required, no force-push.",
-          "done": false
+          "done": true,
+          "done_at": "2026-10-19T10:11:30Z",
+          "done_by": "Anthony",
+          "evidence": "BOOTSTRAP.md F-00 entry, all six steps confirmed 2026-10-16"
         },
         {
           "text": "Create macOS keychain items for the live-check secrets: `JFO_PROBE_PASS`, `JFO_SUPABASE_ANON_KEY`.",
-          "done": false
+          "done": true,
+          "done_at": "2026-10-19T10:11:30Z",
+          "done_by": "Anthony",
+          "evidence": "BOOTSTRAP.md F-00 entry, all six steps confirmed 2026-10-16"
         },
         {
           "text": "Create the GitHub repo for the factory, private.",
-          "done": false
+          "done": true,
+          "done_at": "2026-10-19T10:11:30Z",
+          "done_by": "Anthony",
+          "evidence": "BOOTSTRAP.md F-00 entry, all six steps confirmed 2026-10-16"
         }
       ]
     },
@@ -369,7 +387,7 @@
       "source": "BUILD-ORDER.md#f-06--session-runner",
       "kind": "build",
       "priority": "P1",
-      "status": "awaiting_owner",
+      "status": "done",
       "depends_on": [
         "F-05"
       ],
@@ -434,7 +452,10 @@
       "owner_steps": [
         {
           "text": "F-00 step 1 answered before AC-4 is run repeatedly or on a schedule.",
-          "done": false
+          "done": true,
+          "done_at": "2026-10-19T10:11:49Z",
+          "done_by": "Anthony",
+          "evidence": "F-00 step 1 answered (Z.ai support email), 2026-10-16"
         }
       ],
       "acceptance_hash": "2ff6017acda5d586366072188de0c80cfbfcd67dda517c60ad019c128c10d6cd",
@@ -571,7 +592,7 @@
       "source": "BUILD-ORDER.md#f-09--agent-prompts--l2-review",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-06"
       ],
@@ -654,7 +675,10 @@
         "wall_clock_min": 150
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "acceptance_hash": "7cb198f07cc1d1942e125a41f8b9ad094084e33eea61463753d7ce02b55da8e7",
+      "approved_at": "2026-10-19T10:12:03Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-10",
@@ -662,7 +686,7 @@
       "source": "BUILD-ORDER.md#f-10--factory-run--factory-loop--pr-creation",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-03",
         "F-04",
@@ -800,7 +824,10 @@
         "wall_clock_min": 150
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "acceptance_hash": "4e5ded2c330757a64680ebfb9dfe225639bb555623f6da81d6822c690315b747",
+      "approved_at": "2026-10-19T10:12:05Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-11",
@@ -1833,7 +1860,7 @@
       "source": "BUILD-ORDER.md#f-29--owner-step-tick-factory-tick",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-03",
         "F-04"
@@ -1895,7 +1922,10 @@
         "wall_clock_min": 90
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "acceptance_hash": "9f40c80d308231bd69d4f8652d403ac212b7a72f66414c815e6e3de267d0770b",
+      "approved_at": "2026-10-19T10:12:08Z",
+      "approved_by": "Anthony"
     }
   ]
 }
