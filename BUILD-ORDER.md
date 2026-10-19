@@ -40,10 +40,13 @@ The factory's own build plan, written in the format the factory will consume: on
 | **F-25** | Sensitive-path sentinels | 1b | F-07 | factory_control | M |
 | **F-26** | Merges in order | 1b | F-10 | factory_control | S |
 | **F-27** | Vent tool | 1b | F-06, F-10 | factory_control | S |
-| **F-28** | Dogfood pilot: the factory builds its own safe WOs | 1b | F-23, F-24, F-25, F-26, F-29 | — | owner |
+| **F-28** | Dogfood pilot: the factory builds its own safe WOs | 1b | F-23, F-24, F-25, F-26, F-29, F-30 | — | owner |
 | **F-29** | Owner-step tick (`factory tick`) | 1b | F-03, F-04 | factory_control | S |
+| **F-30** | Run trace: live event log per run | 1b | F-06, F-07, F-08, F-10, F-25 | factory_control | M |
+| **F-31** | Read-only dashboard (`factory dashboard`) | 1b | F-11, F-30 | — | M |
+| **F-32** | Same-session correction | 1b | F-23, F-30 | factory_control | M |
 
-Order to build in: **F-00 (in parallel) → F-01 → F-02 → F-03 → F-04 → F-07 → F-08 → F-05 → F-06 → F-09 → F-10** (done), **then F-29 → F-24 → F-23 → F-25 → F-26 → F-27 → F-28 → F-11 → F-12 → F-16 → F-22 → F-13.** The deterministic core (F-02–F-04, F-07, F-08) went first: it's pure Python and testable without any model. F-29 comes first because nothing else can close without it: F-00 and F-06 are stuck on owner steps no command can tick, and F-09/F-10 can't reconcile until F-06 is done. Hardening comes next, rehearsal fixture first so every later change is checked against a realistic repo. F-28 then runs the factory on its own F-11 and F-12. F-16 measures how much each layer catches before any outside project depends on it.
+Order to build in: **F-00 (in parallel) → F-01 → F-02 → F-03 → F-04 → F-07 → F-08 → F-05 → F-06 → F-09 → F-10 → F-29** (done), **then F-24 → F-23 → F-25 → F-26 → F-27 → F-30 → F-28 → F-11 → F-12 → F-31 → F-16 → F-32 → F-22 → F-13.** The deterministic core (F-02–F-04, F-07, F-08) went first: it's pure Python and testable without any model. F-29 went right after them because nothing else could close without it: F-00 and F-06 were stuck on owner steps no command could tick, and F-09/F-10 can't reconcile until F-06 is done. Hardening comes next, rehearsal fixture first so every later change is checked against a realistic repo. F-30 lands before F-28 so the first unattended loop is traceable while it runs, not only afterwards. F-28 then runs the factory on its own F-11 and F-12. F-31 (dashboard) only reads, so it touches no protected path: it is the next WO the factory can build for itself. F-32 changes how retries spend tokens, so it waits until F-30 and F-28 give a baseline to compare against. Neither F-31 nor F-32 blocks F-13. F-16 measures how much each layer catches before any outside project depends on it.
 
 F-14 (live checks) and F-15 (holdouts) need a deployed project with real users, which the factory itself is not, so they arrive with the first outside project (Phase 2). F-21 stays last: it unlocks only on numbers F-11, F-14 and F-16 produce from real merges.
 
@@ -279,15 +282,41 @@ Lovable's pattern, via Cursor: give agents a tool to complain. The complaints be
 - AC-3 Venting never changes a run's outcome or budget (a test vents mid-run and asserts the attempt record is otherwise identical).
 - AC-4 `factory status` (F-11) lists the week's vents grouped by category, and F-19's review reads them.
 
+### F-30 — Run trace: live event log per run
+Today a run is visible only after it ends: the session loop (`factory/session.py`) keeps the `ResultMessage` and drops every other SDK message, so tool calls, gate evidence and per-phase spend are never recorded, and nobody can see what a session is doing while it runs. Seen in IndyDevDan's Super Simple Software Factory (github.com/disler/super-simple-software-factory): every event is written while the agent works, and every gate records what it checked, not only the verdict. We take the trace and leave the rest (it runs on `main` with no sandbox; its gates check the agent's claims against themselves).
+- AC-1 The orchestrator appends one event per line to `<factory_root>/trace/<project>/<run-id>.jsonl`, outside every clone and outside the sandbox's write allowlist (a test asserts the path is not writable from a session). Event types: `phase_start`/`phase_end` for setup, implementer, L0, L1, L2 and publish; `tool_call` (seat, tool name, args, result snippet, ok, started/ended); `gate_check` (layer, item, ok, note); `session_end` (seat, tokens by component, cost, turns, model). Every event carries run id, task id, attempt number and a sequence number.
+- AC-2 Events are written as they happen. A test with a fake SDK stream asserts a `tool_call` line is on disk before the stream yields its `ResultMessage`.
+- AC-3 Gate events carry evidence on pass and on fail: each L0 check, each L1 red/green proof and each L2 finding is one `gate_check` with a note saying what was looked at (one test per layer, both outcomes).
+- AC-4 Secrets never reach the trace. Args and result snippets are length-capped, and the seat token value plus credential-shaped strings (the F-25 patterns) are replaced with `[redacted]` before the line is written. A test runs a fake tool call whose output contains the seat token and asserts the token appears nowhere in the file.
+- AC-5 Tracing never changes a run. A trace write that fails (disk full, permission) is reported once and the run continues; a test makes every write raise and asserts the attempt record is identical to an untraced run.
+- AC-6 `factory trace <run-id> [--follow]` prints the trace in order, one line per event; `--follow` keeps printing new events until the attempt ends (published, failed or aborted). It reads only.
+- AC-7 Per-phase token totals in the trace sum to the attempt's token totals in `tasks.json` for a fixture run (no second source of truth for spend).
+
 ### F-28 — Dogfood pilot: the factory builds its own safe work orders
 **Kind:** owner_only. The first real loop runs on the factory itself, where a mistake only hurts the factory. Principle 5 still holds: agents never edit what judges them.
 
 Owner steps:
-1. Extend `paths.protected` in this repo's `.factory/project.yaml` (by PR) to cover what judges agents: `factory/l0.py`, `factory/l1.py`, `factory/l2.py`, `factory/gates.py`, `factory/sandbox.py`, `factory/session.py`, `factory/publish.py`, `factory/orchestrator.py`, `factory/prompts.py`, `prompts/**` and every existing `tests/test_f*.py`, on top of today's `.factory/**`, `.github/workflows/**`, `schema/**`, the two spec files and `CLAUDE.md`. This repo is private on a free plan, so it can't have branch protection (see F-10 AC-13): declare `branch_protection: unavailable` in the same PR, so F-26 runs with its own up-to-date check instead of refusing. Nothing server-side then stops a stale merge, so merge factory PRs only after `factory run` has reported them ready against the current `main`.
+1. Extend `paths.protected` in this repo's `.factory/project.yaml` (by PR) to cover what judges agents: `factory/l0.py`, `factory/l1.py`, `factory/l2.py`, `factory/gates.py`, `factory/sandbox.py`, `factory/session.py`, `factory/publish.py`, `factory/orchestrator.py`, `factory/prompts.py`, `factory/trace.py`, `prompts/**` and every existing `tests/test_f*.py`, on top of today's `.factory/**`, `.github/workflows/**`, `schema/**`, the two spec files and `CLAUDE.md`. This repo is private on a free plan, so it can't have branch protection (see F-10 AC-13): declare `branch_protection: unavailable` in the same PR, so F-26 runs with its own up-to-date check instead of refusing. Nothing server-side then stops a stale merge, so merge factory PRs only after `factory run` has reported them ready against the current `main`.
 2. Readiness run on a clean clone: every profile command passes unattended (the F-24 rehearsal covers the mechanics).
 3. Approve F-11 and F-12 only. Their code (`factory/cli.py` status and import commands, new modules) is outside every protected path; the orchestrator adds their own contract tests to the protected set at approval.
 4. `factory run` once, watching; review and merge or reject the PR yourself. Then `factory loop` for the second.
 5. Record per attempt: rounds, your review time, findings you raised that L2 missed, and whether the merged change needed a fix later. That is the baseline F-11 then reports automatically.
+
+### F-31 — Read-only dashboard (`factory dashboard`)
+One local page that shows the queue and any run, live, instead of reading `tasks.json`, progress logs and traces by hand. Read-only by construction, so it can never become a second writer of `tasks.json`, and it needs no web framework.
+- AC-1 `factory dashboard [--port N]` serves on `127.0.0.1` only (a test asserts the bound address), using the standard library HTTP server and static files shipped in the package. No new dependency.
+- AC-2 The server answers `GET` only; every other method gets 405. A test runs every route against a fixture factory root and asserts no file under it changed (mtime and hash).
+- AC-3 Queue view: every task grouped by status, with escalation reasons for `needs_human` and the open steps for `awaiting_owner`, read from `tasks.json` after schema validation (invalid state shows an error page, never partial data).
+- AC-4 Run view: phases as swim lanes on a time axis, tool calls inside each lane, gate checks with their evidence, tokens and cost per phase, from the F-30 trace. A running task updates by polling without a page reload.
+- AC-5 Metrics come from the F-11 functions, not a second implementation: for the F-11 fixture, the dashboard's numbers equal `factory status` output (one test).
+- AC-6 Paths in the URL are run ids and task ids matched against the schema's id patterns; anything else is a 404. A test asserts `..` and absolute paths cannot read outside the factory root.
+
+### F-32 — Same-session correction
+When L0 or L1 fails today, the next round is a fresh session that rebuilds its context from the progress log. The session that just did the work already holds that context. SSSF sends gate violations back into the same live session, so a correction costs a reply, not a restart. The reviewer stays a separate seat: L2 keeps its independence.
+- AC-1 After an L0 or L1 failure, the orchestrator resumes the implementer's session by id and sends the numbered findings (same format as the progress log), up to `budget.max_corrections` per attempt (schema field, default 2, red-first). The resumed session runs in the same clone under the same sandbox settings as the first turn; a test asserts the settings file and run dir are unchanged between turns. Corrections count against the attempt's `max_turns` and wall clock.
+- AC-2 It falls back to today's fresh session plus progress log when the session cannot be resumed, its budget is spent, or the failure is in L2. A test covers each fallback reason and asserts the progress log gets the same entries either way.
+- AC-3 L2 never runs in a resumed implementer session: a test asserts the reviewer seat always starts fresh with its own options.
+- AC-4 The attempt record and the F-30 trace carry each correction (number, findings sent, tokens spent), so F-11 can compare tokens per merged PR before and after this WO.
 
 ## Phase 1c — First outside project
 
