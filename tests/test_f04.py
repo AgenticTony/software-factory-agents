@@ -542,8 +542,14 @@ def test_reconcile_on_this_repos_real_files(tmp_path):
     results = reconcile_bootstrap(
         TaskQueue(queue_path), ledger, approved_by="Tester", confirm=say_yes
     )
-    reconciled = [r.task_id for r in results if r.action == "reconciled"]
-    assert reconciled[:3] == ["F-01", "F-02", "F-03"]
+    # On a fresh queue the prefix reconciles; once the real queue has been
+    # reconciled (2026-10-19) the same entries skip as already done. Either
+    # way they are handled in dependency order and end done.
+    actions = {r.task_id: r.action for r in results}
+    for tid in ("F-01", "F-02", "F-03"):
+        assert actions[tid] in ("reconciled", "skipped"), (tid, actions[tid])
+    handled = [r.task_id for r in results if r.action in ("reconciled", "skipped")]
+    assert handled[:3] == ["F-01", "F-02", "F-03"]
     on_disk = {t["id"]: t for t in json.loads(queue_path.read_text())["tasks"]}
     assert on_disk["F-01"]["status"] == "done"
     assert on_disk["F-02"]["status"] == "done"
@@ -594,7 +600,8 @@ def test_cli_reconcile_bootstrap(tmp_path, capsys, monkeypatch):
     assert statuses["F-01"] == "done" and statuses["F-03"] == "done"
     assert statuses["F-00"] == "draft"
     out = capsys.readouterr().out
-    assert "F-01: reconciled" in out and "F-03: reconciled" in out
+    for tid in ("F-01", "F-03"):
+        assert f"{tid}: reconciled" in out or f"{tid}: skipped — already done" in out
     assert code == (1 if ": failed" in out else 0)
 
 
