@@ -223,6 +223,14 @@ def test_ac_3(rehearsal, monkeypatch):
 def test_ac_4():
     """CI runs the rehearsal on every PR (it is not marked slow or
     optional)."""
+    # The rehearsal this criterion is about must be part of the tree CI
+    # checks out: on a base without F-24 there is no rehearsal to run at
+    # all, whatever ci.yml says. (Checked as a file, not an import: an
+    # editable install of a newer checkout would satisfy the import.)
+    assert (REPO_ROOT / "factory" / "rehearsal.py").is_file(), (
+        "the rehearsal harness must live in the repo CI clones"
+    )
+
     workflow = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text())
     triggers = workflow.get(True) or workflow.get("on")
     assert "pull_request" in triggers, "CI must run on every PR"
