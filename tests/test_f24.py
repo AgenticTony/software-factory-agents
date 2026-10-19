@@ -38,6 +38,7 @@ from factory import sandbox as sandbox_module
 from factory.contract import load_profile
 from factory.gates import git as hardened_git
 from factory.rehearsal import (
+    RehearsalError,
     RehearsalFixture,
     ambient_path_with_home_entries,
     build_rehearsal_fixture,
@@ -260,11 +261,12 @@ def test_ac_3(rehearsal, monkeypatch):
     assert "setup_failed" in findings, result.reports["L0"]
 
     # (3) _build_on_remote_default as a no-op: the run builds on the stale
-    # local main, and run_rehearsal itself raises on the stale-base PR.
+    # local main, and run_rehearsal itself raises on the stale-base PR —
+    # the harness, not only this test, detects INC-003 (review finding 2).
     with monkeypatch.context() as m:
         m.setattr(orchestrator_module, "_build_on_remote_default", lambda *a, **k: None)
         fixture, root = rehearsal()
-        with pytest.raises(Exception, match="remote's default-branch"):
+        with pytest.raises(RehearsalError, match="remote's default-branch"):
             run_rehearsal(fixture, root, now=lambda: OFF_PEAK)
 
 
@@ -381,18 +383,6 @@ def test_review1_path_leak_covers_absolute_home_entries(rehearsal, monkeypatch):
     )
     findings = [f["id"] for f in (result.reports.get("L0") or {}).get("findings") or []]
     assert "setup_failed" in findings, result.reports["L0"]
-
-
-def test_review2_run_rehearsal_detects_stale_base(rehearsal, monkeypatch):
-    """Review finding 2: run_rehearsal is the F-28 readiness mechanic, so
-    IT must detect a stale-base PR (INC-003), not only these tests. A
-    reverted _build_on_remote_default must make it raise, not return a
-    clean pr_opened."""
-    with monkeypatch.context() as m:
-        m.setattr(orchestrator_module, "_build_on_remote_default", lambda *a, **k: None)
-        fixture, root = rehearsal()
-        with pytest.raises(Exception, match="remote's default-branch"):
-            run_rehearsal(fixture, root, now=lambda: OFF_PEAK)
 
 
 def test_review3_fixture_ignores_install_trees(rehearsal):
