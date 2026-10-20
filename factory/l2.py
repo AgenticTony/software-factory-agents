@@ -35,21 +35,23 @@ key** — sha256 of its file, axis and normalised summary — at parse time, so
 a finding raised in one round is recognisable in the next.
 :func:`apply_convergence` then classifies a round's verdict against the
 keys raised before it: a repeat whose subject is provably untouched since
-it was raised (a real delta shows the file unchanged; a repeat from an
-earlier run has no continuity at all) is **carried** — listed as carried,
-never as new, because re-raising it adds no information. In a delta round
-a *new* finding outside the delta is **dropped** unless it says why the
-earlier round missed it: one on a file the delta didn't change, or a
-fileless finding with no acceptance-item anchor (``AC-N``) to place it in
-the contract — an anchored fileless finding keys by its AC references, so
-a re-worded re-raise of the same acceptance item carries like any repeat.
-The function also computes the round's **no-progress** verdict
-(``no_progress`` + ``no_progress_reason``): a FAIL the next round cannot
-act on — every finding a carried repeat from this run on untouched code,
-or everything dropped — so the orchestrator escalates instead of spending
-the round. The effective verdict is recomputed over what survives, which
-is how a declared pass whose only out-of-scope blocker was dropped becomes
-the pass the reviewer actually declared.
+it was raised — a real delta shows the named file unchanged, and a repeat
+from an earlier run has no continuity at all — is **carried**: listed as
+carried, never as new, because re-raising it adds no information. Any
+other in-run repeat (the file was touched, or the finding names no file)
+is an **attempt in progress** and stands as the round's own finding. In a
+delta round a *new* finding on a file the delta didn't change is
+**dropped** unless it says why the earlier round missed it; a finding that
+names no file is never dropped — it cannot be shown to sit in unchanged
+code, and dropping it could flip a declared pass carrying a real
+contract-level blocker into an opened PR. The function also computes the
+round's **no-progress** verdict (``no_progress`` +
+``no_progress_reason``): a FAIL the next round cannot act on — every
+finding a carried repeat from this run on untouched code, or everything
+dropped — so the orchestrator escalates instead of spending the round.
+The effective verdict is recomputed over what survives, which is how a
+declared pass whose only out-of-scope blocker was dropped becomes the
+pass the reviewer actually declared.
 
 Running the reviewer session itself is F-10's wiring; everything here is
 pure parsing and judgement over the text a session produced.
@@ -102,28 +104,20 @@ def _normalise_summary(text: str) -> str:
     return " ".join(text.split()).casefold()
 
 
-# Acceptance-item references ("AC-2") in a finding's text: the contract's
-# own ids, the one anchor a contract-level finding can carry.
-_AC_REF = re.compile(r"\bAC-[0-9]+\b")
-
-
 def finding_key(finding: L2Finding) -> str:
     """The stable identity of a finding: sha256 of file, axis (the rule
     category) and normalised summary (F-23 AC-1). Deliberately excludes
     ``line`` (line numbers drift as the diff moves) and ``severity`` (the
     same defect re-rated a round later is the same finding).
 
-    A finding that names **no file** keys by its acceptance-item
-    references instead of its wording when it quotes any ("AC-2 has no
-    test" == "AC-2 is still untested"): contract-level findings are the
-    same finding when they concern the same acceptance item, however
-    re-worded — that is what lets a re-worded contract bounce carry (and
-    stop) instead of keying fresh every round."""
-    if finding.file is None:
-        acs = sorted(set(_AC_REF.findall(finding.text)))
-        if acs:
-            material = "\x00".join(("", finding.axis or "", "ac:" + ",".join(acs)))
-            return hashlib.sha256(material.encode()).hexdigest()
+    A fileless finding keys the same way — by its wording. An earlier
+    revision keyed fileless findings by any ``AC-n`` ids their text
+    mentions; the owner review reverted it: different defects on one
+    acceptance item merged into one thread and stopped the run after a
+    single fix attempt, while an unanchored contract blocker got dropped
+    and flipped a declared pass into a PR. If contract anchoring is ever
+    wanted, it belongs in the verdict schema as an explicit ``ac`` field
+    validated at parse time — not inferred from prose."""
     material = "\x00".join(
         (finding.file or "", finding.axis or "", _normalise_summary(finding.text))
     )
@@ -391,29 +385,33 @@ def apply_convergence(
       round, because it is an unresolved problem — but is listed
       ``state: "carried"``, never as new.
     * **In-run prior key, provably untouched → carried.** Only a real
-      delta can prove "untouched since": the finding's file is one the
-      delta didn't change. Without a delta (the round fell back to the
-      full diff after the implementer rewrote the reviewed history), an
-      in-run repeat is an attempt in progress — the rewrite touched the
-      history those findings live in — and stands as this round's own
-      finding (``state: "new"``); it must not trigger the stop.
-    * **In-run prior key on a file the delta touched → a repeat in
-      progress.** The implementer changed the code the finding concerns;
-      the reviewer re-raised it anyway. Same rule: ``state: "new"``, no
-      stop.
-    * **New finding outside the delta → needs a why.** In delta mode, a
-      finding whose key was never raised must carry ``missed_earlier``
-      explaining what the earlier round missed when it sits outside the
-      delta: either it names a file the delta didn't change, or it names
-      no file **and** no acceptance item (``AC-N``) to anchor it to the
-      contract. Without the why, it is dropped as
+      delta can prove "untouched since", and only a named file can be
+      shown untouched: the finding's file is one the delta didn't change.
+      Without a delta (the round fell back to the full diff after the
+      implementer rewrote the reviewed history), an in-run repeat is an
+      attempt in progress — the rewrite touched the history those
+      findings live in — and stands as this round's own finding
+      (``state: "new"``); it must not trigger the stop.
+    * **In-run prior key on a file the delta touched, or with no file at
+      all → a repeat in progress.** The implementer changed the code the
+      finding concerns — or, with no file, no delta can ever show the
+      finding's subject untouched, so an honest re-raise after a fix
+      attempt must not be mistaken for a bounce. Same rule:
+      ``state: "new"``, no stop. A genuinely stuck fileless thread runs
+      out at ``attempts_exhausted``; that is the accepted cost of never
+      dropping contract-level findings.
+    * **New finding on a file outside the delta → needs a why.** In delta
+      mode, a finding whose key was never raised and whose file the delta
+      didn't change must carry ``missed_earlier`` explaining what the
+      earlier round missed; without it, it is dropped as
       ``out_of_delta_without_missed_earlier`` and recorded in ``dropped``.
-      An anchored fileless finding ("AC-2 has no test") is never dropped:
-      it concerns the contract, not a location, and its key is its AC
-      references — so a re-worded re-raise of the same acceptance item
-      carries like any repeat instead of keying fresh every round.
-      Rounds without a delta (the first review of a run, or the rewrite
-      fallback) drop nothing: the full diff is the scope.
+      A finding that names **no file** is never dropped: it cannot be
+      shown to sit in unchanged code, and the contract-level findings
+      (a missing test, an unmet acceptance item) rarely name one — a
+      declared pass whose only blocker is a fileless finding must not be
+      flipped into an opened PR. Rounds without a delta (the first review
+      of a run, or the rewrite fallback) drop nothing: the full diff is
+      the scope.
     * The effective verdict is recomputed over what survives: a declared
       ``fail`` stands, and so does a parse error (an invalid verdict is a
       FAIL before and after convergence); a declared ``pass`` whose only
@@ -450,27 +448,27 @@ def apply_convergence(
                 # Raised in an earlier run: no diff continuity ever existed,
                 # so it is always the same finding being re-raised.
                 finding = replace(finding, state="carried")
-            elif delta_mode and (
-                finding.file is None or finding.file not in delta_files
+            elif (
+                delta_mode
+                and finding.file is not None
+                and finding.file not in delta_files
             ):
                 # Raised in this run and provably untouched since: only a
-                # real delta can prove that. Without one (the round fell
-                # back to the full diff after a history rewrite), the
-                # implementer touched what they touched and the repeat is
-                # an attempt in progress, not a carry.
+                # real delta over a named file can prove that. Without a
+                # delta (the history-rewrite fallback), or without a file
+                # (a contract-level finding), the repeat is an attempt in
+                # progress, not a carry.
                 finding = replace(finding, state="carried")
             active.append(finding)
         elif (
             delta_mode
+            and finding.file is not None
+            and finding.file not in delta_files
             and not (finding.missed_earlier or "").strip()
-            and (
-                (finding.file is not None and finding.file not in delta_files)
-                or (finding.file is None and not _AC_REF.search(finding.text))
-            )
         ):
-            # Outside the delta without a why: either a named file the
-            # delta didn't touch, or a fileless finding with no acceptance
-            # anchor to place it inside the change. Both are out of scope.
+            # A named file the delta didn't touch, without a why. A
+            # fileless finding is never dropped: it cannot be shown to
+            # sit in unchanged code (round-1 finding 7).
             dropped.append(
                 {
                     "finding": dict(finding.__dict__),

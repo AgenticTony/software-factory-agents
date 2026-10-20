@@ -50,7 +50,7 @@ def _sha(text: str) -> str:
 # prompt edit can never ride a green run.
 PROMPT_PINS = {
     IMPLEMENTER_FILE: "15f5a0206c3016334173471786af4a4efbd28b1cd0b3b3981cb29b39dca316d6",
-    REVIEWER_FILE: "3a42c5a15fce301e703241ddf00ba697f2037e5eec398d65b50fc0f3439c8466",
+    REVIEWER_FILE: "dbab8437904a53e2256ff942167a9c01d689460f05a48384f4fb70f18cf9f6e7",
 }
 
 

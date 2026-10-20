@@ -240,13 +240,14 @@ def _validator_section(reports: dict) -> str:
     finding the orchestrator dropped as out of scope still belongs in
     front of the human merging the PR, not buried in the JSON).
 
-    The dropped text is reviewer-controlled, so every field is
-    whitespace-collapsed before it enters the markdown: a newline in a
-    finding's text must never start a ``## `` line of its own (it could
-    forge a duplicate section heading and make :func:`check_pr_body`
-    refuse the body after a passing round, or plant spoofed merge-risk
-    text in front of the human). Inside the JSON fence the same text is
-    safe — newlines are escaped there."""
+    The dropped list is reviewer-controlled text, so it rides inside a
+    ``text`` fence — the same treatment the implementer's notes get.
+    Flattening alone was not enough: newlines were gone, but inline HTML
+    and links stayed live (a ``<!--`` could hide everything after it in
+    GitHub's rendered view while :func:`check_pr_body`'s raw regex still
+    passed). Flattening still happens too — a newline inside a fenced
+    block could close the fence and set the payload loose. Inside the
+    JSON fence the same text was always safe (newlines escaped there)."""
     section = fence(json.dumps(reports, indent=2, ensure_ascii=False), "json")
     dropped = (reports.get("L2") or {}).get("dropped") or []
     if dropped:
@@ -259,7 +260,9 @@ def _validator_section(reports: dict) -> str:
         section = (
             "**Reviewer findings dropped as out of scope** (no "
             "`missed_earlier` justification; not counted in the verdict — "
-            "read them before merging):\n\n" + "\n".join(lines) + "\n\n" + section
+            "read them before merging):\n\n"
+            + fence("\n".join(lines), "text")
+            + "\n\n" + section
         )
     return (
         section
@@ -269,8 +272,9 @@ def _validator_section(reports: dict) -> str:
 
 
 def _flat(value) -> str:
-    """Reviewer-controlled text as one markdown-safe line: all whitespace
-    runs (newlines included) collapse to single spaces."""
+    """Reviewer-controlled text as one line: all whitespace runs (newlines
+    included) collapse to single spaces, so it can neither start a line
+    of its own nor close the fence that holds it."""
     return " ".join(str(value or "").split())
 
 

@@ -287,9 +287,12 @@ def _numbered_findings(reports: dict, extra: list[str],
             if finding.get("file"):
                 where = f" ({finding['file']}:{finding.get('line') or ''})"
             lines.append(f"[{layer} {finding.get('id')}] {finding.get('text')}{where}")
+        if not include_dropped:
+            continue
+        # Dropped L2 findings ride the record marked, not actionable: the
+        # log (and the human reading it) sees what the reviewer flagged
+        # even though the orchestrator ruled it out of scope.
         for entry in report.get("dropped") or []:
-            if not include_dropped:
-                continue
             finding = entry.get("finding") or {}
             lines.append(
                 f"[{layer} dropped {finding.get('id')}] {finding.get('text')} "
@@ -303,15 +306,28 @@ def _fix_findings(reports: dict, extra: list[str], l2, reviewed: bool,
                   last_valid_l2: dict | None) -> list[str]:
     """The next round's fix list: actionable findings only.
 
-    Dropped findings are excluded (out of scope). A round whose review
-    produced no verdict contributes no L2 lines of its own — the
-    invalid-verdict marker is the reviewer's failure, not work — and the
-    last valid review's findings are still the open work, which keeps the
-    fix list and the reviewer's carried list describing the same round.
+    Dropped findings are excluded (out of scope — fixing their defect
+    class would pull edits into code the round ruled untouchable, and
+    those edits would put the file into the next delta).
+
+    Whenever this round produced no verdict of its own — the review
+    failed to parse, **or L2 never ran because L0/L1 stopped the round** —
+    the last valid review's findings are still the open work and are
+    substituted for this round's L2 lines, keeping the fix list and the
+    reviewer's carried list describing the same findings. A round whose
+    review session ran but produced no verdict also prepends an explicit
+    note: the implementer must hear that the change went unreviewed, not
+    silently replay the older findings as if they had been accepted.
     """
-    fix_reports = reports
-    if l2 is not None and not reviewed:
-        fix_reports = {**reports, "L2": last_valid_l2}
+    if reviewed:
+        return _numbered_findings(reports, extra, include_dropped=False)
+    if l2 is not None:  # a review ran, but produced no verdict
+        extra = [
+            "[L2 unreviewed] this round's review produced no verdict — the "
+            "change was not reviewed; do not assume it was accepted",
+            *extra,
+        ]
+    fix_reports = {**reports, "L2": last_valid_l2}
     return _numbered_findings(fix_reports, extra, include_dropped=False)
 
 

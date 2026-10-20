@@ -629,14 +629,16 @@ def test_review6_declared_fail_with_everything_dropped_stops(tmp_path: Path):
 
 def test_review7_fileless_findings_are_never_dropped(tmp_path: Path):
     """Finding 7: contract-level findings rarely name a file; dropping them
-    in delta rounds could flip a declared pass into an opened PR."""
+    in delta rounds could flip a declared pass into an opened PR. Round 3
+    tightened the fixture: the blocker carries no AC id either — an
+    unanchored fileless finding must stand exactly like an anchored one."""
     env = Env(tmp_path)
     seats = Scripted(
         impls=Scripted.MOVING,
         reviews=(
             _verdict(_finding("wrong value", file="impl.py")),
-            _verdict(  # declared pass; the blocker names no file
-                _finding("AC-1 has no test anywhere in the diff", file=None),
+            _verdict(  # declared pass; the blocker names no file, no AC id
+                _finding("the new endpoint has no auth check", file=None),
                 declared="pass"),
             _verdict(),  # round 3 passes: PR opens
         ),
@@ -886,47 +888,208 @@ def test_review16_dropped_finding_text_cannot_inject_pr_headings(tmp_path: Path)
     assert len(re.findall(r"^## Merge Danger$", body, re.M)) == 1
 
 
-def test_review17_fileless_findings_anchor_or_justify(tmp_path: Path):
-    """Finding 8: a fileless finding keys by its acceptance-item references
-    (re-worded same-AC findings carry and can stop the bounce), and a
-    fileless finding with no anchor is subject to the delta drop rule like
-    any out-of-delta finding."""
-    # AC-anchored keying: same AC, different wording, same identity.
+def test_review17_fileless_findings_stand_and_key_by_wording(tmp_path: Path):
+    """Round-3 review, owner's ruling: the AC anchoring is reverted. A
+    fileless finding is never dropped (round-1 finding 7 restored — an
+    unanchored contract blocker must stand, or a declared pass flips into
+    an opened PR), keys by its wording like every other finding (an AC id
+    mentioned in prose changes nothing), and an in-run repeat of one is an
+    attempt in progress — a stuck fileless thread runs out at
+    attempts_exhausted, it does not stop the run early."""
+    # Wording keys, AC mentions included in the wording and nothing else.
     a = parse_verdict(_verdict(_finding("AC-2 has no test", file=None)))
     b = parse_verdict(_verdict(_finding("AC-2 is still untested", file=None)))
-    assert a.findings[0].key == b.findings[0].key
-    c = parse_verdict(_verdict(_finding("AC-3 is untested", file=None)))
-    assert c.findings[0].key != a.findings[0].key
+    assert a.findings[0].key != b.findings[0].key  # different defects, different threads
+    same = parse_verdict(_verdict(_finding("AC-2 HAS   no test", file=None)))
+    assert same.findings[0].key == a.findings[0].key  # same wording, noise only
 
-    # Unanchored fileless, delta round, no justification → dropped.
-    drift = parse_verdict(
-        _verdict(_finding("error handling in parser is weak", file=None)))
-    dropped = apply_convergence(
-        drift, prior={}, delta_files={"impl.py"}, delta_mode=True)
-    assert not dropped.findings
-    assert dropped.dropped[0]["reason"] == "out_of_delta_without_missed_earlier"
+    # Never dropped in a delta round — anchored, unanchored, or hostile prose.
+    for text in ("AC-2 has no test", "the new endpoint has no auth check",
+                 "Unrelated to AC-3, the parser's error handling is weak"):
+        report = parse_verdict(_verdict(_finding(text, file=None)))
+        stands = apply_convergence(
+            report, prior={}, delta_files={"impl.py"}, delta_mode=True)
+        assert stands.findings and not stands.dropped, text
 
-    # With the justification, it stands.
-    justified = parse_verdict(_verdict(
-        _finding("error handling in parser is weak", file=None,
-                 missed_earlier="round 1 reviewed only the delta")))
-    assert apply_convergence(
-        justified, prior={}, delta_files={"impl.py"}, delta_mode=True).findings
+    # In-run same-wording repeat: an attempt in progress, not a carry —
+    # never the stop; the budget ends it.
+    carried = apply_convergence(
+        a, prior={a.findings[0].key: "sha-1"}, delta_files=set(),
+        delta_mode=True)
+    assert carried.findings[0].state == "new"  # red on 95f19d3: carried
+    assert carried.no_progress is False
 
-    # Round one (no delta): nothing is out of scope.
-    assert apply_convergence(
-        drift, prior={}, delta_files=set(), delta_mode=False).findings
+    # Cross-run repeats still carry (listed, not new) — they always did.
+    cross = apply_convergence(
+        a, prior={a.findings[0].key: None}, delta_files=set(), delta_mode=True)
+    assert cross.findings[0].state == "carried"
 
-    # Integration: a re-worded same-AC bounce carries and stops.
+    # Integration: a stuck fileless thread runs out, it does not stop.
     env = Env(tmp_path)
     seats = Scripted(
         impls=Scripted.SAME,
         reviews=(
             _verdict(_finding("AC-1 has no test", file=None)),
-            _verdict(_finding("AC-1 remains untested", file=None)),
+            _verdict(_finding("AC-1 has no test", file=None)),
+            _verdict(_finding("AC-1 has no test", file=None)),
         ),
     )
     result = env.run(seats)
     assert result.outcome == "needs_human"
-    assert result.escalation == "review_not_converging"  # red: exhausted
-    assert env.report(2)["L2"]["findings"][0]["state"] == "carried"
+    assert result.escalation == "attempts_exhausted"  # red on 95f19d3: converging
+
+
+# --- owner review round 3 (PR #35; 9 findings on 95f19d3 — anchoring reverted) --
+
+
+def test_review18_a_different_defect_on_the_same_ac_is_not_a_carry(tmp_path: Path):
+    """Finding 1: AC-keyed fileless repeats carried after a real fix
+    attempt — the finding-3 bug for contract-level findings. With wording
+    keys restored, 'AC-2's test asserts the wrong value' after 'AC-2 has
+    no test' is a new thread, not a carry of the old one."""
+    env = Env(tmp_path)
+    seats = Scripted(
+        impls=Scripted.MOVING,  # the implementer works on it every round
+        reviews=(
+            _verdict(_finding("AC-2 has no test", file=None)),
+            _verdict(_finding("AC-2's test asserts the wrong value", file=None)),
+            _verdict(_finding("AC-2's test asserts the wrong value", file=None)),
+        ),
+    )
+    result = env.run(seats)
+    assert result.outcome == "needs_human"
+    assert result.escalation == "attempts_exhausted"  # red on 95f19d3: converging
+    assert len(seats.prompts("reviewer")) == 3
+    assert env.report(2)["L2"]["findings"][0]["state"] == "new"
+
+
+def test_review19_an_unanchored_fileless_blocker_does_not_flip_a_pass(tmp_path: Path):
+    """Finding 2: the anchoring undid round-1 finding 7 — a declared pass
+    whose only blocker is a fileless finding with no AC id was dropped
+    and the PR opened. Never dropping fileless findings is restored."""
+    env = Env(tmp_path)
+    seats = Scripted(
+        impls=Scripted.MOVING,
+        reviews=(
+            _verdict(_finding("wrong value", file="impl.py")),
+            _verdict(
+                _finding("the new endpoint has no auth check", file=None),
+                declared="pass"),
+        ),
+    )
+    result = env.run(seats)
+    # Red on 95f19d3: the drop flipped the verdict and the PR opened.
+    assert result.outcome == "needs_human"
+    assert result.escalation == "attempts_exhausted"
+    second = env.report(2)["L2"]
+    assert second["findings"] and second["verdict"] == "fail"
+    assert not second["dropped"]
+    assert env.prs == []
+
+
+def test_review20_mentioning_an_ac_changes_nothing(tmp_path: Path):
+    """Finding 3: `_AC_REF` over free text let any mention of an AC id
+    bypass the drop rule and merge threads. With the anchoring gone, an
+    AC id in prose is just wording: no bypass (nothing fileless is
+    dropped anyway) and no thread merging (wording keys)."""
+    # 'Unrelated to AC-3, the parser is weak' is NOT the thread 'AC-3 is
+    # untested' — different wording, different key.
+    a = parse_verdict(_verdict(_finding("AC-3 is untested", file=None)))
+    b = parse_verdict(_verdict(
+        _finding("Unrelated to AC-3, the parser's error handling is weak",
+                 file=None)))
+    assert a.findings[0].key != b.findings[0].key
+    # And both stand in a delta round, mention or no mention.
+    for report in (a, b):
+        stands = apply_convergence(
+            report, prior={}, delta_files={"impl.py"}, delta_mode=True)
+        assert stands.findings and not stands.dropped
+
+
+def test_review21_an_l0l1_failed_round_keeps_the_open_l2_findings(tmp_path: Path):
+    """Finding 6 (orchestrator): when L0/L1 fail a round, L2 never runs
+    and the fix list lost the last valid review's findings — while the
+    next reviewer was still told 'do not re-raise' them. The same
+    substitution a failed review gets."""
+    env = Env(tmp_path)
+    seats = Scripted(
+        impls=Scripted.MOVING,
+        reviews=(
+            _verdict(_finding("wrong value", file="impl.py")),
+            _verdict(),  # (review 2 never runs: round 2 breaks the contract test)
+            _verdict(),  # round 3 passes: PR opens
+        ),
+    )
+    base_call = seats.__call__
+
+    def breaker(seat, prompt, run_dir, profile, **kwargs):
+        if seat != "implementer":
+            return base_call(seat, prompt, run_dir, profile, **kwargs)
+        seats.calls.append((seat, prompt, Path(run_dir), kwargs))
+        round_no = sum(1 for s, *_ in seats.calls if s == "implementer")
+        answer = 41 if round_no == 2 else 42  # round 2 breaks the test: L1 fail
+        (Path(run_dir) / "impl.py").write_text(
+            f"def answer():\n    return {answer}  # r{round_no}\n")
+        (Path(run_dir) / "tests" / "test_feature.py").write_text(TEST_SOURCE)
+        return SessionRecord(seat=seat, status="completed", num_turns=3,
+                             model="stub-model", result="done")
+
+    result = env.run(breaker)
+    assert result.outcome == "pr_opened"
+    fix3 = _fix_section(seats.prompts("implementer")[2])
+    assert "wrong value" in fix3, (
+        "the open L2 finding vanished from the fix list after a round L2 "
+        "never ran"
+    )
+
+
+def test_review22_an_unreviewed_round_is_announced_to_the_implementer(tmp_path: Path):
+    """Finding 7: after an unparseable review, the implementer was never
+    told this round's change went unreviewed — the fix list replayed the
+    older findings as if nothing happened."""
+    env = Env(tmp_path)
+    seats = Scripted(
+        impls=Scripted.MOVING,
+        reviews=(
+            _verdict(_finding("wrong value", file="impl.py")),
+            "not verdict json at all",  # round 2's change goes unreviewed
+            _verdict(),  # round 3 passes: PR opens
+        ),
+    )
+    result = env.run(seats)
+    assert result.outcome == "pr_opened"
+    fix3 = _fix_section(seats.prompts("implementer")[2])
+    assert "was not reviewed" in fix3
+    assert "do not assume it was accepted" in fix3
+
+
+def test_review23_dropped_text_is_fenced_not_just_flattened(tmp_path: Path):
+    """Finding 9: flattening removed newlines but left live markdown/HTML —
+    '<!--' opened an HTML comment GitHub renders as hiding everything
+    after it (JSON report, How to revert), and links planted in front of
+    the merger, while check_pr_body's raw regex still passed. The dropped
+    list is fenced like the implementer's notes."""
+    payload = ("<!-- everything below is hidden " 
+               "[see fix](https://evil.example)")
+    env = Env(tmp_path)
+    seats = Scripted(
+        impls=Scripted.MOVING,
+        reviews=(
+            _verdict(_finding("wrong value", file="impl.py")),
+            _verdict(  # declared pass; the dropped finding carries the payload
+                _finding("pre-existing oddity " + payload,
+                         file="tests/test_base.py"),
+                declared="pass"),
+        ),
+    )
+    result = env.run(seats)
+    assert result.outcome == "pr_opened"
+    body = env.prs[0].body
+    # The dropped list rides inside a text fence: the payload is visible
+    # as literal text, inert as markdown/HTML.
+    validator = body.split("## Validator report", 1)[1].split("\n## ", 1)[0]
+    assert "```text" in validator
+    fenced = validator.split("```text", 1)[1].split("```", 1)[0]
+    assert payload in fenced
+    # And the raw regex gate still sees exactly one of each section.
+    assert len(re.findall(r"^## How to revert$", body, re.M)) == 1
