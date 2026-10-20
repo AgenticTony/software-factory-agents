@@ -1,0 +1,173 @@
+{
+  "version": 1,
+  "project": "jobfinderos",
+  "updated_at": "2026-10-18T00:00:00Z",
+  "tasks": [
+    {
+      "id": "WO-21",
+      "title": "Outbound PDF text-layer verification",
+      "source": "docs/work-orders/WO-21-pdf-text-layer.md",
+      "kind": "build",
+      "priority": "P2",
+      "status": "draft",
+      "depends_on": [],
+      "risk": [
+        "external_service"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "`pdf_service.verify_text_layer(pdf_bytes: bytes, expected: str) -> None` exists and raises `pdf_service.PdfTextLayerError` when the PDF's extracted text (pdfplumber, all pages) has fewer than `pdf_service.MIN_TEXT_CHARS` non-whitespace characters, or doesn't contain `expected` after whitespace normalisation. A deliberately broken fixture (a PDF whose page carries the content only as drawn shapes or an image, no text layer) fails with `PdfTextLayerError`. The test must be shown red before the function exists.",
+          "check": {
+            "type": "test",
+            "ref": "backend/tests/test_pdf_text_layer.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Both renderers (`cover_letter_pdf`, `tailored_cv_pdf`) produce PDFs that pass `verify_text_layer` with a known phrase from the source text, for each of: plain ASCII content; a non-ASCII applicant name and body (å ä ö Å Ä Ö, curly quotes, em dash) on the unicode-font path; and the same non-ASCII content on the latin-1 core-font fallback path (`FONT_CANDIDATES` emptied, as `test_pdf_fonts.py` already does). Assert, don't warn.",
+          "check": {
+            "type": "test",
+            "ref": "backend/tests/test_pdf_text_layer.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "With `settings.PDF_TEXT_LAYER_ENFORCE` true, `draft_service._send_with_pdfs` verifies each generated PDF (cover letter and tailored CV) before any email is dispatched. When verification fails it does not call `resend.Emails.send`, sets `application.status = \"failed\"`, and sets `application.error` to a user-facing message that names the document that failed and says the send was blocked because an employer's system couldn't read the PDF. It then returns without raising.",
+          "check": {
+            "type": "test",
+            "ref": "backend/tests/test_pdf_text_layer.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "The send path can't skip the check: in `backend/app/services/draft_service.py` every call to `pdf_service.cover_letter_pdf` or `pdf_service.tailored_cv_pdf` goes through one helper that calls `verify_text_layer` on the bytes before returning them. A source-level test proves no direct render call remains outside that helper.",
+          "check": {
+            "type": "test",
+            "ref": "backend/tests/test_pdf_text_layer.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "No dependency manifest changes: extraction uses `pdfplumber`, already pinned in `backend/requirements.lock` (and used by `tests/test_pdf_fonts.py`). The existing suite stays green, including every test in `tests/test_pdf_fonts.py` unmodified.",
+          "check": {
+            "type": "command",
+            "ref": "cd backend && PYTHONPATH=. .venv/bin/python -m pytest tests/ -q",
+            "expect": "exit 0; L0 reports no new_dependency escalation"
+          }
+        },
+        {
+          "id": "AC-6",
+          "text": "Enforcement ships off: `Settings.PDF_TEXT_LAYER_ENFORCE: bool = False` is declared in `backend/app/core/config.py` (Settings forbids undeclared keys), following the `EMAIL_APPLY_ENABLED` pattern. With it false, verification still runs on every send; a failure logs one WARNING naming the application id and the failing document (no PDF content, no applicant PII in the message) and the send proceeds exactly as today. Turning it on needs only the env var, no deploy of new code.",
+          "check": {
+            "type": "test",
+            "ref": "backend/tests/test_pdf_text_layer.py::test_ac_6"
+          }
+        }
+      ],
+      "out_of_scope": [
+        "Adding pypdf or any other dependency (owner decision: pdfplumber is already pinned; WO-21 design step 1 is superseded).",
+        "Changing PDF layout, fonts, FONT_CANDIDATES order or the rendered content.",
+        "Changing the send flow beyond the verification gate: rate limits, Resend parameters, attachment names, the original-CV attachment.",
+        "Editing or weakening tests/test_pdf_fonts.py or any other existing test.",
+        "Frontend changes, migrations, and the browser-apply path.",
+        "Defaulting PDF_TEXT_LAYER_ENFORCE to true, or flipping it in any deployed environment (owner step)."
+      ],
+      "owner_steps": [
+        {
+          "text": "After merge: deploy the backend (Render) with PDF_TEXT_LAYER_ENFORCE unset (log-only).",
+          "done": false
+        },
+        {
+          "text": "Watch Render logs for PDF text-layer WARNINGs across real sends; if none are false positives, set PDF_TEXT_LAYER_ENFORCE=true on Render and confirm one real send still goes out with readable PDFs.",
+          "done": false
+        }
+      ],
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 120,
+        "wall_clock_min": 90
+      },
+      "attempts": [],
+      "links": {}
+    },
+    {
+      "id": "WO-32",
+      "title": "Self-hosted fonts so the production build runs offline",
+      "source": "docs/work-orders/WO-32-self-hosted-fonts.md",
+      "kind": "build",
+      "priority": "P3",
+      "status": "draft",
+      "depends_on": [],
+      "risk": [],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "`frontend/src/app/layout.tsx` loads Geist, Geist Mono and Familjen Grotesk with `next/font/local` from woff2 files committed under `frontend/src/app/fonts/`, each family's OFL licence file committed beside them. No file under `frontend/src` imports `next/font/google`.",
+          "check": {
+            "type": "command",
+            "ref": "! git grep -n 'next/font/google' -- frontend/src && git grep -q 'next/font/local' -- frontend/src/app/layout.tsx && ls frontend/src/app/fonts/*.woff2 frontend/src/app/fonts/OFL*",
+            "expect": "exit 0"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "The CSS variables `--font-geist-sans`, `--font-geist-mono` and `--font-familjen` keep their names and stay applied on `<html>`, so `globals.css` is unchanged.",
+          "check": {
+            "type": "command",
+            "ref": "for v in --font-geist-sans --font-geist-mono --font-familjen; do grep -q \"variable: '$v'\" frontend/src/app/layout.tsx || exit 1; done && git diff --exit-code origin/main -- frontend/src/app/globals.css",
+            "expect": "exit 0"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "The production build succeeds with no network access to fonts.googleapis.com or fonts.gstatic.com.",
+          "check": {
+            "type": "command",
+            "ref": "cd frontend && NEXT_PUBLIC_API_URL=https://api.jobfinderos.example npm run build",
+            "expect": "exit 0 inside the factory sandbox with both font hosts removed from network_allowlist"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "No dependency manifest changes (no `geist` package; the files are vendored).",
+          "check": {
+            "type": "command",
+            "ref": "git diff --exit-code origin/main -- frontend/package.json frontend/package-lock.json",
+            "expect": "exit 0"
+          }
+        }
+      ],
+      "out_of_scope": [
+        "Changing font families, weights, subsets or any visual styling.",
+        "Adding any npm dependency.",
+        "Editing globals.css."
+      ],
+      "owner_steps": [
+        {
+          "text": "After merge: in the factory profile, add the build command back to L0 and remove fonts.googleapis.com / fonts.gstatic.com from network_allowlist.",
+          "done": false
+        }
+      ],
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 80,
+        "wall_clock_min": 60
+      },
+      "attempts": [],
+      "links": {}
+    }
+  ]
+}
