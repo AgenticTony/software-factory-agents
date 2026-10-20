@@ -241,13 +241,16 @@ def _validator_section(reports: dict) -> str:
     front of the human merging the PR, not buried in the JSON).
 
     The dropped list is reviewer-controlled text, so it rides inside a
-    ``text`` fence — the same treatment the implementer's notes get.
-    Flattening alone was not enough: newlines were gone, but inline HTML
-    and links stayed live (a ``<!--`` could hide everything after it in
-    GitHub's rendered view while :func:`check_pr_body`'s raw regex still
-    passed). Flattening still happens too — a newline inside a fenced
-    block could close the fence and set the payload loose. Inside the
-    JSON fence the same text was always safe (newlines escaped there)."""
+    ``text`` fence — the same treatment the implementer's notes get. The
+    fence is what makes the payload inert: it is one backtick longer than
+    any run in the text and indents every line, so nothing inside can
+    close it or start a ``## `` heading (a ``<!--`` could otherwise hide
+    everything after it in GitHub's rendered view while
+    :func:`check_pr_body`'s raw regex still passed, and links would plant
+    in front of the merger). Flattening keeps each finding on one line of
+    the list — readability, not containment; the fence alone would hold a
+    multiline payload. Inside the JSON fence the same text was always
+    safe (newlines escaped there)."""
     section = fence(json.dumps(reports, indent=2, ensure_ascii=False), "json")
     dropped = (reports.get("L2") or {}).get("dropped") or []
     if dropped:
@@ -273,8 +276,8 @@ def _validator_section(reports: dict) -> str:
 
 def _flat(value) -> str:
     """Reviewer-controlled text as one line: all whitespace runs (newlines
-    included) collapse to single spaces, so it can neither start a line
-    of its own nor close the fence that holds it."""
+    included) collapse to single spaces, so each dropped finding renders
+    as a single readable list line inside the fence that holds it."""
     return " ".join(str(value or "").split())
 
 
