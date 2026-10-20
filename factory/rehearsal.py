@@ -227,13 +227,15 @@ def _env_guard_source() -> str:
     short of a newline is literal to the shell. A newline in a home path
     cannot be represented that way and is rejected here, at build time —
     a fixture that cannot be built correctly is better than one whose
-    guard silently matches nothing.
+    guard silently matches nothing. The rejection is a plain ValueError:
+    it is an invalid fixture-build input, not a run that came back not
+    ready, so it must not speak F-28's RehearsalError vocabulary.
     """
     homes = {str(Path.home())}
     homes.add(str(Path.home().resolve()))
     for home in homes:
         if "\n" in home:
-            raise RehearsalError(
+            raise ValueError(
                 f"cannot bake a home path containing a newline into env-guard.sh: {home!r}"
             )
     lines = "\n".join(sorted(homes))

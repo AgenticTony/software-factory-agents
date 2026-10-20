@@ -521,3 +521,15 @@ def test_review9_env_guard_survives_odd_home_paths(tmp_path, monkeypatch):
         text=True,
     )
     assert clean.returncode == 0, clean.stderr
+
+
+def test_review10_env_guard_rejects_newline_home_paths(monkeypatch):
+    """Review round 2 follow-up: a home path containing a newline cannot be
+    represented in the heredoc, and the build-time rejection is a
+    fixture-build error — a ValueError — not a not-ready RehearsalError:
+    nothing has run yet when it fires, and F-28's readiness contract must
+    not be answerable by a bad build input. Pins the diagnostic too: the
+    message names the newline and the offending path."""
+    monkeypatch.setenv("HOME", "/tmp/bad\nhome")
+    with pytest.raises(ValueError, match=r"newline.*bad"):
+        _env_guard_source()
