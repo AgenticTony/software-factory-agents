@@ -359,9 +359,13 @@ def test_reviewer_fail_is_retried_then_exhausted(tmp_path: Path):
         return SessionRecord(
             seat=seat, status="completed", num_turns=1, model="stub-model",
             tokens={"input_tokens": 60, "output_tokens": 10},
+            # Fileless on purpose: the stub writes identical content each
+            # round, so the review delta is empty and a file-naming new
+            # finding would be dropped as out of scope (F-23). Fileless
+            # findings are never dropped, so each round's finding stands.
             result=json.dumps({"verdict": "fail", "findings": [
                 {"id": "R1", "axis": "spec", "severity": "blocking",
-                 "file": "impl.py", "text": f"scope creep {call_no}"}]}),
+                 "text": f"scope creep {call_no}"}]}),
         )
 
     result = env.run(varying)

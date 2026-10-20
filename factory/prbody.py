@@ -227,12 +227,37 @@ def build_pr_body(
         "Evidence": build_evidence(task, l1_report),
         "Merge Danger": "\n".join(merge_danger),
         "Contract": fence(json.dumps(contract, indent=2, ensure_ascii=False), "json"),
-        "Validator report": fence(json.dumps(reports, indent=2, ensure_ascii=False), "json")
-        + "\n\nL3 holdouts: not run (F-15). L4 live verification runs after deploy (F-14).",
+        "Validator report": _validator_section(reports),
         "How to revert": how_to_revert(task, profile, extra_flags),
     }
     body = "\n\n".join(f"## {name}\n\n{sections[name]}" for name in REQUIRED_SECTIONS)
     return body + "\n\n---\nOpened by the software factory. A human reviews and merges.\n"
+
+
+def _validator_section(reports: dict) -> str:
+    """The gate reports as JSON, with the L2 round's dropped findings —
+    if any — pulled out above the blob (F-23 finding 9: a reviewer
+    finding the orchestrator dropped as out of scope still belongs in
+    front of the human merging the PR, not buried in the JSON)."""
+    section = fence(json.dumps(reports, indent=2, ensure_ascii=False), "json")
+    dropped = (reports.get("L2") or {}).get("dropped") or []
+    if dropped:
+        lines = [
+            f"- [{d.get('finding', {}).get('severity')}] "
+            f"{d.get('finding', {}).get('file') or '(no file)'}: "
+            f"{d.get('finding', {}).get('text')}"
+            for d in dropped
+        ]
+        section = (
+            "**Reviewer findings dropped as out of scope** (no "
+            "`missed_earlier` justification; not counted in the verdict — "
+            "read them before merging):\n\n" + "\n".join(lines) + "\n\n" + section
+        )
+    return (
+        section
+        + "\n\nL3 holdouts: not run (F-15). L4 live verification runs after "
+        "deploy (F-14)."
+    )
 
 
 def check_pr_body(body: str) -> None:

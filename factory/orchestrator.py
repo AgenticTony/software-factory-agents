@@ -37,13 +37,15 @@ protected-path, new-dependency and risk-path hits escalate immediately —
 retrying can't make them safe. A failed round goes back to the implementer
 with numbered findings until ``budget.max_attempts`` attempts (counted
 across runs; ``aborted`` ones excluded) are spent, then ``needs_human`` with
-``attempts_exhausted``. A FAIL whose L2 findings were all raised in an
-earlier round escalates ``review_not_converging`` instead of spending
-another round (F-23: re-review scopes to the delta since the last review,
-repeats are carried rather than re-raised, and the fix prompt says to fix
-the defect class, not the instance). A quota/429 error is not the task's
-fault: the attempt is recorded ``aborted`` with escalation ``quota_exhausted``,
-the task re-queues (``ready``) and ``loop`` stops without retrying.
+``attempts_exhausted``. A FAIL the next round cannot act on escalates
+``review_not_converging`` instead of spending another round (F-23: re-review
+scopes to the delta since the last real review, repeats are carried rather
+than re-raised, and the fix prompt says to fix the defect class, not the
+instance; the stop fires when every finding is a carried repeat from this
+run on untouched code, or everything was dropped as out of scope). A
+quota/429 error is not the task's fault: the attempt is recorded ``aborted``
+with escalation ``quota_exhausted``, the task re-queues (``ready``) and
+``loop`` stops without retrying.
 """
 
 from __future__ import annotations
@@ -269,12 +271,22 @@ def _compact(report: dict | None, tail: int) -> dict | None:
 def _numbered_findings(reports: dict, extra: list[str]) -> list[str]:
     lines: list[str] = list(extra)
     for layer in ("L0", "L1", "L2"):
-        report = reports.get(layer)
-        for finding in (report or {}).get("findings") or []:
+        report = reports.get(layer) or {}
+        for finding in report.get("findings") or []:
             where = ""
             if finding.get("file"):
                 where = f" ({finding['file']}:{finding.get('line') or ''})"
             lines.append(f"[{layer} {finding.get('id')}] {finding.get('text')}{where}")
+        # Dropped L2 findings ride the numbered list marked, not actionable:
+        # the log (and the human reading it) sees what the reviewer flagged
+        # even though the orchestrator ruled it out of scope (F-23).
+        for entry in report.get("dropped") or []:
+            finding = entry.get("finding") or {}
+            lines.append(
+                f"[{layer} dropped {finding.get('id')}] {finding.get('text')} "
+                f"({finding.get('file') or 'no file'}; out of scope, no "
+                "missed_earlier — for the record, not to fix)"
+            )
     return [f"{i}. {text}" for i, text in enumerate(lines, start=1)]
 
 
@@ -367,13 +379,16 @@ def _review_prompt(task: dict, diff: str, l0: dict, l1: dict, delta: str | None 
         json.dumps(_compact(l1, _REVIEW_OUTPUT_TAIL), indent=2, ensure_ascii=False),
         "```",
     ]
-    if delta is None:
+    if delta is None and not carried:
         parts += ["", "## Diff (base...head)", "", "```diff", diff, "```", ""]
         return "\n".join(parts)
-    # A fix round (F-23): the delta since the last review is the primary
-    # scope, the full diff is reference, and findings from earlier rounds
-    # are listed so the reviewer carries them instead of re-raising them.
-    if len(delta) > _REVIEW_DIFF_CAP:
+    # A fix round (F-23): findings from earlier rounds are listed so the
+    # reviewer carries them instead of re-raising them, and the delta (when
+    # the implementer didn't rewrite the reviewed history) is the primary
+    # scope with the full diff as reference. Without a delta — the history
+    # was rewritten, or the last review never produced a verdict — the
+    # full diff stays the scope and nothing is out of it.
+    if delta is not None and len(delta) > _REVIEW_DIFF_CAP:
         delta = delta[:_REVIEW_DIFF_CAP] + f"\n[... delta cut at {_REVIEW_DIFF_CAP} chars ...]\n"
     carried_lines = [
         f"- [{c.get('severity')}] {c.get('file') or '(no file)'}: {c['text']}"
@@ -384,19 +399,24 @@ def _review_prompt(task: dict, diff: str, l0: dict, l1: dict, delta: str | None 
         "## Findings from earlier rounds (already recorded — do not re-raise)",
         "",
         "These were raised in an earlier round and are already recorded. Do not "
-        "re-raise them as new findings; if the delta changed the code they concern "
-        "and they still stand, raise them again and say what changed. The "
-        "implementer was told to fix each finding's defect class, not just the "
-        "named instance — explicitly check the sibling sites of every finding "
-        "below.",
+        "re-raise them as new findings; if the changes below changed the code "
+        "they concern and they still stand, raise them again and say what "
+        "changed. The implementer was told to fix each finding's defect class, "
+        "not just the named instance — explicitly check the sibling sites of "
+        "every finding below.",
         "",
         *carried_lines,
+    ]
+    if delta is None:
+        parts += ["", "## Diff (base...head)", "", "```diff", diff, "```", ""]
+        return "\n".join(parts)
+    parts += [
         "",
         "## Delta since the last review (primary scope)",
         "",
-        "A new finding outside this delta must carry `missed_earlier`: why the "
-        "earlier round missed it. Without that, the orchestrator drops the finding "
-        "as out of scope.",
+        "A new finding on a file outside this delta must carry `missed_earlier`: "
+        "why the earlier round missed it. Without that, the orchestrator drops "
+        "the finding as out of scope.",
         "",
         "```diff",
         delta,
@@ -410,6 +430,22 @@ def _review_prompt(task: dict, diff: str, l0: dict, l1: dict, delta: str | None 
         "",
     ]
     return "\n".join(parts)
+
+
+def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    """Whether ``ancestor`` is reachable from ``descendant`` in ``repo``.
+
+    rc 0 = yes, rc 1 = no; anything else — including the object being
+    absent from a ``--filter=blob:none`` clone after the implementer
+    amended or reset the round it names — also reads as no, because the
+    caller's fallback (full-diff review scope) is always safe.
+    """
+    proc = subprocess.run(
+        ["git", *GIT_HARDENING, "-C", str(repo), "merge-base", "--is-ancestor",
+         ancestor, descendant],
+        capture_output=True,
+    )
+    return proc.returncode == 0
 
 
 def _git_out(repo: Path, *args: str) -> str:
@@ -719,12 +755,16 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
             pushed = False
             opened = False
             round_keys: list = []  # this round's L2 finding keys (F-23)
-            already_raised = set(prior)  # the keys prior to this round
             try:
                 # ---- implementer
-                prompt = _implementer_prompt(task, slice_, branch, log.render(),
-                                             attempt_no, max_attempts,
-                                             fix_findings=prev_findings)
+                # The fix block below carries the newest entry's findings,
+                # so that entry renders without them (read once, not
+                # twice — the entry itself still renders, F-10 AC-10) and
+                # no entry ever renders the seeding hashes.
+                prompt = _implementer_prompt(
+                    task, slice_, branch,
+                    log.render(omit_last_findings=prev_findings is not None),
+                    attempt_no, max_attempts, fix_findings=prev_findings)
                 t0 = time.monotonic()
                 impl = ctx.session_runner(
                     "implementer", prompt, work.root, profile,
@@ -823,9 +863,14 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                             # delta since the last reviewed sha is the
                             # reviewer's primary scope and the convergence
                             # rules (carried repeats, out-of-delta drops)
-                            # apply.
+                            # apply — but only if that sha still exists in
+                            # this clone: an implementer that amended or
+                            # reset the reviewed round's commit makes it
+                            # unreachable, and this round falls back to the
+                            # full diff instead of dying on a bad object.
                             delta = delta_files = None
-                            if last_reviewed is not None:
+                            if last_reviewed is not None and _is_ancestor(
+                                    clean.root, last_reviewed, head_sha):
                                 delta = hardened_git(
                                     clean.root, "diff", "--no-color", "--no-ext-diff",
                                     f"{last_reviewed}...{head_sha}")
@@ -863,29 +908,33 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                     else None),
                                 prior,
                                 delta_files if delta_files is not None else frozenset(),
-                                delta_mode=last_reviewed is not None,
+                                delta_mode=delta is not None,
                             )
-                            round_keys = [
-                                f.key for f in l2.findings
-                                if isinstance(f, L2Finding) and f.key
-                            ]
-                            # This round's verdict becomes the next round's
-                            # "earlier rounds": remember what was raised and
-                            # where the review stopped.
-                            raised = [
-                                {"key": f.key, "file": f.file,
-                                 "severity": f.severity, "text": f.text}
-                                for f in l2.findings if isinstance(f, L2Finding)
-                            ]
-                            for key in round_keys:
-                                prior[key] = head_sha
-                            last_reviewed = head_sha
                             if review.status != "completed":
                                 extra_findings.append(
                                     f"[session {review.status}] the reviewer session ended: "
                                     f"{review.reason}"
                                 )
                             reports["L2"] = l2.to_dict()
+                            # Only a review that produced a parseable verdict
+                            # moves the frontier. A crashed, timed-out or
+                            # invalid review reviewed nothing: the next
+                            # round's delta must still cover this head, or
+                            # code no reviewer ever saw would become "outside
+                            # the delta" and its findings dropped.
+                            if review.status == "completed" and l2.parse_error is None:
+                                round_keys = [
+                                    f.key for f in l2.findings
+                                    if isinstance(f, L2Finding) and f.key
+                                ]
+                                raised = [
+                                    {"key": f.key, "file": f.file,
+                                     "severity": f.severity, "text": f.text}
+                                    for f in l2.findings if isinstance(f, L2Finding)
+                                ]
+                                for key in round_keys:
+                                    prior[key] = head_sha
+                                last_reviewed = head_sha
                         changed = [c.path for c in diff_name_status(clean.root, base_sha, head_sha)]
                     finally:
                         cleanup_run(clean)
@@ -918,32 +967,37 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                     opened = True
                     attempt = attempt_record(attempt_no, started, "pass", records, path, pr=url)
                     queue.append_attempt(task_id, attempt)
+                    # A passed round's findings were accepted as non-blocking:
+                    # recording their keys would poison a later fix round
+                    # after a rejected PR (only failed reviews seed).
                     log.append({"run_id": work.run_id, "attempt": attempt_no, "outcome": "pass",
-                                "pr": url, "findings": findings,
-                                **({"finding_keys": round_keys} if round_keys else {})})
+                                "pr": url, "findings": findings})
                     task = queue.get(task_id)
                     task["links"] = {**(task.get("links") or {}), "pr": url, "branch": branch}
                     queue.transition(task_id, "in_review")
                     return RunResult("pr_opened", task_id, pr=url, reports=reports)
 
-                # F-23 no-progress stop: a FAIL whose findings were all
-                # raised in an earlier round cannot be fixed by another
-                # round — the loop would bounce the same findings back and
-                # forth (the 50-round PR the Claude Code team reported).
-                # Escalate instead of spending the round.
-                if (
-                    l2 is not None
-                    and l2.verdict == "fail"
-                    and l2.findings
-                    and all(
-                        getattr(f, "key", None) in already_raised for f in l2.findings
+                # F-23 no-progress stop: apply_convergence decided, where
+                # the prior set was in hand, that this FAIL gives the next
+                # round nothing it can fix — every finding is a carried
+                # repeat from this run on untouched code (the bounce the
+                # stop exists for; a carry seeded from an earlier run does
+                # not count, and a repeat on a file the fix touched is an
+                # attempt in progress), or every finding was dropped as
+                # out of scope and the declared fail stands with nothing
+                # left. Escalate instead of spending the round.
+                if l2 is not None and l2.no_progress:
+                    note = (
+                        "every L2 finding was dropped as out of scope; the declared "
+                        "fail stands with nothing left to fix"
+                        if not l2.findings and l2.dropped
+                        else "every L2 finding is a carried repeat from an earlier "
+                        "round of this run, on files untouched since: another "
+                        "round has nothing new to fix"
                     )
-                ):
                     attempt = attempt_record(
                         attempt_no, started, "escalated", records, path,
-                        escalation="review_not_converging",
-                        note="every L2 finding was already raised in an earlier "
-                        "round: another round has nothing new to fix",
+                        escalation="review_not_converging", note=note,
                     )
                     finish(attempt, "needs_human", findings, finding_keys=round_keys)
                     return RunResult("needs_human", task_id,

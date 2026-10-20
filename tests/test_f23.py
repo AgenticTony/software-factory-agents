@@ -14,6 +14,7 @@ the next review is scoped to, and when the loop refuses another round.
 """
 
 import json
+import re
 import shlex
 import subprocess
 import sys
@@ -282,12 +283,23 @@ def test_prior_keys_seed_from_an_earlier_runs_progress_log(tmp_path: Path):
         "finding_keys": [first.findings[0].key],
     })
     seats = Scripted(
-        reviews=(_verdict(_finding("Scope creep in impl.py")),),
+        impls=Scripted.SAME,  # the head never moves: nothing either round can fix
+        reviews=(
+            _verdict(_finding("Scope creep in impl.py")),
+            _verdict(_finding("Scope creep in impl.py")),
+        ),
     )
     result = env.run(seats)
-    # Only prior keys in the FAIL → no progress: the run refuses a second round.
+    # Round 1 is carried (cross-run key) but NOT stopped — this run's
+    # implementer just made an attempt the reviewer has seen once
+    # (review finding 8). Round 2 re-raises the same key now with an
+    # in-run raise sha and an untouched file: that is the bounce the
+    # stop exists for.
     assert result.outcome == "needs_human"
     assert result.escalation == "review_not_converging"
+    assert len(seats.prompts("reviewer")) == 2
+    assert env.task()["attempts"][0]["outcome"] == "fail"  # round 1: a plain fail
+    assert env.task()["attempts"][0].get("escalation") is None
     assert env.report(1)["L2"]["findings"][0]["state"] == "carried"
 
 
@@ -397,13 +409,15 @@ def test_ac_4(tmp_path: Path):
     loaded = load_tasks(queue)  # ContractError before the enum lands (red)
     assert loaded["tasks"][0]["attempts"][0]["escalation"] == "review_not_converging"
 
-    # Orchestrator half: a FAIL whose findings were all raised before stops
-    # the loop at that round instead of spending another one.
+    # Orchestrator half: a FAIL whose findings were all raised before and
+    # whose files nobody touched since stops the loop at that round
+    # instead of spending another one (review finding 3: a repeat on a
+    # file the fix DID touch is an attempt in progress, not a bounce).
     repeat = _finding("wrong value returned", file="impl.py")
     env = Env(tmp_path)
     seats = Scripted(
-        impls=Scripted.MOVING,  # budget for a third round exists...
-        reviews=(_verdict(repeat), _verdict(repeat)),  # ...but never gets spent
+        impls=Scripted.SAME,  # identical content: the finding's file is untouched
+        reviews=(_verdict(repeat), _verdict(repeat)),  # budget for a 3rd round exists
     )
     result = env.run(seats)
     assert result.outcome == "needs_human"
@@ -445,3 +459,237 @@ def test_ac_4(tmp_path: Path):
         ),
     )
     assert env3.run(seats3).outcome == "pr_opened"
+
+
+# --- owner review round (PR #35; 9 findings — all fixed red-first) ----------
+
+
+def test_review1_an_invalid_review_does_not_advance_the_frontier(tmp_path: Path):
+    """Finding 1: a review whose output is not valid verdict JSON reviewed
+    nothing — `last_reviewed` must not move, or code no reviewer ever saw
+    becomes 'outside the delta' in the next round."""
+    env = Env(tmp_path)
+    seats = Scripted(
+        impls=Scripted.MOVING,
+        reviews=("this is not verdict json at all", _verdict()),
+    )
+    result = env.run(seats)
+    # Round 2's review covers everything since the last REAL review: the
+    # full diff is the scope, not a delta against an unreviewed head.
+    prompt2 = seats.prompts("reviewer")[1]
+    assert "## Delta since the last review" not in prompt2, (
+        "the round-1 head was marked reviewed although its review "
+        "produced no verdict"
+    )
+    assert "## Diff (base...head)" in prompt2
+    assert result.outcome == "pr_opened"
+
+
+def test_review1b_failed_session_variant(tmp_path: Path):
+    """Finding 1, the timed-out-review half: a reviewer session that never
+    completed also advances nothing."""
+    env = Env(tmp_path)
+    seats = Scripted(impls=Scripted.MOVING, reviews=(_verdict(),))
+    base_call = seats.__call__
+
+    def runner(seat, prompt, run_dir, profile, **kwargs):
+        if seat != "reviewer":
+            return base_call(seat, prompt, run_dir, profile, **kwargs)
+        if not any(c[0] == "reviewer" for c in seats.calls):
+            seats.calls.append((seat, prompt, Path(run_dir), kwargs))
+            return SessionRecord(seat=seat, status="failed",
+                                 reason="error_during_execution")
+        return base_call(seat, prompt, run_dir, profile, **kwargs)
+
+    result = env.run(runner)
+    prompt2 = seats.prompts("reviewer")[1]
+    assert "## Delta since the last review" not in prompt2
+    assert "## Diff (base...head)" in prompt2
+    assert result.outcome == "pr_opened"
+
+
+def test_review2_delta_survives_a_rewritten_prior_round(tmp_path: Path):
+    """Finding 2: an implementer that amends the reviewed round's commit
+    leaves `last_reviewed` unreachable in the fresh clone; the round must
+    fall back to the full diff, not die as orchestrator_error."""
+    env = Env(tmp_path)
+    seats = Scripted(
+        impls=Scripted.MOVING,
+        reviews=(
+            _verdict(_finding("wrong value", file="impl.py")),
+            _verdict(),  # round 2 passes: PR opens
+        ),
+    )
+    base_call = seats.__call__
+
+    def amender(seat, prompt, run_dir, profile, **kwargs):
+        if seat != "implementer":
+            return base_call(seat, prompt, run_dir, profile, **kwargs)
+        seats.calls.append((seat, prompt, Path(run_dir), kwargs))
+        round_no = sum(1 for s, *_ in seats.calls if s == "implementer")
+        (Path(run_dir) / "impl.py").write_text(
+            f"def answer():\n    return 42  # round {round_no}\n")
+        (Path(run_dir) / "tests" / "test_feature.py").write_text(TEST_SOURCE)
+        if round_no > 1:  # amend round 1's commit away: head loses its parent
+            subprocess.run(["git", "-C", str(run_dir), "add", "-A"], check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=s@localhost", "-c", "user.name=S",
+                 "-C", str(run_dir), "commit", "--amend", "--no-edit", "-qm", "x"],
+                check=True)
+        return SessionRecord(seat=seat, status="completed", num_turns=3,
+                             model="stub-model", result="done")
+
+    result = env.run(amender)
+    assert result.outcome == "pr_opened"  # red before: orchestrator_error
+    prompt2 = seats.prompts("reviewer")[1]
+    assert "## Diff (base...head)" in prompt2  # fell back to the full diff
+    assert "## Delta since the last review" not in prompt2
+
+
+def test_review3_a_repeat_on_a_fixed_file_is_not_the_stop(tmp_path: Path):
+    """Finding 3: a prior-key finding on a file the fix DID touch is an
+    attempt in progress, not a bounce — the budget, not convergence, ends
+    the run."""
+    repeat = _finding("wrong value returned", file="impl.py")
+    env = Env(tmp_path)
+    seats = Scripted(
+        impls=Scripted.MOVING,  # impl.py changes every round
+        reviews=(_verdict(repeat), _verdict(repeat), _verdict(repeat)),
+    )
+    result = env.run(seats)
+    assert result.outcome == "needs_human"
+    assert result.escalation == "attempts_exhausted"  # red before: converging
+    assert len(seats.prompts("reviewer")) == 3
+    # The repeat on a touched file stands as the round's own finding.
+    assert env.report(2)["L2"]["findings"][0]["state"] == "new"
+
+
+def test_review4_fix_prompt_carries_the_findings_once_and_no_key_hashes(
+        tmp_path: Path):
+    """Finding 4: the fix block duplicated the history's newest entry, and
+    the history rendered the 64-char finding_keys hashes."""
+    env = Env(tmp_path)
+    seats = Scripted(
+        impls=Scripted.MOVING,
+        reviews=(
+            _verdict(_finding("Xyzzy unique marker finding", file="impl.py")),
+            _verdict(),
+        ),
+    )
+    assert env.run(seats).outcome == "pr_opened"
+    prompt2 = seats.prompts("implementer")[1]
+    assert prompt2.count("Xyzzy unique marker finding") == 1
+    assert not re.search(r"[0-9a-f]{64}", prompt2), (
+        "finding-key hashes leaked into the implementer prompt"
+    )
+
+
+def test_review5_the_stop_is_decided_where_the_prior_set_lives():
+    """Finding 5: apply_convergence computes the no-progress verdict itself
+    (L2Report.no_progress) — no orchestrator-side snapshot to mis-order."""
+    verdict = parse_verdict(_verdict(_finding("wrong value", file="impl.py")))
+    key = verdict.findings[0].key
+
+    untouched = apply_convergence(
+        verdict, prior={key: "sha-1"}, delta_files=set(), delta_mode=True)
+    assert untouched.no_progress is True  # in-run carry, file untouched
+
+    touched = apply_convergence(
+        verdict, prior={key: "sha-1"}, delta_files={"impl.py"}, delta_mode=True)
+    assert touched.no_progress is False  # a fix was attempted
+
+    cross_run = apply_convergence(
+        verdict, prior={key: None}, delta_files=set(), delta_mode=True)
+    assert cross_run.no_progress is False  # earlier run, not this run
+
+    fresh = apply_convergence(verdict, prior={}, delta_files={"impl.py"},
+                              delta_mode=True)
+    assert fresh.no_progress is False
+
+
+def test_review6_declared_fail_with_everything_dropped_stops(tmp_path: Path):
+    """Finding 6: a declared fail whose every finding was dropped leaves a
+    FAIL with nothing to fix — the run must stop, not burn the budget."""
+    env = Env(tmp_path)
+    seats = Scripted(
+        impls=Scripted.MOVING,
+        reviews=(
+            _verdict(_finding("wrong value", file="impl.py")),
+            _verdict(  # declared fail; the one finding is out of the delta
+                _finding("old oddity", file="tests/test_base.py")),
+        ),
+    )
+    result = env.run(seats)
+    assert result.outcome == "needs_human"
+    assert result.escalation == "review_not_converging"  # red before: exhausted
+    assert len(seats.prompts("reviewer")) == 2  # round 3 never spent
+    assert env.report(2)["L2"]["verdict"] == "fail"
+    assert not env.report(2)["L2"]["findings"]
+
+
+def test_review7_fileless_findings_are_never_dropped(tmp_path: Path):
+    """Finding 7: contract-level findings rarely name a file; dropping them
+    in delta rounds could flip a declared pass into an opened PR."""
+    env = Env(tmp_path)
+    seats = Scripted(
+        impls=Scripted.MOVING,
+        reviews=(
+            _verdict(_finding("wrong value", file="impl.py")),
+            _verdict(  # declared pass; the blocker names no file
+                _finding("AC-1 has no test anywhere in the diff", file=None),
+                declared="pass"),
+            _verdict(),  # round 3 passes: PR opens
+        ),
+    )
+    result = env.run(seats)
+    assert result.outcome == "pr_opened"
+    assert len(seats.prompts("reviewer")) == 3  # red before: 2 (PR at round 2)
+    second = env.report(2)["L2"]
+    assert second["findings"] and second["verdict"] == "fail"
+    assert not second["dropped"]
+
+
+def test_review8_a_pass_round_does_not_log_finding_keys(tmp_path: Path):
+    """Finding 8 (pass-path half): a passed round's findings were accepted
+    as non-blocking; recording their keys would poison a later fix round
+    after a rejected PR. (The immediate-stop half is the rewritten
+    cross-run seeding test above.)"""
+    env = Env(tmp_path)
+    seats = Scripted(
+        impls=Scripted.MOVING,
+        reviews=(
+            _verdict(_finding("wrong value", file="impl.py")),
+            _verdict(  # declared pass; the non-blocking note rides the pass
+                _finding("minor tidy-up possible", file="impl.py",
+                         severity="minor"),
+                declared="pass"),
+        ),
+    )
+    assert env.run(seats).outcome == "pr_opened"
+    last = env.log().entries()[-1]
+    assert last["outcome"] == "pass"
+    assert "finding_keys" not in last  # red before: the pass logged keys
+    # Fail rounds still log them — that is what seeds the next run.
+    assert "finding_keys" in env.log().entries()[0]
+
+
+def test_review9_dropped_findings_reach_the_human(tmp_path: Path):
+    """Finding 9: a dropped blocking finding must be visible to the merger
+    (PR body, outside the JSON blob) and in the round's numbered findings."""
+    env = Env(tmp_path)
+    seats = Scripted(
+        impls=Scripted.MOVING,
+        reviews=(
+            _verdict(_finding("wrong value", file="impl.py")),
+            _verdict(  # declared pass; the one blocking finding is out of delta
+                _finding("pre-existing oddity", file="tests/test_base.py"),
+                declared="pass"),
+        ),
+    )
+    result = env.run(seats)
+    assert result.outcome == "pr_opened"
+    body = env.prs[0].body
+    assert "dropped as out of scope" in body  # red before: JSON blob only
+    assert "pre-existing oddity" in body
+    round2_findings = env.log().entries()[1]["findings"]
+    assert any("[L2 dropped" in line for line in round2_findings)

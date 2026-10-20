@@ -36,11 +36,16 @@ a finding raised in one round is recognisable in the next.
 :func:`apply_convergence` then classifies a round's verdict against the
 keys raised before it: a repeat whose file the delta didn't touch is
 **carried** (listed as carried, never as new — re-raising it adds no
-information), and in a delta round a *new* finding outside the delta is
-**dropped** unless it says why the earlier round missed it. The effective
-verdict is recomputed over what survives, which is how a declared pass
-whose only out-of-scope blocker was dropped becomes the pass the reviewer
-actually declared.
+information), and in a delta round a *new* finding on a file outside the
+delta is **dropped** unless it says why the earlier round missed it (a
+finding that names no file is never dropped — it cannot be shown to sit in
+unchanged code). The function also computes the round's **no-progress**
+verdict (``no_progress``): a FAIL the next round cannot act on — every
+finding a carried repeat from this run on untouched code, or everything
+dropped — so the orchestrator escalates instead of spending the round. The
+effective verdict is recomputed over what survives, which is how a declared
+pass whose only out-of-scope blocker was dropped becomes the pass the
+reviewer actually declared.
 
 Running the reviewer session itself is F-10's wiring; everything here is
 pure parsing and judgement over the text a session produced.
@@ -115,13 +120,17 @@ class L2Report(GateReport):
     effective verdict after dropping out-of-scope findings). ``dropped``
     lists the findings :func:`apply_convergence` removed as out of delta,
     with the reason — a dropped finding never reaches the verdict, but the
-    human reading the report still sees it.
+    human reading the report still sees it. ``no_progress`` is the F-23
+    stop verdict, computed by :func:`apply_convergence` where the prior
+    set is in hand: True means this round's FAIL gives the next round
+    nothing it can fix.
     """
 
     layer: ClassVar[str] = "L2"
     parse_error: str | None = None
     declared: str | None = None
     dropped: list = field(default_factory=list)
+    no_progress: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -132,6 +141,7 @@ class L2Report(GateReport):
             "parse_error": self.parse_error,
             "declared": self.declared,
             "dropped": self.dropped,
+            "no_progress": self.no_progress,
         }
 
 
@@ -356,20 +366,35 @@ def apply_convergence(
       code: re-raising it adds no information. It stays in the findings —
       a carried *blocking* finding still fails the round, because it is an
       unresolved problem — but is listed ``state: "carried"``, never as
-      new. A prior key on a file the delta *did* touch is a repeat after a
-      failed fix: it stands as this round's finding (``state: "new"``);
-      its key still counts as already raised for the no-progress stop.
-    * **New finding outside the delta → needs a why.** In delta mode, a
-      finding whose key was never raised and whose file the delta didn't
-      change (or that names no file) must carry ``missed_earlier``
-      explaining what the earlier round missed; without it, it is dropped
-      as ``out_of_delta_without_missed_earlier`` and recorded in
-      ``dropped``. Rounds without a delta (the first review of a run)
-      drop nothing: the full diff is the scope.
+      new.
+    * **Prior key on a file the delta touched → a repeat in progress.**
+      The implementer changed the code the finding concerns; the reviewer
+      re-raised it anyway. It stands as this round's own finding
+      (``state: "new"``) — that is an attempt being reviewed, not a
+      bounce, and it must not trigger the stop.
+    * **New finding on a file outside the delta → needs a why.** In delta
+      mode, a finding whose key was never raised and whose file the delta
+      didn't change must carry ``missed_earlier`` explaining what the
+      earlier round missed; without it, it is dropped as
+      ``out_of_delta_without_missed_earlier`` and recorded in ``dropped``.
+      A finding that names **no file** is never dropped: it cannot be
+      shown to sit in unchanged code, and the contract-level findings
+      (a missing test, an unmet acceptance item) rarely name one. Rounds
+      without a delta (the first review of a run, or a fallback after the
+      implementer rewrote the reviewed history) drop nothing: the full
+      diff is the scope.
     * The effective verdict is recomputed over what survives: a declared
       ``fail`` stands, and so does a parse error (an invalid verdict is a
       FAIL before and after convergence); a declared ``pass`` whose only
       blocking finding was dropped becomes the pass the reviewer declared.
+
+    **No progress** (``no_progress`` on the returned report) means a FAIL
+    the next round cannot act on, either because every finding is a
+    carried repeat from **this run** on untouched code (the bounce the
+    stop exists for — a carry seeded from an earlier run doesn't count:
+    this run's implementer has only just attempted it), or because every
+    finding was dropped and the declared fail stands with nothing left to
+    fix.
 
     Args:
         report: The freshly parsed verdict of this round.
@@ -400,7 +425,8 @@ def apply_convergence(
             active.append(finding)
         elif (
             delta_mode
-            and (finding.file is None or finding.file not in delta_files)
+            and finding.file is not None
+            and finding.file not in delta_files
             and not (finding.missed_earlier or "").strip()
         ):
             dropped.append(
@@ -420,10 +446,22 @@ def apply_convergence(
         if report.parse_error is not None or report.declared == "fail" or blocking
         else "pass"
     )
+    l2_findings = [f for f in active if isinstance(f, L2Finding)]
+    only_this_runs_carries = (
+        l2_findings
+        and len(l2_findings) == len(active)
+        and all(
+            f.state == "carried" and prior.get(f.key) is not None
+            for f in l2_findings
+        )
+    )
+    everything_dropped = not active and bool(dropped)
     return L2Report(
         verdict=verdict,
         findings=active,
         declared=report.declared,
         dropped=dropped,
         parse_error=report.parse_error,
+        no_progress=verdict == "fail"
+        and (only_this_runs_carries or everything_dropped),
     )

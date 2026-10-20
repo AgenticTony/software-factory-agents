@@ -99,9 +99,11 @@ of one diff:
   changed the code a carried finding concerns and it still stands, raise
   it again and say what changed.
 - **Delta since the last review (primary scope)** — what changed since
-  you last reviewed. New findings belong here. A new finding outside the
-  delta must carry a `missed_earlier` field saying why the earlier round
-  missed it; without that, the orchestrator drops it as out of scope.
+  you last reviewed. New findings belong here. A new finding on a file
+  outside the delta must carry a `missed_earlier` field saying why the
+  earlier round missed it; without that, the orchestrator drops it as
+  out of scope. A finding that names no file is never dropped — it
+  cannot be shown to sit in unchanged code.
 - **Full diff (reference only)** — context for judging the delta, not a
   licence to re-open settled code.
 
