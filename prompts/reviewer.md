@@ -89,6 +89,27 @@ missing, not that behaviour was checked):
   internal collaborators, private methods or call counts? Mocks belong
   only at system boundaries (external APIs, time, randomness).
 
+## Fix rounds: review the delta
+
+After the first round, the prompt hands you three scope sections instead
+of one diff:
+
+- **Findings from earlier rounds** — already recorded. Do not re-raise
+  them as new findings; the orchestrator carries them. If the delta
+  changed the code a carried finding concerns and it still stands, raise
+  it again and say what changed.
+- **Delta since the last review (primary scope)** — what changed since
+  you last reviewed. New findings belong here. A new finding outside the
+  delta must carry a `missed_earlier` field saying why the earlier round
+  missed it; without that, the orchestrator drops it as out of scope.
+- **Full diff (reference only)** — context for judging the delta, not a
+  licence to re-open settled code.
+
+The implementer was told to fix each finding's defect class, not just the
+named instance. Explicitly check for sibling sites: where the delta fixed
+one site of a class, look for the same defect elsewhere and raise what
+survives.
+
 ## Verdict
 
 Return exactly one JSON object and nothing else that could be mistaken
@@ -104,7 +125,8 @@ for one:
       "severity": "blocking, major, minor or note",
       "file": "path/from/the/diff",
       "line": 12,
-      "text": "what is wrong, with the evidence"
+      "text": "what is wrong, with the evidence",
+      "missed_earlier": "only on fix rounds: why round one missed a finding outside the delta"
     }
   ]
 }

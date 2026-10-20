@@ -343,14 +343,32 @@ def test_budget_counts_earlier_attempts(tmp_path: Path):
 
 
 def test_reviewer_fail_is_retried_then_exhausted(tmp_path: Path):
-    review = json.dumps({"verdict": "fail", "findings": [
-        {"id": "R1", "axis": "spec", "severity": "blocking", "text": "scope creep"}]})
+    """A reviewer FAIL goes back with numbered findings until the budget is
+    spent. Since F-23 the findings must be genuinely new each round: an
+    identical repeat escalates ``review_not_converging`` after the second
+    round instead (tests/test_f23.py::test_ac_4)."""
     env = Env(tmp_path)
-    seats = Seats(review=review)
-    result = env.run(seats)
+    seats = Seats()
+    base_call = seats.__call__
+
+    def varying(seat, prompt, run_dir, profile, **kwargs):
+        if seat != "reviewer":
+            return base_call(seat, prompt, run_dir, profile, **kwargs)
+        seats.calls.append((seat, prompt, Path(run_dir), kwargs))
+        call_no = sum(1 for s, *_ in seats.calls if s == "reviewer")
+        return SessionRecord(
+            seat=seat, status="completed", num_turns=1, model="stub-model",
+            tokens={"input_tokens": 60, "output_tokens": 10},
+            result=json.dumps({"verdict": "fail", "findings": [
+                {"id": "R1", "axis": "spec", "severity": "blocking",
+                 "file": "impl.py", "text": f"scope creep {call_no}"}]}),
+        )
+
+    result = env.run(varying)
     assert result.outcome == "needs_human"
     assert [c[0] for c in seats.calls] == ["implementer", "reviewer"] * 3
-    assert "scope creep" in seats.prompts("implementer")[1]
+    assert "scope creep 1" in seats.prompts("implementer")[1]
+    assert env.task()["attempts"][-1]["escalation"] == "attempts_exhausted"
     assert env.prs == []
 
 
