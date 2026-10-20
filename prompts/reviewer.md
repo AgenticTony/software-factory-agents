@@ -102,8 +102,12 @@ of one diff:
   you last reviewed. New findings belong here. A new finding on a file
   outside the delta must carry a `missed_earlier` field saying why the
   earlier round missed it; without that, the orchestrator drops it as
-  out of scope. A finding that names no file is never dropped — it
-  cannot be shown to sit in unchanged code.
+  out of scope. A finding that names no file must quote the acceptance
+  item it concerns (its `AC-n` id): a fileless finding with no `AC-n`
+  anchor is treated as outside the delta in fix rounds and needs
+  `missed_earlier` like any other. Anchored fileless findings key by
+  their AC ids across rounds — raise the same acceptance item again in
+  different words and it carries, it does not start a new thread.
 - **Full diff (reference only)** — context for judging the delta, not a
   licence to re-open settled code.
 

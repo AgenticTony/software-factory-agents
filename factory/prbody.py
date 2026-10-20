@@ -238,14 +238,22 @@ def _validator_section(reports: dict) -> str:
     """The gate reports as JSON, with the L2 round's dropped findings —
     if any — pulled out above the blob (F-23 finding 9: a reviewer
     finding the orchestrator dropped as out of scope still belongs in
-    front of the human merging the PR, not buried in the JSON)."""
+    front of the human merging the PR, not buried in the JSON).
+
+    The dropped text is reviewer-controlled, so every field is
+    whitespace-collapsed before it enters the markdown: a newline in a
+    finding's text must never start a ``## `` line of its own (it could
+    forge a duplicate section heading and make :func:`check_pr_body`
+    refuse the body after a passing round, or plant spoofed merge-risk
+    text in front of the human). Inside the JSON fence the same text is
+    safe — newlines are escaped there."""
     section = fence(json.dumps(reports, indent=2, ensure_ascii=False), "json")
     dropped = (reports.get("L2") or {}).get("dropped") or []
     if dropped:
         lines = [
-            f"- [{d.get('finding', {}).get('severity')}] "
-            f"{d.get('finding', {}).get('file') or '(no file)'}: "
-            f"{d.get('finding', {}).get('text')}"
+            f"- [{_flat(d.get('finding', {}).get('severity'))}] "
+            f"{_flat(d.get('finding', {}).get('file')) or '(no file)'}: "
+            f"{_flat(d.get('finding', {}).get('text'))}"
             for d in dropped
         ]
         section = (
@@ -258,6 +266,12 @@ def _validator_section(reports: dict) -> str:
         + "\n\nL3 holdouts: not run (F-15). L4 live verification runs after "
         "deploy (F-14)."
     )
+
+
+def _flat(value) -> str:
+    """Reviewer-controlled text as one markdown-safe line: all whitespace
+    runs (newlines included) collapse to single spaces."""
+    return " ".join(str(value or "").split())
 
 
 def check_pr_body(body: str) -> None:

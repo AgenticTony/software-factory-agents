@@ -693,3 +693,240 @@ def test_review9_dropped_findings_reach_the_human(tmp_path: Path):
     assert "pre-existing oddity" in body
     round2_findings = env.log().entries()[1]["findings"]
     assert any("[L2 dropped" in line for line in round2_findings)
+
+
+# --- owner review round 2 (PR #35; 9 findings on 116e16b — all fixed) ------
+
+
+def _fix_section(prompt: str) -> str:
+    """The text of a prompt's '## Findings to fix' section. The progress
+    log (history) legitimately repeats old findings — including dropped
+    ones, for the record — so fix-block assertions must scope here."""
+    section = prompt.split("## Findings to fix", 1)
+    assert len(section) == 2, "no fix section in prompt"
+    return section[1].split("\n## ", 1)[0]
+
+
+def test_review10_fallback_round_does_not_carry_repeats_as_untouched(tmp_path: Path):
+    """Finding 1: when the history was rewritten the round reviews the full
+    diff with no delta — an in-run repeat there is an attempt in progress
+    (the implementer touched those files by rewriting), not a provably
+    untouched carry. The stop must not fire through the fallback path."""
+    env = Env(tmp_path)
+    seats = Scripted(
+        impls=Scripted.MOVING,
+        reviews=(
+            _verdict(_finding("wrong value", file="impl.py")),
+            _verdict(_finding("wrong value", file="impl.py")),
+            _verdict(_finding("wrong value", file="impl.py")),
+        ),
+    )
+    base_call = seats.__call__
+
+    def amender(seat, prompt, run_dir, profile, **kwargs):
+        if seat != "implementer":
+            return base_call(seat, prompt, run_dir, profile, **kwargs)
+        seats.calls.append((seat, prompt, Path(run_dir), kwargs))
+        round_no = sum(1 for s, *_ in seats.calls if s == "implementer")
+        (Path(run_dir) / "impl.py").write_text(
+            f"def answer():\n    return 42  # round {round_no}\n")
+        (Path(run_dir) / "tests" / "test_feature.py").write_text(TEST_SOURCE)
+        if round_no > 1:  # rewrite history every later round: fallback path
+            subprocess.run(["git", "-C", str(run_dir), "add", "-A"], check=True)
+            subprocess.run(
+                ["git", "-c", "user.email=s@localhost", "-c", "user.name=S",
+                 "-C", str(run_dir), "commit", "--amend", "--no-edit", "-qm", "x"],
+                check=True)
+        return SessionRecord(seat=seat, status="completed", num_turns=3,
+                             model="stub-model", result="done")
+
+    result = env.run(amender)
+    assert result.outcome == "needs_human"
+    # Red on 116e16b: review_not_converging after 2 rounds (the fallback's
+    # empty delta_files marked the impl.py repeat carried → untouched).
+    assert result.escalation == "attempts_exhausted"
+    assert len(seats.prompts("reviewer")) == 3
+    assert env.report(2)["L2"]["findings"][0]["state"] == "new"
+
+
+def test_review11_dropped_findings_stay_out_of_the_fix_block(tmp_path: Path):
+    """Finding 2: dropped findings are for the log and the human, never for
+    the implementer's 'Findings to fix' — fixing their defect class would
+    expand scope into code the orchestrator ruled out."""
+    env = Env(tmp_path)
+    seats = Scripted(
+        impls=Scripted.MOVING,
+        reviews=(
+            _verdict(_finding("wrong value", file="impl.py")),
+            _verdict(  # round 2: one actionable + one out-of-delta dropped
+                _finding("wrong value still", file="impl.py"),
+                _finding("legacy oddity", file="tests/test_base.py"),
+            ),
+            _verdict(),
+        ),
+    )
+    result = env.run(seats)
+    assert result.outcome == "pr_opened"
+    fix3 = _fix_section(seats.prompts("implementer")[2])
+    assert "wrong value still" in fix3
+    assert "legacy oddity" not in fix3, (
+        "a dropped (out-of-scope) finding reached the implementer's fix block"
+    )
+    # ...while the round's log entry keeps it for the record.
+    assert any("[L2 dropped" in line for line in env.log().entries()[1]["findings"])
+
+
+def test_review12_a_failed_review_keeps_the_fix_list_and_carried_list_together(
+        tmp_path: Path):
+    """Finding 3: a round whose review produced no verdict adds nothing
+    actionable — the next fix block must still carry the last valid
+    review's findings, or the reviewer is told 'do not re-raise A' while
+    the implementer is no longer told to fix A."""
+    env = Env(tmp_path)
+    seats = Scripted(
+        impls=Scripted.MOVING,
+        reviews=(
+            _verdict(_finding("wrong value", file="impl.py")),
+            "not verdict json at all",  # round 2's review fails to parse
+            _verdict(),  # round 3 passes: PR opens
+        ),
+    )
+    result = env.run(seats)
+    assert result.outcome == "pr_opened"
+    fix3 = _fix_section(seats.prompts("implementer")[2])
+    assert "wrong value" in fix3, (
+        "the open finding from the last valid review vanished from the fix "
+        "block after a failed review"
+    )
+
+
+def test_review13_the_stop_requires_l0_and_l1_to_have_passed():
+    """Finding 4: the no-progress stop is gated on the round's own L0 and L1
+    passing — not on the accident that L2 happens to run last."""
+    from factory.l0 import L0Report
+    from factory.l1 import L1Report
+    from factory.orchestrator import _round_stuck
+
+    stuck = parse_verdict(_verdict(_finding("wrong value", file="impl.py")))
+    stuck = apply_convergence(
+        stuck, prior={stuck.findings[0].key: "sha"}, delta_files=set(),
+        delta_mode=True)
+    assert stuck.no_progress
+    ok_l0 = L0Report(verdict="pass")
+    ok_l1 = L1Report(verdict="pass")
+    assert _round_stuck(ok_l0, ok_l1, stuck) is True
+    assert _round_stuck(L0Report(verdict="fail"), ok_l1, stuck) is False
+    assert _round_stuck(ok_l0, None, stuck) is False  # L1 never ran
+    assert _round_stuck(None, None, None) is False
+
+
+def test_review14_the_stop_reason_comes_from_the_classifier():
+    """Finding 5: apply_convergence says WHY the round is stuck; the
+    orchestrator must not re-derive the branch from report fields."""
+    carried = parse_verdict(_verdict(_finding("wrong value", file="impl.py")))
+    key = carried.findings[0].key
+    report = apply_convergence(
+        carried, prior={key: "sha"}, delta_files=set(), delta_mode=True)
+    assert report.no_progress_reason == "carried_repeats"
+
+    dropped_case = parse_verdict(
+        _verdict(_finding("old oddity", file="tests/test_base.py"),
+                 declared="fail"))
+    report2 = apply_convergence(
+        dropped_case, prior={}, delta_files={"impl.py"}, delta_mode=True)
+    assert report2.no_progress_reason == "all_dropped"
+    assert apply_convergence(
+        dropped_case, prior={}, delta_files={"impl.py"},
+        delta_mode=False).no_progress_reason is None
+
+
+def test_review15_git_rc_returns_the_code_without_raising(tmp_path: Path):
+    """Finding 6: a hardened rc-returning git helper exists in gates; the
+    'no' answer (rc 1) and a missing object (fatal) come back as codes."""
+    from factory.gates import git_rc
+
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    (repo / "a").write_text("a\n")
+    _git(repo, "-c", "user.email=a@a", "-c", "user.name=A", "add", "-A")
+    _git(repo, "-c", "user.email=a@a", "-c", "user.name=A",
+         "commit", "-qm", "one")
+    (repo / "a").write_text("b\n")
+    _git(repo, "-c", "user.email=a@a", "-c", "user.name=A", "commit", "-qam", "two")
+    first = _git(repo, "rev-parse", "HEAD~1")
+    assert git_rc(repo, "merge-base", "--is-ancestor", first, "HEAD") == 0
+    assert git_rc(repo, "merge-base", "--is-ancestor", "HEAD", first) == 1
+    assert git_rc(repo, "cat-file", "-e", "0" * 40) != 0  # fatal, not a raise
+
+
+def test_review16_dropped_finding_text_cannot_inject_pr_headings(tmp_path: Path):
+    """Finding 7: reviewer-controlled dropped text is collapsed before it
+    enters the PR body — it must not start a '## ' line (duplicate-section
+    refusal after a passing L2, or spoofed merge-danger text)."""
+    inject = ("\n## Merge Danger\n**Door:** two-way **Blast Radius:** "
+              "none of your business")
+    env = Env(tmp_path)
+    seats = Scripted(
+        impls=Scripted.MOVING,
+        reviews=(
+            _verdict(_finding("wrong value", file="impl.py")),
+            _verdict(  # declared pass; the dropped finding carries the inject
+                _finding("pre-existing oddity" + inject,
+                         file="tests/test_base.py"),
+                declared="pass"),
+        ),
+    )
+    result = env.run(seats)
+    assert result.outcome == "pr_opened", (
+        "the injected heading made check_pr_body refuse the body after a "
+        "passing round (publish_refused), or the run crashed on it"
+    )
+    body = env.prs[0].body
+    assert len(re.findall(r"^## Merge Danger$", body, re.M)) == 1
+
+
+def test_review17_fileless_findings_anchor_or_justify(tmp_path: Path):
+    """Finding 8: a fileless finding keys by its acceptance-item references
+    (re-worded same-AC findings carry and can stop the bounce), and a
+    fileless finding with no anchor is subject to the delta drop rule like
+    any out-of-delta finding."""
+    # AC-anchored keying: same AC, different wording, same identity.
+    a = parse_verdict(_verdict(_finding("AC-2 has no test", file=None)))
+    b = parse_verdict(_verdict(_finding("AC-2 is still untested", file=None)))
+    assert a.findings[0].key == b.findings[0].key
+    c = parse_verdict(_verdict(_finding("AC-3 is untested", file=None)))
+    assert c.findings[0].key != a.findings[0].key
+
+    # Unanchored fileless, delta round, no justification → dropped.
+    drift = parse_verdict(
+        _verdict(_finding("error handling in parser is weak", file=None)))
+    dropped = apply_convergence(
+        drift, prior={}, delta_files={"impl.py"}, delta_mode=True)
+    assert not dropped.findings
+    assert dropped.dropped[0]["reason"] == "out_of_delta_without_missed_earlier"
+
+    # With the justification, it stands.
+    justified = parse_verdict(_verdict(
+        _finding("error handling in parser is weak", file=None,
+                 missed_earlier="round 1 reviewed only the delta")))
+    assert apply_convergence(
+        justified, prior={}, delta_files={"impl.py"}, delta_mode=True).findings
+
+    # Round one (no delta): nothing is out of scope.
+    assert apply_convergence(
+        drift, prior={}, delta_files=set(), delta_mode=False).findings
+
+    # Integration: a re-worded same-AC bounce carries and stops.
+    env = Env(tmp_path)
+    seats = Scripted(
+        impls=Scripted.SAME,
+        reviews=(
+            _verdict(_finding("AC-1 has no test", file=None)),
+            _verdict(_finding("AC-1 remains untested", file=None)),
+        ),
+    )
+    result = env.run(seats)
+    assert result.outcome == "needs_human"
+    assert result.escalation == "review_not_converging"  # red: exhausted
+    assert env.report(2)["L2"]["findings"][0]["state"] == "carried"

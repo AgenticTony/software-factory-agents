@@ -344,28 +344,34 @@ def test_budget_counts_earlier_attempts(tmp_path: Path):
 
 def test_reviewer_fail_is_retried_then_exhausted(tmp_path: Path):
     """A reviewer FAIL goes back with numbered findings until the budget is
-    spent. Since F-23 the findings must be genuinely new each round: an
-    identical repeat escalates ``review_not_converging`` after the second
-    round instead (tests/test_f23.py::test_ac_4)."""
+    spent. The implementer writes different (still green) content each
+    round so the review delta is real, and the findings name impl.py —
+    the common file-named-retry path, in the delta, exercised as such
+    (an identical round-2 finding on the untouched file would rightly
+    escalate review_not_converging instead: F-23)."""
     env = Env(tmp_path)
     seats = Seats()
-    base_call = seats.__call__
 
     def varying(seat, prompt, run_dir, profile, **kwargs):
-        if seat != "reviewer":
-            return base_call(seat, prompt, run_dir, profile, **kwargs)
+        if seat == "implementer":
+            seats.calls.append((seat, prompt, Path(run_dir), kwargs))
+            round_no = sum(1 for s, *_ in seats.calls if s == "implementer")
+            (Path(run_dir) / "impl.py").write_text(
+                f"def answer():\n    return 42  # fix round {round_no}\n")
+            (Path(run_dir) / "tests" / "test_feature.py").write_text(TEST_SOURCE)
+            return SessionRecord(
+                seat=seat, status="completed", num_turns=3, model="stub-model",
+                tokens={"input_tokens": 120, "output_tokens": 40},
+                result="Implemented answer().",
+            )
         seats.calls.append((seat, prompt, Path(run_dir), kwargs))
         call_no = sum(1 for s, *_ in seats.calls if s == "reviewer")
         return SessionRecord(
             seat=seat, status="completed", num_turns=1, model="stub-model",
             tokens={"input_tokens": 60, "output_tokens": 10},
-            # Fileless on purpose: the stub writes identical content each
-            # round, so the review delta is empty and a file-naming new
-            # finding would be dropped as out of scope (F-23). Fileless
-            # findings are never dropped, so each round's finding stands.
             result=json.dumps({"verdict": "fail", "findings": [
                 {"id": "R1", "axis": "spec", "severity": "blocking",
-                 "text": f"scope creep {call_no}"}]}),
+                 "file": "impl.py", "text": f"scope creep {call_no}"}]}),
         )
 
     result = env.run(varying)

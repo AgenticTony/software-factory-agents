@@ -63,7 +63,7 @@ from typing import Callable
 
 from factory.config import CONFIG_FILE, FactoryConfig, in_peak_window, load_config
 from factory.contract import load_profile
-from factory.gates import CommandResult, diff_name_status
+from factory.gates import CommandResult, diff_name_status, git_rc
 from factory.gates import git as hardened_git
 from factory.l0 import run_l0
 from factory.l1 import run_l1
@@ -268,7 +268,17 @@ def _compact(report: dict | None, tail: int) -> dict | None:
     return report
 
 
-def _numbered_findings(reports: dict, extra: list[str]) -> list[str]:
+def _numbered_findings(reports: dict, extra: list[str],
+                       include_dropped: bool = True) -> list[str]:
+    """The round's numbered finding lines.
+
+    ``include_dropped=False`` builds the implementer's fix list: dropped
+    findings are out of scope by the orchestrator's own ruling — telling
+    the implementer to "fix the defect class" of one would pull edits
+    into code the round ruled untouchable, and those edits would put the
+    file into the next delta. The full list (default) is the round's
+    record: log, PR evidence, the human's read.
+    """
     lines: list[str] = list(extra)
     for layer in ("L0", "L1", "L2"):
         report = reports.get(layer) or {}
@@ -277,10 +287,9 @@ def _numbered_findings(reports: dict, extra: list[str]) -> list[str]:
             if finding.get("file"):
                 where = f" ({finding['file']}:{finding.get('line') or ''})"
             lines.append(f"[{layer} {finding.get('id')}] {finding.get('text')}{where}")
-        # Dropped L2 findings ride the numbered list marked, not actionable:
-        # the log (and the human reading it) sees what the reviewer flagged
-        # even though the orchestrator ruled it out of scope (F-23).
         for entry in report.get("dropped") or []:
+            if not include_dropped:
+                continue
             finding = entry.get("finding") or {}
             lines.append(
                 f"[{layer} dropped {finding.get('id')}] {finding.get('text')} "
@@ -288,6 +297,37 @@ def _numbered_findings(reports: dict, extra: list[str]) -> list[str]:
                 "missed_earlier — for the record, not to fix)"
             )
     return [f"{i}. {text}" for i, text in enumerate(lines, start=1)]
+
+
+def _fix_findings(reports: dict, extra: list[str], l2, reviewed: bool,
+                  last_valid_l2: dict | None) -> list[str]:
+    """The next round's fix list: actionable findings only.
+
+    Dropped findings are excluded (out of scope). A round whose review
+    produced no verdict contributes no L2 lines of its own — the
+    invalid-verdict marker is the reviewer's failure, not work — and the
+    last valid review's findings are still the open work, which keeps the
+    fix list and the reviewer's carried list describing the same round.
+    """
+    fix_reports = reports
+    if l2 is not None and not reviewed:
+        fix_reports = {**reports, "L2": last_valid_l2}
+    return _numbered_findings(fix_reports, extra, include_dropped=False)
+
+
+# The stop's note comes from the classifier's reason, never re-derived
+# here: if apply_convergence grows a third branch, the note follows it.
+_NO_PROGRESS_NOTES = {
+    "carried_repeats": (
+        "every L2 finding is a carried repeat from an earlier round of "
+        "this run, on files untouched since: another round has nothing "
+        "new to fix"
+    ),
+    "all_dropped": (
+        "every L2 finding was dropped as out of scope; the declared fail "
+        "stands with nothing left to fix"
+    ),
+}
 
 
 def _implementer_prompt(task: dict, slice_: dict | None, branch: str, history: str,
@@ -438,14 +478,30 @@ def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
     rc 0 = yes, rc 1 = no; anything else — including the object being
     absent from a ``--filter=blob:none`` clone after the implementer
     amended or reset the round it names — also reads as no, because the
-    caller's fallback (full-diff review scope) is always safe.
+    caller's fallback (full-diff review scope) is always safe. Runs
+    through the hardened, timeout-bounded :func:`factory.gates.git_rc`.
     """
-    proc = subprocess.run(
-        ["git", *GIT_HARDENING, "-C", str(repo), "merge-base", "--is-ancestor",
-         ancestor, descendant],
-        capture_output=True,
+    return git_rc(repo, "merge-base", "--is-ancestor", ancestor, descendant) == 0
+
+
+def _round_stuck(l0, l1, l2) -> bool:
+    """Whether the no-progress stop applies to this round (F-23).
+
+    It is not enough that ``l2.no_progress`` is set: the stop may only
+    spend a round the deterministic gates passed. Today L2 runs solely
+    after L0 and L1 pass, but that ordering is a property of the wiring,
+    not of the data — a future advisory L1 or a reordered pipeline would
+    otherwise escalate `review_not_converging` on a round whose L0/L1
+    findings are fresh, actionable work.
+    """
+    return bool(
+        l2 is not None
+        and l2.no_progress
+        and l0 is not None
+        and l0.verdict == "pass"
+        and l1 is not None
+        and l1.verdict == "pass"
     )
-    return proc.returncode == 0
 
 
 def _git_out(repo: Path, *args: str) -> str:
@@ -668,7 +724,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
             prior.setdefault(key, None)
     raised: list[dict] = []  # this run's findings, for the next round's prompt
     last_reviewed: str | None = None  # the head sha L2 last saw
-    prev_findings: list[str] | None = None  # the failed round's numbered findings
+    last_valid_l2: dict | None = None  # the last parseable verdict's report
+    prev_findings: list[str] | None = None  # the failed round's fix list
     round_no = 0
 
     work = create_run(project, source, factory_root=ctx.factory_root, ref=default_branch)
@@ -755,6 +812,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
             pushed = False
             opened = False
             round_keys: list = []  # this round's L2 finding keys (F-23)
+            reviewed = False  # did this round's review produce a verdict?
             try:
                 # ---- implementer
                 # The fix block below carries the newest entry's findings,
@@ -922,7 +980,11 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                             # round's delta must still cover this head, or
                             # code no reviewer ever saw would become "outside
                             # the delta" and its findings dropped.
-                            if review.status == "completed" and l2.parse_error is None:
+                            reviewed = (
+                                review.status == "completed" and l2.parse_error is None
+                            )
+                            if reviewed:
+                                last_valid_l2 = l2.to_dict()
                                 round_keys = [
                                     f.key for f in l2.findings
                                     if isinstance(f, L2Finding) and f.key
@@ -985,16 +1047,12 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                 # not count, and a repeat on a file the fix touched is an
                 # attempt in progress), or every finding was dropped as
                 # out of scope and the declared fail stands with nothing
-                # left. Escalate instead of spending the round.
-                if l2 is not None and l2.no_progress:
-                    note = (
-                        "every L2 finding was dropped as out of scope; the declared "
-                        "fail stands with nothing left to fix"
-                        if not l2.findings and l2.dropped
-                        else "every L2 finding is a carried repeat from an earlier "
-                        "round of this run, on files untouched since: another "
-                        "round has nothing new to fix"
-                    )
+                # left. Escalate instead of spending the round — and only
+                # when the round's own L0/L1 passed (_round_stuck): fresh
+                # deterministic findings are actionable work, whatever the
+                # review repeats.
+                if _round_stuck(l0, l1, l2):
+                    note = _NO_PROGRESS_NOTES[l2.no_progress_reason]
                     attempt = attempt_record(
                         attempt_no, started, "escalated", records, path,
                         escalation="review_not_converging", note=note,
@@ -1012,7 +1070,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                      reports=reports)
                 attempt = attempt_record(attempt_no, started, "fail", records, path)
                 finish(attempt, None, findings, finding_keys=round_keys)
-                prev_findings = findings
+                prev_findings = _fix_findings(
+                    reports, extra_findings, l2, reviewed, last_valid_l2)
                 task = queue.get(task_id)
             except Exception as exc:
                 # The orchestrator itself failed mid-round (gh after the push,
