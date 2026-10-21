@@ -99,11 +99,24 @@ ALLOWED_TRANSITIONS: dict[tuple[str, str], str] = {
     ("not_buildable", "done"): "owner-only task: every owner step ticked (F-29)",
     ("awaiting_owner", "draft"): "contract changed",
     ("needs_human", "draft"): "contract changed",
-    # F-26 recovery edges (owner acts, replayed via reconcile): the
-    # escalated PR is re-opened on GitHub, or rejected for a fix round.
-    ("needs_human", "in_review"): "owner re-opened the escalated PR (F-26 recovery)",
-    ("needs_human", "in_progress"): "owner rejected the escalated PR; fix round (F-26 recovery)",
     ("done", "draft"): "contract changed (human reopen)",
+}
+# F-26 recovery edges (round-4 findings 1+2) sit OUTSIDE the general
+# table on purpose: the table is status-pair-only, and these edges are
+# legal only for a task whose last attempt escalated stale_base/pr_closed
+# and which still holds links.pr. The one writer is the stale-PR sweep,
+# which applies them from GitHub's PR state — the owner re-opens a
+# pr_closed PR (→ in_review) or closes a stale_base PR to reject it
+# (→ in_progress; the next run's reclaim_abandoned re-queues the fix
+# round). No other needs_human task (credential_added,
+# protected_path_touched, attempts_exhausted, …) may exit through them.
+RECOVERY_ESCALATIONS = ("stale_base", "pr_closed")
+RECOVERY_TRANSITIONS: dict[tuple[str, str], str] = {
+    ("needs_human", "in_review"):
+        "owner re-opened the escalated PR (F-26 recovery, sweep-applied)",
+    ("needs_human", "in_progress"):
+        "owner rejected the escalated PR; fix round (F-26 recovery, "
+        "sweep-applied)",
 }
 
 LEGAL_TARGETS: dict[str, frozenset[str]] = {
@@ -165,6 +178,37 @@ def check_transition(current: str, new: str) -> str:
         targets = ", ".join(sorted(LEGAL_TARGETS.get(current, frozenset()))) or "none"
         raise TransitionError(
             f"illegal transition {current} -> {new}; allowed from {current}: {targets}"
+        )
+    return reason
+
+
+def recovery_task_eligible(task: dict) -> bool:
+    """Whether the F-26 recovery edges may move this task (round-4 f2).
+
+    True only for a ``needs_human`` task whose last attempt escalated
+    ``stale_base``/``pr_closed`` and which still holds ``links.pr`` —
+    the sweep and the transition gate share this one predicate, so the
+    writer can never widen the edges on its own.
+    """
+    attempts = task.get("attempts") or []
+    return (task.get("status") == "needs_human"
+            and bool(attempts)
+            and attempts[-1].get("escalation") in RECOVERY_ESCALATIONS
+            and bool((task.get("links") or {}).get("pr")))
+
+
+def check_recovery_transition(task: dict, new: str) -> str:
+    """Validate one F-26 recovery transition for this specific task.
+
+    Raises:
+        TransitionError: If the edge isn't a recovery edge, or the task
+            isn't a stale_base/pr_closed escalation holding a PR link.
+    """
+    reason = RECOVERY_TRANSITIONS.get((task.get("status"), new))
+    if reason is None or not recovery_task_eligible(task):
+        raise TransitionError(
+            f"recovery transition {task.get('status')} -> {new} needs a "
+            "stale_base/pr_closed escalation and a PR link (F-26)"
         )
     return reason
 
@@ -561,7 +605,14 @@ class TaskQueue:
             ConcurrentWriteError: If another writer changed the file.
         """
         task = self.get(task_id)
-        check_transition(task.get("status"), new_status)
+        current = task.get("status")
+        if (current, new_status) in RECOVERY_TRANSITIONS:
+            # F-26 recovery edges: gated on the task, not just the pair
+            # (round-4 finding 2) — only the sweep writes them, and only
+            # for an eligible escalation.
+            check_recovery_transition(task, new_status)
+        else:
+            check_transition(current, new_status)
         _check_kind_rules(task, task.get("status"), new_status)
         _check_slice_rules(task, new_status)
         _check_owner_step_rules(task, new_status)

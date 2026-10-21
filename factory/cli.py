@@ -149,6 +149,25 @@ def _run_tick(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_extra(result) -> str:
+    """The detail printed after a run's outcome.
+
+    F-26 round-4 finding 3: a concurrency_wait names its cause — the PRs
+    GitHub reports open, and the links whose state couldn't be resolved
+    (which the limit presumes open) — so a scheduled stall never looks
+    like a healthy tick.
+    """
+    if result.outcome == "concurrency_wait":
+        named = [
+            *(f"open: {url}" for url in result.open_prs),
+            *(f"state unknown (counts as open): {url}"
+              for url in result.unresolved_prs),
+        ]
+        if named:
+            return "; ".join(named)
+    return result.pr or result.escalation or ""
+
+
 def _run_orchestrator(args: argparse.Namespace) -> int:
     """Dispatch run/loop; known failures exit 2 with a message, not a traceback."""
     try:
@@ -158,13 +177,11 @@ def _run_orchestrator(args: argparse.Namespace) -> int:
         if args.command == "run":
             result = run_once(Path(args.queue), profile_path=args.profile, **kwargs)
             detail = f" {result.task_id}" if result.task_id else ""
-            extra = result.pr or result.escalation or ""
-            print(f"factory run: {result.outcome}{detail} {extra}".rstrip())
+            print(f"factory run: {result.outcome}{detail} {_run_extra(result)}".rstrip())
             return _EXIT[result.outcome]
         loop = run_loop(Path(args.queue), profile_path=args.profile, **kwargs)
         for result in loop.results:
-            extra = result.pr or result.escalation or ""
-            print(f"  {result.task_id or '-'}: {result.outcome} {extra}".rstrip())
+            print(f"  {result.task_id or '-'}: {result.outcome} {_run_extra(result)}".rstrip())
         print(f"factory loop: stopped ({loop.stop_reason}) after {len(loop.results)} run(s)")
         return _EXIT[loop.stop_reason]
     except _RUN_ERRORS as exc:

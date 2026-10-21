@@ -687,23 +687,33 @@ def test_review10_a_404_names_the_other_causes():
 # --------------------------------------- owner review round 2 (8 findings) --
 
 
-def test_review11_a_fix_round_does_not_fill_its_own_slot(tmp_path: Path):
-    """Round-2 finding 1 (blocking): a rejected PR's task keeps its open
-    PR link through the fix round — the picked task must not count its
-    own PR against the concurrency limit, or it waits forever."""
+def test_review11_a_fix_round_waits_for_its_old_pr_to_close(tmp_path: Path):
+    """Round-4 finding 4 (supersedes round-2 finding 1's exclusion): the
+    picked task's own PR counts while GitHub reports it open — excluding
+    it let the fix round open a second PR and orphan the rejected one
+    (two open factory PRs is exactly what AC-2 forbids). The wait names
+    the PR (round-4 finding 3); close it and the fix round runs."""
     env = Env(tmp_path)
-    assert env.run(Seats()).outcome == "pr_opened"
+    seats = Seats()
+    assert env.run(seats).outcome == "pr_opened"
+    worked = len(seats.calls)
 
-    # You reject the PR: the task returns for a fix round (and re-queues),
-    # links.pr kept, the PR itself still open on GitHub.
+    # You reject the PR: the task returns for a fix round, links.pr kept,
+    # the PR itself still open on GitHub.
     q = TaskQueue(env.queue_path)
     q.transition("T-1", "in_progress")
     q.transition("T-1", "ready")
 
-    result = env.run(Seats())  # pr_state default: the old PR is open
+    blocked = env.run(seats)  # default fake: the old PR is still open
 
+    assert blocked.outcome == "concurrency_wait"
+    assert len(seats.calls) == worked  # no session while the old PR holds the slot
+    assert len(env.prs) == 1
+    assert env.task()["links"]["pr"] in blocked.open_prs  # the stall names it
+
+    result = env.run(seats, pr_state=lambda url: "closed")
     assert result.outcome == "pr_opened"
-    assert len(env.prs) == 2
+    assert len(env.prs) == 2  # the fix round's PR; the old one is closed
 
 
 def test_review12_conflicts_are_structural_locale_pinned_and_named(
@@ -1038,14 +1048,210 @@ def test_review24_an_idle_tick_only_queries_open_prs(tmp_path: Path):
     assert calls == [t1_pr]  # only the open PR's link, never T-2's
 
 
-def test_review25_recovery_edges_are_legal_and_documented():
-    """Round-3 finding 8: the documented owner remedies must have legal
-    transitions — re-opened PR → back to in_review; rejected PR → fix
-    round — and TASK-CONTRACT must carry both rows."""
-    from factory.state import check_transition
+def test_review25_recovery_edges_are_legal_and_documented(tmp_path: Path):
+    """Round-3 finding 8 (rewritten for round-4 finding 2's gate): the
+    recovery edges are legal for an escalated task holding a PR link —
+    applied through the queue, which enforces the gate — and
+    TASK-CONTRACT carries both rows."""
+    env = Env(tmp_path, tasks=[_task("T-1")])
+    assert env.run(Seats()).outcome == "pr_opened"
+    env.advance_remote_main("def answer():\n    return 99\n",
+                            message="conflicting remote change")
+    assert env.run(Seats()).outcome == "needs_human"  # stale_base, PR linked
+    TaskQueue(env.queue_path).transition("T-1", "in_progress")  # eligible
 
-    check_transition("needs_human", "in_review")   # PR re-opened
-    check_transition("needs_human", "in_progress")  # rejected → fix round
+    env2 = Env(tmp_path / "b", tasks=[_task("T-1")])
+    assert env2.run(Seats()).outcome == "pr_opened"
+    assert env2.run(Seats(), pr_state=lambda url: "closed").escalation \
+        == "pr_closed"
+    TaskQueue(env2.queue_path).transition("T-1", "in_review")  # eligible
+
     doc = (REPO_ROOT / "TASK-CONTRACT.md").read_text()
     assert "`needs_human → in_review`" in doc
     assert "`needs_human → in_progress`" in doc
+
+
+# --------------------------- round 4 (owner review) ------------------------
+
+
+def test_review26_a_reopened_pr_is_recovered_by_the_sweep(tmp_path: Path):
+    """Round-4 finding 1: the pr_closed remedy is reachable through the
+    tooling — no hand-edit, no reconcile (which skips non-draft tasks).
+    You re-open the PR on GitHub; the next run's sweep moves the task
+    back to in_review and says so in the progress log."""
+    env = Env(tmp_path, tasks=[_task("T-1")])
+    assert env.run(Seats()).outcome == "pr_opened"
+    assert env.run(Seats(), pr_state=lambda url: "closed").escalation \
+        == "pr_closed"
+
+    result = env.run(Seats())  # you re-opened it; the default fake: open
+
+    assert result.outcome == "idle"  # nothing to pick; the recovery is the story
+    assert env.task()["status"] == "in_review"
+    assert any(e.get("outcome") == "recovered" for e in env.log().entries())
+
+
+def test_review27_a_rejected_stale_pr_returns_for_a_fix_round(tmp_path: Path):
+    """Round-4 findings 1+7: the stale_base fix-round remedy is the sweep
+    reading your rejection (the closed PR). The round re-runs from the
+    current default head — no owner branch update is promised or used."""
+    env = Env(tmp_path, tasks=[_task("T-1")])  # 3 attempts: run + escalation + fix round
+    assert env.run(Seats()).outcome == "pr_opened"
+    env.advance_remote_main("def answer():\n    return 99\n",
+                            message="conflicting remote change")
+    assert env.run(Seats()).outcome == "needs_human"  # stale_base; PR open
+    old_pr = env.task()["links"]["pr"]
+
+    rejected = env.run(Seats(), pr_state=lambda url: "closed")
+
+    assert rejected.outcome == "idle"  # pick ran before the sweep: none
+    assert env.task()["status"] == "in_progress"  # sweep queued the fix round
+    assert any(e.get("outcome") == "recovered" for e in env.log().entries())
+
+    result = env.run(Seats(), pr_state=lambda url: "closed")  # reclaim→ready
+    assert result.outcome == "pr_opened"
+    assert len(env.prs) == 2
+    assert env.task()["links"]["pr"] != old_pr
+
+
+def test_review28_recovery_edges_are_gated_to_f26_escalations(tmp_path: Path):
+    """Round-4 finding 2: the recovery edges left the general table —
+    check_transition refuses them — and the queue applies them only to a
+    stale_base/pr_closed escalation that still holds its PR link. A
+    credential_added task with a PR link must not exit through them."""
+    from factory.state import TransitionError, check_transition
+
+    with pytest.raises(TransitionError):
+        check_transition("needs_human", "in_review")
+    with pytest.raises(TransitionError):
+        check_transition("needs_human", "in_progress")
+
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
+    assert env.run(Seats()).outcome == "pr_opened"
+    env.advance_remote_main("def answer():\n    return 99\n",
+                            message="conflicting remote change")
+    assert env.run(Seats()).outcome == "needs_human"  # T-1 stale_base
+
+    # A credential_added escalation holding a PR link: gated out (its PR
+    # was never validated — in_review would assert a pass that never
+    # happened).
+    q = TaskQueue(env.queue_path)
+    t2 = q.get("T-2")
+    t2["status"] = "needs_human"
+    t2["links"] = {"pr": "https://github.com/fixture/fixture/pull/7"}
+    t2["attempts"] = [{
+        "run_id": "r1", "slice_id": "T-2", "started": "2026-10-18T10:00:00Z",
+        "outcome": "escalated", "escalation": "credential_added",
+        "prompt_versions": {}, "skills": [],
+    }]
+    q.save()
+    for target in ("in_review", "in_progress"):
+        with pytest.raises(TransitionError):
+            TaskQueue(env.queue_path).transition("T-2", target)
+
+    TaskQueue(env.queue_path).transition("T-1", "in_progress")  # eligible
+    q = TaskQueue(env.queue_path)
+    q.get("T-1")["status"] = "needs_human"  # back for the no-link half
+    q.get("T-1")["links"] = {}
+    q.save()
+    with pytest.raises(TransitionError):
+        TaskQueue(env.queue_path).transition("T-1", "in_review")
+
+
+def test_review29_a_fail_closed_stall_names_its_cause(tmp_path: Path):
+    """Round-4 finding 3: a fail-closed stall (an unresolvable PR link)
+    still exits 0 as concurrency_wait, but the RunResult and the CLI line
+    name the link — scheduled ticks can't look healthy while nothing
+    builds."""
+    from factory.cli import _run_extra
+    from factory.publish import PublishError
+
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
+    assert env.run(Seats()).outcome == "pr_opened"
+    env.advance_remote_main("def answer():\n    return 99\n",
+                            message="conflicting remote change")
+    assert env.run(Seats()).outcome == "needs_human"
+    q = TaskQueue(env.queue_path)
+    rotten = "https://github.com/gone/fixture/pull/1"
+    q.get("T-1")["links"]["pr"] = rotten
+    q.save()
+
+    def flaky(url):
+        if "gone" in url:
+            raise PublishError("gh pr view failed: secondary rate limit")
+        return "open"
+
+    result = env.run(Seats(), pr_state=flaky)
+
+    assert result.outcome == "concurrency_wait"
+    assert result.unresolved_prs == [rotten]
+    assert rotten in _run_extra(result)
+
+
+def test_review30_timeouts_surface_as_run_errors(tmp_path: Path, monkeypatch):
+    """Round-4 finding 5: the sweep's merge and the build's initial fetch
+    wrap TimeoutExpired into RunError — a slow remote is the usual
+    exit-2 message, never a Python traceback."""
+    import factory.orchestrator as orch
+    from factory.runs import RunError
+
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
+    assert env.run(Seats()).outcome == "pr_opened"
+    env.advance_remote_main("def answer():\n    return 99\n",
+                            message="conflicting remote change")
+
+    real_run = subprocess.run
+
+    def hang_merge(args, **kwargs):
+        if "merge" in args and "--no-edit" in args:
+            raise subprocess.TimeoutExpired(args, 300)
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(orch, "subprocess", SimpleNamespace(
+        run=hang_merge, TimeoutExpired=subprocess.TimeoutExpired))
+    with pytest.raises(RunError, match="timed out"):
+        env.run(Seats())
+
+    # Half 2: the run's initial fetch of the remote default branch
+    # (_build_on_remote_default — blob-filtered, unlike the sweep's full
+    # fetches).
+    env2 = Env(tmp_path / "b", tasks=[_task("T-1")])
+
+    def hang_build_fetch(args, **kwargs):
+        if "fetch" in args and "--filter=blob:none" in args:
+            raise subprocess.TimeoutExpired(args, 300)
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(orch, "subprocess", SimpleNamespace(
+        run=hang_build_fetch, TimeoutExpired=subprocess.TimeoutExpired))
+    with pytest.raises(RunError, match="timed out"):
+        env2.run(Seats())
+
+
+def test_review31_run_ids_come_from_the_public_api():
+    """Round-4 finding 6: runs.py exposes new_run_id() as the seam for
+    session-less records (its docstring owns the no-run-dir fact), and
+    the orchestrator no longer imports the private _new_run_id."""
+    import inspect
+    import re
+
+    from factory import runs
+
+    assert not hasattr(runs, "_new_run_id")
+    assert re.match(r"^\d{8}T\d{6}Z-[0-9a-f]{6}$", runs.new_run_id())
+    assert "no run dir" in runs.new_run_id.__doc__
+    src = inspect.getsource(__import__("factory.orchestrator",
+                                       fromlist=["orchestrator"]))
+    assert "_new_run_id" not in src
+
+
+def test_review32_the_documented_remedies_are_the_sweeps():
+    """Round-4 findings 1+7: TASK-CONTRACT's recovery rows name the sweep
+    as their writer (reconcile never applies them), and the stale_base
+    remedy no longer tells the owner to update a branch the fix round
+    would discard."""
+    doc = (REPO_ROOT / "TASK-CONTRACT.md").read_text()
+    assert "replayed via reconcile" not in doc
+    assert "updates the branch" not in doc
+    assert "is not reused" in doc
+    assert "the next run's sweep moves the task back" in doc

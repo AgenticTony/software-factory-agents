@@ -132,8 +132,12 @@ ILLEGAL_EDGE_CLASSES = {
     "exit_from_needs_human": [
         ("needs_human", "ready"),
         ("needs_human", "done"),
-        # in_review / in_progress are legal since F-26's recovery edges
-        # (owner re-opens or rejects the escalated PR); tested in test_f26.
+        # in_review / in_progress left the general table in F-26 round 4:
+        # they are recovery edges, legal only for a stale_base/pr_closed
+        # escalation holding a PR link — queue.transition enforces the
+        # gate (tested in tests/test_f26.py).
+        ("needs_human", "in_review"),
+        ("needs_human", "in_progress"),
     ],
     # not_buildable -> done exists since F-29, guarded to owner_only tasks
     # with every step ticked (tests/test_f29.py); every other exit is illegal.
