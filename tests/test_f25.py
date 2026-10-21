@@ -940,3 +940,78 @@ def test_review10_risk_flag_enums_match_across_schemas():
         project_schema["properties"]["sentinels"]["propertyNames"]["enum"]
     )
     assert risk_flag == paths_risk == sentinels
+
+
+# --- owner review round 2 (PR #37; the redaction-order leak and three
+# smaller findings — all fixed red-first) ----------------------------------
+
+
+def test_review11_redaction_happens_before_the_output_cut(tmp_path):
+    """Redacting only the LAST 200 chars leaks the head of a key that
+    straddles the cut: what survives no longer looks like a key. Redact
+    the whole output, then cut (review round 2, finding 1)."""
+    repo = _repo(tmp_path, "r11", {"src/pay/charge.py": "x = 1\n"})
+    _change(repo, {"src/pay/charge.py": "x = 2\n"})
+    filler = "Z" * 189
+    profile = dict(BASE_PROFILE)
+    profile["paths"] = {"risk": {"payments": ["src/pay/**"]}, "protected": []}
+    profile["sentinels"] = {"payments": [{
+        # output = "AKIAIOSFODNN7EXAMPLE Z*189" (210 chars): the old
+        # cut-then-redact order kept the last 200 — "NN7EXAMPLE Z*189" —
+        # a key fragment no shape matches, leaked unredacted
+        "command": f'echo "AKIAIOSFODNN7EXAMPLE {filler}" && exit 1',
+        "description": "payments scan",
+    }]}
+    report = _run(repo, profile, task={"id": "T-1", "risk": ["payments"]})
+    assert "sentinel_failed" in _finding_ids(report)
+    dumped = json.dumps(report.to_dict())
+    assert "AKIAIOSFODNN7EXAMPLE" not in dumped
+    assert "NN7EXAMPLE" not in dumped, "the cut landed inside the key and leaked its tail"
+    assert "[redacted]" in dumped
+
+
+def test_review12_copied_source_paths_do_not_touch_risk_flags(tmp_path):
+    """A copy's SOURCE path is not the file the diff changes: copying out
+    of ``src/pay`` must not raise ``risk_path_touched`` (the pre-F-25
+    diff policy matched copies by their new path only). Renames keep both
+    halves (review round 2, finding 3)."""
+    from factory.l0 import check_diff_policy
+
+    risk = {"payments": ["src/pay/**"]}
+    # copy OUT of the risk path: old semantics matched the new path only
+    out = [FileChange("src/general.py", "C", old_path="src/pay/charge.py")]
+    assert matched_risk_flags(risk, out) == set()
+
+    # copy INTO the risk path still matches (pinned by round 1's review7)
+    into = [FileChange("src/pay/copy.py", "C", old_path="src/general.py")]
+    assert matched_risk_flags(risk, into) == {"payments"}
+
+    # rename away still touches the flag (both halves, as ever)
+    away = [FileChange("src/general.py", "R", old_path="src/pay/charge.py")]
+    assert matched_risk_flags(risk, away) == {"payments"}
+
+    # and through the diff policy: an undeclared copy-out does not escalate
+    profile = dict(BASE_PROFILE)
+    profile["paths"] = {"risk": {"payments": ["src/pay/**"]}, "protected": []}
+    findings, escalations, added, matched = check_diff_policy(
+        profile, out, {"id": "T-1", "risk": []})
+    assert "risk_path_touched" not in escalations
+    assert added == [] and matched == set()
+
+
+def test_review13_skip_marker_findings_redact_their_line_echo(tmp_path):
+    """The no-echo rule is not lint-only: a skip marker whose reason
+    carries a token must not print it (review round 2, finding 4)."""
+    token = "ghp_" + "a" * 36
+    repo = _repo(tmp_path, "r13", {"tests/test_a.py": "def test_ac_1():\n    assert True\n"})
+    _change(
+        repo,
+        {"tests/test_a.py": f"import pytest\n\n\n@pytest.mark.skip(reason='{token}')\n"
+                            "def test_ac_1():\n    assert True\n"},
+    )
+    report = _run(repo)
+    assert "skip_marker_added" in _finding_ids(report)
+    assert "credential_added" in _finding_ids(report)
+    dumped = json.dumps(report.to_dict())
+    assert token not in dumped
+    assert "[redacted]" in dumped

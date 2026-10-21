@@ -35,8 +35,9 @@ Trust boundaries, each enforced in code rather than prose:
 Escalation rules (VALIDATOR-SPEC "Rounds and escalation"): L0's
 credential, protected-path, sentinel-failure, new-dependency and
 risk-path hits escalate immediately — retrying can't make them safe (a
-credential stays leaked in the pushed history even once the line is
-removed). A failed round goes back to the implementer
+credential found by L0 sits in the run branch's LOCAL history: nothing
+is pushed before a passing round, but a passing retry would push that
+earlier commit). A failed round goes back to the implementer
 with numbered findings until ``budget.max_attempts`` attempts (counted
 across runs; ``aborted`` ones excluded) are spent, then ``needs_human`` with
 ``attempts_exhausted``. A FAIL the next round cannot act on escalates
@@ -109,8 +110,9 @@ OpenPR = Callable[[PullRequest], str]
 _QUOTA = re.compile(r"(?<!\d)429(?!\d)|rate[ _-]?limit|quota", re.IGNORECASE)
 
 # L0 escalation classes, most severe first (one escalation per attempt).
-# credential_added leads: a leaked secret needs rotation and cannot be
-# un-leaked by any retry or revert.
+# credential_added leads: the model provider saw the token (rotate it), and
+# a passing retry would push the branch whose local history still contains
+# the credential commit — nothing is pushed at find time.
 _L0_ESCALATION_ORDER = (
     "credential_added", "protected_path_touched", "sentinel_failed",
     "new_dependency", "risk_path_touched",

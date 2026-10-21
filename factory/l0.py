@@ -502,13 +502,14 @@ def run_l0(
         profile, changes, task, matched_flags=matched
     )
     # F-25: the built-in sentinel pass — pure diff scans; a credential hit
-    # escalates immediately (removing the line next round cannot un-leak
-    # it from the branch history). Each sentinel leaves a result
+    # escalates immediately (nothing is pushed before a passing round, but
+    # a passing retry would push the branch whose local history still
+    # holds the credential commit). Each sentinel leaves a result
     # (pass/fail) on the report so the attempt record and the PR body can
     # show what was checked. The project sentinel COMMANDS run later,
     # after setup (F-25 review finding 1).
     builtin_findings, sentinel_results, sentinel_escalations = builtin_sentinel_pass(
-        profile, changes, findings, matched
+        profile, changes, matched
     )
     findings.extend(builtin_findings)
     escalations = sorted(set(escalations) | set(sentinel_escalations))

@@ -141,13 +141,16 @@ def matched_risk_flags(risk_globs: dict, changes) -> set:
     THE single implementation of "which risk flags did this diff touch"
     (owner review finding 7): L0 computes it once and passes it through —
     the builtin pass, the project sentinels and ``check_diff_policy``
-    consume the same set. A rename touches both its old and new path (a
-    rename away from a risk path still touched it).
+    consume the same set. A RENAME touches both its old and new path (a
+    rename away from a risk path still touched it — the pre-F-25 event
+    split's semantics). A copy's source path does NOT count: the diff
+    changes the new file, and copying out of a risk path never raised the
+    flag before F-25 (round-2 finding 3).
     """
     matched: set = set()
     for change in changes:
         paths = {change.path}
-        if change.old_path:
+        if change.status == "R" and change.old_path:
             paths.add(change.old_path)
         for flag, globs in risk_globs.items():
             if any(matches(path, globs) for path in paths):
@@ -199,20 +202,21 @@ def builtin_sentinel_findings(changes, risk_globs: dict) -> list:
                         line=no,
                     )
                 )
+            # Every echoed line goes through redact_credentials — the
+            # no-echo rule is not lint-only: a skip reason can carry a
+            # token, and the credential scanner cannot be the only guard
+            # on what findings print (round-2 finding 4).
+            echo = redact_credentials(text.strip())
             if test_file and any(p.search(text) for p in SKIP_MARKER_PATTERNS):
                 findings.append(
                     Finding(
                         "skip_marker_added",
-                        f"skip/only marker added in {scan_path}:{no}: {text.strip()}",
+                        f"skip/only marker added in {scan_path}:{no}: {echo}",
                         file=scan_path,
                         line=no,
                     )
                 )
             if in_risk_path and any(p.search(text) for p in LINT_SUPPRESSION_PATTERNS):
-                echo = (
-                    text.strip() if shape is None
-                    else f"line not echoed (matched credential shape: {shape})"
-                )
                 findings.append(
                     Finding(
                         "lint_suppression_added",
@@ -227,7 +231,8 @@ def builtin_sentinel_findings(changes, risk_globs: dict) -> list:
                     findings.append(
                         Finding(
                             "assertion_removed",
-                            f"assertion removed in {scan_path}:{no}: {text.strip()}",
+                            f"assertion removed in {scan_path}:{no}: "
+                            f"{redact_credentials(text.strip())}",
                             file=scan_path,
                             line=no,
                         )
@@ -236,28 +241,26 @@ def builtin_sentinel_findings(changes, risk_globs: dict) -> list:
     return findings
 
 
-def builtin_sentinel_pass(profile: dict, changes, findings, matched: set):
+def builtin_sentinel_pass(profile: dict, changes, matched: set):
     """The pure half of the sentinel pass: scan, derive results, escalate.
 
     Args:
         profile: The loaded ``project.yaml`` mapping.
         changes: ``FileChange`` list from ``diff_file_changes``.
-        findings: ``check_diff_policy``'s findings (kept for signature
-            symmetry; the built-in results are derived from the combined
-            finding ids).
         matched: The diff's matched risk flags —
             :func:`matched_risk_flags` computed ONCE by the caller.
 
     Returns:
         ``(findings, results, escalations)`` — the four built-in scans'
         findings, one result dict per built-in sentinel (pass/fail), and
-        the ``credential_added`` escalation when a credential was found
-        (removing the line next round cannot un-leak it from the branch
-        history, so retrying can't make it safe).
+        the ``credential_added`` escalation when a credential was found:
+        nothing is pushed before a passing round, but a passing retry
+        would push the branch whose local history still holds the
+        credential commit — retrying can't make it safe.
     """
     risk_globs = (profile.get("paths") or {}).get("risk") or {}
     scans = builtin_sentinel_findings(changes, risk_globs)
-    finding_ids = {f.id for f in findings} | {f.id for f in scans}
+    finding_ids = {f.id for f in scans}
     escalations: list[str] = []
     if "credential_added" in finding_ids:
         escalations.append("credential_added")
@@ -356,7 +359,10 @@ def run_project_sentinels(
                 })
                 continue
             reason = "timed out" if result.timed_out else f"exit {result.exit_code}"
-            output = redact_credentials(result.output.strip()[-200:])
+            # Redact the WHOLE output, then cut: cutting first can land
+            # inside a key, and the surviving fragment no longer matches
+            # any credential shape (round-2 finding 1).
+            output = redact_credentials(result.output).strip()[-200:]
             findings.append(
                 Finding(
                     "sentinel_failed",
