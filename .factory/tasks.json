@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-21T06:26:37Z",
+  "updated_at": "2026-10-21T13:52:45Z",
   "tasks": [
     {
       "id": "F-00",
@@ -1638,7 +1638,7 @@
       "source": "BUILD-ORDER.md#f-25--sensitive-path-sentinels",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-07"
       ],
@@ -1691,7 +1691,10 @@
         "wall_clock_min": 150
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "acceptance_hash": "e44287dd91327588971d870a1a290b30579c2be07c2d3224933160662df05baf",
+      "approved_at": "2026-10-21T13:52:45Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-26",
