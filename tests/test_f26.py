@@ -745,8 +745,10 @@ def test_review12_conflicts_are_structural_locale_pinned_and_named(
 
 
 def test_review13_an_unresolvable_pr_link_does_not_abort_the_run(tmp_path: Path):
-    """Round-2 finding 4: one rotten PR URL (transferred repo, rate limit)
-    on an unrelated old task must stop neither the run nor the queue."""
+    """Round-2 finding 4 (no-crash half; the limit half moved to
+    test_review20 under round-3 finding 2): one rotten PR URL on an old
+    task must stop neither the run nor the queue — nothing raises, exit
+    is a clean wait, not 2."""
     from factory.publish import PublishError
 
     env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
@@ -765,8 +767,9 @@ def test_review13_an_unresolvable_pr_link_does_not_abort_the_run(tmp_path: Path)
             raise PublishError("gh pr view failed: HTTP 404")
         return "open"
 
-    result = env.run(Seats(), pr_state=flaky)
-    assert result.outcome == "pr_opened"  # T-2 ran; nothing raised
+    result = env.run(Seats(), pr_state=flaky)  # must not raise
+    assert result.outcome in ("concurrency_wait", "pr_opened")
+    assert env.task("T-2")["status"] in ("ready", "in_review")
 
 
 def test_review14_a_closed_pr_escalates_pr_closed(tmp_path: Path):
@@ -852,3 +855,197 @@ def test_review17_an_idle_queue_in_the_peak_window_returns_idle(tmp_path: Path):
         protection=_protection(PROTECTED_STRICT), pr_state=lambda u: "open",
     )
     assert loop.stop_reason == "queue_empty"
+
+
+# --------------------------------------- owner review round 3 (8 findings) --
+
+
+def test_review18_the_sweep_runs_with_no_pickable_task(tmp_path: Path):
+    """Round-3 finding 1: a run with nothing to pick must still re-validate
+    open PRs (AC-3's 'every run') — the F-27-waits-on-F-26 shape."""
+    env = Env(tmp_path)  # one task; after its PR the queue has no pick
+    assert env.run(Seats()).outcome == "pr_opened"
+    env.advance_remote_main("def answer():\n    return 99\n",
+                            message="conflicting remote change")
+
+    result = env.run(Seats())  # pick is None — the sweep must still run
+
+    assert result.outcome == "needs_human"
+    assert result.escalation == "stale_base"
+    assert env.task()["status"] == "needs_human"
+
+
+def test_review19_a_closed_pr_surfaces_with_no_pickable_task(tmp_path: Path):
+    """Round-3 finding 1, closed half: pr_closed must surface even when no
+    task is pickable."""
+    env = Env(tmp_path)
+    assert env.run(Seats()).outcome == "pr_opened"
+
+    result = env.run(Seats(), pr_state=lambda url: "closed")
+
+    assert result.outcome == "needs_human"
+    assert result.escalation == "pr_closed"
+    assert env.task()["status"] == "needs_human"
+
+
+def test_review20_an_unknown_pr_state_fails_closed_on_the_limit(
+        tmp_path: Path):
+    """Round-3 finding 2 (supersedes round-2 finding 4's 'runs anyway'
+    half, keeping its no-crash half): a gh lookup that fails is presumed
+    OPEN for the concurrency limit — fail closed — while the run itself
+    still refuses nothing and raises nothing."""
+    from factory.publish import PublishError
+
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
+    assert env.run(Seats()).outcome == "pr_opened"
+    env.advance_remote_main("def answer():\n    return 99\n",
+                            message="conflicting remote change")
+    assert env.run(Seats()).outcome == "needs_human"  # T-1 escalated, PR open
+    q = TaskQueue(env.queue_path)
+    q.get("T-1")["links"]["pr"] = "https://github.com/gone/fixture/pull/1"
+    q.save()
+
+    def flaky(url):
+        if "gone" in url:
+            raise PublishError("gh pr view failed: secondary rate limit")
+        return "open"
+
+    seats = Seats()
+    result = env.run(seats, pr_state=flaky)
+
+    # No crash (round-2 finding 4), but the unknown PR holds its slot
+    # (round-3 finding 2): the picked task waits, a second PR never opens.
+    assert result.outcome == "concurrency_wait"
+    assert seats.calls == []
+    assert env.task("T-2")["status"] == "ready"
+
+
+def test_review21_network_git_never_prompts_and_is_bounded(
+        tmp_path: Path, monkeypatch):
+    """Round-3 finding 3: every remote git call (ls-remote, both fetches,
+    the merge) runs with GIT_TERMINAL_PROMPT=0 and a timeout — a private
+    remote with an expired credential helper must fail, not hang the
+    lease on a username prompt."""
+    import types
+
+    import factory.orchestrator as orch
+
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
+    assert env.run(Seats()).outcome == "pr_opened"
+    env.advance_remote_main(None, extra_file="remote_only.txt")
+
+    seen: list[tuple[tuple, dict]] = []
+    real_run = subprocess.run
+
+    def spy(args, **kwargs):
+        joined = tuple(str(a) for a in args)
+        if any(k in joined for k in ("ls-remote", "fetch", "merge")):
+            seen.append((joined, kwargs))
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(
+        orch, "subprocess",
+        types.SimpleNamespace(run=spy, TimeoutExpired=subprocess.TimeoutExpired))
+
+    result = env.run(Seats())  # drives ls-remote + fetches (+ maybe merge)
+
+    assert result.outcome in ("concurrency_wait", "needs_human")
+    remote_calls = [(a, kw) for a, kw in seen
+                    if "ls-remote" in a or ("fetch" in a and "clone" not in a)]
+    assert remote_calls, "expected remote git calls in the sweep"
+    for args, kwargs in remote_calls:
+        env_kw = kwargs.get("env") or {}
+        assert env_kw.get("GIT_TERMINAL_PROMPT") == "0"
+        assert kwargs.get("timeout"), f"no timeout on {args}"
+
+
+def test_review22_pr_closed_run_ids_are_unique(tmp_path: Path):
+    """Round-3 finding 4: pr_closed escalations carry real generated run
+    ids — no shared literal 'pr-closed' across tasks."""
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
+    assert env.run(Seats()).outcome == "pr_opened"
+    assert env.run(Seats(), pr_state=lambda url: "merged").outcome == "pr_opened"
+    assert env.task("T-1")["status"] == "in_review"
+    assert env.task("T-2")["status"] == "in_review"
+
+    closed = lambda url: "closed"  # noqa: E731
+    first = env.run(Seats(), pr_state=closed)
+    assert first.escalation == "pr_closed"
+    second = env.run(Seats(), pr_state=closed)
+    assert second.escalation == "pr_closed"
+
+    run_id_re = __import__("re").compile(r"^\d{8}T\d{6}Z-[0-9a-f]{6}$")
+    ids = [env.task(t)["attempts"][-1]["run_id"] for t in ("T-1", "T-2")]
+    assert ids[0] != ids[1]
+    for rid in ids:
+        assert run_id_re.match(rid), rid
+
+
+def test_review23_an_up_to_date_pr_is_cached_too(tmp_path: Path, monkeypatch):
+    """Round-3 finding 6: the up-to-date path also stamps
+    links.revalidated, so the ls-remote pre-check skips the common
+    no-clone case on every later tick."""
+    import factory.orchestrator as orch
+
+    env = Env(tmp_path)  # single task: the sweep runs with no pick
+    assert env.run(Seats()).outcome == "pr_opened"
+
+    result = env.run(Seats())  # up to date — must stamp, no escalation
+    assert result.outcome == "idle"
+    cached = env.task()["links"].get("revalidated")
+    assert cached, "the up-to-date path must stamp the cache"
+    assert cached["pr"] == _git(env.remote, "rev-parse",
+                                f"refs/heads/{env.task()['links']['branch']}")
+    assert cached["default"] == _git(env.remote, "rev-parse", "refs/heads/main")
+
+    real_create_run = orch.create_run
+    made: list = []
+
+    def counting(project, source, **kwargs):
+        made.append(project)
+        return real_create_run(project, source, **kwargs)
+
+    monkeypatch.setattr(orch, "create_run", counting)
+    assert env.run(Seats()).outcome == "idle"  # unchanged heads
+    assert made == []  # ls-remote answered; no clone, no fetch
+
+
+def test_review24_an_idle_tick_only_queries_open_prs(tmp_path: Path):
+    """Round-3 finding 7: with nothing to pick, the run resolves only the
+    in_review links — a build-up of needs_human tasks with old PR links
+    adds no gh round-trips."""
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
+    assert env.run(Seats()).outcome == "pr_opened"
+
+    # T-2 becomes a needs_human task holding an old PR link (hand-set:
+    # the transition path from ready would be a no-op edge error; only
+    # the sweep's gh behavior is under test here).
+    q = TaskQueue(env.queue_path)
+    q.get("T-2")["status"] = "needs_human"
+    q.get("T-2")["links"] = {"pr": "https://github.com/fixture/fixture/pull/99"}
+    q.save()
+
+    calls: list[str] = []
+
+    def counting(url):
+        calls.append(url)
+        return "open"
+
+    result = env.run(Seats(), pr_state=counting)  # idle tick (no pick)
+
+    assert result.outcome == "idle"
+    t1_pr = env.task("T-1")["links"]["pr"]
+    assert calls == [t1_pr]  # only the open PR's link, never T-2's
+
+
+def test_review25_recovery_edges_are_legal_and_documented():
+    """Round-3 finding 8: the documented owner remedies must have legal
+    transitions — re-opened PR → back to in_review; rejected PR → fix
+    round — and TASK-CONTRACT must carry both rows."""
+    from factory.state import check_transition
+
+    check_transition("needs_human", "in_review")   # PR re-opened
+    check_transition("needs_human", "in_progress")  # rejected → fix round
+    doc = (REPO_ROOT / "TASK-CONTRACT.md").read_text()
+    assert "`needs_human → in_review`" in doc
+    assert "`needs_human → in_progress`" in doc

@@ -86,6 +86,7 @@ from factory.runs import (
     GIT_HARDENING,
     RunDir,
     RunError,
+    _new_run_id,
     cleanup_run,
     create_run,
 )
@@ -651,24 +652,19 @@ def run_once(
     queue.reclaim_abandoned()
     queue.demote_changed_contracts()
     pick = queue.pick()
-    if pick is None:
-        # Round-2 finding 8: a drained queue is done whatever the clock
-        # says — idle/queue_empty, never peak_window. The sweep lives
-        # after the window check below, so an idle run starts nothing and
-        # judges nothing either.
-        return RunResult("idle")
-    task_id = pick.task["id"]
     if in_peak_window(now(), config.peak_window):
-        # Before the sweep (round-1 finding 5): the window protects the
-        # machine and the quota, so no sandboxed gate work and no
-        # re-validation escalations may happen inside it.
-        return RunResult("peak_window", task_id=task_id)
-    # Round-2 findings 4+6: one gh lookup per unique PR URL per run,
-    # shared by the sweep and the limit. A failed lookup is None —
-    # neither wedges the run nor counts the PR (a live gh outage stops
-    # the run at gh_pr_create anyway; a rotten link on an old task is
-    # not this queue's verdict to make).
-    states = _resolve_pr_states(_pr_urls(queue), pr_state)
+        # Round-2 finding 8: a drained queue is done whatever the clock
+        # says — idle/queue_empty, never peak_window — and the window
+        # still gates the sweep itself (round-1 finding 5): no gate work,
+        # no gh lookups, no re-validation escalations inside it.
+        return RunResult("idle" if pick is None else "peak_window",
+                         task_id=pick.task["id"] if pick else None)
+    # Round-3 findings 1+7: the sweep runs on EVERY off-peak run, with or
+    # without pickable work (AC-3's "every run" — F-27 waiting on F-26's
+    # open PR must still see it go stale or closed), and an idle tick
+    # resolves only the open-PR (in_review) links — a build-up of
+    # needs_human tasks with old links adds no gh round-trips.
+    states = _resolve_pr_states(_pr_urls(queue, ("in_review",)), pr_state)
     stale = _sweep_stale_prs(
         queue, profile, factory_root=factory_root,
         srt_bin_path=srt_bin_path, gate_timeout_sec=gate_timeout_sec,
@@ -676,14 +672,21 @@ def run_once(
     )
     if stale is not None:
         return stale
+    if pick is None:
+        return RunResult("idle")
+    task_id = pick.task["id"]
     # F-26 AC-2: at most `repo.concurrency` (default 1) open factory PRs
     # per repo — counted on GitHub's word, not the queue's statuses: an
     # escalated task's PR stays open (round-1 finding 3), and a task whose
     # PR was merged or closed frees its slot even before reconcile. The
     # picked task's own PR never counts against it (round-2 finding 1):
     # a rejected PR's fix round reuses that slot, so counting it would
-    # deadlock the task on itself. A ready task waits — untouched, no
-    # session, no attempt.
+    # deadlock the task on itself. A failed lookup is presumed open —
+    # the limit fails closed (round-3 finding 2); the count's extra
+    # links are resolved only now that a task is picked.
+    states.update(_resolve_pr_states(
+        _pr_urls(queue, ("ready", "in_progress", "needs_human"),
+                 exclude=task_id), pr_state))
     open_prs = _count_open_prs(queue, states, exclude=task_id)
     if open_prs >= (profile.get("repo") or {}).get("concurrency", 1):
         return RunResult("concurrency_wait", task_id=task_id)
@@ -750,13 +753,24 @@ def _fetch_sha(repo: Path, remote: str, ref: str) -> str:
     and merge both the new default head and the PR branch, and the clone
     is a ``--filter=blob:none`` partial whose lazy blob fetches go to the
     local source repo — which may hold neither. Two refs of full objects
-    cost far less than a merge that dies mid-checkout.
+    cost far less than a merge that dies mid-checkout. Runs with
+    GIT_TERMINAL_PROMPT=0 and a timeout (round-3 finding 3): a private
+    remote with an expired credential helper fails fast instead of
+    hanging the run lease on a username prompt.
     """
-    proc = subprocess.run(
-        ["git", *GIT_HARDENING, "-C", str(repo), "fetch", "--quiet", "--no-tags",
-         remote, ref],
-        capture_output=True, text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["git", *GIT_HARDENING, "-C", str(repo), "fetch", "--quiet", "--no-tags",
+             remote, ref],
+            capture_output=True, text=True,
+            env={**os.environ, **_GIT_NET_ENV}, timeout=_NET_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RunError(
+            f"fetch of {ref!r} from {remote} timed out after {_NET_TIMEOUT_SEC}s "
+            "(GIT_TERMINAL_PROMPT=0 was set: a hung credential helper or an "
+            "unreachable remote, not a prompt waiting for you)"
+        ) from exc
     if proc.returncode != 0:
         raise RunError(
             f"cannot fetch {ref!r} from {remote}: {proc.stderr.strip()[:500]}. "
@@ -789,26 +803,41 @@ def _conflict_paths(repo: Path) -> list[str]:
 
 _PR_STATES_STATUSES = ("ready", "in_progress", "in_review", "needs_human")
 
+# Remote git (ls-remote, fetches, the sweep's merge) must never sit on a
+# credential prompt: a private HTTPS remote with an expired helper would
+# hold the run lease forever on a username prompt (round-3 finding 3).
+_GIT_NET_ENV = {"GIT_TERMINAL_PROMPT": "0"}
+_NET_TIMEOUT_SEC = 300
 
-def _pr_urls(queue: TaskQueue) -> list[str]:
-    """Every PR URL the run may need the state of, unique, queue order."""
+
+def _pr_urls(queue: TaskQueue, statuses: tuple, *, exclude: str | None = None) -> list[str]:
+    """Every PR URL of tasks in ``statuses`` (unique, queue order).
+
+    Resolution is lazy by design (round-3 finding 7): the sweep needs
+    only ``in_review`` links; the count's ``ready``/``in_progress``/
+    ``needs_human`` links are resolved only once a task is actually
+    picked, so idle ticks don't pay for a build-up of old links.
+    """
     urls: list[str] = []
     for task in queue.doc.get("tasks", []):
-        if task.get("status") in _PR_STATES_STATUSES:
-            url = (task.get("links") or {}).get("pr")
-            if url and url not in urls:
-                urls.append(url)
+        if task.get("status") not in statuses or task.get("id") == exclude:
+            continue
+        url = (task.get("links") or {}).get("pr")
+        if url and url not in urls:
+            urls.append(url)
     return urls
 
 
 def _resolve_pr_states(urls: list[str], pr_state: Callable) -> dict:
     """One ``pr_state`` lookup per URL; a failed lookup is None, never a
-    raise (round-2 finding 4).
+    raise (round-2 finding 4: a rotten link stops neither the run nor
+    the queue — the run proceeds; round-3 finding 2 decides what None
+    *means* per consumer).
 
-    None is distinct from every GitHub answer: the count ignores the PR
-    (a rotten link on an old task must not wedge the queue, and a live
-    gh outage stops the run at ``gh_pr_create`` anyway) and the sweep
-    skips the task (its readiness can't be judged on an unknown state).
+    ``None`` is distinct from every GitHub answer: the concurrency limit
+    treats it as open (fail closed — a permission check never fails
+    open), while the sweep skips the task (advisory re-validation is not
+    judged on an unknown state).
     """
     states: dict[str, str | None] = {}
     for url in urls:
@@ -828,8 +857,8 @@ def _count_open_prs(queue: TaskQueue, states: dict, *, exclude: str) -> int:
     either way). Post-merge statuses are excluded: ``in_review →
     deploying`` means the PR merged. ``exclude`` drops the picked task's
     own link: a rejected PR's fix round reuses that slot (round-2
-    finding 1). Unknown states (None) don't count — see
-    :func:`_resolve_pr_states`.
+    finding 1). An unknown state (a failed gh lookup) counts as open —
+    the limit fails closed (round-3 finding 2).
     """
     count = 0
     for task in queue.doc.get("tasks", []):
@@ -838,7 +867,7 @@ def _count_open_prs(queue: TaskQueue, states: dict, *, exclude: str) -> int:
         if task.get("status") not in _PR_STATES_STATUSES:
             continue
         url = (task.get("links") or {}).get("pr")
-        if url and states.get(url) == "open":
+        if url and states.get(url, None) in (None, "open"):
             count += 1
     return count
 
@@ -846,24 +875,73 @@ def _count_open_prs(queue: TaskQueue, states: dict, *, exclude: str) -> int:
 def _ls_remote_heads(remote: str, refs: tuple[str, ...]) -> dict[str, str]:
     """``{refname: sha}`` for the named refs via one ``git ls-remote``.
 
-    An optimization seam only (round-2 finding 7): on any failure the
-    answer is empty and the caller falls through to the clone path, whose
-    fetches remain the authoritative check.
+    An optimization seam only (round-2 finding 7): on any failure —
+    including a timeout — the answer is empty and the caller falls
+    through to the clone path, whose fetches remain the authoritative
+    check. Runs with GIT_TERMINAL_PROMPT=0 and a timeout so it can never
+    sit on a credential prompt (round-3 finding 3).
     """
-    proc = subprocess.run(
-        ["git", *GIT_HARDENING, "ls-remote", remote,
-         *(f"refs/heads/{ref}" for ref in refs)],
-        capture_output=True, text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["git", *GIT_HARDENING, "ls-remote", remote,
+             *(f"refs/heads/{ref}" for ref in refs)],
+            capture_output=True, text=True,
+            env={**os.environ, **_GIT_NET_ENV}, timeout=_NET_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        return {}
     if proc.returncode != 0:
         return {}
     heads: dict[str, str] = {}
     for line in proc.stdout.splitlines():
-        sha, _, ref = line.partition("\t")
         if "\t" not in line:
             continue
+        sha, _, ref = line.partition("\t")
         heads[ref.removeprefix("refs/heads/")] = sha
     return heads
+
+
+def _sweep_escalation(
+    queue: TaskQueue, factory_root: Path, profile: dict, task_id: str, *,
+    escalation: str, note: str, run_id: str,
+    report_path: Path | None = None, reports: dict | None = None,
+) -> RunResult:
+    """Record one sweep escalation and move the task to needs_human.
+
+    The one builder for every sweep path (round-3 finding 5): the
+    escalated attempt, its progress-log entry and the transition are one
+    shape, so a future required attempt field lands in one place, not
+    three — a schema refusal inside the escalation path is the failure
+    this hoists out.
+    """
+    attempt = {
+        "run_id": run_id,
+        "slice_id": _slice_id_of(queue.get(task_id)),
+        "started": now_iso(),
+        "ended": now_iso(),
+        "outcome": "escalated",
+        "rounds": 0,
+        "turns": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "prompt_versions": dict(prompt_versions(profile)),
+        "skills": [],  # setting_sources=[]: no session ran
+        "escalation": escalation,
+        "note": note,
+    }
+    if report_path is not None:
+        attempt["validator_report"] = str(report_path)
+    findings = _numbered_findings(
+        reports if reports is not None else {"L0": None, "L1": None, "L2": None},
+        [f"[{escalation}] {note}"],
+    )
+    queue.append_attempt(task_id, attempt)
+    ProgressLog.for_task(factory_root, profile["name"], task_id).append({
+        "run_id": run_id, "outcome": "escalated",
+        "escalation": escalation, "findings": findings,
+    })
+    queue.transition(task_id, "needs_human")
+    return RunResult("needs_human", task_id, escalation=escalation, reports=reports)
 
 
 def _sweep_stale_prs(
@@ -916,32 +994,20 @@ def _sweep_stale_prs(
             continue
         if state == "closed":
             # Round-2 finding 5: closed without merging — surface the
-            # task instead of stranding it silently in in_review.
-            attempt = {
-                "run_id": "pr-closed",
-                "slice_id": _slice_id_of(task),
-                "started": now_iso(),
-                "ended": now_iso(),
-                "outcome": "escalated",
-                "rounds": 0,
-                "turns": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "prompt_versions": dict(prompt_versions(profile)),
-                "skills": [],  # setting_sources=[]: no session ran
-                "escalation": "pr_closed",
-                "note": (f"GitHub reports the PR closed without merging: "
-                         f"{links['pr']} — re-open it, or re-queue the work "
-                         f"by re-approving the task"),
-            }
-            queue.append_attempt(task_id, attempt)
-            ProgressLog.for_task(factory_root, project, task_id).append({
-                "run_id": "pr-closed", "outcome": "escalated",
-                "escalation": "pr_closed",
-                "findings": [f"1. [pr_closed] {attempt['note']}"],
-            })
-            queue.transition(task_id, "needs_human")
-            return RunResult("needs_human", task_id, escalation="pr_closed")
+            # task instead of stranding it silently in in_review. The
+            # run id is a real generated one (round-3 finding 4): no
+            # session ran, but audit joins by run_id must not collide
+            # across tasks or escalations.
+            return _sweep_escalation(
+                queue, factory_root, profile, task_id,
+                escalation="pr_closed",
+                note=(f"GitHub reports the PR closed without merging: "
+                      f"{links['pr']} — re-open it (`needs_human → "
+                      f"in_review` once GitHub shows it open again), or "
+                      f"reject it for a fix round "
+                      f"(`needs_human → in_progress`)"),
+                run_id=_new_run_id(),
+            )
         if state != "open":
             continue  # unknown (gh failed): not ours to judge or to wedge on
         branch = links["branch"]
@@ -960,13 +1026,21 @@ def _sweep_stale_prs(
             pr_sha = _fetch_sha(work.root, repo_cfg["remote"], branch)
             if git_rc(work.root, "merge-base", "--is-ancestor",
                       default_sha, pr_sha) == 0:
+                # Up to date — and that conclusion is cached too (round-3
+                # finding 6): same pair ⇒ same ancestry, so later ticks
+                # skip at the ls-remote pre-check without cloning.
+                if links.get("revalidated") != {"pr": pr_sha,
+                                                "default": default_sha}:
+                    links["revalidated"] = {"pr": pr_sha, "default": default_sha}
+                    queue.save()
                 continue  # the PR branch already contains the default head
             if links.get("revalidated") == {"pr": pr_sha, "default": default_sha}:
                 continue  # already re-validated against exactly this base
 
             # Stale: merge the PR onto the new base; a conflict is itself
             # a re-validation failure (the merge a human would attempt).
-            # The merge runs under LC_ALL=C (deterministic note text) and
+            # The merge runs under LC_ALL=C (deterministic note text)
+            # with prompts disabled and a timeout (round-3 finding 3);
             # conflicts are read from the index, not from git's localized
             # messages (round-2 finding 2); any other failure is
             # infrastructure, not the PR.
@@ -975,7 +1049,8 @@ def _sweep_stale_prs(
                 ["git", *GIT_HARDENING, "-C", str(work.root), *_IDENTITY,
                  "merge", "--no-edit", default_sha],
                 capture_output=True, text=True,
-                env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+                env={**os.environ, "LC_ALL": "C", "LANG": "C", **_GIT_NET_ENV},
+                timeout=_NET_TIMEOUT_SEC,
             )
             reports: dict = {"L0": None, "L1": None, "L2": None}
             note: str | None = None
@@ -1031,31 +1106,11 @@ def _sweep_stale_prs(
                 json.dumps(reports, indent=2, ensure_ascii=False) + "\n")
 
             if note is not None:
-                attempt = {
-                    "run_id": work.run_id,
-                    "slice_id": _slice_id_of(queue.get(task_id)),
-                    "started": now_iso(),
-                    "ended": now_iso(),
-                    "outcome": "escalated",
-                    "rounds": 0,
-                    "turns": 0,
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "prompt_versions": dict(prompt_versions(profile)),
-                    "skills": [],  # setting_sources=[]: no session ran
-                    "escalation": "stale_base",
-                    "note": note,
-                    "validator_report": str(report_path),
-                }
-                findings = _numbered_findings(reports, [f"[stale_base] {note}"])
-                queue.append_attempt(task_id, attempt)
-                ProgressLog.for_task(factory_root, project, task_id).append({
-                    "run_id": work.run_id, "outcome": "escalated",
-                    "escalation": "stale_base", "findings": findings,
-                })
-                queue.transition(task_id, "needs_human")
-                return RunResult("needs_human", task_id, escalation="stale_base",
-                                 reports=reports)
+                return _sweep_escalation(
+                    queue, factory_root, profile, task_id,
+                    escalation="stale_base", note=note, run_id=work.run_id,
+                    report_path=report_path, reports=reports,
+                )
             # Pass: no attempt (no session ran, no budget spent); the
             # readiness record is the log entry plus the stored report,
             # and links.revalidated caches the pair so an unchanged base
@@ -1091,8 +1146,8 @@ def _build_on_remote_default(work: RunDir, remote: str, default_branch: str) -> 
     proc = subprocess.run(
         ["git", *GIT_HARDENING, "-C", str(work.root), "fetch", "--quiet",
          "--no-tags", "--filter=blob:none", remote, default_branch],
-        capture_output=True,
-        text=True,
+        capture_output=True, text=True,
+        env={**os.environ, **_GIT_NET_ENV}, timeout=_NET_TIMEOUT_SEC,
     )
     if proc.returncode != 0:
         raise RunError(

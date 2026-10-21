@@ -131,9 +131,9 @@ ILLEGAL_EDGE_CLASSES = {
     ],
     "exit_from_needs_human": [
         ("needs_human", "ready"),
-        ("needs_human", "in_progress"),
-        ("needs_human", "in_review"),
         ("needs_human", "done"),
+        # in_review / in_progress are legal since F-26's recovery edges
+        # (owner re-opens or rejects the escalated PR); tested in test_f26.
     ],
     # not_buildable -> done exists since F-29, guarded to owner_only tasks
     # with every step ticked (tests/test_f29.py); every other exit is illegal.

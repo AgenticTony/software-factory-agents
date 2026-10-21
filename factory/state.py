@@ -99,6 +99,10 @@ ALLOWED_TRANSITIONS: dict[tuple[str, str], str] = {
     ("not_buildable", "done"): "owner-only task: every owner step ticked (F-29)",
     ("awaiting_owner", "draft"): "contract changed",
     ("needs_human", "draft"): "contract changed",
+    # F-26 recovery edges (owner acts, replayed via reconcile): the
+    # escalated PR is re-opened on GitHub, or rejected for a fix round.
+    ("needs_human", "in_review"): "owner re-opened the escalated PR (F-26 recovery)",
+    ("needs_human", "in_progress"): "owner rejected the escalated PR; fix round (F-26 recovery)",
     ("done", "draft"): "contract changed (human reopen)",
 }
 
