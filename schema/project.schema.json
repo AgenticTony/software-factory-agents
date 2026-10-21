@@ -50,6 +50,24 @@
       }
     },
     "dependency_manifests": { "type": "array", "items": { "type": "string" } },
+    "sentinels": {
+      "type": "object",
+      "description": "risk flag -> project sentinels (F-25): [{command, description}]. Each command runs when the diff touches that flag's paths.risk globs; a failure FAILs the L0 verdict and escalates sentinel_failed. Keys must be risk flags from tasks.schema.json.",
+      "propertyNames": { "enum": ["auth", "payments", "rls", "migration", "safety", "privacy", "new_dependency", "deploy", "cross_repo", "external_service", "factory_control"] },
+      "additionalProperties": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "object",
+          "required": ["command", "description"],
+          "additionalProperties": false,
+          "properties": {
+            "command": { "type": "string", "minLength": 1 },
+            "description": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
     "deploy": {
       "type": "object",
       "required": ["mechanism", "auto_on_merge"],

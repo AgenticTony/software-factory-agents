@@ -54,7 +54,10 @@ flips it, per the verifier's standing rule):
   paths, locked at approval.
 - Skip markers and removed assertions are line heuristics over the diff's
   added/removed lines in test files. A moved assertion trips the rule; a
-  human reviews the FAIL.
+  human reviews the FAIL. These two are the oldest of the built-in
+  sentinels (F-25); ``factory.sentinels`` adds credential and
+  lint-suppression scanners and the profile's ``sentinels.<risk flag>``
+  commands, and records one result per sentinel on the report.
 - Command output is scanned for ``file:line`` errors (gcc/ruff and tsc
   styles). A failing command whose output yields no parseable location —
   or that reports a failure no baseline entry can cover (a failed test, a
@@ -87,6 +90,7 @@ from factory.gates import git as _git
 from factory.gates import is_test_file as _is_test_file
 from factory.gates import matches as _matches
 from factory.gates import run_command as _run_command
+from factory.sentinels import run_sentinels
 
 # Added lines in test files matching any of these -> skip_marker_added.
 SKIP_MARKER_PATTERNS = (
@@ -153,6 +157,7 @@ class L0Report(GateReport):
     escalations: list = field(default_factory=list)
     risk_flags_added: list = field(default_factory=list)
     preexisting_notes: list = field(default_factory=list)
+    sentinel_results: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -163,6 +168,7 @@ class L0Report(GateReport):
             "risk_flags_added": self.risk_flags_added,
             "commands": self.commands_as_dicts(),
             "preexisting_notes": self.preexisting_notes,
+            "sentinel_results": self.sentinel_results,
         }
 
 
@@ -520,6 +526,15 @@ def run_l0(
     _assert_checkout(repo, head_ref)
     changes = diff_file_changes(repo, base_ref, head_ref)
     findings, escalations, risk_flags_added = check_diff_policy(profile, changes, task)
+    # F-25: the sentinel pass — built-in invariants over the diff plus the
+    # profile's sentinels.<risk flag> commands for touched flags. Each
+    # sentinel leaves a result (pass/fail/skipped) on the report so the
+    # attempt record and the PR body can show what was checked.
+    sentinel_findings, sentinel_results, sentinel_escalations = run_sentinels(
+        profile, changes, findings, repo, runner=runner, timeout_sec=timeout_sec
+    )
+    findings.extend(sentinel_findings)
+    escalations = sorted(set(escalations) | set(sentinel_escalations))
 
     preexisting: list[str] = []
     missing = None
@@ -624,4 +639,5 @@ def run_l0(
         risk_flags_added=risk_flags_added,
         command_results=results,
         preexisting_notes=sorted(set(preexisting)),
+        sentinel_results=sentinel_results,
     )

@@ -8,6 +8,8 @@ validator facts, never from the agent's own account:
 * **Evidence** — per contract test ref: red on base (with L1's
   ``red_reason``) and green on head, read from the L1 report's command
   results.
+* **Sentinels** — every sentinel L0 ran on the diff, pass or fail (F-25),
+  as a table read from the L0 report's ``sentinel_results``.
 * **Merge Danger** — **Door** (``one-way`` when the task carries any of
   :data:`ONE_WAY_FLAGS`, else ``two-way``) and **Blast Radius** (risk
   flags plus the ``paths.risk`` globs the diff matched, or ``contained``).
@@ -34,6 +36,7 @@ from factory.gates import contract_test_refs, matches
 REQUIRED_SECTIONS = (
     "Summary",
     "Evidence",
+    "Sentinels",
     "Merge Danger",
     "Contract",
     "Validator report",
@@ -164,6 +167,40 @@ def build_evidence(task: dict, l1_report) -> str:
     return "\n".join(rows)
 
 
+def build_sentinel_section(reports: dict) -> str:
+    """The Sentinels section: every sentinel L0 ran, pass or fail (F-25).
+
+    Read from the L0 report's ``sentinel_results`` — orchestrator facts, not
+    model text. A project sentinel's ``detail`` carries its command output,
+    so it is flattened and pipe-escaped like the dropped-findings lines: one
+    inert table cell, never a line of its own.
+    """
+    results = ((reports.get("L0") or {}).get("sentinel_results")) or []
+    if not results:
+        return "No sentinel results were recorded for this run."
+    rows = [
+        "| Sentinel | Kind | Risk flag | Verdict | Detail |",
+        "|---|---|---|---|---|",
+    ]
+    for result in results:
+        rows.append(
+            f"| `{_cell(result.get('name'))}` | {result.get('kind', '—')} "
+            f"| {_cell(result.get('risk_flag'))} | **{result.get('verdict', '—')}** "
+            f"| {_cell(result.get('detail'))} |"
+        )
+    rows.append("")
+    rows.append(
+        "Every sentinel L0 ran on this diff, pass or fail (F-25); built from "
+        "the L0 report, not model text."
+    )
+    return "\n".join(rows)
+
+
+def _cell(value) -> str:
+    """One inert table cell: flattened, pipes escaped, empty shown as ``—``."""
+    return _flat(value).replace("|", "\\|") or "—"
+
+
 def build_pr_body(
     task: dict,
     profile: dict,
@@ -225,6 +262,7 @@ def build_pr_body(
     sections = {
         "Summary": "\n".join(summary),
         "Evidence": build_evidence(task, l1_report),
+        "Sentinels": build_sentinel_section(reports),
         "Merge Danger": "\n".join(merge_danger),
         "Contract": fence(json.dumps(contract, indent=2, ensure_ascii=False), "json"),
         "Validator report": _validator_section(reports),
