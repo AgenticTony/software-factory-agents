@@ -363,25 +363,30 @@ def test_ac_3(tmp_path: Path):
     """Stale base: the default branch moved past an open PR's base →
     re-run L0 and L1 on the PR merged onto the new base. Failure →
     needs_human / stale_base (schema enum, red-first; the transition is a
-    new legal edge). Up to date → no re-validation. Pass → still ready."""
-    env = Env(tmp_path)
+    new legal edge). Up to date → no re-validation. Pass → still ready.
+
+    A second ready task rides along: the sweep runs on the way to the
+    next pick (an idle queue starts nothing and judges nothing — round-2
+    finding 8), and the open PR then holds the concurrency slot, so the
+    pass/no-op scenarios end in concurrency_wait, not idle."""
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
     assert env.run(Seats()).outcome == "pr_opened"
-    branch = env.task()["links"]["branch"]
-    assert env.task()["status"] == "in_review"
+    branch = env.task("T-1")["links"]["branch"]
+    assert env.task("T-1")["status"] == "in_review"
 
     # Up to date: the sweep is a no-op — no new attempt, no new log entry.
-    before_attempts = len(env.task()["attempts"])
+    before_attempts = len(env.task("T-1")["attempts"])
     before_entries = len(env.log().entries())
-    assert env.run(Seats()).outcome == "idle"
-    assert len(env.task()["attempts"]) == before_attempts
+    assert env.run(Seats()).outcome == "concurrency_wait"  # T-2 waits on T-1
+    assert len(env.task("T-1")["attempts"]) == before_attempts
     assert len(env.log().entries()) == before_entries
 
     # Stale but clean (an unrelated remote advance): re-validation runs,
     # passes on the merged tree, and the PR stays ready for merge.
     env.advance_remote_main(None, extra_file="remote_only.txt")
     result = env.run(Seats())
-    assert result.outcome == "idle"
-    task = env.task()
+    assert result.outcome == "concurrency_wait"
+    task = env.task("T-1")
     assert task["status"] == "in_review"
     assert len(task["attempts"]) == before_attempts  # no budget spent
     entries = env.log().entries()
@@ -394,7 +399,7 @@ def test_ac_3(tmp_path: Path):
     result = env.run(Seats())
     assert result.outcome == "needs_human"
     assert result.escalation == "stale_base"
-    task = env.task()
+    task = env.task("T-1")
     assert task["status"] == "needs_human"
     last = task["attempts"][-1]
     assert last["escalation"] == "stale_base"
@@ -414,7 +419,7 @@ def test_stale_revalidation_catches_a_broken_merge(tmp_path: Path):
     """A stale merge that *conflicts-free* merges but fails the gates also
     escalates stale_base: the re-validation runs the real L0/L1, not just
     git-merge."""
-    env = Env(tmp_path)
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
     assert env.run(Seats()).outcome == "pr_opened"
 
     # The remote deletes impl.py's test dependency: the PR's own test file
@@ -432,7 +437,7 @@ def test_stale_revalidation_catches_a_broken_merge(tmp_path: Path):
     result = env.run(Seats())
     assert result.outcome == "needs_human"
     assert result.escalation == "stale_base"
-    assert env.task()["status"] == "needs_human"
+    assert env.task("T-1")["status"] == "needs_human"
 
 
 # ----------------------------------------------- the gh api classifier ------
@@ -506,17 +511,18 @@ def test_review1_a_merged_pr_is_never_revalidated(tmp_path: Path):
     """Finding 1: a squash-merged PR (task still in_review until reconcile)
     must be skipped by the sweep, not escalated stale_base — the contract
     tests already pass on the new main, so re-validation would fail."""
-    env = Env(tmp_path)
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
     assert env.run(Seats()).outcome == "pr_opened"
     env.advance_remote_main("def answer():\n    return 99\n",
                             message="merged the pr on github")
-    before = len(env.task()["attempts"])
+    before = len(env.task("T-1")["attempts"])
     entries = len(env.log().entries())
 
     result = env.run(Seats(), pr_state=lambda url: "merged")
 
-    assert result.outcome == "idle"  # nothing ready; the merged PR is not ours
-    task = env.task()
+    # The merged PR is skipped AND frees its slot: the next task runs.
+    assert result.outcome == "pr_opened"
+    task = env.task("T-1")
     assert task["status"] == "in_review"          # reconcile's story, not ours
     assert len(task["attempts"]) == before        # no stale_base attempt
     assert len(env.log().entries()) == entries    # no re-validation ran
@@ -525,14 +531,14 @@ def test_review1_a_merged_pr_is_never_revalidated(tmp_path: Path):
 def test_review2_a_deleted_branch_after_merge_does_not_wedge(tmp_path: Path):
     """Finding 2: with auto-delete head branches, the PR's branch is gone
     from the remote while the task sits in_review — run must not raise."""
-    env = Env(tmp_path)
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
     _force_in_review(env, branch="factory/t-1-gone")
     # The branch is deliberately never pushed: fetching it would fail.
 
     result = env.run(Seats(), pr_state=lambda url: "merged")
 
-    assert result.outcome == "idle"
-    assert env.task()["status"] == "in_review"
+    assert result.outcome == "pr_opened"          # the next task is not wedged
+    assert env.task("T-1")["status"] == "in_review"
 
 
 def test_review3_the_open_pr_limit_counts_open_prs(tmp_path: Path):
@@ -562,29 +568,31 @@ def test_review3_the_open_pr_limit_counts_open_prs(tmp_path: Path):
 def test_review4_revalidation_is_cached_per_base(tmp_path: Path):
     """Finding 4: an unchanged (pr branch, default head) pair must not be
     re-validated — no second full L0/L1, no duplicate log entry."""
-    env = Env(tmp_path)
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
     assert env.run(Seats()).outcome == "pr_opened"
     env.advance_remote_main(None, extra_file="remote_only.txt")
-    assert env.run(Seats()).outcome == "idle"   # re-validation runs, passes
-    task = env.task()
+    assert env.run(Seats()).outcome == "concurrency_wait"  # re-validated, T-2 waits
+    task = env.task("T-1")
     cached = task["links"].get("revalidated")
     assert cached and cached["default"] == _git(env.remote, "rev-parse", "refs/heads/main")
     entries = len(env.log().entries())
 
     result = env.run(Seats())  # main has not moved: nothing to redo
 
-    assert result.outcome == "idle"
+    assert result.outcome == "concurrency_wait"
     assert len(env.log().entries()) == entries
-    assert env.task()["links"]["revalidated"] == cached
+    assert env.task("T-1")["links"]["revalidated"] == cached
 
 
 def test_review5_the_peak_window_skips_the_sweep(tmp_path: Path):
-    """Finding 5: the sandboxed gate work must not run during the peak
-    window — the run returns peak_window before any re-validation."""
+    """Round-1 finding 5 (kept meaningful under round-2 finding 8's
+    ordering): with a task pickable, the sandboxed gate work must not run
+    during the peak window — the run returns peak_window before any
+    re-validation."""
     from datetime import datetime
 
     monday_0930 = datetime(2026, 10, 19, 9, 30, tzinfo=STOCKHOLM)
-    env = Env(tmp_path)
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
     assert env.run(Seats()).outcome == "pr_opened"
     env.advance_remote_main(None, extra_file="remote_only.txt")
     entries = len(env.log().entries())
@@ -592,29 +600,44 @@ def test_review5_the_peak_window_skips_the_sweep(tmp_path: Path):
     result = env.run(Seats(), now=lambda: monday_0930)
 
     assert result.outcome == "peak_window"
-    assert len(env.log().entries()) == entries  # the sweep never ran
+    assert env.task("T-2")["status"] == "ready"  # untouched, no session
+    assert len(env.log().entries()) == entries   # the sweep never ran
 
 
-def test_review6_merge_failure_classification():
-    """Finding 6: only a real conflict is a conflict — other git failures
-    are infrastructure faults, not the PR's stale_base. git prints the
-    conflict report to STDOUT (probed against real git), so both streams
-    feed the classifier."""
-    from factory.orchestrator import _merge_is_conflict
+def test_review6_merge_failure_classification(tmp_path: Path):
+    """Round-1 finding 6, superseded by round-2 findings 2+3: conflicts
+    are detected STRUCTURALLY (git diff --diff-filter=U — no locale can
+    change it) and the merge subprocess runs under LC_ALL=C so any quoted
+    git text is deterministic. A conflicted repo lists its paths; a clean
+    tree lists none (an infrastructure failure would leave none either,
+    and raises RunError instead of stale_base)."""
+    from factory.orchestrator import _conflict_paths
 
-    conflict = ("Auto-merging impl.py\nCONFLICT (content): Merge conflict in impl.py\n"
-                "Automatic merge failed; fix conflicts and then commit the result.")
-    assert _merge_is_conflict(conflict, "")
-    assert _merge_is_conflict("", conflict)  # stderr variant stays covered
-    assert not _merge_is_conflict("", "fatal: bad object 0123456789")
-    assert not _merge_is_conflict("error: unable to find 0123456789 (missing)", "")
-    assert not _merge_is_conflict("", "fatal: refusing to merge unrelated histories")
+    repo = tmp_path / "conflicted"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "-c", "user.email=x@x", "-c", "user.name=x", "commit", "-q",
+         "--allow-empty", "-m", "base")
+    _git(repo, "checkout", "-qb", "other")
+    (repo / "f").write_text("pr\n")
+    _git(repo, "-c", "user.email=x@x", "-c", "user.name=x", "add", "-A")
+    _git(repo, "-c", "user.email=x@x", "-c", "user.name=x", "commit", "-qm", "pr")
+    _git(repo, "checkout", "-q", "main")
+    (repo / "f").write_text("main\n")
+    _git(repo, "-c", "user.email=x@x", "-c", "user.name=x", "add", "-A")
+    _git(repo, "-c", "user.email=x@x", "-c", "user.name=x", "commit", "-qm", "moved")
+    proc = subprocess.run(["git", "-C", str(repo), "merge", "--no-edit", "other"],
+                          capture_output=True, text=True)
+    assert proc.returncode != 0
+    assert _conflict_paths(repo) == ["f"]
 
 
 def test_review7_escalation_survives_a_task_without_attempts(tmp_path: Path):
     """Finding 7: an in_review task with links but no logged attempts
-    (hand-reconciled or migrated state) must escalate cleanly."""
-    env = Env(tmp_path)
+    (hand-reconciled or migrated state) must escalate cleanly. A second
+    ready task keeps the sweep reachable (round-2 finding 8: an idle
+    queue starts nothing and judges nothing)."""
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
     branch = "factory/t-1-manual"
     _push_remote_branch(env, branch, "def answer():\n    return 42\n")
     _force_in_review(env, branch=branch)
@@ -626,7 +649,7 @@ def test_review7_escalation_survives_a_task_without_attempts(tmp_path: Path):
 
     assert result.outcome == "needs_human"
     assert result.escalation == "stale_base"
-    attempt = env.task()["attempts"][-1]
+    attempt = env.task("T-1")["attempts"][-1]
     assert attempt["slice_id"] == "T-1"   # no IndexError; falls back to the id
 
 
@@ -651,3 +674,173 @@ def test_review10_a_404_names_the_other_causes():
     got = classify_protection(1, "", "gh: Not Found (HTTP 404)")
     assert not got.checked and not got.plan_limit
     assert "does not exist" in got.detail or "token" in got.detail
+
+
+# --------------------------------------- owner review round 2 (8 findings) --
+
+
+def test_review11_a_fix_round_does_not_fill_its_own_slot(tmp_path: Path):
+    """Round-2 finding 1 (blocking): a rejected PR's task keeps its open
+    PR link through the fix round — the picked task must not count its
+    own PR against the concurrency limit, or it waits forever."""
+    env = Env(tmp_path)
+    assert env.run(Seats()).outcome == "pr_opened"
+
+    # You reject the PR: the task returns for a fix round (and re-queues),
+    # links.pr kept, the PR itself still open on GitHub.
+    q = TaskQueue(env.queue_path)
+    q.transition("T-1", "in_progress")
+    q.transition("T-1", "ready")
+
+    result = env.run(Seats())  # pr_state default: the old PR is open
+
+    assert result.outcome == "pr_opened"
+    assert len(env.prs) == 2
+
+
+def test_review12_conflicts_are_structural_locale_pinned_and_named(
+        tmp_path: Path, monkeypatch):
+    """Round-2 findings 2+3 (blocking + note): conflict detection reads
+    git's unmerged-file index (no locale can change it), the merge runs
+    under LC_ALL=C, and the stale_base note names the conflicting paths
+    instead of quoting an empty stderr."""
+    import types
+
+    import factory.orchestrator as orch
+
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
+    assert env.run(Seats()).outcome == "pr_opened"
+    env.advance_remote_main("def answer():\n    return 99\n",
+                            message="conflicting remote change")
+
+    merge_envs: list = []
+    real_run = subprocess.run
+
+    def spy(args, **kwargs):
+        if "merge" in args and "--no-edit" in args:
+            merge_envs.append(kwargs.get("env"))
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(
+        orch, "subprocess",
+        types.SimpleNamespace(run=spy, TimeoutExpired=subprocess.TimeoutExpired))
+
+    result = env.run(Seats())
+
+    assert result.outcome == "needs_human"
+    assert result.escalation == "stale_base"
+    assert len(merge_envs) == 1
+    assert merge_envs[0] and merge_envs[0].get("LC_ALL") == "C"
+    note = env.task("T-1")["attempts"][-1]["note"]
+    assert "impl.py" in note          # the conflicting file is named
+    assert "()" not in note           # never an empty parenthetical
+
+
+def test_review13_an_unresolvable_pr_link_does_not_abort_the_run(tmp_path: Path):
+    """Round-2 finding 4: one rotten PR URL (transferred repo, rate limit)
+    on an unrelated old task must stop neither the run nor the queue."""
+    from factory.publish import PublishError
+
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
+    assert env.run(Seats()).outcome == "pr_opened"
+    env.advance_remote_main("def answer():\n    return 99\n",
+                            message="conflicting remote change")
+    assert env.run(Seats()).outcome == "needs_human"  # T-1 escalated, PR open
+
+    # The escalated task's link rots (repo transferred/renamed).
+    q = TaskQueue(env.queue_path)
+    q.get("T-1")["links"]["pr"] = "https://github.com/gone/fixture/pull/1"
+    q.save()
+
+    def flaky(url):
+        if "gone" in url:
+            raise PublishError("gh pr view failed: HTTP 404")
+        return "open"
+
+    result = env.run(Seats(), pr_state=flaky)
+    assert result.outcome == "pr_opened"  # T-2 ran; nothing raised
+
+
+def test_review14_a_closed_pr_escalates_pr_closed(tmp_path: Path):
+    """Round-2 finding 5: a PR closed without merging must surface its
+    task (needs_human / pr_closed), never leave it silently in_review."""
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
+    assert env.run(Seats()).outcome == "pr_opened"
+
+    result = env.run(Seats(), pr_state=lambda url: "closed")
+
+    assert result.outcome == "needs_human"
+    assert result.escalation == "pr_closed"
+    task = env.task("T-1")
+    assert task["status"] == "needs_human"
+    last = task["attempts"][-1]
+    assert last["escalation"] == "pr_closed"
+    assert last["outcome"] == "escalated"
+    schema = json.loads((REPO_ROOT / "schema" / "tasks.schema.json").read_text())
+    assert "pr_closed" in schema["$defs"]["escalation"]["enum"]
+
+
+def test_review15_pr_state_is_resolved_once_per_run(tmp_path: Path):
+    """Round-2 finding 6: the sweep and the limit share one gh lookup per
+    PR URL per run — no double subprocess round-trips."""
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
+    assert env.run(Seats()).outcome == "pr_opened"
+    env.advance_remote_main(None, extra_file="remote_only.txt")
+
+    calls: dict[str, int] = {}
+
+    def counting(url):
+        calls[url] = calls.get(url, 0) + 1
+        return "open"
+
+    result = env.run(Seats(), pr_state=counting)
+
+    assert result.outcome == "concurrency_wait"
+    assert calls and set(calls.values()) == {1}   # each URL exactly once
+
+
+def test_review16_a_cache_hit_needs_no_clone(tmp_path: Path, monkeypatch):
+    """Round-2 finding 7: ls-remote decides the revalidated-cache hit
+    before any scratch clone or full fetch."""
+    import factory.orchestrator as orch
+
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
+    assert env.run(Seats()).outcome == "pr_opened"
+    env.advance_remote_main(None, extra_file="remote_only.txt")
+    assert env.run(Seats()).outcome == "concurrency_wait"  # re-validated + cached
+
+    real_create_run = orch.create_run
+    made: list = []
+
+    def counting(project, source, **kwargs):
+        made.append(project)
+        return real_create_run(project, source, **kwargs)
+
+    monkeypatch.setattr(orch, "create_run", counting)
+    result = env.run(Seats())  # unchanged main: the cache must decide
+
+    assert result.outcome == "concurrency_wait"
+    assert made == []  # no clone, no fetch — ls-remote answered first
+
+
+def test_review17_an_idle_queue_in_the_peak_window_returns_idle(tmp_path: Path):
+    """Round-2 finding 8: an empty queue during the peak window reports
+    idle / queue_empty, not peak_window — a drained queue is 'done',
+    whatever the clock says."""
+    from datetime import datetime
+
+    monday_0930 = datetime(2026, 10, 19, 9, 30, tzinfo=STOCKHOLM)
+    env = Env(tmp_path)
+    assert env.run(Seats()).outcome == "pr_opened"  # queue now drained
+
+    result = env.run(Seats(), now=lambda: monday_0930)
+    assert result.outcome == "idle"
+
+    from factory.orchestrator import run_loop
+
+    loop = run_loop(
+        env.queue_path, factory_root=env.root, session_runner=Seats(),
+        open_pr=env.open_pr, now=lambda: monday_0930,
+        protection=_protection(PROTECTED_STRICT), pr_state=lambda u: "open",
+    )
+    assert loop.stop_reason == "queue_empty"
