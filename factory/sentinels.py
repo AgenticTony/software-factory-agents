@@ -22,8 +22,9 @@ silently orphan a sentinel result behind an always-``pass`` row:
 - ``lint_suppression_added`` — ``# noqa``, ``type: ignore`` or a
   lint-disable comment on an added line in a file under a ``paths.risk``
   glob. Outside risk paths the same comment is ordinary code review
-  territory. When the same line also matched a credential shape, the
-  finding does not echo the line (same no-echo rule).
+  territory. The echoed line goes through :func:`redact_credentials`, as
+  do the skip-marker and assertion echoes, so a credential on the same
+  line prints as ``[redacted]``.
 - ``skip_marker_added`` — a skip/xfail/only marker added on an existing
   test.
 
