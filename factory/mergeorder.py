@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from factory.contract import ContractError
-from factory.publish import github_slug
+from factory.publish import PublishError, github_slug
 
 __all__ = [
     "MergeOrderError",
@@ -48,6 +48,7 @@ __all__ = [
     "admission",
     "classify_protection",
     "gh_branch_protection",
+    "gh_pr_state",
 ]
 
 # gh api error text markers. The plan-limit refusal is how GitHub answers
@@ -115,7 +116,15 @@ def classify_protection(returncode: int, stdout: str, stderr: str) -> Protection
     if _PLAN_LIMIT.search(text) and _FORBIDDEN.search(text):
         return Protection(plan_limit=True, detail=text.strip()[:300])
     if _NOT_FOUND.search(text):
-        return Protection(detail="branch protection is off (404 not protected)")
+        # A 404 is ambiguous: protection off, a missing repo/branch/slug,
+        # or a token that cannot see a private repo. Say all three —
+        # "protection is off" alone sends the owner to enable protection
+        # that may already exist behind an auth problem.
+        return Protection(
+            detail="GitHub answered 404 for the protection call: branch "
+            "protection may be off, or the repo or branch does not exist, "
+            "or the token cannot see this repo"
+        )
     return Protection(detail=text.strip()[:300] or f"gh api exited {returncode}")
 
 
@@ -141,8 +150,6 @@ def gh_branch_protection(
     """
     gh = gh_bin or shutil.which("gh")
     if not gh:
-        from factory.publish import PublishError
-
         raise PublishError(
             "cannot check branch protection: gh is not installed (the factory "
             "checks the default branch's protection with `gh api`)"
@@ -153,6 +160,44 @@ def gh_branch_protection(
         capture_output=True, text=True,
     )
     return classify_protection(proc.returncode, proc.stdout, proc.stderr)
+
+
+def gh_pr_state(
+    pr_url: str, *, gh_bin: str | None = None, _run: Callable = subprocess.run
+) -> str:
+    """Ask GitHub whether a PR is still open: ``open`` | ``merged`` | ``closed``.
+
+    The stale-base sweep and the open-PR limit must follow GitHub's truth,
+    not the queue's: a squash-merged PR leaves its task ``in_review`` until
+    reconcile (F-14), and its head branch may already be auto-deleted —
+    re-validating or fetching either would blame a shipped PR. gh emits
+    ``OPEN``/``MERGED``/``CLOSED``; the answer is lowercased here.
+
+    Raises:
+        PublishError: gh is missing, or ``gh pr view`` failed — an unknown
+            PR state is never guessed.
+    """
+    gh = gh_bin or shutil.which("gh")
+    if not gh:
+        raise PublishError(
+            "cannot check PR state: gh is not installed (the factory checks "
+            "open PRs with `gh pr view`)"
+        )
+    proc = _run(
+        [gh, "pr", "view", pr_url, "--json", "state"],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        raise PublishError(
+            f"cannot check PR state for {pr_url}: {proc.stderr.strip()[:300]}"
+        )
+    try:
+        state = json.loads(proc.stdout).get("state") or ""
+    except json.JSONDecodeError:
+        state = ""
+    if not isinstance(state, str) or not state.strip():
+        raise PublishError(f"gh pr view {pr_url} printed no state: {proc.stdout[:200]}")
+    return state.strip().lower()
 
 
 def admission(
@@ -197,5 +242,5 @@ def admission(
         f"{setting}: {state.detail or 'branch protection is not verifiable'}"
         + (" (repo.branch_protection: unavailable does not excuse a repo "
            "that could have protection)"
-           if declared and state.checked else "")
+           if declared else "")
     )

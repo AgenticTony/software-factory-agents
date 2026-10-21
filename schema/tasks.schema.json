@@ -160,7 +160,17 @@
             "pr": { "type": "string" },
             "branch": { "type": "string" },
             "execution_record": { "type": "string" },
-            "step": { "type": "string", "description": "e.g. SoloAdventurer execution-order step number" }
+            "step": { "type": "string", "description": "e.g. SoloAdventurer execution-order step number" },
+            "revalidated": {
+              "type": "object",
+              "description": "F-26 stale-base cache: the (pr branch sha, default head sha) pair this PR was last re-validated against. An unchanged pair is not re-run; written by the sweep on every pass.",
+              "additionalProperties": false,
+              "required": ["pr", "default"],
+              "properties": {
+                "pr": { "type": "string" },
+                "default": { "type": "string" }
+              }
+            }
           }
         }
       },

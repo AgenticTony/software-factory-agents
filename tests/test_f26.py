@@ -172,6 +172,7 @@ class Env:
     def run(self, session_runner, **kwargs):
         kwargs.setdefault("now", lambda: OFF_PEAK)
         kwargs.setdefault("protection", _protection(PROTECTED_STRICT))
+        kwargs.setdefault("pr_state", lambda url: "open")
         return run_once(
             self.queue_path,
             factory_root=self.root,
@@ -183,6 +184,7 @@ class Env:
     def loop(self, session_runner, **kwargs):
         kwargs.setdefault("now", lambda: OFF_PEAK)
         kwargs.setdefault("protection", _protection(PROTECTED_STRICT))
+        kwargs.setdefault("pr_state", lambda url: "open")
         return run_loop(
             self.queue_path,
             factory_root=self.root,
@@ -476,3 +478,176 @@ def test_gh_branch_protection_refuses_non_github_remote():
 
     with pytest.raises(PublishError):
         gh_branch_protection("/tmp/not-github", "main", _run=lambda *a, **k: _gh(0))
+
+
+# --------------------------------------------- owner review round (10 findings) --
+
+
+def _force_in_review(env: Env, task_id: str = "T-1", *, branch: str,
+                     pr_url: str = "https://github.com/fixture/fixture/pull/9") -> None:
+    """Hand-craft a task sitting in_review with PR + branch links."""
+    q = TaskQueue(env.queue_path)
+    q.transition(task_id, "in_progress")
+    q.transition(task_id, "in_review")
+    q.get(task_id)["links"] = {"pr": pr_url, "branch": branch}
+    q.save()
+
+
+def _push_remote_branch(env: Env, branch: str, impl_body: str) -> None:
+    scratch = env.tmp / f"branch-{branch.replace('/', '-')}"
+    subprocess.run(["git", "clone", "-q", str(env.remote), str(scratch)], check=True)
+    (scratch / "impl.py").write_text(impl_body)
+    _git(scratch, "-c", "user.email=x@x", "-c", "user.name=x", "add", "-A")
+    _git(scratch, "-c", "user.email=x@x", "-c", "user.name=x", "commit", "-qm", "pr branch")
+    _git(scratch, "push", "-q", "origin", f"HEAD:refs/heads/{branch}")
+
+
+def test_review1_a_merged_pr_is_never_revalidated(tmp_path: Path):
+    """Finding 1: a squash-merged PR (task still in_review until reconcile)
+    must be skipped by the sweep, not escalated stale_base — the contract
+    tests already pass on the new main, so re-validation would fail."""
+    env = Env(tmp_path)
+    assert env.run(Seats()).outcome == "pr_opened"
+    env.advance_remote_main("def answer():\n    return 99\n",
+                            message="merged the pr on github")
+    before = len(env.task()["attempts"])
+    entries = len(env.log().entries())
+
+    result = env.run(Seats(), pr_state=lambda url: "merged")
+
+    assert result.outcome == "idle"  # nothing ready; the merged PR is not ours
+    task = env.task()
+    assert task["status"] == "in_review"          # reconcile's story, not ours
+    assert len(task["attempts"]) == before        # no stale_base attempt
+    assert len(env.log().entries()) == entries    # no re-validation ran
+
+
+def test_review2_a_deleted_branch_after_merge_does_not_wedge(tmp_path: Path):
+    """Finding 2: with auto-delete head branches, the PR's branch is gone
+    from the remote while the task sits in_review — run must not raise."""
+    env = Env(tmp_path)
+    _force_in_review(env, branch="factory/t-1-gone")
+    # The branch is deliberately never pushed: fetching it would fail.
+
+    result = env.run(Seats(), pr_state=lambda url: "merged")
+
+    assert result.outcome == "idle"
+    assert env.task()["status"] == "in_review"
+
+
+def test_review3_the_open_pr_limit_counts_open_prs(tmp_path: Path):
+    """Finding 3: an escalated task's PR stays open on GitHub — it must
+    still count against the limit, or the next run opens a second PR."""
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
+    assert env.run(Seats()).outcome == "pr_opened"
+    env.advance_remote_main("def answer():\n    return 99\n",
+                            message="conflicting remote change")
+    result = env.run(Seats())  # T-1 goes stale -> needs_human, PR stays open
+    assert result.outcome == "needs_human"
+    assert result.escalation == "stale_base"
+    assert env.task("T-1")["status"] == "needs_human"
+
+    # T-2 is ready, but T-1's PR is still OPEN on GitHub: the limit holds.
+    seats = Seats()
+    result = env.run(seats)
+    assert result.outcome == "concurrency_wait"
+    assert seats.calls == []
+    assert env.task("T-2")["status"] == "ready"
+
+    # Once GitHub reports that PR merged, the slot frees.
+    result = env.run(Seats(), pr_state=lambda url: "merged")
+    assert result.outcome == "pr_opened"
+
+
+def test_review4_revalidation_is_cached_per_base(tmp_path: Path):
+    """Finding 4: an unchanged (pr branch, default head) pair must not be
+    re-validated — no second full L0/L1, no duplicate log entry."""
+    env = Env(tmp_path)
+    assert env.run(Seats()).outcome == "pr_opened"
+    env.advance_remote_main(None, extra_file="remote_only.txt")
+    assert env.run(Seats()).outcome == "idle"   # re-validation runs, passes
+    task = env.task()
+    cached = task["links"].get("revalidated")
+    assert cached and cached["default"] == _git(env.remote, "rev-parse", "refs/heads/main")
+    entries = len(env.log().entries())
+
+    result = env.run(Seats())  # main has not moved: nothing to redo
+
+    assert result.outcome == "idle"
+    assert len(env.log().entries()) == entries
+    assert env.task()["links"]["revalidated"] == cached
+
+
+def test_review5_the_peak_window_skips_the_sweep(tmp_path: Path):
+    """Finding 5: the sandboxed gate work must not run during the peak
+    window — the run returns peak_window before any re-validation."""
+    from datetime import datetime
+
+    monday_0930 = datetime(2026, 10, 19, 9, 30, tzinfo=STOCKHOLM)
+    env = Env(tmp_path)
+    assert env.run(Seats()).outcome == "pr_opened"
+    env.advance_remote_main(None, extra_file="remote_only.txt")
+    entries = len(env.log().entries())
+
+    result = env.run(Seats(), now=lambda: monday_0930)
+
+    assert result.outcome == "peak_window"
+    assert len(env.log().entries()) == entries  # the sweep never ran
+
+
+def test_review6_merge_failure_classification():
+    """Finding 6: only a real conflict is a conflict — other git failures
+    are infrastructure faults, not the PR's stale_base. git prints the
+    conflict report to STDOUT (probed against real git), so both streams
+    feed the classifier."""
+    from factory.orchestrator import _merge_is_conflict
+
+    conflict = ("Auto-merging impl.py\nCONFLICT (content): Merge conflict in impl.py\n"
+                "Automatic merge failed; fix conflicts and then commit the result.")
+    assert _merge_is_conflict(conflict, "")
+    assert _merge_is_conflict("", conflict)  # stderr variant stays covered
+    assert not _merge_is_conflict("", "fatal: bad object 0123456789")
+    assert not _merge_is_conflict("error: unable to find 0123456789 (missing)", "")
+    assert not _merge_is_conflict("", "fatal: refusing to merge unrelated histories")
+
+
+def test_review7_escalation_survives_a_task_without_attempts(tmp_path: Path):
+    """Finding 7: an in_review task with links but no logged attempts
+    (hand-reconciled or migrated state) must escalate cleanly."""
+    env = Env(tmp_path)
+    branch = "factory/t-1-manual"
+    _push_remote_branch(env, branch, "def answer():\n    return 42\n")
+    _force_in_review(env, branch=branch)
+    assert env.task()["attempts"] == []
+    env.advance_remote_main("def answer():\n    return 99\n",
+                            message="conflicting remote change")
+
+    result = env.run(Seats())
+
+    assert result.outcome == "needs_human"
+    assert result.escalation == "stale_base"
+    attempt = env.task()["attempts"][-1]
+    assert attempt["slice_id"] == "T-1"   # no IndexError; falls back to the id
+
+
+def test_review9_not_protected_with_declaration_names_the_excuse(tmp_path):
+    """Finding 9: a 404 with `branch_protection: unavailable` declared must
+    say the declaration was considered and does not excuse the repo."""
+    profile = {
+        "repo": {"path": "/tmp/x", "default_branch": "main",
+                 "remote": "https://github.com/o/r.git",
+                 "branch_protection": "unavailable"}
+    }
+    with pytest.raises(MergeOrderError, match="does not excuse"):
+        admission(profile, _protection(
+            Protection(checked=False, strict=False,
+                       detail="branch protection is off (404 not protected)")))
+
+
+def test_review10_a_404_names_the_other_causes():
+    """Finding 10: 404 also means a missing repo/branch or a token without
+    access — the message must not send the owner to enable protection that
+    already exists."""
+    got = classify_protection(1, "", "gh: Not Found (HTTP 404)")
+    assert not got.checked and not got.plan_limit
+    assert "does not exist" in got.detail or "token" in got.detail

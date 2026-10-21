@@ -197,6 +197,7 @@ class Env:
     def run(self, session_runner, **kwargs):
         kwargs.setdefault("now", lambda: OFF_PEAK)
         kwargs.setdefault("protection", lambda remote, branch: PROTECTED_STRICT)
+        kwargs.setdefault("pr_state", lambda url: "open")
         return run_once(
             self.queue_path,
             factory_root=self.root,
@@ -208,6 +209,7 @@ class Env:
     def loop(self, session_runner, **kwargs):
         kwargs.setdefault("now", lambda: OFF_PEAK)
         kwargs.setdefault("protection", lambda remote, branch: PROTECTED_STRICT)
+        kwargs.setdefault("pr_state", lambda url: "open")
         return run_loop(
             self.queue_path,
             factory_root=self.root,
@@ -896,7 +898,8 @@ def test_ac_12_killed_run_is_cleaned_by_next_loop(tmp_path: Path):
 
         run_once(Path({str(env.queue_path)!r}), factory_root=Path({str(env.root)!r}),
                  session_runner=seat, open_pr=lambda pr: "never", now=lambda: OFF_PEAK,
-                 protection=lambda r, b: Protection(checked=True, strict=True))
+                 protection=lambda r, b: Protection(checked=True, strict=True),
+                 pr_state=lambda u: "open")
         """
     ))
     proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
@@ -1070,6 +1073,7 @@ def test_default_seat_runner_signature_matches(tmp_path: Path, monkeypatch):
     env = Env(tmp_path)
     result = run_once(env.queue_path, factory_root=env.root, open_pr=env.open_pr,
                       protection=lambda r, b: PROTECTED_STRICT,
+                      pr_state=lambda u: "open",
                       now=lambda: OFF_PEAK)
     assert result.outcome == "pr_opened"
     assert [c[0] for c in seats.calls] == ["implementer", "reviewer"]
@@ -1208,6 +1212,7 @@ def test_review2_pr_failure_after_push_escalates_instead_of_requeueing(tmp_path)
 
     result = run_once(env.queue_path, factory_root=env.root, session_runner=Seats(),
                       protection=lambda r, b: PROTECTED_STRICT,
+                      pr_state=lambda u: "open",
                       open_pr=failing_open_pr, now=lambda: OFF_PEAK)
 
     assert result.outcome == "needs_human"

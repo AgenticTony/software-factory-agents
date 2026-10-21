@@ -71,7 +71,7 @@ from factory.gates import git as hardened_git
 from factory.l0 import run_l0
 from factory.l1 import run_l1
 from factory.l2 import L2Finding, apply_convergence, parse_verdict
-from factory.mergeorder import admission, gh_branch_protection
+from factory.mergeorder import admission, gh_branch_protection, gh_pr_state
 from factory.prbody import PRBodyError, build_pr_body, check_pr_body
 from factory.progress import ProgressLog
 from factory.prompts import (
@@ -160,7 +160,8 @@ class LoopResult:
     limit is taken) | ``error``.
     """
 
-    stop_reason: str  # queue_empty | quota_exhausted | peak_window | escalation
+    stop_reason: str  # queue_empty | concurrency_wait | quota_exhausted |
+    #                 peak_window | escalation | error
     results: list = field(default_factory=list)
 
 
@@ -602,6 +603,7 @@ def run_once(
     srt_bin_path: Path | None = None,
     gate_timeout_sec: int = 600,
     protection: Callable | None = None,
+    pr_state: Callable | None = None,
 ) -> RunResult:
     """Pick the next task and take it to a PR, an escalation or a stop.
 
@@ -623,6 +625,9 @@ def run_once(
             inject a fake. The admission check runs before the queue is
             even read: a repo whose merges can't be ordered starts
             nothing.
+        pr_state: Open-PR seam (default
+            :func:`factory.mergeorder.gh_pr_state`); the stale-base sweep
+            and the open-PR limit follow GitHub's truth, not the queue's.
 
     Returns:
         The :class:`RunResult`.
@@ -638,31 +643,36 @@ def run_once(
     config = config if config is not None else load_config(factory_root / CONFIG_FILE)
     now = now or (lambda: datetime.now(timezone.utc))
     admission(profile, protection or gh_branch_protection)
+    pr_state = pr_state or gh_pr_state
 
     queue = TaskQueue(queue_path)
     reclaim_runs(queue, profile["name"], factory_root)
     queue.reclaim_abandoned()
     queue.demote_changed_contracts()
+    pick = queue.pick()
+    if in_peak_window(now(), config.peak_window):
+        # Before the sweep (F-26 review finding 5): the window protects
+        # the machine and the quota, so no sandboxed gate work and no
+        # re-validation escalations may happen inside it — the run
+        # starts nothing at all.
+        return RunResult("peak_window",
+                         task_id=pick.task["id"] if pick else None)
     stale = _sweep_stale_prs(
         queue, profile, factory_root=factory_root,
         srt_bin_path=srt_bin_path, gate_timeout_sec=gate_timeout_sec,
+        pr_state=pr_state,
     )
     if stale is not None:
         return stale
-    pick = queue.pick()
     if pick is None:
         return RunResult("idle")
     task_id = pick.task["id"]
-    if in_peak_window(now(), config.peak_window):
-        return RunResult("peak_window", task_id=task_id)
     # F-26 AC-2: at most `repo.concurrency` (default 1) open factory PRs
-    # per repo. A ready task waits — untouched, no session, no attempt —
-    # while the limit is taken (the sweep above may have just freed it).
-    open_prs = sum(
-        1
-        for task in queue.doc.get("tasks", [])
-        if task.get("status") == "in_review" and (task.get("links") or {}).get("pr")
-    )
+    # per repo — counted on GitHub's word, not the queue's statuses: an
+    # escalated task's PR stays open (review finding 3), and a task whose
+    # PR was merged or closed frees its slot even before reconcile. A
+    # ready task waits — untouched, no session, no attempt.
+    open_prs = _count_open_prs(queue, pr_state)
     if open_prs >= (profile.get("repo") or {}).get("concurrency", 1):
         return RunResult("concurrency_wait", task_id=task_id)
 
@@ -744,14 +754,51 @@ def _fetch_sha(repo: Path, remote: str, ref: str) -> str:
 
 
 def _slice_id_of(task: dict) -> str:
-    """The slice the task's logged attempts belong to (unsliced: the id)."""
+    """The slice the task's logged attempts belong to (unsliced: the id).
+
+    Empty ``attempts`` (a hand-reconciled or migrated in_review task) is
+    expected: the escalation path must survive it, not index-error.
+    """
     attempts = task.get("attempts") or []
-    return attempts[-1].get("slice_id") or task["id"]
+    return (attempts[-1].get("slice_id") or task["id"]) if attempts else task["id"]
+
+
+def _merge_is_conflict(stdout: str, stderr: str) -> bool:
+    """Whether a failed ``git merge`` failed because of a real conflict.
+
+    git prints the conflict report ("CONFLICT (…) … Automatic merge
+    failed") to **stdout**; stderr carries everything else (missing
+    objects in a filtered clone, hardening config, unrelated histories).
+    Anything not a conflict is an infrastructure fault: raising it as
+    ``stale_base`` would blame the PR for the machine.
+    """
+    return "CONFLICT (" in stdout or "Automatic merge failed" in stdout or \
+        "CONFLICT (" in stderr or "Automatic merge failed" in stderr
+
+
+def _count_open_prs(queue: TaskQueue, pr_state: Callable) -> int:
+    """Open factory PRs on GitHub, per the ``pr_state`` seam.
+
+    Statuses whose PR can still be open: ``in_review`` (awaiting merge),
+    ``needs_human`` (escalated — the PR stays open until you reject it)
+    and ``in_progress``/``ready`` around a fix round (GitHub answers
+    either way). Post-merge statuses are excluded: ``in_review →
+    deploying`` means the PR merged.
+    """
+    count = 0
+    for task in queue.doc.get("tasks", []):
+        if task.get("status") not in ("ready", "in_progress", "in_review",
+                                      "needs_human"):
+            continue
+        url = (task.get("links") or {}).get("pr")
+        if url and pr_state(url) == "open":
+            count += 1
+    return count
 
 
 def _sweep_stale_prs(
     queue: TaskQueue, profile: dict, *, factory_root: Path,
-    srt_bin_path: Path | None, gate_timeout_sec: int,
+    srt_bin_path: Path | None, gate_timeout_sec: int, pr_state: Callable,
 ) -> RunResult | None:
     """F-26 AC-3: bring every open factory PR's readiness up to date.
 
@@ -790,7 +837,13 @@ def _sweep_stale_prs(
     default_branch = repo_cfg["default_branch"]
     for task in open_prs:
         task_id = task["id"]
-        branch = task["links"]["branch"]
+        links = task["links"]
+        if pr_state(links["pr"]) != "open":
+            # Merged or closed: the queue-reconcile story. Re-validating a
+            # shipped PR would fail L1's red-first proof on code that
+            # already landed, and its head branch may be auto-deleted.
+            continue
+        branch = links["branch"]
         work = create_run(project, source, factory_root=factory_root,
                           ref=default_branch)
         try:
@@ -799,9 +852,12 @@ def _sweep_stale_prs(
             if git_rc(work.root, "merge-base", "--is-ancestor",
                       default_sha, pr_sha) == 0:
                 continue  # the PR branch already contains the default head
+            if links.get("revalidated") == {"pr": pr_sha, "default": default_sha}:
+                continue  # already re-validated against exactly this base
 
             # Stale: merge the PR onto the new base; a conflict is itself
             # a re-validation failure (the merge a human would attempt).
+            # Any other merge failure is infrastructure, not the PR.
             hardened_git(work.root, "checkout", "-q", "--detach", pr_sha)
             merge = subprocess.run(
                 ["git", *GIT_HARDENING, "-C", str(work.root), *_IDENTITY,
@@ -812,6 +868,13 @@ def _sweep_stale_prs(
             note: str | None = None
             merged_sha: str | None = None
             if merge.returncode != 0:
+                if not _merge_is_conflict(merge.stdout, merge.stderr):
+                    raise RunError(
+                        f"git merge of {branch} onto {default_branch}@"
+                        f"{default_sha[:12]} failed without a conflict "
+                        f"marker (infrastructure, not the PR): "
+                        f"{merge.stderr.strip()[:300]}"
+                    )
                 note = (
                     f"merge conflict: {branch} does not merge onto "
                     f"{default_branch}@{default_sha[:12]} ({merge.stderr.strip()[:300]})"
@@ -878,7 +941,12 @@ def _sweep_stale_prs(
                 return RunResult("needs_human", task_id, escalation="stale_base",
                                  reports=reports)
             # Pass: no attempt (no session ran, no budget spent); the
-            # readiness record is the log entry plus the stored report.
+            # readiness record is the log entry plus the stored report,
+            # and links.revalidated caches the pair so an unchanged base
+            # is not re-paid on every later run.
+            queue.get(task_id)["links"]["revalidated"] = {
+                "pr": pr_sha, "default": default_sha}
+            queue.save()
             ProgressLog.for_task(factory_root, project, task_id).append({
                 "run_id": work.run_id, "outcome": "pass",
                 "note": (f"stale-base re-validation: L0+L1 pass on {branch} "

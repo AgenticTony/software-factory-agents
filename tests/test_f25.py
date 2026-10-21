@@ -524,6 +524,7 @@ class Env:
 
         kwargs.setdefault("now", lambda: OFF_PEAK)
         kwargs.setdefault("protection", lambda r, b: Protection(checked=True, strict=True))
+        kwargs.setdefault("pr_state", lambda url: "open")
         return run_once(
             self.queue_path,
             factory_root=self.root,

@@ -473,9 +473,11 @@ def run_rehearsal(
         session_runner=_RehearsalSeats(),
         open_pr=open_pr,
         now=now or (lambda: datetime.now(timezone.utc)),
-        # The fixture remote is a local path; the real gh seam can't answer
-        # for it. The rehearsal exercises run mechanics, not admission.
+        # The fixture remote is a local path; the real gh seams can't
+        # answer for it. The rehearsal exercises run mechanics, not
+        # admission or PR-state tracking.
         protection=lambda remote, branch: Protection(checked=True, strict=True),
+        pr_state=lambda url: "open",
     )
     if result.outcome != "pr_opened":
         detail = f"escalation {result.escalation}" if result.escalation else "no escalation"
