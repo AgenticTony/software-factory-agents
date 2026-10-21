@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-19T10:12:08Z",
+  "updated_at": "2026-10-20T14:54:38Z",
   "tasks": [
     {
       "id": "F-00",
@@ -1560,7 +1560,7 @@
       "source": "BUILD-ORDER.md#f-24--realistic-rehearsal-fixture-in-ci",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-05",
         "F-07",
@@ -1624,7 +1624,10 @@
         "wall_clock_min": 150
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "acceptance_hash": "01c70b4187f8f8ec19b8a524c59fff1b9b525becc9363af389196dfdf1132b84",
+      "approved_at": "2026-10-20T14:54:38Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-25",

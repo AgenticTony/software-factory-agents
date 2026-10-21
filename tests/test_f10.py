@@ -343,14 +343,42 @@ def test_budget_counts_earlier_attempts(tmp_path: Path):
 
 
 def test_reviewer_fail_is_retried_then_exhausted(tmp_path: Path):
-    review = json.dumps({"verdict": "fail", "findings": [
-        {"id": "R1", "axis": "spec", "severity": "blocking", "text": "scope creep"}]})
+    """A reviewer FAIL goes back with numbered findings until the budget is
+    spent. The implementer writes different (still green) content each
+    round so the review delta is real, and the findings name impl.py —
+    the common file-named-retry path, in the delta, exercised as such
+    (an identical round-2 finding on the untouched file would rightly
+    escalate review_not_converging instead: F-23)."""
     env = Env(tmp_path)
-    seats = Seats(review=review)
-    result = env.run(seats)
+    seats = Seats()
+
+    def varying(seat, prompt, run_dir, profile, **kwargs):
+        if seat == "implementer":
+            seats.calls.append((seat, prompt, Path(run_dir), kwargs))
+            round_no = sum(1 for s, *_ in seats.calls if s == "implementer")
+            (Path(run_dir) / "impl.py").write_text(
+                f"def answer():\n    return 42  # fix round {round_no}\n")
+            (Path(run_dir) / "tests" / "test_feature.py").write_text(TEST_SOURCE)
+            return SessionRecord(
+                seat=seat, status="completed", num_turns=3, model="stub-model",
+                tokens={"input_tokens": 120, "output_tokens": 40},
+                result="Implemented answer().",
+            )
+        seats.calls.append((seat, prompt, Path(run_dir), kwargs))
+        call_no = sum(1 for s, *_ in seats.calls if s == "reviewer")
+        return SessionRecord(
+            seat=seat, status="completed", num_turns=1, model="stub-model",
+            tokens={"input_tokens": 60, "output_tokens": 10},
+            result=json.dumps({"verdict": "fail", "findings": [
+                {"id": "R1", "axis": "spec", "severity": "blocking",
+                 "file": "impl.py", "text": f"scope creep {call_no}"}]}),
+        )
+
+    result = env.run(varying)
     assert result.outcome == "needs_human"
     assert [c[0] for c in seats.calls] == ["implementer", "reviewer"] * 3
-    assert "scope creep" in seats.prompts("implementer")[1]
+    assert "scope creep 1" in seats.prompts("implementer")[1]
+    assert env.task()["attempts"][-1]["escalation"] == "attempts_exhausted"
     assert env.prs == []
 
 

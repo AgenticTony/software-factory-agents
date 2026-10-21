@@ -37,9 +37,15 @@ protected-path, new-dependency and risk-path hits escalate immediately —
 retrying can't make them safe. A failed round goes back to the implementer
 with numbered findings until ``budget.max_attempts`` attempts (counted
 across runs; ``aborted`` ones excluded) are spent, then ``needs_human`` with
-``attempts_exhausted``. A quota/429 error is not the task's fault: the
-attempt is recorded ``aborted`` with escalation ``quota_exhausted``, the
-task re-queues (``ready``) and ``loop`` stops without retrying.
+``attempts_exhausted``. A FAIL the next round cannot act on escalates
+``review_not_converging`` instead of spending another round (F-23: re-review
+scopes to the delta since the last real review, repeats are carried rather
+than re-raised, and the fix prompt says to fix the defect class, not the
+instance; the stop fires when every finding is a carried repeat from this
+run on untouched code, or everything was dropped as out of scope). A
+quota/429 error is not the task's fault: the attempt is recorded ``aborted``
+with escalation ``quota_exhausted``, the task re-queues (``ready``) and
+``loop`` stops without retrying.
 """
 
 from __future__ import annotations
@@ -57,11 +63,11 @@ from typing import Callable
 
 from factory.config import CONFIG_FILE, FactoryConfig, in_peak_window, load_config
 from factory.contract import load_profile
-from factory.gates import CommandResult, diff_name_status
+from factory.gates import CommandResult, diff_name_status, git_rc
 from factory.gates import git as hardened_git
 from factory.l0 import run_l0
 from factory.l1 import run_l1
-from factory.l2 import parse_verdict
+from factory.l2 import L2Finding, apply_convergence, parse_verdict
 from factory.prbody import PRBodyError, build_pr_body, check_pr_body
 from factory.progress import ProgressLog
 from factory.prompts import (
@@ -262,20 +268,87 @@ def _compact(report: dict | None, tail: int) -> dict | None:
     return report
 
 
-def _numbered_findings(reports: dict, extra: list[str]) -> list[str]:
+def _numbered_findings(reports: dict, extra: list[str],
+                       include_dropped: bool = True) -> list[str]:
+    """The round's numbered finding lines.
+
+    ``include_dropped=False`` builds the implementer's fix list: dropped
+    findings are out of scope by the orchestrator's own ruling — telling
+    the implementer to "fix the defect class" of one would pull edits
+    into code the round ruled untouchable, and those edits would put the
+    file into the next delta. The full list (default) is the round's
+    record: log, PR evidence, the human's read.
+    """
     lines: list[str] = list(extra)
     for layer in ("L0", "L1", "L2"):
-        report = reports.get(layer)
-        for finding in (report or {}).get("findings") or []:
+        report = reports.get(layer) or {}
+        for finding in report.get("findings") or []:
             where = ""
             if finding.get("file"):
                 where = f" ({finding['file']}:{finding.get('line') or ''})"
             lines.append(f"[{layer} {finding.get('id')}] {finding.get('text')}{where}")
+        if not include_dropped:
+            continue
+        # Dropped L2 findings ride the record marked, not actionable: the
+        # log (and the human reading it) sees what the reviewer flagged
+        # even though the orchestrator ruled it out of scope.
+        for entry in report.get("dropped") or []:
+            finding = entry.get("finding") or {}
+            lines.append(
+                f"[{layer} dropped {finding.get('id')}] {finding.get('text')} "
+                f"({finding.get('file') or 'no file'}; out of scope, no "
+                "missed_earlier — for the record, not to fix)"
+            )
     return [f"{i}. {text}" for i, text in enumerate(lines, start=1)]
 
 
+def _fix_findings(reports: dict, extra: list[str], l2, reviewed: bool,
+                  last_valid_l2: dict | None) -> list[str]:
+    """The next round's fix list: actionable findings only.
+
+    Dropped findings are excluded (out of scope — fixing their defect
+    class would pull edits into code the round ruled untouchable, and
+    those edits would put the file into the next delta).
+
+    Whenever this round produced no verdict of its own — the review
+    failed to parse, **or L2 never ran because L0/L1 stopped the round** —
+    the last valid review's findings are still the open work and are
+    substituted for this round's L2 lines, keeping the fix list and the
+    reviewer's carried list describing the same findings. A round whose
+    review session ran but produced no verdict also prepends an explicit
+    note: the implementer must hear that the change went unreviewed, not
+    silently replay the older findings as if they had been accepted.
+    """
+    if reviewed:
+        return _numbered_findings(reports, extra, include_dropped=False)
+    if l2 is not None:  # a review ran, but produced no verdict
+        extra = [
+            "[L2 unreviewed] this round's review produced no verdict — the "
+            "change was not reviewed; do not assume it was accepted",
+            *extra,
+        ]
+    fix_reports = {**reports, "L2": last_valid_l2}
+    return _numbered_findings(fix_reports, extra, include_dropped=False)
+
+
+# The stop's note comes from the classifier's reason, never re-derived
+# here: if apply_convergence grows a third branch, the note follows it.
+_NO_PROGRESS_NOTES = {
+    "carried_repeats": (
+        "every L2 finding is a carried repeat from an earlier round of "
+        "this run, on files untouched since: another round has nothing "
+        "new to fix"
+    ),
+    "all_dropped": (
+        "every L2 finding was dropped as out of scope; the declared fail "
+        "stands with nothing left to fix"
+    ),
+}
+
+
 def _implementer_prompt(task: dict, slice_: dict | None, branch: str, history: str,
-                        attempt: int, max_attempts: int) -> str:
+                        attempt: int, max_attempts: int,
+                        fix_findings: list[str] | None = None) -> str:
     contract = {
         "acceptance": task.get("acceptance", []),
         "out_of_scope": task.get("out_of_scope", []),
@@ -308,6 +381,18 @@ def _implementer_prompt(task: dict, slice_: dict | None, branch: str, history: s
         "",
         f"This is attempt {attempt} of {max_attempts}.",
     ]
+    if fix_findings:
+        parts += [
+            "",
+            "## Findings to fix",
+            "",
+            *fix_findings,
+            "",
+            "Each finding above names one instance of a defect class. Fix the class, "
+            "not the instance: search the codebase for sibling sites with the same "
+            "defect class and fix them in this round too. The next review "
+            "explicitly checks the siblings.",
+        ]
     if history:
         parts += [
             "",
@@ -318,7 +403,8 @@ def _implementer_prompt(task: dict, slice_: dict | None, branch: str, history: s
     return "\n".join(parts) + "\n"
 
 
-def _review_prompt(task: dict, diff: str, l0: dict, l1: dict) -> str:
+def _review_prompt(task: dict, diff: str, l0: dict, l1: dict, delta: str | None = None,
+                   carried: list[dict] | None = None) -> str:
     contract = {
         "id": task["id"],
         "title": task.get("title"),
@@ -328,7 +414,7 @@ def _review_prompt(task: dict, diff: str, l0: dict, l1: dict) -> str:
     }
     if len(diff) > _REVIEW_DIFF_CAP:
         diff = diff[:_REVIEW_DIFF_CAP] + f"\n[... diff cut at {_REVIEW_DIFF_CAP} chars ...]\n"
-    return "\n".join([
+    parts = [
         "Review this change. Return only the verdict JSON your instructions define.",
         "",
         "## Contract",
@@ -348,14 +434,90 @@ def _review_prompt(task: dict, diff: str, l0: dict, l1: dict) -> str:
         "```json",
         json.dumps(_compact(l1, _REVIEW_OUTPUT_TAIL), indent=2, ensure_ascii=False),
         "```",
+    ]
+    if delta is None and not carried:
+        parts += ["", "## Diff (base...head)", "", "```diff", diff, "```", ""]
+        return "\n".join(parts)
+    # A fix round (F-23): findings from earlier rounds are listed so the
+    # reviewer carries them instead of re-raising them, and the delta (when
+    # the implementer didn't rewrite the reviewed history) is the primary
+    # scope with the full diff as reference. Without a delta — the history
+    # was rewritten, or the last review never produced a verdict — the
+    # full diff stays the scope and nothing is out of it.
+    if delta is not None and len(delta) > _REVIEW_DIFF_CAP:
+        delta = delta[:_REVIEW_DIFF_CAP] + f"\n[... delta cut at {_REVIEW_DIFF_CAP} chars ...]\n"
+    carried_lines = [
+        f"- [{c.get('severity')}] {c.get('file') or '(no file)'}: {c['text']}"
+        for c in carried or []
+    ] or ["- (none stood in this run's earlier rounds)"]
+    parts += [
         "",
-        "## Diff (base...head)",
+        "## Findings from earlier rounds (already recorded — do not re-raise)",
+        "",
+        "These were raised in an earlier round and are already recorded. Do not "
+        "re-raise them as new findings; if the changes below changed the code "
+        "they concern and they still stand, raise them again and say what "
+        "changed. The implementer was told to fix each finding's defect class, "
+        "not just the named instance — explicitly check the sibling sites of "
+        "every finding below.",
+        "",
+        *carried_lines,
+    ]
+    if delta is None:
+        parts += ["", "## Diff (base...head)", "", "```diff", diff, "```", ""]
+        return "\n".join(parts)
+    parts += [
+        "",
+        "## Delta since the last review (primary scope)",
+        "",
+        "A new finding on a file outside this delta must carry `missed_earlier`: "
+        "why the earlier round missed it. Without that, the orchestrator drops "
+        "the finding as out of scope.",
+        "",
+        "```diff",
+        delta,
+        "```",
+        "",
+        "## Full diff (base...head, reference only)",
         "",
         "```diff",
         diff,
         "```",
         "",
-    ])
+    ]
+    return "\n".join(parts)
+
+
+def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    """Whether ``ancestor`` is reachable from ``descendant`` in ``repo``.
+
+    rc 0 = yes, rc 1 = no; anything else — including the object being
+    absent from a ``--filter=blob:none`` clone after the implementer
+    amended or reset the round it names — also reads as no, because the
+    caller's fallback (full-diff review scope) is always safe. Runs
+    through the hardened, timeout-bounded :func:`factory.gates.git_rc`.
+    """
+    return git_rc(repo, "merge-base", "--is-ancestor", ancestor, descendant) == 0
+
+
+def _round_stuck(l0, l1, l2) -> bool:
+    """Whether the no-progress stop applies to this round (F-23).
+
+    It is not enough that ``l2.no_progress`` is set: the stop may only
+    spend a round the deterministic gates passed. Today L2 runs solely
+    after L0 and L1 pass, but that ordering is a property of the wiring,
+    not of the data — a future advisory L1 or a reordered pipeline would
+    otherwise escalate `review_not_converging` on a round whose L0/L1
+    findings are fresh, actionable work.
+    """
+    return bool(
+        l2 is not None
+        and l2.no_progress
+        and l0 is not None
+        and l0.verdict == "pass"
+        and l1 is not None
+        and l1.verdict == "pass"
+    )
 
 
 def _git_out(repo: Path, *args: str) -> str:
@@ -568,6 +730,20 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
     reviewer_system = assemble_reviewer_prompt(profile)
     session_seconds = 0.0
 
+    # F-23 review-convergence state, living across this run's rounds. The
+    # prior finding keys seed from the task's progress log (an earlier run
+    # or a rejected-PR fix round), so a finding raised there is carried
+    # here; their raise shas are gone with the old clone, hence None.
+    prior: dict[str, str | None] = {}
+    for entry in log.entries():
+        for key in entry.get("finding_keys") or []:
+            prior.setdefault(key, None)
+    raised: list[dict] = []  # this run's findings, for the next round's prompt
+    last_reviewed: str | None = None  # the head sha L2 last saw
+    last_valid_l2: dict | None = None  # the last parseable verdict's report
+    prev_findings: list[str] | None = None  # the failed round's fix list
+    round_no = 0
+
     work = create_run(project, source, factory_root=ctx.factory_root, ref=default_branch)
     try:
         _build_on_remote_default(work, repo_cfg["remote"], default_branch)
@@ -600,15 +776,20 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
             record.update({k: v for k, v in extra.items() if v is not None})
             return record
 
-        def finish(attempt, status, findings, **result):
-            queue.append_attempt(task_id, attempt)
-            log.append({
+        def finish(attempt, status, findings, finding_keys=None, **result):
+            entry = {
                 "run_id": attempt["run_id"],
                 "attempt": attempt["rounds"],
                 "outcome": attempt["outcome"],
                 "escalation": attempt.get("escalation"),
                 "findings": findings,
-            })
+            }
+            if finding_keys:
+                # F-23: the stable keys of this round's L2 findings, so the
+                # next run seeds its carried set from the log.
+                entry["finding_keys"] = finding_keys
+            queue.append_attempt(task_id, attempt)
+            log.append(entry)
             if status is not None:
                 queue.transition(task_id, status)
             return result
@@ -636,6 +817,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
 
             # This round's state, initialised before anything can raise: the
             # error path below records its attempt from whatever exists.
+            round_no += 1
             records: list = []
             reports: dict = {"L0": None, "L1": None, "L2": None}
             extra_findings: list[str] = []
@@ -645,10 +827,18 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
             path = None
             pushed = False
             opened = False
+            round_keys: list = []  # this round's L2 finding keys (F-23)
+            reviewed = False  # did this round's review produce a verdict?
             try:
                 # ---- implementer
-                prompt = _implementer_prompt(task, slice_, branch, log.render(),
-                                             attempt_no, max_attempts)
+                # The fix block below carries the newest entry's findings,
+                # so that entry renders without them (read once, not
+                # twice — the entry itself still renders, F-10 AC-10) and
+                # no entry ever renders the seeding hashes.
+                prompt = _implementer_prompt(
+                    task, slice_, branch,
+                    log.render(omit_last_findings=prev_findings is not None),
+                    attempt_no, max_attempts, fix_findings=prev_findings)
                 t0 = time.monotonic()
                 impl = ctx.session_runner(
                     "implementer", prompt, work.root, profile,
@@ -740,11 +930,35 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                        ["1. wall-clock budget spent before the L2 review"])
                                 return RunResult("needs_human", task_id,
                                                  escalation="budget_exhausted", reports=reports)
-                            diff = hardened_git(clean.root, "diff", "--no-color", "--no-ext-diff",
+                            diff = hardened_git(clean.root, "diff", "--no-color",
+                                                "--no-ext-diff",
                                                 f"{base_sha}...{head_sha}")
+                            # F-23: from this run's second review on, the
+                            # delta since the last reviewed sha is the
+                            # reviewer's primary scope and the convergence
+                            # rules (carried repeats, out-of-delta drops)
+                            # apply — but only if that sha still exists in
+                            # this clone: an implementer that amended or
+                            # reset the reviewed round's commit makes it
+                            # unreachable, and this round falls back to the
+                            # full diff instead of dying on a bad object.
+                            delta = delta_files = None
+                            if last_reviewed is not None and _is_ancestor(
+                                    clean.root, last_reviewed, head_sha):
+                                delta = hardened_git(
+                                    clean.root, "diff", "--no-color", "--no-ext-diff",
+                                    f"{last_reviewed}...{head_sha}")
+                                delta_files = frozenset(
+                                    path
+                                    for change in diff_name_status(
+                                        clean.root, last_reviewed, head_sha)
+                                    for path in (change.path, change.old_path)
+                                    if path
+                                )
                             t0 = time.monotonic()
                             review_prompt = _review_prompt(
-                                task, diff, reports["L0"], reports["L1"])
+                                task, diff, reports["L0"], reports["L1"],
+                                delta=delta, carried=raised)
                             review = ctx.session_runner(
                                 "reviewer", review_prompt,
                                 clean.root, profile, factory_root=ctx.factory_root,
@@ -762,14 +976,43 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                 finish(attempt, "ready", [f"1. quota: {review.reason}"])
                                 return RunResult("quota_exhausted", task_id,
                                                  escalation="quota_exhausted", reports=reports)
-                            l2 = parse_verdict(review.result if review.status == "completed"
-                                               else None)
+                            l2 = apply_convergence(
+                                parse_verdict(
+                                    review.result if review.status == "completed"
+                                    else None),
+                                prior,
+                                delta_files if delta_files is not None else frozenset(),
+                                delta_mode=delta is not None,
+                            )
                             if review.status != "completed":
                                 extra_findings.append(
                                     f"[session {review.status}] the reviewer session ended: "
                                     f"{review.reason}"
                                 )
                             reports["L2"] = l2.to_dict()
+                            # Only a review that produced a parseable verdict
+                            # moves the frontier. A crashed, timed-out or
+                            # invalid review reviewed nothing: the next
+                            # round's delta must still cover this head, or
+                            # code no reviewer ever saw would become "outside
+                            # the delta" and its findings dropped.
+                            reviewed = (
+                                review.status == "completed" and l2.parse_error is None
+                            )
+                            if reviewed:
+                                last_valid_l2 = l2.to_dict()
+                                round_keys = [
+                                    f.key for f in l2.findings
+                                    if isinstance(f, L2Finding) and f.key
+                                ]
+                                raised = [
+                                    {"key": f.key, "file": f.file,
+                                     "severity": f.severity, "text": f.text}
+                                    for f in l2.findings if isinstance(f, L2Finding)
+                                ]
+                                for key in round_keys:
+                                    prior[key] = head_sha
+                                last_reviewed = head_sha
                         changed = [c.path for c in diff_name_status(clean.root, base_sha, head_sha)]
                     finally:
                         cleanup_run(clean)
@@ -802,6 +1045,9 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                     opened = True
                     attempt = attempt_record(attempt_no, started, "pass", records, path, pr=url)
                     queue.append_attempt(task_id, attempt)
+                    # A passed round's findings were accepted as non-blocking:
+                    # recording their keys would poison a later fix round
+                    # after a rejected PR (only failed reviews seed).
                     log.append({"run_id": work.run_id, "attempt": attempt_no, "outcome": "pass",
                                 "pr": url, "findings": findings})
                     task = queue.get(task_id)
@@ -809,15 +1055,39 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                     queue.transition(task_id, "in_review")
                     return RunResult("pr_opened", task_id, pr=url, reports=reports)
 
+                # F-23 no-progress stop: apply_convergence decided, where
+                # the prior set was in hand, that this FAIL gives the next
+                # round nothing it can fix — every finding is a carried
+                # repeat from this run on untouched code (the bounce the
+                # stop exists for; a carry seeded from an earlier run does
+                # not count, and a repeat on a file the fix touched is an
+                # attempt in progress), or every finding was dropped as
+                # out of scope and the declared fail stands with nothing
+                # left. Escalate instead of spending the round — and only
+                # when the round's own L0/L1 passed (_round_stuck): fresh
+                # deterministic findings are actionable work, whatever the
+                # review repeats.
+                if _round_stuck(l0, l1, l2):
+                    note = _NO_PROGRESS_NOTES[l2.no_progress_reason]
+                    attempt = attempt_record(
+                        attempt_no, started, "escalated", records, path,
+                        escalation="review_not_converging", note=note,
+                    )
+                    finish(attempt, "needs_human", findings, finding_keys=round_keys)
+                    return RunResult("needs_human", task_id,
+                                     escalation="review_not_converging", reports=reports)
+
                 used += 1
                 if attempt_no >= max_attempts:
                     attempt = attempt_record(attempt_no, started, "escalated", records, path,
                                              escalation="attempts_exhausted")
-                    finish(attempt, "needs_human", findings)
+                    finish(attempt, "needs_human", findings, finding_keys=round_keys)
                     return RunResult("needs_human", task_id, escalation="attempts_exhausted",
                                      reports=reports)
                 attempt = attempt_record(attempt_no, started, "fail", records, path)
-                finish(attempt, None, findings)
+                finish(attempt, None, findings, finding_keys=round_keys)
+                prev_findings = _fix_findings(
+                    reports, extra_findings, l2, reviewed, last_valid_l2)
                 task = queue.get(task_id)
             except Exception as exc:
                 # The orchestrator itself failed mid-round (gh after the push,

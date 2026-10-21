@@ -193,6 +193,26 @@ def git(repo: Path, *args: str) -> str:
     return proc.stdout
 
 
+def git_rc(repo: Path, *args: str, timeout_sec: int = 60) -> int:
+    """Hardened git whose answer IS the exit code — it never raises.
+
+    For the questions git encodes in its status (``merge-base
+    --is-ancestor``: 0 yes, 1 no), where raising on non-zero would make
+    the "no" answer unrepresentable. Any non-zero — including a missing
+    object's fatal — comes back as the code; the caller decides which
+    codes mean what. ``timeout_sec`` bounds the call so a stalled object
+    fetch can never hang the round (124 on timeout, like ``sh``).
+    """
+    try:
+        proc = subprocess.run(
+            ["git", *GIT_HARDENING, "-C", str(repo), *args],
+            capture_output=True, text=True, timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired:
+        return 124
+    return proc.returncode
+
+
 def _text(data) -> str:
     """Normalise captured output: POSIX ``TimeoutExpired`` carries raw bytes
     (or ``None``) even when the run asked for text."""

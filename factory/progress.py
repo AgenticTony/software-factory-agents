@@ -115,14 +115,31 @@ class ProgressLog:
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
-    def render(self) -> str:
-        """The entries as prompt text for a fresh session ('' when empty)."""
+    def render(self, omit_last_findings: bool = False) -> str:
+        """The entries as prompt text for a fresh session ('' when empty).
+
+        ``finding_keys`` is machine data for the next run's convergence
+        seeding, never prompt content — the implementer can do nothing
+        with 64-char hashes. ``omit_last_findings`` renders the newest
+        entry without its ``findings`` field: the orchestrator sets it on
+        a fix round, where the prompt's "Findings to fix" block already
+        carries that round's findings (with the sibling instruction), so
+        the implementer reads them once, not twice. The entry itself —
+        outcome, escalation, run id — still renders: F-10 AC-10, every
+        round receives entries 1..N.
+
+        Args:
+            omit_last_findings: Drop the newest entry's findings field.
+        """
         entries = self.entries()
         if not entries:
             return ""
         blocks = []
-        for record in entries:
-            body = {k: v for k, v in record.items() if k not in ("n", "prev")}
+        for index, record in enumerate(entries):
+            exclude = ("n", "prev", "finding_keys")
+            if omit_last_findings and index == len(entries) - 1:
+                exclude = exclude + ("findings",)
+            body = {k: v for k, v in record.items() if k not in exclude}
             blocks.append(
                 f"### entry {record['n']}\n\n```json\n"
                 + json.dumps(body, indent=2, sort_keys=True, ensure_ascii=False)

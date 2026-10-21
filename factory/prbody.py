@@ -227,12 +227,58 @@ def build_pr_body(
         "Evidence": build_evidence(task, l1_report),
         "Merge Danger": "\n".join(merge_danger),
         "Contract": fence(json.dumps(contract, indent=2, ensure_ascii=False), "json"),
-        "Validator report": fence(json.dumps(reports, indent=2, ensure_ascii=False), "json")
-        + "\n\nL3 holdouts: not run (F-15). L4 live verification runs after deploy (F-14).",
+        "Validator report": _validator_section(reports),
         "How to revert": how_to_revert(task, profile, extra_flags),
     }
     body = "\n\n".join(f"## {name}\n\n{sections[name]}" for name in REQUIRED_SECTIONS)
     return body + "\n\n---\nOpened by the software factory. A human reviews and merges.\n"
+
+
+def _validator_section(reports: dict) -> str:
+    """The gate reports as JSON, with the L2 round's dropped findings —
+    if any — pulled out above the blob (F-23 finding 9: a reviewer
+    finding the orchestrator dropped as out of scope still belongs in
+    front of the human merging the PR, not buried in the JSON).
+
+    The dropped list is reviewer-controlled text, so it rides inside a
+    ``text`` fence — the same treatment the implementer's notes get. The
+    fence is what makes the payload inert: it is one backtick longer than
+    any run in the text and indents every line, so nothing inside can
+    close it or start a ``## `` heading (a ``<!--`` could otherwise hide
+    everything after it in GitHub's rendered view while
+    :func:`check_pr_body`'s raw regex still passed, and links would plant
+    in front of the merger). Flattening keeps each finding on one line of
+    the list — readability, not containment; the fence alone would hold a
+    multiline payload. Inside the JSON fence the same text was always
+    safe (newlines escaped there)."""
+    section = fence(json.dumps(reports, indent=2, ensure_ascii=False), "json")
+    dropped = (reports.get("L2") or {}).get("dropped") or []
+    if dropped:
+        lines = [
+            f"- [{_flat(d.get('finding', {}).get('severity'))}] "
+            f"{_flat(d.get('finding', {}).get('file')) or '(no file)'}: "
+            f"{_flat(d.get('finding', {}).get('text'))}"
+            for d in dropped
+        ]
+        section = (
+            "**Reviewer findings dropped as out of scope** (no "
+            "`missed_earlier` justification; not counted in the verdict — "
+            "read them before merging):\n\n"
+            + fence("\n".join(lines), "text")
+            + "\n\n" + section
+        )
+    return (
+        section
+        + "\n\nL3 holdouts: not run (F-15). L4 live verification runs after "
+        "deploy (F-14)."
+    )
+
+
+def _flat(value) -> str:
+    """Reviewer-controlled text as one line: all whitespace runs (newlines
+    included) collapse to single spaces, so each dropped finding renders
+    as a single readable list line inside the fence that holds it."""
+    return " ".join(str(value or "").split())
 
 
 def check_pr_body(body: str) -> None:
