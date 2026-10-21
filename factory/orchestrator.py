@@ -33,9 +33,10 @@ Trust boundaries, each enforced in code rather than prose:
   entries 1..N, read-only, from outside the clone.
 
 Escalation rules (VALIDATOR-SPEC "Rounds and escalation"): L0's
-protected-path, sentinel-failure, new-dependency and risk-path hits
-escalate immediately — retrying can't make them safe. A failed round goes
-back to the implementer
+credential, protected-path, sentinel-failure, new-dependency and
+risk-path hits escalate immediately — retrying can't make them safe (a
+credential stays leaked in the pushed history even once the line is
+removed). A failed round goes back to the implementer
 with numbered findings until ``budget.max_attempts`` attempts (counted
 across runs; ``aborted`` ones excluded) are spent, then ``needs_human`` with
 ``attempts_exhausted``. A FAIL the next round cannot act on escalates
@@ -108,8 +109,11 @@ OpenPR = Callable[[PullRequest], str]
 _QUOTA = re.compile(r"(?<!\d)429(?!\d)|rate[ _-]?limit|quota", re.IGNORECASE)
 
 # L0 escalation classes, most severe first (one escalation per attempt).
+# credential_added leads: a leaked secret needs rotation and cannot be
+# un-leaked by any retry or revert.
 _L0_ESCALATION_ORDER = (
-    "protected_path_touched", "sentinel_failed", "new_dependency", "risk_path_touched",
+    "credential_added", "protected_path_touched", "sentinel_failed",
+    "new_dependency", "risk_path_touched",
 )
 
 # Caps on what travels into prompts and the PR body (GitHub refuses bodies
@@ -1077,6 +1081,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                     attempt = attempt_record(
                         attempt_no, started, "escalated", records, path,
                         escalation="review_not_converging", note=note,
+                        sentinels=list(l0.sentinel_results) if l0 is not None else None,
                     )
                     finish(attempt, "needs_human", findings, finding_keys=round_keys)
                     return RunResult("needs_human", task_id,
@@ -1084,8 +1089,11 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
 
                 used += 1
                 if attempt_no >= max_attempts:
-                    attempt = attempt_record(attempt_no, started, "escalated", records, path,
-                                             escalation="attempts_exhausted")
+                    attempt = attempt_record(
+                        attempt_no, started, "escalated", records, path,
+                        escalation="attempts_exhausted",
+                        sentinels=list(l0.sentinel_results) if l0 is not None else None,
+                    )
                     finish(attempt, "needs_human", findings, finding_keys=round_keys)
                     return RunResult("needs_human", task_id, escalation="attempts_exhausted",
                                      reports=reports)

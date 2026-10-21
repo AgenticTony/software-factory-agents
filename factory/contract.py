@@ -250,6 +250,28 @@ def load_tasks(path: Path | str, schema_path: Path | None = None) -> dict:
     return data
 
 
+def _check_profile_semantics(data: dict, origin: str) -> None:
+    """Readable front-end checks on a parsed profile (schema backs them).
+
+    Args:
+        data: The parsed profile mapping.
+        origin: Profile path, for the error message.
+
+    Raises:
+        ContractError: On the first semantic violation found.
+    """
+    sentinels = data.get("sentinels") or {}
+    risk_globs = (data.get("paths") or {}).get("risk") or {}
+    for flag, entries in sentinels.items():
+        if not risk_globs.get(flag):
+            raise ContractError(
+                f"{origin}: sentinels.{flag} has no paths.risk globs, so its "
+                f"{len(entries)} sentinel(s) could never run — add "
+                f"paths.risk.{flag} globs or drop the sentinels key "
+                "(a skipped-forever sentinel reads as checked when it can't be)"
+            )
+
+
 def load_profile(path: Path | str, schema_path: Path | None = None) -> dict:
     """Load and fully validate a project.yaml profile.
 
@@ -262,7 +284,8 @@ def load_profile(path: Path | str, schema_path: Path | None = None) -> dict:
 
     Raises:
         ContractError: If the file is unreadable or not YAML, not a mapping,
-            or schema-invalid.
+            schema-invalid, or semantically inconsistent (F-25: a
+            ``sentinels.<flag>`` whose flag has no ``paths.risk`` globs).
     """
     path = Path(path)
     origin = str(path)
@@ -275,4 +298,5 @@ def load_profile(path: Path | str, schema_path: Path | None = None) -> dict:
             f"{origin}: profile must be a YAML mapping, got {type(data).__name__}"
         )
     _validate(data, schema_path or SCHEMA_DIR / "project.schema.json", origin)
+    _check_profile_semantics(data, origin)
     return data

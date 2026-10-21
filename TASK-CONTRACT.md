@@ -76,7 +76,7 @@ Recovery and continuation edges (same allowed-transition table, kept out of the 
 | `deploying → ready` | the previous slice merged and live-verified and more slices remain. Owner-step and `done` evaluation waits until the last slice merges; a task can only be `done`/`awaiting_owner` with every slice merged. |
 | `ready → blocked` | a dependency regressed (its task was reopened or demoted). `sync_readiness` reconciles both directions. |
 
-Escalation reasons (enum): `attempts_exhausted`, `budget_exhausted`, `risk_path_touched`, `new_dependency`, `protected_path_touched`, `contract_ambiguous`, `quota_exhausted`, `live_check_failed`, `cross_repo`, `pr_create_failed`, `orchestrator_error`, `publish_refused`, `review_not_converging`, `sentinel_failed`.
+Escalation reasons (enum): `attempts_exhausted`, `budget_exhausted`, `risk_path_touched`, `new_dependency`, `protected_path_touched`, `contract_ambiguous`, `quota_exhausted`, `live_check_failed`, `cross_repo`, `pr_create_failed`, `orchestrator_error`, `publish_refused`, `review_not_converging`, `sentinel_failed`, `credential_added`.
 
 The three orchestrator-side reasons (F-10):
 
@@ -87,6 +87,8 @@ The three orchestrator-side reasons (F-10):
 `review_not_converging` (F-23): a review round's FAIL contained only findings already raised in an earlier round — the loop is bouncing the same findings back and forth, and another round cannot fix that. Re-review now scopes to the delta since the last review and carries repeats instead of re-raising them (BUILD-ORDER F-23); reaching this escalation means those mechanisms see no progress. A human decides whether the findings are real, the reviewer is wrong, or the contract is the problem.
 
 `sentinel_failed` (F-25): a project sentinel — a `sentinels.<risk flag>` command in `project.yaml` — ran because the diff touched that flag's `paths.risk` globs, and failed. Retrying cannot make an invariant hold, so the task is `needs_human` with the sentinel's output in the L0 report and the attempt record. Read what the sentinel said: either the change really breaks the project's invariant (reject the PR or fix the project), or the sentinel command itself is wrong (fix it in `project.yaml` by PR).
+
+`credential_added` (F-25): the diff adds a credential-shaped string (a key, token or private-key pattern). Removing the line in a later round cannot un-leak it — the secret stays in the branch's pushed history — so the task is `needs_human` on the round that found it, with no implementer retry. Rotate the credential (a leaked secret is compromised regardless of this repo), then decide whether to rewrite the branch history or reject the change outright.
 
 ## 4. Picking the next task
 
@@ -111,7 +113,7 @@ The adapter. Everything the factory must know about a repo that isn't in a task.
 | `paths.risk` | Globs whose change adds a risk flag (auth, migrations, RLS, payments, safety). |
 | `paths.protected` | Globs workers may not modify: validator-owned tests, contract fixtures, CI config, the factory's own files. Workers may *add* tests elsewhere. |
 | `dependency_manifests` | Files whose change means a new/changed dependency (`package.json`, `requirements*.lock`). |
-| `sentinels` | Per risk flag, a list of `{command, description}` (F-25). Each command runs when the diff touches that flag's `paths.risk` globs; a failure FAILs L0 and escalates `sentinel_failed`. The built-in sentinels (credential added, skip marker, assertion removed, lint suppression in risk paths) always run. |
+| `sentinels` | Per risk flag, a list of `{command, description}` (F-25). Each command runs — after `commands.setup`, only — when the diff touches that flag's `paths.risk` globs; a failure FAILs L0 and escalates `sentinel_failed` (a flag with no `paths.risk` globs is refused at load). The built-in sentinels (credential added, skip marker, assertion removed, lint suppression in risk paths) always run; a credential find also escalates `credential_added` (rotate it — removing the line cannot un-leak the history). |
 | `deploy` | Mechanism, whether merge auto-deploys, the deploy command if manual. |
 | `live_checks` | Post-deploy commands the orchestrator runs **outside** the sandbox with secrets from the macOS keychain. |
 | `holdouts` | Directory outside the repo (`~/factory/holdouts/<project>/`) and how to run it. |

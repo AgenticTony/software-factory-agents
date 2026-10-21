@@ -6,20 +6,26 @@ there. This module is L0's standing set of "security sentinel" invariants
 sentinel's name, so a human merge sees exactly what was checked, pass or
 fail.
 
-Two of the four built-in sentinels predate this module — ``skip_marker_added``
-and ``assertion_removed`` are line heuristics ``factory.l0.check_diff_policy``
-has enforced since F-07. F-25 names the standing set, adds the two new
-scanners below, and records a result per sentinel in the L0 report.
+All four built-in scanners live here — each sentinel's scanner and its
+result are produced together, so renaming a finding id can no longer
+silently orphan a sentinel result behind an always-``pass`` row:
 
+- ``assertion_removed`` — an assertion line removed from an existing test
+  without a replacement (a moved assertion trips it; a human reviews).
 - ``credential_added`` — a credential-shaped string (private-key block,
   well-known token prefixes, a generic secret assignment) on an added line
   in ANY file. The finding text names the matched shape and NEVER echoes
   the line: findings ride into reports, prompts and PR bodies, so the
-  sentinel itself must not become the leak it exists to catch. Heuristic
-  by necessity — a human reviews, like ``assertion_removed``.
-- ``lint_suppression_added`` — ``# noqa``, ``type: ignore`` or a lint-disable
-  comment on an added line in a file under a ``paths.risk`` glob. Outside
-  risk paths the same comment is ordinary code review territory.
+  sentinel must not become the leak it exists to catch. A credential also
+  ESCALATES ``credential_added`` — removing the line next round cannot
+  un-leak it from the branch history ("retrying can't make it safe").
+- ``lint_suppression_added`` — ``# noqa``, ``type: ignore`` or a
+  lint-disable comment on an added line in a file under a ``paths.risk``
+  glob. Outside risk paths the same comment is ordinary code review
+  territory. When the same line also matched a credential shape, the
+  finding does not echo the line (same no-echo rule).
+- ``skip_marker_added`` — a skip/xfail/only marker added on an existing
+  test.
 
 Projects extend the set per risk flag in ``project.yaml``::
 
@@ -29,20 +35,26 @@ Projects extend the set per risk flag in ``project.yaml``::
           description: no TODOs left in payments code
 
 Each command runs (through the same sandboxed runner as the other gate
-commands) only when the diff touches that flag's ``paths.risk`` globs; a
-failure FAILs the verdict and escalates ``sentinel_failed``. Untouched
-flags record their sentinels as ``skipped`` — the human sees what was
-checked, and what deliberately wasn't.
+commands) only when the diff touches that flag's ``paths.risk`` globs, and
+only AFTER ``commands.setup`` has succeeded — a sentinel may need the
+environment setup installs, and a fresh-clone failure before setup would
+escalate a correct change. When setup fails, project sentinels are recorded
+``skipped``. A failing sentinel FAILs the verdict and escalates
+``sentinel_failed``; untouched flags also record ``skipped`` — the human
+sees what was checked, and what deliberately wasn't. Sentinel COMMAND
+OUTPUT is redacted through :data:`CREDENTIAL_PATTERNS` before it reaches
+any finding or result: a payments scan that greps for keys prints exactly
+the strings that must not travel further.
 
-:data:`CREDENTIAL_PATTERNS` is the reusable shape list (F-30's trace
-redaction and any later consumer import it from here rather than
-re-deriving it).
+:data:`CREDENTIAL_PATTERNS` and :func:`redact_credentials` are the reusable
+shape list and scrubber (F-30's trace redaction and any later consumer
+import them from here rather than re-deriving them).
 """
 
 import re
 from pathlib import Path
 
-from factory.gates import CommandRunner, Finding, matches, run_command
+from factory.gates import CommandRunner, Finding, is_test_file, matches, run_command
 
 # (shape name, pattern) — the name is what findings and results carry.
 _CREDENTIAL_SHAPES = (
@@ -68,6 +80,39 @@ _CREDENTIAL_SHAPES = (
 # (trace redaction) and later consumers reuse.
 CREDENTIAL_PATTERNS = tuple(pattern for _, pattern in _CREDENTIAL_SHAPES)
 
+
+def redact_credentials(text: str) -> str:
+    """Replace every credential-shaped match in ``text`` with ``[redacted]``.
+
+    Sentinel command output (a payments scan that greps for keys prints
+    exactly what it found) and any other untrusted text that must travel
+    into findings, reports or PR bodies goes through here first.
+    """
+    for pattern in CREDENTIAL_PATTERNS:
+        text = pattern.sub("[redacted]", text)
+    return text
+
+
+# Added lines in test files matching any of these -> skip_marker_added.
+SKIP_MARKER_PATTERNS = (
+    re.compile(r"pytest\.mark\.(?:skip|skipif|xfail)"),
+    re.compile(r"\bpytest\.skip\("),
+    re.compile(r"\bskipTest\("),
+    re.compile(r"@unittest\.skip"),
+    re.compile(r"\bthis\.skip\("),
+    re.compile(r"\b(?:it|describe|test|context)\.skip\("),
+    re.compile(r"\b(?:xit|xdescribe)\("),
+    re.compile(r"\b(?:it|describe|test)\.only\("),
+)
+
+# Removed lines in test files matching any of these -> assertion_removed.
+# Substring-level on purpose: catches assertEqual/expect(...) variants;
+# comments mentioning "assert" can false-positive — a human reviews.
+ASSERTION_PATTERNS = (
+    re.compile(r"\bassert"),
+    re.compile(r"\bexpect\("),
+)
+
 # Added lines matching any of these in a file under a risk-path glob ->
 # lint_suppression_added.
 LINT_SUPPRESSION_PATTERNS = (
@@ -82,8 +127,6 @@ LINT_SUPPRESSION_PATTERNS = (
 )
 
 # The standing built-in sentinel set, sorted for deterministic result order.
-# skip_marker_added and assertion_removed are emitted by
-# factory.l0.check_diff_policy (F-07); the other two by this module.
 BUILTIN_SENTINELS = (
     "assertion_removed",
     "credential_added",
@@ -95,8 +138,11 @@ BUILTIN_SENTINELS = (
 def matched_risk_flags(risk_globs: dict, changes) -> set:
     """The risk flags whose ``paths.risk`` globs the diff touches.
 
-    A rename touches both its old and new path (a rename away from a risk
-    path still touched it), matching check_diff_policy's rename semantics.
+    THE single implementation of "which risk flags did this diff touch"
+    (owner review finding 7): L0 computes it once and passes it through —
+    the builtin pass, the project sentinels and ``check_diff_policy``
+    consume the same set. A rename touches both its old and new path (a
+    rename away from a risk path still touched it).
     """
     matched: set = set()
     for change in changes:
@@ -109,12 +155,16 @@ def matched_risk_flags(risk_globs: dict, changes) -> set:
     return matched
 
 
-def builtin_sentinel_findings(changes, risk_globs: dict) -> list:
-    """Scan added lines for the two F-25 built-in sentinels.
+def _credential_shape(text: str) -> str | None:
+    """The first credential shape that matches ``text``, else None."""
+    for name, pattern in _CREDENTIAL_SHAPES:
+        if pattern.search(text):
+            return name
+    return None
 
-    ``skip_marker_added`` and ``assertion_removed`` (the other two built-ins)
-    are line heuristics inside :func:`factory.l0.check_diff_policy` and are
-    not re-scanned here.
+
+def builtin_sentinel_findings(changes, risk_globs: dict) -> list:
+    """Scan the diff with all four built-in sentinels.
 
     Args:
         changes: ``FileChange`` list from ``diff_file_changes``.
@@ -122,51 +172,148 @@ def builtin_sentinel_findings(changes, risk_globs: dict) -> list:
 
     Returns:
         Findings for ``credential_added`` (any file) and
-        ``lint_suppression_added`` (risk-path files only). Credential
-        findings name the matched shape; the line itself is never echoed.
+        ``lint_suppression_added`` (risk-path files only) — those two
+        scanners plus the skip-marker and assertion scanners below, one
+        home for the whole standing set. Credential-bearing lines are
+        never echoed: findings name the shape only.
     """
     findings: list[Finding] = []
     all_risk_globs = [glob for globs in risk_globs.values() for glob in globs]
     for change in changes:
         in_risk_path = matches(change.path, all_risk_globs)
+        # Skip/assertion scanning follows the rename semantics of
+        # check_diff_policy's event split: a rename's old half is judged by
+        # its own side, so a test renamed INTO the test paths scans by its
+        # new path, one renamed OUT by its old.
+        scan_path = change.old_path if is_test_file(change.old_path or "") else change.path
+        test_file = is_test_file(scan_path)
         for no, text in change.added_lines:
-            for name, pattern in _CREDENTIAL_SHAPES:
-                if pattern.search(text):
-                    findings.append(
-                        Finding(
-                            "credential_added",
-                            f"credential-shaped string added in {change.path}:{no} "
-                            f"({name}); the line is not echoed here",
-                            file=change.path,
-                            line=no,
-                        )
-                    )
-                    break
-            if in_risk_path and any(p.search(text) for p in LINT_SUPPRESSION_PATTERNS):
+            shape = _credential_shape(text)
+            if shape is not None:
                 findings.append(
                     Finding(
-                        "lint_suppression_added",
-                        f"lint suppression added in {change.path}:{no}: {text.strip()}",
+                        "credential_added",
+                        f"credential-shaped string added in {change.path}:{no} "
+                        f"({shape}); the line is not echoed here",
                         file=change.path,
                         line=no,
                     )
                 )
+            if test_file and any(p.search(text) for p in SKIP_MARKER_PATTERNS):
+                findings.append(
+                    Finding(
+                        "skip_marker_added",
+                        f"skip/only marker added in {scan_path}:{no}: {text.strip()}",
+                        file=scan_path,
+                        line=no,
+                    )
+                )
+            if in_risk_path and any(p.search(text) for p in LINT_SUPPRESSION_PATTERNS):
+                echo = (
+                    text.strip() if shape is None
+                    else f"line not echoed (matched credential shape: {shape})"
+                )
+                findings.append(
+                    Finding(
+                        "lint_suppression_added",
+                        f"lint suppression added in {change.path}:{no}: {echo}",
+                        file=change.path,
+                        line=no,
+                    )
+                )
+        if test_file:
+            for no, text in change.removed_lines:
+                if any(p.search(text) for p in ASSERTION_PATTERNS):
+                    findings.append(
+                        Finding(
+                            "assertion_removed",
+                            f"assertion removed in {scan_path}:{no}: {text.strip()}",
+                            file=scan_path,
+                            line=no,
+                        )
+                    )
     findings.sort(key=lambda f: (f.id, f.file or "", f.line or 0))
     return findings
 
 
+def builtin_sentinel_pass(profile: dict, changes, findings, matched: set):
+    """The pure half of the sentinel pass: scan, derive results, escalate.
+
+    Args:
+        profile: The loaded ``project.yaml`` mapping.
+        changes: ``FileChange`` list from ``diff_file_changes``.
+        findings: ``check_diff_policy``'s findings (kept for signature
+            symmetry; the built-in results are derived from the combined
+            finding ids).
+        matched: The diff's matched risk flags —
+            :func:`matched_risk_flags` computed ONCE by the caller.
+
+    Returns:
+        ``(findings, results, escalations)`` — the four built-in scans'
+        findings, one result dict per built-in sentinel (pass/fail), and
+        the ``credential_added`` escalation when a credential was found
+        (removing the line next round cannot un-leak it from the branch
+        history, so retrying can't make it safe).
+    """
+    risk_globs = (profile.get("paths") or {}).get("risk") or {}
+    scans = builtin_sentinel_findings(changes, risk_globs)
+    finding_ids = {f.id for f in findings} | {f.id for f in scans}
+    escalations: list[str] = []
+    if "credential_added" in finding_ids:
+        escalations.append("credential_added")
+    results = []
+    for name in BUILTIN_SENTINELS:
+        entry = {
+            "name": name,
+            "kind": "builtin",
+            "verdict": "fail" if name in finding_ids else "pass",
+        }
+        if name == "lint_suppression_added":
+            entry["detail"] = (
+                "risk paths touched: " + ", ".join(sorted(matched))
+                if matched
+                else "no risk path touched"
+            )
+        results.append(entry)
+    return scans, results, escalations
+
+
+def skipped_project_results(profile: dict, reason: str) -> list:
+    """One ``skipped`` result per configured project sentinel, with why.
+
+    Used when the sentinels cannot run at all — setup failed, so the
+    environment they may need was never built.
+    """
+    config = profile.get("sentinels") or {}
+    return [
+        {
+            "name": entry["description"],
+            "kind": "project",
+            "verdict": "skipped",
+            "risk_flag": flag,
+            "detail": reason,
+        }
+        for flag in sorted(config)
+        for entry in config[flag]
+    ]
+
+
 def run_project_sentinels(
     profile: dict,
-    changes,
+    matched: set,
     repo: Path | str,
     runner: CommandRunner | None = None,
     timeout_sec: int = 600,
 ):
     """Run the profile's ``sentinels.<risk flag>`` commands for touched flags.
 
+    Called by L0 only after ``commands.setup`` has succeeded — a sentinel
+    may need the environment setup installs (owner review finding 1).
+
     Args:
         profile: The loaded ``project.yaml`` mapping.
-        changes: ``FileChange`` list from ``diff_file_changes``.
+        matched: The diff's matched risk flags —
+            :func:`matched_risk_flags` computed ONCE by the caller.
         repo: Repository the commands run in.
         runner: Executes each command; default unconfined
             :func:`~factory.gates.run_command` (L0 passes the sandboxed
@@ -177,11 +324,10 @@ def run_project_sentinels(
         ``(findings, results, escalations)`` — a FAIL finding plus the
         ``sentinel_failed`` escalation per failing command, and one result
         dict per configured sentinel (``skipped`` when the flag's globs
-        were not touched).
+        were not touched). Command output is redacted through
+        :func:`redact_credentials` before it reaches any text.
     """
     config = profile.get("sentinels") or {}
-    risk_globs = (profile.get("paths") or {}).get("risk") or {}
-    matched = matched_risk_flags(risk_globs, changes)
     repo = Path(repo)
     findings: list[Finding] = []
     results: list[dict] = []
@@ -210,11 +356,12 @@ def run_project_sentinels(
                 })
                 continue
             reason = "timed out" if result.timed_out else f"exit {result.exit_code}"
+            output = redact_credentials(result.output.strip()[-200:])
             findings.append(
                 Finding(
                     "sentinel_failed",
                     f"project sentinel failed ({flag}: {entry['description']}; "
-                    f"{reason}): {command}",
+                    f"{reason}): {redact_credentials(command)}\noutput: {output}",
                 )
             )
             results.append({
@@ -222,58 +369,7 @@ def run_project_sentinels(
                 "kind": "project",
                 "verdict": "fail",
                 "risk_flag": flag,
-                "detail": result.output.strip()[-200:],
+                "detail": output,
             })
             escalations.append("sentinel_failed")
     return findings, results, escalations
-
-
-def run_sentinels(
-    profile: dict,
-    changes,
-    findings,
-    repo: Path | str,
-    runner: CommandRunner | None = None,
-    timeout_sec: int = 600,
-):
-    """The full F-25 sentinel pass L0 runs right after the diff policy.
-
-    Args:
-        profile: The loaded ``project.yaml`` mapping.
-        changes: ``FileChange`` list from ``diff_file_changes``.
-        findings: ``check_diff_policy``'s findings — the skip-marker and
-            assertion sentinels are read from them, not re-scanned.
-        repo: Repository the project sentinel commands run in.
-        runner: Command runner (see :func:`run_project_sentinels`).
-        timeout_sec: Per-command wall-clock cap.
-
-    Returns:
-        ``(findings_to_add, sentinel_results, escalations_to_add)`` — the
-        new FAIL findings (new built-ins plus failed project sentinels),
-        one result dict per sentinel (built-in and project, pass/fail/
-        skipped), and the ``sentinel_failed`` escalation when a project
-        sentinel failed.
-    """
-    risk_globs = (profile.get("paths") or {}).get("risk") or {}
-    builtin_new = builtin_sentinel_findings(changes, risk_globs)
-    finding_ids = {f.id for f in findings} | {f.id for f in builtin_new}
-    matched = matched_risk_flags(risk_globs, changes)
-    results = []
-    for name in BUILTIN_SENTINELS:
-        entry = {
-            "name": name,
-            "kind": "builtin",
-            "verdict": "fail" if name in finding_ids else "pass",
-        }
-        if name == "lint_suppression_added":
-            entry["detail"] = (
-                "risk paths touched: " + ", ".join(sorted(matched))
-                if matched
-                else "no risk path touched"
-            )
-        results.append(entry)
-    project_findings, project_results, escalations = run_project_sentinels(
-        profile, changes, repo, runner=runner, timeout_sec=timeout_sec
-    )
-    results.extend(project_results)
-    return builtin_new + project_findings, results, escalations
