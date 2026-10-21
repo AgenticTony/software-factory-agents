@@ -108,6 +108,8 @@ Not every round shares a session: an aborted run re-enters the queue, and a PR y
 
 `max_attempts` defaults to 3, matching your existing `loop.md`. Risk, protected-path, new-dependency and cross-repo hits escalate **immediately**: no retries, since retrying won't make them safe.
 
+Merge order (F-26) guards the same invariant one level up: a PR's validation only holds on the base it was built on, so before `factory run` starts (or reports an open factory PR ready), it checks ordering. Admission: a repo whose default branch doesn't require status checks with `strict` (branches up to date) refuses to run at all — except a plan-limited repo (GitHub's 403) that declares `repo.branch_protection: unavailable`, where the factory enforces the equivalent itself. The stale-base sweep: every `factory run` fetches the remote default head and each open factory PR's branch; when the default has moved past the PR's base, L0 and L1 re-run on the PR merged onto the new base (locally proving the merge a strict setting would force). A failure — merge conflict or gates — escalates `stale_base` and the task leaves `in_review` for `needs_human`; a pass is recorded in the progress log and the PR stays ready. The loop keeps at most one open factory PR per repo (`repo.concurrency`, default 1), so ready tasks wait rather than stacking PRs on a base that is about to move.
+
 ## Validating the validator
 
 A validator nobody has tested is just another claim. Monthly, per project:

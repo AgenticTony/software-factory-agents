@@ -123,7 +123,8 @@ ILLEGAL_EDGE_CLASSES = {
         ("in_review", "ready"),
     ],
     "lateral": [
-        ("in_review", "needs_human"),
+        # in_review -> needs_human is legal since F-26 (stale base failed
+        # re-validation on the new default head); tested in test_f26.
         ("in_review", "awaiting_owner"),
         ("blocked", "in_progress"),
         ("blocked", "done"),

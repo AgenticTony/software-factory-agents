@@ -16,7 +16,9 @@
         "path": { "type": "string" },
         "default_branch": { "type": "string" },
         "remote": { "type": "string" },
-        "merge_method": { "enum": ["squash", "merge", "rebase"] }
+        "merge_method": { "enum": ["squash", "merge", "rebase"] },
+        "branch_protection": { "enum": ["unavailable"], "description": "Declare only when GitHub answers the protection call with its plan-limit 403 (a private repo on a free plan): the factory then enforces up-to-date itself (re-validates open factory PRs against the current remote default head, F-26). Never excuses a repo that could have protection but doesn't." },
+        "concurrency": { "type": "integer", "minimum": 1, "description": "Open factory PRs allowed at once (default 1). A ready task waits while the limit is taken (F-26)." }
       }
     },
     "commands": {

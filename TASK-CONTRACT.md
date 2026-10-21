@@ -73,10 +73,11 @@ Recovery and continuation edges (same allowed-transition table, kept out of the 
 |---|---|
 | `in_progress → ready` | the run aborted with no PR and no outcome (orchestrator crash, killed session). The task re-enters the queue under the same attempt budget. Liveness comes from a **run lease**, an OS lock the session holds for its whole life and the OS releases when the process dies. `reclaim_abandoned` applies this edge only when the lease is free, so a live run is never reclaimed, and a run that died before its first attempt record still is. |
 | `in_review → in_progress` | you rejected the PR — the task returns for a fix round. |
+| `in_review → needs_human` | stale base (F-26): the default branch moved past the open PR's base and re-validation of the PR merged onto the new base failed — the PR was only ever validated on the base it was built on. |
 | `deploying → ready` | the previous slice merged and live-verified and more slices remain. Owner-step and `done` evaluation waits until the last slice merges; a task can only be `done`/`awaiting_owner` with every slice merged. |
 | `ready → blocked` | a dependency regressed (its task was reopened or demoted). `sync_readiness` reconciles both directions. |
 
-Escalation reasons (enum): `attempts_exhausted`, `budget_exhausted`, `risk_path_touched`, `new_dependency`, `protected_path_touched`, `contract_ambiguous`, `quota_exhausted`, `live_check_failed`, `cross_repo`, `pr_create_failed`, `orchestrator_error`, `publish_refused`, `review_not_converging`, `sentinel_failed`, `credential_added`.
+Escalation reasons (enum): `attempts_exhausted`, `budget_exhausted`, `risk_path_touched`, `new_dependency`, `protected_path_touched`, `contract_ambiguous`, `quota_exhausted`, `live_check_failed`, `cross_repo`, `pr_create_failed`, `orchestrator_error`, `publish_refused`, `review_not_converging`, `sentinel_failed`, `credential_added`, `stale_base`.
 
 The three orchestrator-side reasons (F-10):
 
@@ -89,6 +90,8 @@ The three orchestrator-side reasons (F-10):
 `sentinel_failed` (F-25): a project sentinel — a `sentinels.<risk flag>` command in `project.yaml` — ran because the diff touched that flag's `paths.risk` globs, and failed. Retrying cannot make an invariant hold, so the task is `needs_human` with the sentinel's output in the L0 report and the attempt record. Read what the sentinel said: either the change really breaks the project's invariant (reject the PR or fix the project), or the sentinel command itself is wrong (fix it in `project.yaml` by PR).
 
 `credential_added` (F-25): the diff adds a credential-shaped string (a key, token or private-key pattern). Nothing is pushed before a passing round, so the credential sits in the run branch's LOCAL history only — but a retry that later passes would push that earlier commit, so the task is `needs_human` on the round that found it, with no implementer retry. Rotate the credential regardless (the model provider saw it; it is compromised even though nothing was pushed). No history rewrite is needed: re-queueing discards the run branch — each run clones the default branch fresh. The shapes are heuristics; a false positive costs exactly this escalation (`needs_human`, no retry), where a human confirms and re-queues — erring protective is the intent.
+
+`stale_base` (F-26): the default branch moved past an open factory PR's base, and re-running L0 and L1 on the PR merged onto the new base failed (or the merge itself conflicts). The PR's validation only ever held on the base it was built on, so the task leaves `in_review` for `needs_human` instead of waiting on a merge that would break `main`. The attempt record's `note` says which step failed; the stored report (`<run-id>-revalidate.json`) carries the L0/L1 output. The owner updates the branch (a fix round via PR rejection) or rejects the PR; `factory run` refuses to report a factory PR ready against a default head it hasn't been validated on.
 
 ## 4. Picking the next task
 
@@ -107,7 +110,7 @@ The adapter. Everything the factory must know about a repo that isn't in a task.
 
 | Section | Contents |
 |---|---|
-| `repo` | Local path, default branch, remote, merge method. |
+| `repo` | Local path, default branch, remote, merge method. `branch_protection: unavailable` declares the plan-limit exception (F-26): GitHub answers the protection call with a 403 because the plan can't have protection, and the factory enforces up-to-date itself (re-validating open factory PRs against the current remote default head). `concurrency` caps open factory PRs per repo (default 1; a ready task waits while the limit is taken). |
 | `commands` | `setup`, `lint`, `typecheck`, `test`, `build` — exact commands, run from repo root. |
 | `baselines` | Path to a baseline file (test counts, known errors) if the project has one. |
 | `paths.risk` | Globs whose change adds a risk flag (auth, migrations, RLS, payments, safety). |

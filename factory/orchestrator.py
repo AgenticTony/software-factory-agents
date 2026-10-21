@@ -71,6 +71,7 @@ from factory.gates import git as hardened_git
 from factory.l0 import run_l0
 from factory.l1 import run_l1
 from factory.l2 import L2Finding, apply_convergence, parse_verdict
+from factory.mergeorder import admission, gh_branch_protection
 from factory.prbody import PRBodyError, build_pr_body, check_pr_body
 from factory.progress import ProgressLog
 from factory.prompts import (
@@ -134,11 +135,13 @@ _IDENTITY = ("-c", "user.name=Software Factory", "-c", "user.email=factory@local
 class RunResult:
     """The outcome of one ``run``.
 
-    ``outcome``: ``idle`` (nothing eligible), ``pr_opened``, ``needs_human``,
-    ``quota_exhausted``, ``peak_window`` (no session was started, or the
-    run stopped before its next session), or ``error`` (the orchestrator
-    itself failed mid-round; the attempt is recorded, the task is
-    re-queued, and a persistent failure escalates via the budget).
+    ``outcome``: ``idle`` (nothing eligible), ``pr_opened``,
+    ``needs_human``, ``quota_exhausted``, ``peak_window`` (no session was
+    started, or the run stopped before its next session),
+    ``concurrency_wait`` (F-26: the repo's open-PR limit is taken, the
+    ready task waits untouched), or ``error`` (the orchestrator itself
+    failed mid-round; the attempt is recorded, the task is re-queued, and
+    a persistent failure escalates via the budget).
     """
 
     outcome: str
@@ -150,7 +153,12 @@ class RunResult:
 
 @dataclass
 class LoopResult:
-    """Why ``loop`` stopped, plus each run's result."""
+    """Why ``loop`` stopped, plus each run's result.
+
+    ``stop_reason``: ``queue_empty`` | ``quota_exhausted`` | ``peak_window``
+    | ``escalation`` | ``concurrency_wait`` (F-26: the repo's open-PR
+    limit is taken) | ``error``.
+    """
 
     stop_reason: str  # queue_empty | quota_exhausted | peak_window | escalation
     results: list = field(default_factory=list)
@@ -593,6 +601,7 @@ def run_once(
     now: Callable[[], datetime] | None = None,
     srt_bin_path: Path | None = None,
     gate_timeout_sec: int = 600,
+    protection: Callable | None = None,
 ) -> RunResult:
     """Pick the next task and take it to a PR, an escalation or a stop.
 
@@ -609,6 +618,11 @@ def run_once(
         now: Clock for the peak-window checks (aware datetimes).
         srt_bin_path: srt override for tests (still pin-checked).
         gate_timeout_sec: Per-command cap for L0/L1.
+        protection: Branch-protection seam (default
+            :func:`factory.mergeorder.gh_branch_protection`); F-26 tests
+            inject a fake. The admission check runs before the queue is
+            even read: a repo whose merges can't be ordered starts
+            nothing.
 
     Returns:
         The :class:`RunResult`.
@@ -623,17 +637,34 @@ def run_once(
     factory_root = Path(factory_root) if factory_root else FACTORY_ROOT_DEFAULT
     config = config if config is not None else load_config(factory_root / CONFIG_FILE)
     now = now or (lambda: datetime.now(timezone.utc))
+    admission(profile, protection or gh_branch_protection)
 
     queue = TaskQueue(queue_path)
     reclaim_runs(queue, profile["name"], factory_root)
     queue.reclaim_abandoned()
     queue.demote_changed_contracts()
+    stale = _sweep_stale_prs(
+        queue, profile, factory_root=factory_root,
+        srt_bin_path=srt_bin_path, gate_timeout_sec=gate_timeout_sec,
+    )
+    if stale is not None:
+        return stale
     pick = queue.pick()
     if pick is None:
         return RunResult("idle")
     task_id = pick.task["id"]
     if in_peak_window(now(), config.peak_window):
         return RunResult("peak_window", task_id=task_id)
+    # F-26 AC-2: at most `repo.concurrency` (default 1) open factory PRs
+    # per repo. A ready task waits — untouched, no session, no attempt —
+    # while the limit is taken (the sweep above may have just freed it).
+    open_prs = sum(
+        1
+        for task in queue.doc.get("tasks", [])
+        if task.get("status") == "in_review" and (task.get("links") or {}).get("pr")
+    )
+    if open_prs >= (profile.get("repo") or {}).get("concurrency", 1):
+        return RunResult("concurrency_wait", task_id=task_id)
 
     ctx = _Ctx(
         queue=queue, task_id=task_id, profile=profile, factory_root=factory_root,
@@ -688,6 +719,175 @@ def _finish_unrecorded_publish(
     task["links"] = {**(task.get("links") or {}), "pr": url}
     queue.transition(task_id, "in_review")
     return RunResult("pr_opened", task_id, pr=url)
+
+
+def _fetch_sha(repo: Path, remote: str, ref: str) -> str:
+    """Fetch ``ref`` from ``remote`` (full, not blob-filtered) → its sha.
+
+    Full on purpose: the sweep's scratch clone must be able to check out
+    and merge both the new default head and the PR branch, and the clone
+    is a ``--filter=blob:none`` partial whose lazy blob fetches go to the
+    local source repo — which may hold neither. Two refs of full objects
+    cost far less than a merge that dies mid-checkout.
+    """
+    proc = subprocess.run(
+        ["git", *GIT_HARDENING, "-C", str(repo), "fetch", "--quiet", "--no-tags",
+         remote, ref],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        raise RunError(
+            f"cannot fetch {ref!r} from {remote}: {proc.stderr.strip()[:500]}. "
+            "The run refuses to judge an open PR against an unknown base."
+        )
+    return _git_out(repo, "rev-parse", "--verify", "FETCH_HEAD")
+
+
+def _slice_id_of(task: dict) -> str:
+    """The slice the task's logged attempts belong to (unsliced: the id)."""
+    attempts = task.get("attempts") or []
+    return attempts[-1].get("slice_id") or task["id"]
+
+
+def _sweep_stale_prs(
+    queue: TaskQueue, profile: dict, *, factory_root: Path,
+    srt_bin_path: Path | None, gate_timeout_sec: int,
+) -> RunResult | None:
+    """F-26 AC-3: bring every open factory PR's readiness up to date.
+
+    For each task ``in_review`` with PR and branch links, fetch the
+    remote's default-branch head and the PR branch into a scratch clone.
+    When the PR branch already contains the default head there is nothing
+    to do. Otherwise the PR is stale: merge it onto the new base and
+    re-run L0 and L1 on the merged tree — locally proving the merge a
+    strict branch-protection setting (or the ``branch_protection:
+    unavailable`` self-enforcement, AC-1) would force before it happens.
+    A failure — merge conflict or gates — escalates ``stale_base``: the
+    PR was only ever validated on the base it was built on. A pass is
+    recorded in the progress log; the task stays ``in_review``, its
+    readiness now proven against the current default head. Runs
+    unconditionally: for a strictly-protected repo this merely front-runs
+    what GitHub enforces at merge time.
+
+    Returns:
+        A ``needs_human`` result when a stale PR failed re-validation, or
+        None (all open PRs up to date, or none open).
+
+    Raises:
+        RunError: The remote (or the PR branch on it) can't be fetched.
+    """
+    open_prs = [
+        task for task in queue.doc.get("tasks", [])
+        if task.get("status") == "in_review"
+        and (task.get("links") or {}).get("pr")
+        and (task.get("links") or {}).get("branch")
+    ]
+    if not open_prs:
+        return None
+    repo_cfg = profile["repo"]
+    project = profile["name"]
+    source = Path(repo_cfg["path"]).expanduser()
+    default_branch = repo_cfg["default_branch"]
+    for task in open_prs:
+        task_id = task["id"]
+        branch = task["links"]["branch"]
+        work = create_run(project, source, factory_root=factory_root,
+                          ref=default_branch)
+        try:
+            default_sha = _fetch_sha(work.root, repo_cfg["remote"], default_branch)
+            pr_sha = _fetch_sha(work.root, repo_cfg["remote"], branch)
+            if git_rc(work.root, "merge-base", "--is-ancestor",
+                      default_sha, pr_sha) == 0:
+                continue  # the PR branch already contains the default head
+
+            # Stale: merge the PR onto the new base; a conflict is itself
+            # a re-validation failure (the merge a human would attempt).
+            hardened_git(work.root, "checkout", "-q", "--detach", pr_sha)
+            merge = subprocess.run(
+                ["git", *GIT_HARDENING, "-C", str(work.root), *_IDENTITY,
+                 "merge", "--no-edit", default_sha],
+                capture_output=True, text=True,
+            )
+            reports: dict = {"L0": None, "L1": None, "L2": None}
+            note: str | None = None
+            merged_sha: str | None = None
+            if merge.returncode != 0:
+                note = (
+                    f"merge conflict: {branch} does not merge onto "
+                    f"{default_branch}@{default_sha[:12]} ({merge.stderr.strip()[:300]})"
+                )
+            else:
+                merged_sha = _git_out(work.root, "rev-parse", "--verify", "HEAD")
+                clean = create_run(project, work.root, factory_root=factory_root,
+                                   ref=merged_sha)
+                try:
+                    _gate_settings(profile, clean, factory_root)
+                    runner = sandboxed_runner(clean.root, clean.settings_path,
+                                              srt_bin_path=srt_bin_path)
+                    live = queue.get(task_id)
+                    l0 = run_l0(profile, clean.root, default_sha, merged_sha,
+                                task=live, runner=runner, timeout_sec=gate_timeout_sec)
+                    reports["L0"] = l0.to_dict()
+                    l1 = None
+                    if l0.verdict == "pass" and not l0.escalations:
+                        l1 = run_l1(profile, clean.root, default_sha, merged_sha,
+                                    task=live, runner=runner,
+                                    timeout_sec=gate_timeout_sec)
+                        reports["L1"] = l1.to_dict()
+                    if l0.verdict != "pass":
+                        note = f"L0 failed on {branch} merged onto {default_sha[:12]}"
+                    elif l0.escalations:
+                        note = ("L0 escalations on the merged tree: "
+                                + ", ".join(l0.escalations))
+                    elif l1 is None or l1.verdict != "pass":
+                        note = f"L1 failed on {branch} merged onto {default_sha[:12]}"
+                finally:
+                    cleanup_run(clean)
+
+            reports_dir = (factory_root / "reports" / project
+                           / re.sub(r"[^\w.-]", "_", task_id))
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            report_path = reports_dir / f"{work.run_id}-revalidate.json"
+            report_path.write_text(
+                json.dumps(reports, indent=2, ensure_ascii=False) + "\n")
+
+            if note is not None:
+                attempt = {
+                    "run_id": work.run_id,
+                    "slice_id": _slice_id_of(queue.get(task_id)),
+                    "started": now_iso(),
+                    "ended": now_iso(),
+                    "outcome": "escalated",
+                    "rounds": 0,
+                    "turns": 0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "prompt_versions": dict(prompt_versions(profile)),
+                    "skills": [],  # setting_sources=[]: no session ran
+                    "escalation": "stale_base",
+                    "note": note,
+                    "validator_report": str(report_path),
+                }
+                findings = _numbered_findings(reports, [f"[stale_base] {note}"])
+                queue.append_attempt(task_id, attempt)
+                ProgressLog.for_task(factory_root, project, task_id).append({
+                    "run_id": work.run_id, "outcome": "escalated",
+                    "escalation": "stale_base", "findings": findings,
+                })
+                queue.transition(task_id, "needs_human")
+                return RunResult("needs_human", task_id, escalation="stale_base",
+                                 reports=reports)
+            # Pass: no attempt (no session ran, no budget spent); the
+            # readiness record is the log entry plus the stored report.
+            ProgressLog.for_task(factory_root, project, task_id).append({
+                "run_id": work.run_id, "outcome": "pass",
+                "note": (f"stale-base re-validation: L0+L1 pass on {branch} "
+                         f"merged onto {default_branch}@{default_sha[:12]} "
+                         f"({report_path.name})"),
+            })
+        finally:
+            cleanup_run(work)
+    return None
 
 
 def _build_on_remote_default(work: RunDir, remote: str, default_branch: str) -> None:
@@ -1176,6 +1376,8 @@ def run_loop(queue_path: Path | str, profile_path: Path | str | None = None,
     results: list[RunResult] = []
     stops = {"idle": "queue_empty", "quota_exhausted": "quota_exhausted",
              "peak_window": "peak_window", "needs_human": "escalation",
+             # F-26: the open-PR limit is taken; the ready task waits.
+             "concurrency_wait": "concurrency_wait",
              # A broken orchestrator stops the loop: it must not drain the
              # attempt budget unattended (each error round spends a session).
              "error": "error"}

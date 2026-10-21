@@ -87,6 +87,7 @@ ALLOWED_TRANSITIONS: dict[tuple[str, str], str] = {
     ("in_progress", "draft"): "contract changed",
     ("in_review", "deploying"): "PR merged",
     ("in_review", "in_progress"): "you rejected the PR; fix round",
+    ("in_review", "needs_human"): "stale base failed re-validation on the new default head (F-26)",
     ("in_review", "draft"): "contract changed",
     ("deploying", "needs_human"): "L4 live check failed (reverted)",
     ("deploying", "awaiting_owner"): "L4 passed, owner steps still open",

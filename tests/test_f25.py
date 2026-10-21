@@ -520,7 +520,10 @@ class Env:
         return TaskQueue(self.queue_path).get(task_id)
 
     def run(self, session_runner, **kwargs):
+        from factory.mergeorder import Protection
+
         kwargs.setdefault("now", lambda: OFF_PEAK)
+        kwargs.setdefault("protection", lambda r, b: Protection(checked=True, strict=True))
         return run_once(
             self.queue_path,
             factory_root=self.root,
