@@ -20,7 +20,7 @@
       "enum": ["auth", "payments", "rls", "migration", "safety", "privacy", "new_dependency", "deploy", "cross_repo", "external_service", "factory_control"]
     },
     "escalation": {
-      "enum": ["attempts_exhausted", "budget_exhausted", "risk_path_touched", "new_dependency", "protected_path_touched", "contract_ambiguous", "quota_exhausted", "live_check_failed", "cross_repo", "pr_create_failed", "orchestrator_error", "publish_refused", "review_not_converging"]
+      "enum": ["attempts_exhausted", "budget_exhausted", "risk_path_touched", "new_dependency", "protected_path_touched", "contract_ambiguous", "quota_exhausted", "live_check_failed", "cross_repo", "pr_create_failed", "orchestrator_error", "publish_refused", "review_not_converging", "sentinel_failed", "credential_added"]
     },
     "check": {
       "type": "object",
@@ -76,7 +76,23 @@
         "escalation": { "$ref": "#/$defs/escalation" },
         "prompt_versions": { "type": "object", "description": "seat -> prompt content hash (F-09); used for credit assignment in F-19", "additionalProperties": { "type": "string" } },
         "skills": { "type": "array", "items": { "type": "string" }, "description": "Skills loaded in the session, name@version" },
-        "note": { "type": "string" }
+        "note": { "type": "string" },
+        "sentinels": {
+          "type": "array",
+          "description": "Sentinel results recorded for this attempt (F-25): every sentinel L0 ran, pass or fail, so the human merge sees what was checked.",
+          "items": {
+            "type": "object",
+            "required": ["name", "kind", "verdict"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string" },
+              "kind": { "enum": ["builtin", "project"] },
+              "verdict": { "enum": ["pass", "fail", "skipped"] },
+              "risk_flag": { "type": "string" },
+              "detail": { "type": "string" }
+            }
+          }
+        }
       }
     },
     "task": {

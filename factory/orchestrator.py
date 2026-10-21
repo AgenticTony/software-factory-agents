@@ -33,8 +33,11 @@ Trust boundaries, each enforced in code rather than prose:
   entries 1..N, read-only, from outside the clone.
 
 Escalation rules (VALIDATOR-SPEC "Rounds and escalation"): L0's
-protected-path, new-dependency and risk-path hits escalate immediately —
-retrying can't make them safe. A failed round goes back to the implementer
+credential, protected-path, sentinel-failure, new-dependency and
+risk-path hits escalate immediately — retrying can't make them safe (a
+credential found by L0 sits in the run branch's LOCAL history: nothing
+is pushed before a passing round, but a passing retry would push that
+earlier commit). A failed round goes back to the implementer
 with numbered findings until ``budget.max_attempts`` attempts (counted
 across runs; ``aborted`` ones excluded) are spent, then ``needs_human`` with
 ``attempts_exhausted``. A FAIL the next round cannot act on escalates
@@ -107,7 +110,13 @@ OpenPR = Callable[[PullRequest], str]
 _QUOTA = re.compile(r"(?<!\d)429(?!\d)|rate[ _-]?limit|quota", re.IGNORECASE)
 
 # L0 escalation classes, most severe first (one escalation per attempt).
-_L0_ESCALATION_ORDER = ("protected_path_touched", "new_dependency", "risk_path_touched")
+# credential_added leads: the model provider saw the token (rotate it), and
+# a passing retry would push the branch whose local history still contains
+# the credential commit — nothing is pushed at find time.
+_L0_ESCALATION_ORDER = (
+    "credential_added", "protected_path_touched", "sentinel_failed",
+    "new_dependency", "risk_path_touched",
+)
 
 # Caps on what travels into prompts and the PR body (GitHub refuses bodies
 # over 65,536 characters). The full reports stay on disk.
@@ -887,6 +896,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                 attempt_no, started, "escalated", records, path,
                                 escalation=escalation,
                                 note="L0 escalations: " + ", ".join(l0.escalations),
+                                sentinels=list(l0.sentinel_results),
                             )
                             finish(attempt, "needs_human",
                                    _numbered_findings(reports, [f"[L0 escalation] {escalation}"]))
@@ -1043,7 +1053,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                         title=f"{task_id}: {task.get('title', '')}", body=body,
                     ))
                     opened = True
-                    attempt = attempt_record(attempt_no, started, "pass", records, path, pr=url)
+                    attempt = attempt_record(attempt_no, started, "pass", records, path,
+                                             pr=url, sentinels=list(l0.sentinel_results))
                     queue.append_attempt(task_id, attempt)
                     # A passed round's findings were accepted as non-blocking:
                     # recording their keys would poison a later fix round
@@ -1072,6 +1083,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                     attempt = attempt_record(
                         attempt_no, started, "escalated", records, path,
                         escalation="review_not_converging", note=note,
+                        sentinels=list(l0.sentinel_results) if l0 is not None else None,
                     )
                     finish(attempt, "needs_human", findings, finding_keys=round_keys)
                     return RunResult("needs_human", task_id,
@@ -1079,12 +1091,18 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
 
                 used += 1
                 if attempt_no >= max_attempts:
-                    attempt = attempt_record(attempt_no, started, "escalated", records, path,
-                                             escalation="attempts_exhausted")
+                    attempt = attempt_record(
+                        attempt_no, started, "escalated", records, path,
+                        escalation="attempts_exhausted",
+                        sentinels=list(l0.sentinel_results) if l0 is not None else None,
+                    )
                     finish(attempt, "needs_human", findings, finding_keys=round_keys)
                     return RunResult("needs_human", task_id, escalation="attempts_exhausted",
                                      reports=reports)
-                attempt = attempt_record(attempt_no, started, "fail", records, path)
+                attempt = attempt_record(
+                    attempt_no, started, "fail", records, path,
+                    sentinels=list(l0.sentinel_results) if l0 is not None else None,
+                )
                 finish(attempt, None, findings, finding_keys=round_keys)
                 prev_findings = _fix_findings(
                     reports, extra_findings, l2, reviewed, last_valid_l2)

@@ -54,7 +54,11 @@ flips it, per the verifier's standing rule):
   paths, locked at approval.
 - Skip markers and removed assertions are line heuristics over the diff's
   added/removed lines in test files. A moved assertion trips the rule; a
-  human reviews the FAIL.
+  human reviews the FAIL. All four built-in sentinels (F-25) scan in
+  ``factory.sentinels`` — these two, plus the credential and
+  lint-suppression scanners — which also runs the profile's
+  ``sentinels.<risk flag>`` commands after setup and records one result
+  per sentinel on the report.
 - Command output is scanned for ``file:line`` errors (gcc/ruff and tsc
   styles). A failing command whose output yields no parseable location —
   or that reports a failure no baseline entry can cover (a failed test, a
@@ -87,25 +91,11 @@ from factory.gates import git as _git
 from factory.gates import is_test_file as _is_test_file
 from factory.gates import matches as _matches
 from factory.gates import run_command as _run_command
-
-# Added lines in test files matching any of these -> skip_marker_added.
-SKIP_MARKER_PATTERNS = (
-    re.compile(r"pytest\.mark\.(?:skip|skipif|xfail)"),
-    re.compile(r"\bpytest\.skip\("),
-    re.compile(r"\bskipTest\("),
-    re.compile(r"@unittest\.skip"),
-    re.compile(r"\bthis\.skip\("),
-    re.compile(r"\b(?:it|describe|test|context)\.skip\("),
-    re.compile(r"\b(?:xit|xdescribe)\("),
-    re.compile(r"\b(?:it|describe|test)\.only\("),
-)
-
-# Removed lines in test files matching any of these -> assertion_removed.
-# Substring-level on purpose: catches assertEqual/expect(...) variants;
-# comments mentioning "assert" can false-positive — a human reviews.
-ASSERTION_PATTERNS = (
-    re.compile(r"\bassert"),
-    re.compile(r"\bexpect\("),
+from factory.sentinels import (
+    builtin_sentinel_pass,
+    matched_risk_flags,
+    run_project_sentinels,
+    skipped_project_results,
 )
 
 # Reported-error locations in command output. A failing command with no
@@ -153,6 +143,7 @@ class L0Report(GateReport):
     escalations: list = field(default_factory=list)
     risk_flags_added: list = field(default_factory=list)
     preexisting_notes: list = field(default_factory=list)
+    sentinel_results: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -163,6 +154,7 @@ class L0Report(GateReport):
             "risk_flags_added": self.risk_flags_added,
             "commands": self.commands_as_dicts(),
             "preexisting_notes": self.preexisting_notes,
+            "sentinel_results": self.sentinel_results,
         }
 
 
@@ -203,31 +195,37 @@ def _failure_marker(output: str) -> str | None:
     return None
 
 
-def check_diff_policy(profile: dict, changes: list, task: dict | None = None):
+def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
+                      matched_flags: set | None = None):
     """Apply the L0 diff policy to a set of changed paths.
 
     FAIL classes (findings): protected path touched (modified or deleted),
-    test file deleted, skip marker added, assertion removed. Escalation
-    classes (no FAIL by themselves): undeclared risk path touched
-    (flag added; forces a human merge), dependency manifest changed.
+    test file deleted. Escalation classes (no FAIL by themselves):
+    undeclared risk path touched (flag added; forces a human merge),
+    dependency manifest changed. The skip-marker, assertion, credential
+    and lint-suppression sentinels (F-25) scan in
+    :func:`factory.sentinels.builtin_sentinel_findings`, not here — one
+    home for the standing set.
 
     Args:
         profile: The loaded ``project.yaml`` mapping.
         changes: ``FileChange`` list from ``diff_file_changes``.
         task: The task record (its ``risk`` and acceptance test refs).
+        matched_flags: The diff's matched risk flags, when the caller
+            already computed them (:func:`factory.sentinels.matched_risk_flags`
+            — computed once per L0 run and passed through); ``None``
+            computes them here for direct callers.
 
     Returns:
-        ``(findings, escalations, risk_flags_added)``.
+        ``(findings, escalations, risk_flags_added, matched_flags)``.
     """
     task = task or {}
     paths = profile.get("paths") or {}
     protected = list(paths.get("protected") or []) + sorted(contract_test_files(task))
-    risk_globs = paths.get("risk") or {}
     manifests = profile.get("dependency_manifests") or []
 
     findings: list[Finding] = []
     escalations: set[str] = set()
-    matched_flags: set[str] = set()
 
     def events(change):
         """(path, verb) pairs; a rename deletes the old path, modifies the new."""
@@ -248,9 +246,6 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None):
                     )
                 )
                 escalations.add("protected_path_touched")
-            for flag, globs in risk_globs.items():
-                if _matches(path, globs):
-                    matched_flags.add(flag)
             if _matches(path, manifests):
                 escalations.add("new_dependency")
 
@@ -273,36 +268,14 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None):
                 )
             )
 
-        scan_path = change.old_path if _is_test_file(change.old_path or "") else change.path
-        if not _is_test_file(scan_path):
-            continue
-        for no, text in change.added_lines:
-            if any(p.search(text) for p in SKIP_MARKER_PATTERNS):
-                findings.append(
-                    Finding(
-                        "skip_marker_added",
-                        f"skip/only marker added in {scan_path}:{no}: {text.strip()}",
-                        file=scan_path,
-                        line=no,
-                    )
-                )
-        for no, text in change.removed_lines:
-            if any(p.search(text) for p in ASSERTION_PATTERNS):
-                findings.append(
-                    Finding(
-                        "assertion_removed",
-                        f"assertion removed in {scan_path}:{no}: {text.strip()}",
-                        file=scan_path,
-                        line=no,
-                    )
-                )
-
+    if matched_flags is None:
+        matched_flags = matched_risk_flags(paths.get("risk") or {}, changes)
     risk_flags_added = sorted(matched_flags - set(task.get("risk") or []))
     if risk_flags_added:
         escalations.add("risk_path_touched")
 
     findings.sort(key=lambda f: (f.id, f.file or "", f.line or 0))
-    return findings, sorted(escalations), risk_flags_added
+    return findings, sorted(escalations), risk_flags_added, matched_flags
 
 
 def _load_baseline(profile: dict, repo: Path, base_ref: str):
@@ -519,7 +492,27 @@ def run_l0(
     repo = Path(repo)
     _assert_checkout(repo, head_ref)
     changes = diff_file_changes(repo, base_ref, head_ref)
-    findings, escalations, risk_flags_added = check_diff_policy(profile, changes, task)
+    # Matched risk flags: computed ONCE here and passed through the diff
+    # policy, the built-in sentinels and the project sentinels — one
+    # implementation (factory.sentinels.matched_risk_flags), one
+    # computation per run (F-25 review finding 7).
+    risk_globs = (profile.get("paths") or {}).get("risk") or {}
+    matched = matched_risk_flags(risk_globs, changes)
+    findings, escalations, risk_flags_added, _matched = check_diff_policy(
+        profile, changes, task, matched_flags=matched
+    )
+    # F-25: the built-in sentinel pass — pure diff scans; a credential hit
+    # escalates immediately (nothing is pushed before a passing round, but
+    # a passing retry would push the branch whose local history still
+    # holds the credential commit). Each sentinel leaves a result
+    # (pass/fail) on the report so the attempt record and the PR body can
+    # show what was checked. The project sentinel COMMANDS run later,
+    # after setup (F-25 review finding 1).
+    builtin_findings, sentinel_results, sentinel_escalations = builtin_sentinel_pass(
+        profile, changes, matched
+    )
+    findings.extend(builtin_findings)
+    escalations = sorted(set(escalations) | set(sentinel_escalations))
 
     preexisting: list[str] = []
     missing = None
@@ -535,67 +528,89 @@ def run_l0(
         preexisting.extend(notes)
 
     commands = profile.get("commands") or {}
-    ordered = [("setup", commands.get("setup"))]
-    ordered += [(g, commands.get(g)) for g in _GATE_ORDER]
-    ordered += sorted((f"extra:{k}", v) for k, v in (commands.get("extra") or {}).items())
 
     results: list[CommandResult] = []
-    for name, command in ordered:
-        if not command:
-            continue
-        result = (runner or _run_command)(name, command, repo, timeout_sec)
+    setup_failed = False
+    setup_command = commands.get("setup")
+    if setup_command:
+        result = (runner or _run_command)("setup", setup_command, repo, timeout_sec)
         results.append(result)
-        if name == "setup" and (result.timed_out or result.exit_code != 0):
+        if result.timed_out or result.exit_code != 0:
             findings.append(
                 Finding(
                     "setup_failed",
                     f"setup failed (exit {result.exit_code}); remaining gates skipped",
                 )
             )
-            break
-        if result.exit_code == 0 and not result.timed_out:
-            continue
-        if result.timed_out:
-            findings.append(
-                Finding(
-                    "command_timeout",
-                    f"{name} exceeded {timeout_sec}s: {result.command}",
-                )
-            )
-            continue
-        errors = parse_errors(result.output)
-        if not errors:
-            findings.append(
-                Finding(
-                    "command_failed",
-                    f"{name} exited {result.exit_code} with no parsable error location: "
-                    f"{result.output.strip()[:500]}",
-                )
-            )
-            continue
-        cwd = command_cwd(command)
-        errors = sorted({(repo_relative(f, cwd, repo), n) for f, n in errors})
-        for file, line in errors:
-            if line in known_errors.get(file, set()):
-                preexisting.append(f"{file}:{line} pre-existing (baselined), not a failure")
-            else:
+            setup_failed = True
+    if not setup_failed:
+        # Project sentinel commands run only after setup has succeeded
+        # (F-25 review finding 1): a sentinel may need the environment
+        # setup installs, and a fresh-clone failure before setup would
+        # escalate a correct change. When setup fails they are recorded
+        # skipped, never run.
+        project_findings, project_results, project_escalations = run_project_sentinels(
+            profile, matched, repo, runner=runner, timeout_sec=timeout_sec
+        )
+        findings.extend(project_findings)
+        sentinel_results.extend(project_results)
+        escalations = sorted(set(escalations) | set(project_escalations))
+    else:
+        sentinel_results.extend(
+            skipped_project_results(profile, "setup failed; sentinel not run")
+        )
+
+    ordered = [(g, commands.get(g)) for g in _GATE_ORDER]
+    ordered += sorted((f"extra:{k}", v) for k, v in (commands.get("extra") or {}).items())
+    if not setup_failed:
+        for name, command in ordered:
+            if not command:
+                continue
+            result = (runner or _run_command)(name, command, repo, timeout_sec)
+            results.append(result)
+            if result.exit_code == 0 and not result.timed_out:
+                continue
+            if result.timed_out:
                 findings.append(
                     Finding(
-                        "new_error",
-                        f"{name}: new error at {file}:{line} (not in baseline)",
-                        file=file,
-                        line=line,
+                        "command_timeout",
+                        f"{name} exceeded {timeout_sec}s: {result.command}",
                     )
                 )
-        marker = _failure_marker(result.output)
-        if marker:
-            findings.append(
-                Finding(
-                    "command_failed",
-                    f"{name} exited {result.exit_code} reporting a failure no "
-                    f"baseline entry covers: {marker}",
+                continue
+            errors = parse_errors(result.output)
+            if not errors:
+                findings.append(
+                    Finding(
+                        "command_failed",
+                        f"{name} exited {result.exit_code} with no parsable error location: "
+                        f"{result.output.strip()[:500]}",
+                    )
                 )
-            )
+                continue
+            cwd = command_cwd(command)
+            errors = sorted({(repo_relative(f, cwd, repo), n) for f, n in errors})
+            for file, line in errors:
+                if line in known_errors.get(file, set()):
+                    preexisting.append(f"{file}:{line} pre-existing (baselined), not a failure")
+                else:
+                    findings.append(
+                        Finding(
+                            "new_error",
+                            f"{name}: new error at {file}:{line} (not in baseline)",
+                            file=file,
+                            line=line,
+                        )
+                    )
+            marker = _failure_marker(result.output)
+            if marker:
+                findings.append(
+                    Finding(
+                        "command_failed",
+                        f"{name} exited {result.exit_code} reporting a failure no "
+                        f"baseline entry covers: {marker}",
+                    )
+                )
 
     if min_tests is not None:
         test_result = next((r for r in results if r.name == "test"), None)
@@ -624,4 +639,5 @@ def run_l0(
         risk_flags_added=risk_flags_added,
         command_results=results,
         preexisting_notes=sorted(set(preexisting)),
+        sentinel_results=sentinel_results,
     )
