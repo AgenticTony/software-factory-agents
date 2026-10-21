@@ -626,9 +626,17 @@ def test_review6_merge_failure_classification(tmp_path: Path):
     (repo / "f").write_text("main\n")
     _git(repo, "-c", "user.email=x@x", "-c", "user.name=x", "add", "-A")
     _git(repo, "-c", "user.email=x@x", "-c", "user.name=x", "commit", "-qm", "moved")
-    proc = subprocess.run(["git", "-C", str(repo), "merge", "--no-edit", "other"],
-                          capture_output=True, text=True)
-    assert proc.returncode != 0
+    # Identity + LC_ALL=C mirror the sweep's merge invocation: a machine
+    # without an ambient git identity (CI's fresh runners) refuses the
+    # merge with rc=128 "Committer identity unknown" BEFORE conflicting,
+    # leaving no unmerged paths — the production merge always carries
+    # _IDENTITY, and so does the fixture.
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=x@x", "-c", "user.name=x",
+         "merge", "--no-edit", "other"],
+        capture_output=True, text=True,
+        env={**__import__("os").environ, "LC_ALL": "C", "LANG": "C"})
+    assert proc.returncode == 1  # a conflict, not an identity refusal
     assert _conflict_paths(repo) == ["f"]
 
 
