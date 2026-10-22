@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-21T13:52:45Z",
+  "updated_at": "2026-10-22T12:09:59Z",
   "tasks": [
     {
       "id": "F-00",
@@ -1702,7 +1702,7 @@
       "source": "BUILD-ORDER.md#f-26--merges-in-order",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-10"
       ],
@@ -1747,7 +1747,10 @@
         "wall_clock_min": 90
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "acceptance_hash": "1672d067e4830931ea1985e45b2b1d47b8c8dc043140dc075a4e75cd261bea39",
+      "approved_at": "2026-10-22T12:09:59Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-27",
