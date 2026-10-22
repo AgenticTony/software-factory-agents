@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
-from factory.progress import ProgressLog, safe_name
+from factory.progress import ProgressLog, ProgressLogError, safe_name
 from factory.sentinels import redact_credentials
 from factory.state import now_iso
 
@@ -53,6 +53,10 @@ VENT_CATEGORIES = (
 # Text is length-capped: one vent is a note, not a transcript.
 VENT_TEXT_CAP = 2000
 VENT_TOOL_NAME = "vent"
+# What the CLI calls the tool (and so what ``allowed_tools`` must name):
+# SDK MCP tools are exposed as ``mcp__<server>__<tool>``, and the server is
+# registered under VENT_TOOL_NAME too.
+VENT_QUALIFIED_NAME = f"mcp__{VENT_TOOL_NAME}__{VENT_TOOL_NAME}"
 VENT_TRUNCATED = " …[vent truncated]"
 
 # Vents older than this drop out of the weekly grouping (F-11's "the
@@ -63,13 +67,19 @@ VENT_WINDOW_DAYS = 7
 class VentCollector:
     """In-memory vent sink living inside one session's runner process.
 
-    The runner increments :attr:`turn` as assistant messages stream past,
-    so a vent made mid-stream is stamped with the turn it happened in
-    (best effort, single asyncio loop: the SDK invokes the in-process
-    handler between stream messages). :func:`record` is the handler's one
-    effect — it appends to :attr:`vents` and nothing else; the sandboxed
-    runner cannot reach the real log, and the orchestrator flushes
-    :attr:`vents` into it once the session returns.
+    Turns: the runner feeds every assistant message to
+    :meth:`observe`. One API turn streams as several messages (one per
+    content block) sharing a ``message_id``, so a turn is a distinct id.
+    The SDK may run the handler before the consumer has pulled the
+    message carrying its ``tool_use`` block, so :meth:`record` stamps the
+    turn seen so far and :meth:`observe` later re-stamps the vent with the
+    turn of its own ``tool_use`` block (matched by its input). A session
+    cut off before that block was consumed keeps the call-time turn.
+
+    :meth:`record` is the handler's one effect — it appends to
+    :attr:`vents` and nothing else; the sandboxed runner cannot reach the
+    real log, and the orchestrator flushes :attr:`vents` into it once the
+    session returns.
     """
 
     def __init__(self, run_id: str, task_id: str, seat: str) -> None:
@@ -78,6 +88,44 @@ class VentCollector:
         self.seat = seat
         self.turn = 0
         self.vents: list[dict[str, Any]] = []
+        self._seen_ids: set[str] = set()
+        # (category, raw text) per vent, parallel to ``vents`` — the key a
+        # tool_use block's input is matched on; never leaves the runner.
+        self._keys: list[tuple[str, str]] = []
+        self._matched: list[bool] = []
+        # tool_use inputs seen in the stream, not yet matched to a vent.
+        self._pending: list[tuple[int, tuple[str, str]]] = []
+
+    def observe(self, message: Any) -> None:
+        """Count turns and match vent ``tool_use`` blocks to their vents.
+
+        Subagent messages (``parent_tool_use_id`` set) do not advance the
+        session's turn; a vent a subagent makes takes the current turn.
+        """
+        if getattr(message, "parent_tool_use_id", None) is None:
+            message_id = getattr(message, "message_id", None)
+            if message_id is None or message_id not in self._seen_ids:
+                self.turn += 1
+                if message_id is not None:
+                    self._seen_ids.add(message_id)
+        for block in getattr(message, "content", None) or []:
+            if getattr(block, "name", None) != VENT_QUALIFIED_NAME:
+                continue
+            raw = getattr(block, "input", None) or {}
+            key = (str(raw.get("category")), str(raw.get("text")))
+            self._pending.append((self.turn, key))
+        self._match()
+
+    def _match(self) -> None:
+        for index, key in enumerate(self._keys):
+            if self._matched[index]:
+                continue
+            for slot, (turn, pending_key) in enumerate(self._pending):
+                if pending_key == key:
+                    self.vents[index]["turn"] = turn
+                    self._matched[index] = True
+                    del self._pending[slot]
+                    break
 
     def record(self, category: str, text: str) -> dict[str, Any]:
         """Validate, cap and redact one vent; return the stored record.
@@ -93,24 +141,37 @@ class VentCollector:
                 f"unknown vent category {category!r}: expected one of "
                 f"{list(VENT_CATEGORIES)}"
             )
-        text = str(text)
-        if len(text) > VENT_TEXT_CAP:
-            text = text[: VENT_TEXT_CAP - len(VENT_TRUNCATED)] + VENT_TRUNCATED
-        # F-25's invariant, held for the same reason: untrusted session
-        # text is redacted before it reaches orchestrator-owned storage
-        # (a model echoing a credential into a complaint must not persist
-        # it into the logs `factory status` later prints).
-        text = redact_credentials(text)
+        raw = str(text)
         vent = {
             "run_id": self.run_id,
             "task_id": self.task_id,
             "seat": self.seat,
             "turn": self.turn,
             "category": category,
-            "text": text,
+            "text": clean_text(raw),
+            # When the call was made, not when the session returned.
+            "at": now_iso(),
         }
         self.vents.append(vent)
+        self._keys.append((category, raw))
+        self._matched.append(False)
+        self._match()  # the tool_use block may already have streamed past
         return vent
+
+
+def clean_text(text: str) -> str:
+    """Redact, THEN cap (review finding 2: capping first could cut a
+    credential in half and leave a prefix no pattern matches).
+
+    F-25's invariant, held for the same reason: untrusted session text is
+    redacted before it reaches orchestrator-owned storage — a model echoing
+    a credential into a complaint must not persist it into the logs
+    `factory status` later prints.
+    """
+    text = redact_credentials(text)
+    if len(text) > VENT_TEXT_CAP:
+        text = text[: VENT_TEXT_CAP - len(VENT_TRUNCATED)] + VENT_TRUNCATED
+    return text
 
 
 def make_vent_tool(collector: VentCollector) -> "SdkMcpTool[Any]":
@@ -171,23 +232,59 @@ def vent_server(collector: VentCollector) -> "McpSdkServerConfig":
 
 
 def flush_vents(
-    log: ProgressLog, vents: "Sequence[dict[str, Any]]", *, at: str | None = None
+    log: ProgressLog,
+    vents: "Sequence[Any]",
+    *,
+    at: str | None = None,
+    run_id: str | None = None,
+    task_id: str | None = None,
+    seat: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Append one progress-log entry per vent record, stamped ``at``.
+    """Append one progress-log entry per valid vent, as one batch.
 
     The orchestrator-side half of AC-2: called the moment a session
-    returns (its record carried the vents out of the sandbox), so each
-    tool call becomes exactly one log entry — ``kind: "vent"`` plus every
-    field the record stamped — in the task's canonical log outside every
-    clone. An empty ``vents`` is a no-op.
+    returns, so each tool call becomes exactly one log entry in the task's
+    canonical log outside every clone. An empty ``vents`` is a no-op.
+
+    ``vents`` crossed the sandbox boundary on the runner's stdout, so they
+    are untrusted (review finding 1): every entry is rebuilt from the
+    whitelisted fields only — ``kind`` is always ``"vent"``, and no
+    ``n``/``prev``/``finding_keys``/``findings`` can ride in. A vent that
+    is not a mapping, has a category outside :data:`VENT_CATEGORIES` or a
+    non-string text is dropped; text is redacted and capped again here;
+    ``run_id``/``task_id``/``seat``, when given, override what the record
+    claims (the orchestrator knows which session it ran).
+
+    ``at`` is the flush time: the fallback stamp for a vent whose own
+    ``at`` (stamped at call time) is missing, unparsable or later than the
+    flush — a vent cannot be dated into the future to linger in the
+    weekly window.
     """
     stamp = at or now_iso()
-    stored = []
+    ceiling = _parse_at(stamp)
+    entries = []
     for vent in vents:
-        stored.append(
-            log.append({"kind": "vent", **vent, "at": stamp})
-        )
-    return stored
+        if not isinstance(vent, dict):
+            continue
+        category, text = vent.get("category"), vent.get("text")
+        if category not in VENT_CATEGORIES or not isinstance(text, str):
+            continue
+        turn = vent.get("turn")
+        made = vent.get("at")
+        made_at = _parse_at(made) if isinstance(made, str) else None
+        keep_made = made_at is not None and (ceiling is None or made_at <= ceiling)
+        entries.append({
+            "kind": "vent",
+            "run_id": run_id if run_id is not None else str(vent.get("run_id", "")),
+            "task_id": task_id if task_id is not None else str(vent.get("task_id", "")),
+            "seat": seat if seat is not None else str(vent.get("seat", "")),
+            "turn": turn if isinstance(turn, int) and not isinstance(turn, bool)
+            and turn >= 0 else 0,
+            "category": category,
+            "text": clean_text(text),
+            "at": made if keep_made else stamp,
+        })
+    return log.append_many(entries)
 
 
 def _parse_at(text: str) -> datetime | None:
@@ -203,6 +300,7 @@ def weeks_vents(
     project: str,
     *,
     now: datetime | None = None,
+    unreadable: list[str] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """The project's vents from the trailing seven days, grouped by
     category — the one reading seam `factory status` (F-11) lists and the
@@ -215,6 +313,11 @@ def weeks_vents(
     ``at`` stay (a malformed stamp must not hide a vent from the owner);
     entries that are not vents are ignored. Read-only: nothing under
     ``factory_root`` is written.
+
+    A task log that fails to parse or verify is skipped, not raised (one
+    corrupt file must not hide every other task's vents); its path is
+    appended to ``unreadable`` when the caller passes a list, so the status
+    page can say so.
     """
     root = Path(factory_root) / "progress" / safe_name(project)
     moment = now or datetime.now(timezone.utc)
@@ -225,7 +328,13 @@ def weeks_vents(
     if not root.is_dir():
         return grouped
     for path in sorted(root.glob("*.jsonl")):
-        for entry in ProgressLog(path).entries():
+        try:
+            entries = ProgressLog(path).entries()
+        except (ProgressLogError, OSError, UnicodeDecodeError):
+            if unreadable is not None:
+                unreadable.append(str(path))
+            continue
+        for entry in entries:
             if entry.get("kind") != "vent":
                 continue
             if entry.get("category") not in grouped:

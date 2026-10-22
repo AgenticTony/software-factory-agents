@@ -63,6 +63,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -287,6 +288,26 @@ def reclaim_runs(queue: TaskQueue, project: str, factory_root: Path) -> list[Pat
 def _branch_name(task_id: str, run_id: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", task_id.lower()).strip("-") or "task"
     return f"factory/{slug}-{run_id.lower()}"
+
+
+def _log_vents(log: ProgressLog, record: SessionRecord, seat: str,
+               run_id: str, task_id: str) -> None:
+    """Flush a session's vents into the task's progress log (F-27).
+
+    Telemetry, never control flow (AC-3, review finding 5): a flush that
+    fails — a broken log chain, a full disk — costs the vents, reported on
+    stderr, never the attempt record or the run. The orchestrator stamps
+    the run, task and seat it actually ran; the record's own claims about
+    them are untrusted (they crossed the sandbox boundary).
+    """
+    try:
+        flush_vents(log, record.vents, run_id=run_id, task_id=task_id, seat=seat)
+    except Exception as exc:  # noqa: BLE001 — telemetry must not crash a run
+        print(
+            f"factory: {task_id} {seat} vents not logged "
+            f"({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
 
 
 def _is_quota(record: SessionRecord) -> bool:
@@ -1492,7 +1513,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                 # F-27: the session's vents reach the task's progress log
                 # the moment the session returns — before any gate can
                 # crash, and whatever the session's outcome was.
-                flush_vents(log, impl.vents)
+                _log_vents(log, impl, "implementer", work.run_id, task_id)
                 if _is_quota(impl):
                     attempt = attempt_record(attempt_no, started, "aborted", records, None,
                                              escalation="quota_exhausted", note=impl.reason)
@@ -1617,7 +1638,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                             )
                             session_seconds += time.monotonic() - t0
                             records.append(review)
-                            flush_vents(log, review.vents)  # F-27, as above
+                            _log_vents(log, review, "reviewer",  # F-27, as above
+                                       work.run_id, task_id)
                             if _is_quota(review):
                                 attempt = attempt_record(
                                     attempt_no, started, "aborted", records, None,

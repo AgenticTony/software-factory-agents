@@ -32,7 +32,8 @@ Seats:
   wait forever for an approval nobody can give).
 
 Both seats carry one extra tool (F-27): ``vent(category, text)``, an
-in-process SDK tool (``factory.vent``) listed in ``allowed_tools``. The
+in-process SDK tool (``factory.vent``) the CLI exposes as
+``mcp__vent__vent``, listed under that name in ``allowed_tools``. The
 handler runs inside this sandboxed runner, so it only appends to an
 in-memory collector; the vents ride the record out and the orchestrator
 flushes them into the task's progress log. Venting never touches the
@@ -90,7 +91,7 @@ from factory.sandbox import (
     run_sandboxed,
     write_settings,
 )
-from factory.vent import VENT_TOOL_NAME, VentCollector, vent_server
+from factory.vent import VENT_QUALIFIED_NAME, VENT_TOOL_NAME, VentCollector, vent_server
 
 DEFAULT_BASE_URL = "https://api.z.ai/api/anthropic"
 DEFAULT_TIMEOUT_MS = 600_000
@@ -303,15 +304,17 @@ SEATS: dict[str, SeatConfig] = {
         # Both seats carry the vent tool (F-27 AC-1): a grant-list entry
         # (allowed_tools auto-allows without prompting; it restricts
         # nothing), with the in-process server attached per session by
-        # build_options from the run's collector.
-        allowed_tools=("vent",),
+        # build_options from the run's collector. The grant names the tool
+        # as the CLI sees it (``mcp__vent__vent``), so it still holds if a
+        # seat ever leaves bypassPermissions (review finding 4).
+        allowed_tools=(VENT_QUALIFIED_NAME,),
         # See the module docstring: the sandbox is the permission system;
         # prompts are bypassed, hooks + srt enforce the policy.
         permission_mode="bypassPermissions",
     ),
     "reviewer": SeatConfig(
         name="reviewer",
-        allowed_tools=("vent",),
+        allowed_tools=(VENT_QUALIFIED_NAME,),
         # WO: "the reviewer gets no Write/Edit". NotebookEdit is the same
         # class of tool, so it goes too — a reviewer that cannot mutate.
         disallowed_tools=("Write", "Edit", "NotebookEdit"),
@@ -983,11 +986,10 @@ async def run_session(
                     except asyncio.TimeoutError as exc:
                         raise _WallClock() from exc
                     if isinstance(message, AssistantMessage):
-                        # The turn a vent lands in (F-27): assistant turns
-                        # counted as they stream past, so the in-process
-                        # tool handler — invoked between messages on this
-                        # same loop — stamps the current turn.
-                        vent_collector.turn += 1
+                        # The turn a vent lands in (F-27): distinct message
+                        # ids counted, and each vent re-stamped with the
+                        # turn of its own tool_use block (VentCollector).
+                        vent_collector.observe(message)
                     if isinstance(message, ResultMessage):
                         result_message = message
             except _WallClock:

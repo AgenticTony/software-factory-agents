@@ -109,21 +109,47 @@ class ProgressLog:
             ProgressLogError: The existing log fails verification, or the
                 entry tries to set ``n``/``prev`` itself.
         """
-        if {"n", "prev"} & set(entry):
-            raise ProgressLogError("entries may not set 'n' or 'prev': the log numbers them")
+        return self.append_many([entry])[0]
+
+    def append_many(self, entries: "list[dict]") -> list[dict]:
+        """Append several entries under one lock, one read-and-verify and
+        one fsync — chained exactly as the same number of :meth:`append`
+        calls would chain them (F-27: a session's vents flush as a batch).
+
+        Args:
+            entries: JSON-serialisable mappings; none may set ``n``/``prev``.
+
+        Returns:
+            The stored entries, in order ([] for an empty batch, which
+            touches nothing).
+
+        Raises:
+            ProgressLogError: The existing log fails verification, or an
+                entry tries to set ``n``/``prev`` itself (nothing is written).
+        """
+        for entry in entries:
+            if {"n", "prev"} & set(entry):
+                raise ProgressLogError("entries may not set 'n' or 'prev': the log numbers them")
+        if not entries:
+            return []
         self.path.parent.mkdir(parents=True, exist_ok=True)
         lock = self.path.with_name(self.path.name + ".lock")
         with lock.open("w") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
-                entries, prev = self._read()
-                record = {"n": len(entries) + 1, "prev": prev, **entry}
-                line = json.dumps(record, sort_keys=True, ensure_ascii=False)
+                existing, prev = self._read()
+                stored, lines = [], []
+                for offset, entry in enumerate(entries):
+                    record = {"n": len(existing) + offset + 1, "prev": prev, **entry}
+                    line = json.dumps(record, sort_keys=True, ensure_ascii=False)
+                    prev = _digest(line)
+                    stored.append(record)
+                    lines.append(line + "\n")
                 with self.path.open("a") as fh:
-                    fh.write(line + "\n")
+                    fh.write("".join(lines))
                     fh.flush()
                     os.fsync(fh.fileno())
-                return record
+                return stored
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
