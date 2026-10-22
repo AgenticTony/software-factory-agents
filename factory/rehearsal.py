@@ -53,6 +53,7 @@ import yaml
 
 from factory.contract import acceptance_hash
 from factory.gates import git as hardened_git
+from factory.mergeorder import Protection
 from factory.orchestrator import run_once
 from factory.publish import PullRequest
 from factory.runs import GIT_HARDENING
@@ -472,6 +473,11 @@ def run_rehearsal(
         session_runner=_RehearsalSeats(),
         open_pr=open_pr,
         now=now or (lambda: datetime.now(timezone.utc)),
+        # The fixture remote is a local path; the real gh seams can't
+        # answer for it. The rehearsal exercises run mechanics, not
+        # admission or PR-state tracking.
+        protection=lambda remote, branch: Protection(checked=True, strict=True),
+        pr_state=lambda url: "open",
     )
     if result.outcome != "pr_opened":
         detail = f"escalation {result.escalation}" if result.escalation else "no escalation"

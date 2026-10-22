@@ -20,7 +20,7 @@
       "enum": ["auth", "payments", "rls", "migration", "safety", "privacy", "new_dependency", "deploy", "cross_repo", "external_service", "factory_control"]
     },
     "escalation": {
-      "enum": ["attempts_exhausted", "budget_exhausted", "risk_path_touched", "new_dependency", "protected_path_touched", "contract_ambiguous", "quota_exhausted", "live_check_failed", "cross_repo", "pr_create_failed", "orchestrator_error", "publish_refused", "review_not_converging", "sentinel_failed", "credential_added"]
+      "enum": ["attempts_exhausted", "budget_exhausted", "risk_path_touched", "new_dependency", "protected_path_touched", "contract_ambiguous", "quota_exhausted", "live_check_failed", "cross_repo", "pr_create_failed", "orchestrator_error", "publish_refused", "review_not_converging", "sentinel_failed", "credential_added", "stale_base", "pr_closed"]
     },
     "check": {
       "type": "object",
@@ -160,7 +160,21 @@
             "pr": { "type": "string" },
             "branch": { "type": "string" },
             "execution_record": { "type": "string" },
-            "step": { "type": "string", "description": "e.g. SoloAdventurer execution-order step number" }
+            "step": { "type": "string", "description": "e.g. SoloAdventurer execution-order step number" },
+            "merged": {
+              "type": "string",
+              "description": "F-26: the URL of the PR GitHub reported merged. Terminal for that PR only — while links.pr equals it, the link is never gh-polled, counted open, or re-validated again and the task waits in in_review for the F-14 deploy gate; a later PR on the task (links.pr changes) is not covered."
+            },
+            "revalidated": {
+              "type": "object",
+              "description": "F-26 stale-base cache: the (pr branch sha, default head sha) pair this PR was last re-validated against. An unchanged pair is not re-run; written by the sweep on every pass.",
+              "additionalProperties": false,
+              "required": ["pr", "default"],
+              "properties": {
+                "pr": { "type": "string" },
+                "default": { "type": "string" }
+              }
+            }
           }
         }
       },

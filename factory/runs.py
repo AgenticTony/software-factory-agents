@@ -76,9 +76,9 @@ def create_run(
         )
 
     runs_root = root / "runs"
-    dest = runs_root / project / _new_run_id()
+    dest = runs_root / project / new_run_id()
     while dest.exists():  # uuid suffix makes this near-impossible; stay safe
-        dest = runs_root / project / _new_run_id()
+        dest = runs_root / project / new_run_id()
 
     # uploadpack.allowFilter: a local file:// server refuses blob filters by
     # default, git then WARNS ("filtering not recognized by server, ignoring")
@@ -157,7 +157,14 @@ def cleanup_run(run: RunDir) -> None:
                   ignore_errors=True)
 
 
-def _new_run_id() -> str:
+def new_run_id() -> str:
+    """One run id (``<UTC-stamp>-<6 hex>``).
+
+    ``create_run`` ids name a run dir; ids minted outside a run (F-26's
+    session-less sweep escalations and recoveries) have no run dir —
+    audit joins key on the id itself, and uniqueness is the contract
+    (round-4 finding 6).
+    """
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{stamp}-{uuid.uuid4().hex[:6]}"
 

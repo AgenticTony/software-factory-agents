@@ -14,6 +14,7 @@ from factory.approve import (
     approve_task,
     default_approver,
     reconcile_bootstrap,
+    recover_task,
 )
 from factory.config import ConfigError, load_config
 from factory.contract import ContractError
@@ -28,10 +29,12 @@ from factory.session import SessionConfigError
 from factory.state import TaskQueue
 from factory.tick import TickError, tick_steps
 
-# run/loop exit codes: 0 = a PR opened, nothing to do, or the peak window;
-# 1 = an escalation needs you; 3 = the quota stop; 2 = the orchestrator
-# itself failed (the task was re-queued, every run dir removed).
+# run/loop exit codes: 0 = a PR opened, nothing to do, the peak window, or
+# the F-26 open-PR limit reached (a ready task waits); 1 = an escalation
+# needs you; 3 = the quota stop; 2 = the orchestrator itself failed (the
+# task was re-queued, every run dir removed).
 _EXIT = {"pr_opened": 0, "idle": 0, "peak_window": 0, "queue_empty": 0,
+         "concurrency_wait": 0,
          "needs_human": 1, "escalation": 1, "quota_exhausted": 3, "error": 2}
 _RUN_ERRORS = (ConfigError, ContractError, GateError, PRBodyError, ProgressLogError,
                PublishError, PushRefused, RunError, SandboxError, SessionConfigError)
@@ -66,7 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument(
         "--queue",
         default=".factory/tasks.json",
-        help="queue path (default: %(default)s)",
+        help="queue file (default: %(default)s)",
     )
     approve.add_argument(
         "--ledger",
@@ -75,6 +78,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     approve.add_argument(
         "--approved-by", default=None, help="approver name (default: git user.name)"
+    )
+
+    recover = sub.add_parser(
+        "recover", help="queue a fix round for a parked F-26 escalation")
+    recover.add_argument(
+        "task_id", help="task id to recover (stale_base/pr_closed only)")
+    recover.add_argument(
+        "--yes", action="store_true",
+        help="non-interactive confirmation",
+    )
+    recover.add_argument(
+        "--queue", default=".factory/tasks.json",
+        help="queue file (default: %(default)s)",
     )
 
     tick = sub.add_parser("tick", help="tick owner steps of a task (F-29)")
@@ -130,6 +146,22 @@ def _run_approve(args: argparse.Namespace) -> int:
         return 130
 
 
+def _run_recover(args: argparse.Namespace) -> int:
+    """Dispatch the recover subcommand; refusals exit 1, never a traceback."""
+    try:
+        status = recover_task(
+            TaskQueue(args.queue), args.task_id, assume_yes=args.yes
+        )
+        print(f"{args.task_id}: needs_human -> {status} (fix round queued)")
+        return 0
+    except (ApprovalError, ContractError) as exc:
+        print(f"factory recover: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("factory recover: interrupted", file=sys.stderr)
+        return 130
+
+
 def _run_tick(args: argparse.Namespace) -> int:
     """Dispatch the tick subcommand; refusals exit 1, never a traceback."""
     try:
@@ -147,6 +179,25 @@ def _run_tick(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_extra(result) -> str:
+    """The detail printed after a run's outcome.
+
+    F-26 round-4 finding 3: a concurrency_wait names its cause — the PRs
+    GitHub reports open, and the links whose state couldn't be resolved
+    (which the limit presumes open) — so a scheduled stall never looks
+    like a healthy tick.
+    """
+    if result.outcome == "concurrency_wait":
+        named = [
+            *(f"open: {url}" for url in result.open_prs),
+            *(f"state unknown (counts as open): {url}"
+              for url in result.unresolved_prs),
+        ]
+        if named:
+            return "; ".join(named)
+    return result.pr or result.escalation or ""
+
+
 def _run_orchestrator(args: argparse.Namespace) -> int:
     """Dispatch run/loop; known failures exit 2 with a message, not a traceback."""
     try:
@@ -156,13 +207,18 @@ def _run_orchestrator(args: argparse.Namespace) -> int:
         if args.command == "run":
             result = run_once(Path(args.queue), profile_path=args.profile, **kwargs)
             detail = f" {result.task_id}" if result.task_id else ""
-            extra = result.pr or result.escalation or ""
-            print(f"factory run: {result.outcome}{detail} {extra}".rstrip())
+            print(f"factory run: {result.outcome}{detail} {_run_extra(result)}".rstrip())
+            # F-26 AC-3 (round-7 finding 2): each open PR proven current
+            # against the remote default head, so the owner merges only
+            # what this run reported ready.
+            for line in result.ready_prs:
+                print(f"  ready: {line}")
             return _EXIT[result.outcome]
         loop = run_loop(Path(args.queue), profile_path=args.profile, **kwargs)
         for result in loop.results:
-            extra = result.pr or result.escalation or ""
-            print(f"  {result.task_id or '-'}: {result.outcome} {extra}".rstrip())
+            print(f"  {result.task_id or '-'}: {result.outcome} {_run_extra(result)}".rstrip())
+            for line in result.ready_prs:
+                print(f"    ready: {line}")
         print(f"factory loop: stopped ({loop.stop_reason}) after {len(loop.results)} run(s)")
         return _EXIT[loop.stop_reason]
     except _RUN_ERRORS as exc:
@@ -197,6 +253,8 @@ def main(argv: list | None = None) -> int:
                 "plain markdown, so reconcile confirms every entry interactively"
             )
         return _run_approve(args)
+    if args.command == "recover":
+        return _run_recover(args)
     if args.command in ("run", "loop"):
         return _run_orchestrator(args)
     if args.command == "tick":

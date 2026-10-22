@@ -155,10 +155,15 @@ class Env:
         task = self.task()
         return json.loads(Path(task["attempts"][attempt_no - 1]["validator_report"]).read_text())
 
-    def run(self, session_runner):
+    def run(self, session_runner, **kwargs):
+        from factory.mergeorder import Protection
+
+        kwargs.setdefault("now", lambda: OFF_PEAK)
+        kwargs.setdefault("protection", lambda r, b: Protection(checked=True, strict=True))
+        kwargs.setdefault("pr_state", lambda url: "open")
         return run_once(
             self.queue_path, factory_root=self.root, session_runner=session_runner,
-            open_pr=self.open_pr, now=lambda: OFF_PEAK,
+            open_pr=self.open_pr, **kwargs,
         )
 
 

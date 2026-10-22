@@ -36,6 +36,7 @@ from factory.config import ConfigError, PeakWindow, in_peak_window, load_config
 from factory.contract import ContractError, acceptance_hash
 from factory.gates import CommandResult
 from factory.l1 import L1Report
+from factory.mergeorder import Protection
 from factory.orchestrator import (
     PullRequest,
     reclaim_runs,
@@ -74,6 +75,10 @@ TEST_SOURCE = textwrap.dedent(
     """
 )
 REVIEW_PASS = json.dumps({"verdict": "pass", "findings": []})
+# F-26: the default protection fake — a repo whose default branch
+# requires status checks with strict. The fixture remote is a local
+# path, so the real gh seam could never answer for it.
+PROTECTED_STRICT = Protection(checked=True, strict=True)
 
 
 # ----------------------------------------------------------------- fixtures --
@@ -191,6 +196,8 @@ class Env:
 
     def run(self, session_runner, **kwargs):
         kwargs.setdefault("now", lambda: OFF_PEAK)
+        kwargs.setdefault("protection", lambda remote, branch: PROTECTED_STRICT)
+        kwargs.setdefault("pr_state", lambda url: "open")
         return run_once(
             self.queue_path,
             factory_root=self.root,
@@ -201,6 +208,8 @@ class Env:
 
     def loop(self, session_runner, **kwargs):
         kwargs.setdefault("now", lambda: OFF_PEAK)
+        kwargs.setdefault("protection", lambda remote, branch: PROTECTED_STRICT)
+        kwargs.setdefault("pr_state", lambda url: "open")
         return run_loop(
             self.queue_path,
             factory_root=self.root,
@@ -525,8 +534,13 @@ def test_ac_5():
         re.compile(r"gh\s+pr\s+merge"),
         re.compile(r"""["']pr["']\s*,\s*["']merge["']"""),
         re.compile(r"pulls/[^\s\"']*/merge"),
-        re.compile(r"""["']merge["']\s*,\s*["']--"""),
     ]
+    # A fourth pattern, ["'merge"' followed by a flagged arg, was removed
+    # for F-26: the stale-base sweep runs a LOCAL `git merge --no-edit`
+    # on a scratch clone to validate what a merge would produce — the
+    # simulation this AC exists to allow. The three patterns above still
+    # catch every real PR-merge mechanism (shell form, argv form, REST
+    # endpoint); merging a PR remains the owner's act.
     offenders = []
     files = sorted((REPO_ROOT / "factory").rglob("*.py")) + sorted(
         (REPO_ROOT / "prompts").rglob("*.md")
@@ -871,6 +885,7 @@ def test_ac_12_killed_run_is_cleaned_by_next_loop(tmp_path: Path):
         from pathlib import Path
         from zoneinfo import ZoneInfo
         sys.path.insert(0, {str(REPO_ROOT)!r})
+        from factory.mergeorder import Protection
         from factory.orchestrator import run_once
 
         # Fixed off-peak clock: on the real clock a weekday morning falls in the
@@ -882,7 +897,9 @@ def test_ac_12_killed_run_is_cleaned_by_next_loop(tmp_path: Path):
             os.kill(os.getpid(), signal.SIGKILL)  # killed mid-session
 
         run_once(Path({str(env.queue_path)!r}), factory_root=Path({str(env.root)!r}),
-                 session_runner=seat, open_pr=lambda pr: "never", now=lambda: OFF_PEAK)
+                 session_runner=seat, open_pr=lambda pr: "never", now=lambda: OFF_PEAK,
+                 protection=lambda r, b: Protection(checked=True, strict=True),
+                 pr_state=lambda u: "open")
         """
     ))
     proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
@@ -1055,6 +1072,8 @@ def test_default_seat_runner_signature_matches(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(orchestrator, "run_session_sandboxed", checked)
     env = Env(tmp_path)
     result = run_once(env.queue_path, factory_root=env.root, open_pr=env.open_pr,
+                      protection=lambda r, b: PROTECTED_STRICT,
+                      pr_state=lambda u: "open",
                       now=lambda: OFF_PEAK)
     assert result.outcome == "pr_opened"
     assert [c[0] for c in seats.calls] == ["implementer", "reviewer"]
@@ -1192,6 +1211,8 @@ def test_review2_pr_failure_after_push_escalates_instead_of_requeueing(tmp_path)
         raise PublishError("gh pr create failed: HTTP 422")
 
     result = run_once(env.queue_path, factory_root=env.root, session_runner=Seats(),
+                      protection=lambda r, b: PROTECTED_STRICT,
+                      pr_state=lambda u: "open",
                       open_pr=failing_open_pr, now=lambda: OFF_PEAK)
 
     assert result.outcome == "needs_human"
