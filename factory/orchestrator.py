@@ -164,6 +164,11 @@ class RunResult:
     # healthy idle tick. Empty for every other outcome.
     open_prs: list[str] = field(default_factory=list)
     unresolved_prs: list[str] = field(default_factory=list)
+    # F-26 AC-3 report (round-7 finding 2): every open PR this run's
+    # sweep proved current — up to date with, or re-validated on, the
+    # remote default head — as ``<url> against <branch>@<sha12>``. Set on
+    # every outcome reached after the sweep; empty when it didn't run.
+    ready_prs: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -685,15 +690,17 @@ def run_once(
     states = _resolve_pr_states(list(dict.fromkeys(
         _pr_urls(queue, ("in_review",), skip_merged=True)
         + [task["links"]["pr"] for task in recovery])), pr_state)
+    ready: list[str] = []
     stale = _sweep_stale_prs(
         queue, profile, factory_root=factory_root,
         srt_bin_path=srt_bin_path, gate_timeout_sec=gate_timeout_sec,
-        states=states, recovery=recovery,
+        states=states, recovery=recovery, ready=ready,
     )
     if stale is not None:
+        stale.ready_prs = ready
         return stale
     if pick is None:
-        return RunResult("idle")
+        return RunResult("idle", ready_prs=ready)
     task_id = pick.task["id"]
     # F-26 AC-2: at most `repo.concurrency` (default 1) open factory PRs
     # per repo — counted on GitHub's word, not the queue's statuses: an
@@ -715,7 +722,8 @@ def run_once(
     limit = (profile.get("repo") or {}).get("concurrency", 1)
     if len(open_urls) + len(unresolved_urls) >= limit:
         return RunResult("concurrency_wait", task_id=task_id,
-                         open_prs=open_urls, unresolved_prs=unresolved_urls)
+                         open_prs=open_urls, unresolved_prs=unresolved_urls,
+                         ready_prs=ready)
 
     ctx = _Ctx(
         queue=queue, task_id=task_id, profile=profile, factory_root=factory_root,
@@ -725,10 +733,10 @@ def run_once(
     )
     with queue.begin_run(task_id):
         try:
-            recovered = _finish_unrecorded_publish(queue, task_id, pick.slice)
-            if recovered is not None:
-                return recovered
-            return _run_task(ctx, pick.slice)
+            result = (_finish_unrecorded_publish(queue, task_id, pick.slice)
+                      or _run_task(ctx, pick.slice))
+            result.ready_prs = ready
+            return result
         except BaseException:
             # The run didn't reach a recorded end state: re-queue it (the
             # aborted-run edge) so the queue isn't wedged until the next
@@ -840,6 +848,18 @@ _NET_TIMEOUT_SEC = 300
 _MERGE_TIMEOUT_SEC = 300
 
 
+def _is_merged(links: dict) -> bool:
+    """Whether ``links.pr`` is the PR GitHub reported merged.
+
+    ``links.merged`` holds the merged PR's URL, not a flag (round-7
+    finding 1): publishing keeps a task's other links, so a boolean
+    stamp would carry over to the task's next PR (a rebuilt task, a
+    later slice), which then would never be polled, counted or
+    re-validated. A new PR on the task is simply not merged.
+    """
+    return bool(links.get("pr")) and links.get("merged") == links.get("pr")
+
+
 def _pr_urls(queue: TaskQueue, statuses: tuple,
              *, skip_merged: bool = False) -> list[str]:
     """Every PR URL of tasks in ``statuses`` (unique, queue order).
@@ -856,7 +876,7 @@ def _pr_urls(queue: TaskQueue, statuses: tuple,
     for task in queue.doc.get("tasks", []):
         if task.get("status") not in statuses:
             continue
-        if skip_merged and (task.get("links") or {}).get("merged"):
+        if skip_merged and _is_merged(task.get("links") or {}):
             continue
         url = (task.get("links") or {}).get("pr")
         if url and url not in urls:
@@ -920,7 +940,7 @@ def _count_open_prs(queue: TaskQueue, states: dict) -> tuple[list[str], list[str
         url = links.get("pr")
         if not url or url in open_urls or url in unresolved_urls:
             continue
-        if links.get("merged"):
+        if _is_merged(links):
             continue  # stamped terminal (round-6 finding 2): not open
         if states.get(url, None) is None:
             unresolved_urls.append(url)
@@ -1004,7 +1024,7 @@ def _sweep_escalation(
 def _sweep_stale_prs(
     queue: TaskQueue, profile: dict, *, factory_root: Path,
     srt_bin_path: Path | None, gate_timeout_sec: int, states: dict,
-    recovery: list[dict],
+    recovery: list[dict], ready: list[str],
 ) -> RunResult | None:
     """F-26 AC-3: bring every open factory PR's readiness up to date.
 
@@ -1037,6 +1057,14 @@ def _sweep_stale_prs(
     already closed at escalation, so the sweep reads no new intent from
     it — its fix-round word is ``factory recover``.
 
+    Every open PR proven current against the remote default head — up
+    to date with it, re-validated on it now, or cached as either for
+    exactly this head — is appended to ``ready`` as ``<url> against
+    <branch>@<sha12>`` (round-7 finding 2): the report AC-3 and F-28's
+    owner step ("merge only after `factory run` has reported them
+    ready against the current main") need. A PR with an unknown state,
+    or one that fails re-validation, is never reported ready.
+
     Returns:
         A ``needs_human`` result when a stale PR failed re-validation, or
         None (all open PRs up to date, or none open).
@@ -1060,7 +1088,7 @@ def _sweep_stale_prs(
             # stamp makes merged terminal: later runs never gh-poll the
             # link, count it, or re-validate it.
             new_status = "in_review"
-            task["links"]["merged"] = True
+            task["links"]["merged"] = task["links"]["pr"]
             note = (f"GitHub shows {task['links']['pr']} merged: "
                     f"{escalation} recovery — back to in_review, where "
                     f"every merged PR waits in in_review for the F-14 "
@@ -1093,7 +1121,7 @@ def _sweep_stale_prs(
         if task.get("status") == "in_review"
         and (task.get("links") or {}).get("pr")
         and (task.get("links") or {}).get("branch")
-        and not (task.get("links") or {}).get("merged")
+        and not _is_merged(task.get("links") or {})
     ]
     if not open_prs:
         return None
@@ -1108,7 +1136,7 @@ def _sweep_stale_prs(
             # in_review for the F-14 deploy gate (nothing here advances
             # it), and the stamp makes merged terminal — later runs
             # never gh-poll this link again.
-            links["merged"] = True
+            links["merged"] = links["pr"]
             queue.save()
             continue
         if state == "closed":
@@ -1136,6 +1164,8 @@ def _sweep_stale_prs(
         cached = links.get("revalidated")
         if (cached and heads.get(branch) == cached["pr"]
                 and heads.get(default_branch) == cached["default"]):
+            ready.append(f"{links['pr']} against "
+                         f"{default_branch}@{cached['default'][:12]}")
             continue  # cached pair unchanged on the remote: nothing to redo
         work = create_run(project, source, factory_root=factory_root,
                           ref=default_branch)
@@ -1151,8 +1181,12 @@ def _sweep_stale_prs(
                                                 "default": default_sha}:
                     links["revalidated"] = {"pr": pr_sha, "default": default_sha}
                     queue.save()
+                ready.append(f"{links['pr']} against "
+                             f"{default_branch}@{default_sha[:12]}")
                 continue  # the PR branch already contains the default head
             if links.get("revalidated") == {"pr": pr_sha, "default": default_sha}:
+                ready.append(f"{links['pr']} against "
+                             f"{default_branch}@{default_sha[:12]}")
                 continue  # already re-validated against exactly this base
 
             # Stale: merge the PR onto the new base; a conflict is itself
@@ -1258,6 +1292,8 @@ def _sweep_stale_prs(
                          f"merged onto {default_branch}@{default_sha[:12]} "
                          f"({report_path.name})"),
             })
+            ready.append(f"{links['pr']} against "
+                         f"{default_branch}@{default_sha[:12]}")
         finally:
             cleanup_run(work)
     return None

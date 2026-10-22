@@ -208,10 +208,17 @@ def _run_orchestrator(args: argparse.Namespace) -> int:
             result = run_once(Path(args.queue), profile_path=args.profile, **kwargs)
             detail = f" {result.task_id}" if result.task_id else ""
             print(f"factory run: {result.outcome}{detail} {_run_extra(result)}".rstrip())
+            # F-26 AC-3 (round-7 finding 2): each open PR proven current
+            # against the remote default head, so the owner merges only
+            # what this run reported ready.
+            for line in result.ready_prs:
+                print(f"  ready: {line}")
             return _EXIT[result.outcome]
         loop = run_loop(Path(args.queue), profile_path=args.profile, **kwargs)
         for result in loop.results:
             print(f"  {result.task_id or '-'}: {result.outcome} {_run_extra(result)}".rstrip())
+            for line in result.ready_prs:
+                print(f"    ready: {line}")
         print(f"factory loop: stopped ({loop.stop_reason}) after {len(loop.results)} run(s)")
         return _EXIT[loop.stop_reason]
     except _RUN_ERRORS as exc:

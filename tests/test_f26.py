@@ -1446,7 +1446,8 @@ def test_review39_a_merged_park_is_stamp_terminal(tmp_path: Path):
 
     merged = env.run(Seats(), pr_state=lambda url: "merged")
     assert merged.outcome == "idle"
-    assert env.task("T-1")["links"]["merged"] is True  # stamped once
+    links = env.task("T-1")["links"]
+    assert links["merged"] == links["pr"]  # stamped once, naming the PR
 
     calls: list[str] = []
 
@@ -1519,3 +1520,103 @@ def test_review41_recovery_routes_blocked_on_unmet_deps(tmp_path: Path):
     q.save()
     assert recover_task(TaskQueue(env.queue_path), "T-1", assume_yes=True,
                         pr_state=lambda url: "closed") == "blocked"
+
+
+# --------------------------- round 7 (owner review) ------------------------
+
+
+def test_review42_merged_stamp_does_not_carry_to_a_new_pr(tmp_path: Path):
+    """Round-7 finding 1: ``links.merged`` names the PR that merged, not
+    the task. Publishing keeps the task's other links, so a boolean
+    stamp carried over to the task's NEXT PR (a rebuilt task, a later
+    slice) — that PR was never gh-polled, never counted against the
+    limit and never re-validated: a second open factory PR (AC-2)."""
+    env = Env(tmp_path, tasks=[_task("T-1")])
+    assert env.run(Seats()).outcome == "pr_opened"
+    first = env.task("T-1")["links"]["pr"]
+    assert env.run(Seats(), pr_state=lambda url: "merged").outcome == "idle"
+    assert env.task("T-1")["links"]["merged"] == first  # names the PR
+
+    # The task comes back for another PR (rebuilt after a contract
+    # change, or its next slice) — its links still carry the stamp.
+    q = TaskQueue(env.queue_path)
+    q.get("T-1")["status"] = "ready"
+    q.save()
+    states = {first: "merged"}
+    assert env.run(Seats(), pr_state=lambda url: states.get(url, "open")
+                   ).outcome == "pr_opened"
+    second = env.task("T-1")["links"]["pr"]
+    assert second != first
+
+    # A new ready task: the second PR is open and must hold the slot.
+    q = TaskQueue(env.queue_path)
+    q.doc["tasks"].append(_task("T-2"))
+    q.save()
+    asked: list[str] = []
+
+    def state(url):
+        asked.append(url)
+        return states.get(url, "open")
+
+    result = env.run(Seats(), pr_state=state)
+
+    assert result.outcome == "concurrency_wait"
+    assert result.open_prs == [second]
+    assert second in asked  # the new PR is polled, not stamp-skipped
+    assert first not in asked  # the merged one stays terminal
+    assert len(env.prs) == 2  # no third PR
+
+
+def test_review43_run_reports_each_ready_pr_against_main(tmp_path: Path):
+    """Round-7 finding 2: AC-3's "before reporting it ready" — and F-28's
+    owner step "merge factory PRs only after `factory run` has reported
+    them ready against the current main" — need a visible report. Every
+    open PR the sweep found up to date (or re-validated) on the current
+    remote head is named on the result: ``<url> against main@<sha12>``."""
+    env = Env(tmp_path, tasks=[_task("T-1")])
+    assert env.run(Seats()).outcome == "pr_opened"
+    url = env.task("T-1")["links"]["pr"]
+    head = _git(env.remote, "rev-parse", "refs/heads/main")
+
+    up_to_date = env.run(Seats())
+    assert up_to_date.outcome == "idle"
+    assert up_to_date.ready_prs == [f"{url} against main@{head[:12]}"]
+
+    # main moves (no conflict): re-validated on the new head, then ready.
+    moved = env.advance_remote_main(None, extra_file="unrelated.txt")
+    revalidated = env.run(Seats())
+    assert revalidated.outcome == "idle"
+    assert revalidated.ready_prs == [f"{url} against main@{moved[:12]}"]
+
+    # The ls-remote cache hit still reports it ready (nothing re-run).
+    cached = env.run(Seats())
+    assert cached.ready_prs == [f"{url} against main@{moved[:12]}"]
+
+    # Not ready: a stale PR that fails re-validation, a PR whose state
+    # is unknown — neither may be reported ready.
+    unknown = env.run(Seats(), pr_state=lambda u: None)
+    assert unknown.ready_prs == []
+    env.advance_remote_main("def answer():\n    return 99\n",
+                            message="conflicting remote change")
+    stale = env.run(Seats())
+    assert stale.outcome == "needs_human"
+    assert stale.ready_prs == []
+
+
+def test_review44_cli_prints_the_ready_lines(tmp_path: Path, monkeypatch, capsys):
+    """Round-7 finding 2, CLI half: `factory run` and `factory loop`
+    print one `ready:` line per ready PR, so the owner sees it without
+    reading progress logs."""
+    import factory.cli as cli
+    from factory.orchestrator import LoopResult, RunResult
+
+    line = "https://github.com/o/r/pull/7 against main@0123456789ab"
+    monkeypatch.setattr(cli, "run_once", lambda *a, **k: RunResult(
+        "idle", ready_prs=[line]))
+    assert cli.main(["run", "--queue", str(tmp_path / "tasks.json")]) == 0
+    assert f"  ready: {line}" in capsys.readouterr().out.splitlines()
+
+    monkeypatch.setattr(cli, "run_loop", lambda *a, **k: LoopResult(
+        "queue_empty", results=[RunResult("idle", ready_prs=[line])]))
+    assert cli.main(["loop", "--queue", str(tmp_path / "tasks.json")]) == 0
+    assert f"    ready: {line}" in capsys.readouterr().out.splitlines()
