@@ -161,6 +161,10 @@
             "branch": { "type": "string" },
             "execution_record": { "type": "string" },
             "step": { "type": "string", "description": "e.g. SoloAdventurer execution-order step number" },
+            "merged": {
+              "type": "boolean",
+              "description": "F-26: GitHub reported this PR merged. Terminal — the link is never gh-polled, counted open, or re-validated again; the task waits in in_review for the F-14 deploy gate."
+            },
             "revalidated": {
               "type": "object",
               "description": "F-26 stale-base cache: the (pr branch sha, default head sha) pair this PR was last re-validated against. An unchanged pair is not re-run; written by the sweep on every pass.",

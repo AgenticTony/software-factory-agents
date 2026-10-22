@@ -98,6 +98,7 @@ from factory.state import (
     TaskQueue,
     now_iso,
     recovery_task_eligible,
+    unmet_dependencies,
 )
 
 __all__ = [
@@ -682,7 +683,7 @@ def run_once(
     # one scan, and the URLs resolved are exactly the set swept.
     recovery = _recovery_tasks(queue)
     states = _resolve_pr_states(list(dict.fromkeys(
-        _pr_urls(queue, ("in_review",))
+        _pr_urls(queue, ("in_review",), skip_merged=True)
         + [task["links"]["pr"] for task in recovery])), pr_state)
     stale = _sweep_stale_prs(
         queue, profile, factory_root=factory_root,
@@ -706,7 +707,8 @@ def run_once(
     # open — the limit fails closed (round-3 finding 2) and the wait
     # names the unresolvable link (round-4 finding 3); the count's extra
     # links are resolved only now that a task is picked.
-    pending = [url for url in _pr_urls(queue, _PR_STATES_STATUSES)
+    pending = [url for url in _pr_urls(queue, _PR_STATES_STATUSES,
+                                       skip_merged=True)
                if url not in states]
     states.update(_resolve_pr_states(pending, pr_state))
     open_urls, unresolved_urls = _count_open_prs(queue, states)
@@ -838,18 +840,23 @@ _NET_TIMEOUT_SEC = 300
 _MERGE_TIMEOUT_SEC = 300
 
 
-def _pr_urls(queue: TaskQueue, statuses: tuple) -> list[str]:
+def _pr_urls(queue: TaskQueue, statuses: tuple,
+             *, skip_merged: bool = False) -> list[str]:
     """Every PR URL of tasks in ``statuses`` (unique, queue order).
 
     Resolution is lazy by design (round-3 finding 7): the sweep needs
     only ``in_review`` links (plus the recovery-eligible needs_human
     ones); the count's remaining links are resolved only once a task is
     actually picked, so idle ticks don't pay for a build-up of old
-    links.
+    links. ``skip_merged`` drops ``links.merged`` tasks (round-6
+    finding 2): merged is terminal — stamped once by the sweep, never
+    gh-polled or counted again — so a merged park adds no per-run call.
     """
     urls: list[str] = []
     for task in queue.doc.get("tasks", []):
         if task.get("status") not in statuses:
+            continue
+        if skip_merged and (task.get("links") or {}).get("merged"):
             continue
         url = (task.get("links") or {}).get("pr")
         if url and url not in urls:
@@ -909,9 +916,12 @@ def _count_open_prs(queue: TaskQueue, states: dict) -> tuple[list[str], list[str
     for task in queue.doc.get("tasks", []):
         if task.get("status") not in _PR_STATES_STATUSES:
             continue
-        url = (task.get("links") or {}).get("pr")
+        links = task.get("links") or {}
+        url = links.get("pr")
         if not url or url in open_urls or url in unresolved_urls:
             continue
+        if links.get("merged"):
+            continue  # stamped terminal (round-6 finding 2): not open
         if states.get(url, None) is None:
             unresolved_urls.append(url)
         elif states[url] == "open":
@@ -1016,11 +1026,14 @@ def _sweep_stale_prs(
     F-26 recovery edges from GitHub's PR state — one of the two writers
     they have (reconcile skips non-draft tasks; tasks.json is never
     hand-edited; the other is `factory recover`). A re-opened or merged
-    escalated PR goes back to ``in_review`` (a merged one then rides the
-    standard reconcile story — round-5 finding 4); a closed stale_base
-    PR was your rejection — the task goes straight to ``ready`` for its
-    fix round (round-5 finding 3: no lease-less ``in_progress`` hop for
-    the next run's reclaim to clean up). A pr_closed task's PR was
+    escalated PR goes back to ``in_review`` (a merged one waits there
+    for the F-14 deploy gate like every merged factory PR, stamped
+    terminal — round-5 finding 4 + round-6 findings 1+2); a closed
+    stale_base PR was your rejection — the task goes straight to
+    ``ready`` (or ``blocked`` when a dependency is open — round-6
+    finding 4) for its fix round (round-5 finding 3: no lease-less
+    ``in_progress`` hop for the next run's reclaim to clean up). A
+    pr_closed task's PR was
     already closed at escalation, so the sweep reads no new intent from
     it — its fix-round word is ``factory recover``.
 
@@ -1039,24 +1052,34 @@ def _sweep_stale_prs(
         state = states.get(task["links"]["pr"])
         escalation = task["attempts"][-1].get("escalation")
         if state == "merged":
-            # Round-5 finding 4: you resolved the conflict on GitHub and
-            # merged — shipped code must not strand the task (and its
-            # dependants) in needs_human. Back to in_review, the standard
-            # merged story; the loop below then skips it (state merged)
-            # until reconcile moves it on.
+            # Round-5 finding 4 + round-6 findings 1+2: you resolved the
+            # conflict on GitHub and merged — the task returns to
+            # in_review, exactly where every merged factory PR waits for
+            # the F-14 deploy gate (nothing in F-26 advances a merged
+            # task; reconcile skips non-draft tasks by design). The
+            # stamp makes merged terminal: later runs never gh-poll the
+            # link, count it, or re-validate it.
             new_status = "in_review"
+            task["links"]["merged"] = True
             note = (f"GitHub shows {task['links']['pr']} merged: "
-                    f"{escalation} recovery — back to in_review for "
-                    f"reconcile")
+                    f"{escalation} recovery — back to in_review, where "
+                    f"every merged PR waits in in_review for the F-14 "
+                    f"deploy gate")
         elif state == "open" and escalation == "pr_closed":
             new_status = "in_review"
             note = (f"GitHub shows {task['links']['pr']} open again: "
                     f"{escalation} recovery — {task['id']} → in_review")
         elif state == "closed" and escalation == "stale_base":
-            new_status = "ready"
+            # Round-6 finding 4: the fix round lands where approval
+            # would — blocked when a dependency is open, never a
+            # silently-unpickable ready.
+            new_status = (
+                "blocked" if unmet_dependencies(task, queue.doc.get("tasks", []))
+                else "ready"
+            )
             note = (f"GitHub shows {task['links']['pr']} closed (your "
                     f"rejection): {escalation} recovery — {task['id']} → "
-                    f"ready for a fix round")
+                    f"{new_status} for a fix round")
         else:
             continue  # no owner action to read
         queue.transition(task["id"], new_status)
@@ -1070,6 +1093,7 @@ def _sweep_stale_prs(
         if task.get("status") == "in_review"
         and (task.get("links") or {}).get("pr")
         and (task.get("links") or {}).get("branch")
+        and not (task.get("links") or {}).get("merged")
     ]
     if not open_prs:
         return None
@@ -1078,9 +1102,14 @@ def _sweep_stale_prs(
         links = task["links"]
         state = states.get(links["pr"])
         if state == "merged":
-            # The queue-reconcile story. Re-validating a shipped PR would
-            # fail L1's red-first proof on code that already landed, and
-            # its head branch may be auto-deleted.
+            # A shipped PR: re-validating it would fail L1's red-first
+            # proof on code that already landed, and its head branch may
+            # be auto-deleted. Round-6 findings 1+2: the task waits in
+            # in_review for the F-14 deploy gate (nothing here advances
+            # it), and the stamp makes merged terminal — later runs
+            # never gh-poll this link again.
+            links["merged"] = True
+            queue.save()
             continue
         if state == "closed":
             # Round-2 finding 5: closed without merging — surface the

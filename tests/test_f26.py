@@ -973,14 +973,15 @@ def test_review22_pr_closed_run_ids_are_unique(tmp_path: Path):
     """Round-3 finding 4: pr_closed escalations carry real generated run
     ids — no shared literal 'pr-closed' across tasks."""
     env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
-    assert env.run(Seats()).outcome == "pr_opened"
-    assert env.run(Seats(), pr_state=lambda url: "merged").outcome == "pr_opened"
-    assert env.task("T-1")["status"] == "in_review"
-    assert env.task("T-2")["status"] == "in_review"
+    assert env.run(Seats()).outcome == "pr_opened"   # T-1's PR
 
     closed = lambda url: "closed"  # noqa: E731
-    first = env.run(Seats(), pr_state=closed)
+    first = env.run(Seats(), pr_state=closed)  # T-1 closed → escalated
     assert first.escalation == "pr_closed"
+    assert env.run(Seats(), pr_state=closed).outcome == "pr_opened"  # T-2's
+    assert env.task("T-1")["status"] == "needs_human"
+    assert env.task("T-2")["status"] == "in_review"
+
     second = env.run(Seats(), pr_state=closed)
     assert second.escalation == "pr_closed"
 
@@ -1296,6 +1297,7 @@ def test_review34_a_pr_closed_task_can_be_recovered_for_a_fix_round(
     from factory.approve import ApprovalError, recover_task
     from factory.cli import main
 
+    closed = lambda url: "closed"  # noqa: E731  (recover's round-6 gate)
     env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
     assert env.run(Seats()).outcome == "pr_opened"
     assert env.run(Seats(), pr_state=lambda url: "closed").escalation \
@@ -1313,12 +1315,19 @@ def test_review34_a_pr_closed_task_can_be_recovered_for_a_fix_round(
     }]
     q.save()
     with pytest.raises(ApprovalError):
-        recover_task(TaskQueue(env.queue_path), "T-2", assume_yes=True)
+        recover_task(TaskQueue(env.queue_path), "T-2", assume_yes=True,
+                     pr_state=closed)
     assert main(["recover", "T-2", "--queue", str(env.queue_path),
                  "--yes"]) == 1
 
-    assert main(["recover", "T-1", "--queue", str(env.queue_path),
-                 "--yes"]) == 0
+    import factory.approve as approve_mod
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(approve_mod, "gh_pr_state", closed)
+    try:
+        assert main(["recover", "T-1", "--queue", str(env.queue_path),
+                     "--yes"]) == 0
+    finally:
+        monkeypatch.undo()
     assert env.task("T-1")["status"] == "ready"
 
     result = env.run(Seats(), pr_state=lambda url: "closed")
@@ -1398,3 +1407,115 @@ def test_review37_the_recovery_scan_runs_once_per_run(tmp_path, monkeypatch):
     monkeypatch.setattr(orch, "_recovery_tasks", counting)
     assert env.run(Seats()).outcome in ("idle", "concurrency_wait")
     assert len(calls) == 1
+
+
+# --------------------------- round 6 (owner review) ------------------------
+
+
+def test_review38_a_merged_park_names_its_real_wait(tmp_path: Path):
+    """Round-6 finding 1: nothing advances a merged task from in_review
+    (reconcile skips non-draft tasks; in_review → deploying is F-14,
+    unbuilt) — the docs and the recovery note must say so instead of
+    promising a reconcile that never comes."""
+    env = Env(tmp_path, tasks=[_task("T-1")])
+    assert env.run(Seats()).outcome == "pr_opened"
+    env.advance_remote_main("def answer():\n    return 99\n",
+                            message="conflicting remote change")
+    assert env.run(Seats()).outcome == "needs_human"  # stale_base
+
+    result = env.run(Seats(), pr_state=lambda url: "merged")
+
+    assert result.outcome == "idle"
+    assert env.task("T-1")["status"] == "in_review"
+    note = next(e.get("note") or "" for e in reversed(env.log().entries())
+                if e.get("outcome") == "recovered")
+    assert "F-14" in note  # the wait is named, not "for reconcile"
+
+    doc = (REPO_ROOT / "TASK-CONTRACT.md").read_text()
+    assert "reconcile owns it from there" not in doc
+    assert "ride the standard merged (reconcile) story" not in doc
+    assert "waits in in_review for the F-14 deploy gate" in doc
+
+
+def test_review39_a_merged_park_is_stamp_terminal(tmp_path: Path):
+    """Round-6 finding 2: merged is terminal — the sweep stamps
+    links.merged once, and later runs neither gh-poll the link nor let
+    the unknown (unresolved) state fail the concurrency limit closed."""
+    env = Env(tmp_path, tasks=[_task("T-1")])
+    assert env.run(Seats()).outcome == "pr_opened"
+
+    merged = env.run(Seats(), pr_state=lambda url: "merged")
+    assert merged.outcome == "idle"
+    assert env.task("T-1")["links"]["merged"] is True  # stamped once
+
+    calls: list[str] = []
+
+    def counting(url):
+        calls.append(url)
+        return "open"
+
+    later = env.run(Seats(), pr_state=counting)  # every later tick
+
+    assert calls == []  # the merged link is never re-asked
+    assert later.outcome == "idle"  # and never counted open (fail-closed)
+
+
+def test_review40_recover_requires_a_closed_pr(tmp_path: Path, monkeypatch):
+    """Round-6 finding 3: recover is the fix-round word — it refuses
+    unless GitHub reports the PR closed. An open PR would hold the
+    concurrency slot forever: every later run returns concurrency_wait
+    naming it and the fix round never starts."""
+    import factory.approve as approve_mod
+    from factory.approve import ApprovalError, recover_task
+    from factory.cli import main
+
+    env = Env(tmp_path, tasks=[_task("T-1")])
+    assert env.run(Seats()).outcome == "pr_opened"
+    env.advance_remote_main("def answer():\n    return 99\n",
+                            message="conflicting remote change")
+    assert env.run(Seats()).outcome == "needs_human"  # stale_base; PR open
+
+    with pytest.raises(ApprovalError, match="close the PR first"):
+        recover_task(TaskQueue(env.queue_path), "T-1", assume_yes=True,
+                     pr_state=lambda url: "open")
+    monkeypatch.setattr(approve_mod, "gh_pr_state", lambda url: "open")
+    assert main(["recover", "T-1", "--queue", str(env.queue_path),
+                 "--yes"]) == 1
+    assert env.task("T-1")["status"] == "needs_human"  # nothing moved
+
+    # A re-opened pr_closed PR is the same refusal: the sweep returns it
+    # to in_review, recover must not fight that.
+    assert recover_task(TaskQueue(env.queue_path), "T-1", assume_yes=True,
+                        pr_state=lambda url: "closed") == "ready"
+
+    doc = (REPO_ROOT / "TASK-CONTRACT.md").read_text()
+    assert "recover requires the PR closed" in doc
+
+
+def test_review41_recovery_routes_blocked_on_unmet_deps(tmp_path: Path):
+    """Round-6 finding 4: the fix-round edge lands the task in the same
+    place approval would — blocked when a dependency is open, not a
+    silently-unpickable ready."""
+    from factory.approve import recover_task
+
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
+    assert env.run(Seats()).outcome == "pr_opened"
+    env.advance_remote_main("def answer():\n    return 99\n",
+                            message="conflicting remote change")
+    assert env.run(Seats()).outcome == "needs_human"  # T-1 stale_base
+
+    q = TaskQueue(env.queue_path)  # the dependency regressed to draft
+    q.get("T-1")["depends_on"] = ["T-2"]  # not hashed: no contract demotion
+    q.get("T-2")["status"] = "draft"
+    q.save()
+
+    swept = env.run(Seats(), pr_state=lambda url: "closed")
+    assert swept.outcome == "idle"
+    assert env.task("T-1")["status"] == "blocked"  # not a dead ready
+
+    # And the command routes the same way.
+    q = TaskQueue(env.queue_path)
+    q.get("T-1")["status"] = "needs_human"  # back for the command half
+    q.save()
+    assert recover_task(TaskQueue(env.queue_path), "T-1", assume_yes=True,
+                        pr_state=lambda url: "closed") == "blocked"

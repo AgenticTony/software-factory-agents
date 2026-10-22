@@ -121,6 +121,9 @@ RECOVERY_TRANSITIONS: dict[tuple[str, str], str] = {
     ("needs_human", "ready"):
         "owner rejected the escalated PR; fix round (F-26 recovery, "
         "sweep- or recover-applied)",
+    ("needs_human", "blocked"):
+        "the recovery fix round queued, but a dependency is open — same "
+        "routing approval uses (F-26 recovery, round-6 finding 4)",
 }
 
 LEGAL_TARGETS: dict[str, frozenset[str]] = {

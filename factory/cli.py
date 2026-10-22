@@ -69,7 +69,15 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument(
         "--queue",
         default=".factory/tasks.json",
-        help="queue file (default: .factory/tasks.json)",
+        help="queue file (default: %(default)s)",
+    )
+    approve.add_argument(
+        "--ledger",
+        default=".factory/BOOTSTRAP.md",
+        help="bootstrap ledger path for --reconcile-bootstrap (default: %(default)s)",
+    )
+    approve.add_argument(
+        "--approved-by", default=None, help="approver name (default: git user.name)"
     )
 
     recover = sub.add_parser(
@@ -82,15 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recover.add_argument(
         "--queue", default=".factory/tasks.json",
-        help="queue file (default: .factory/tasks.json)",
-    )
-    approve.add_argument(
-        "--ledger",
-        default=".factory/BOOTSTRAP.md",
-        help="bootstrap ledger path for --reconcile-bootstrap (default: %(default)s)",
-    )
-    approve.add_argument(
-        "--approved-by", default=None, help="approver name (default: git user.name)"
+        help="queue file (default: %(default)s)",
     )
 
     tick = sub.add_parser("tick", help="tick owner steps of a task (F-29)")

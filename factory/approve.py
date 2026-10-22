@@ -42,6 +42,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 from factory.contract import NON_EXECUTABLE_KINDS, ContractError, acceptance_hash
+from factory.mergeorder import gh_pr_state
+from factory.publish import PublishError
 from factory.state import (
     TaskQueue,
     now_iso,
@@ -261,6 +263,7 @@ def recover_task(
     task_id: str,
     *,
     assume_yes: bool = False,
+    pr_state: Callable[[str], str] | None = None,
     confirm: Callable[[str], bool] = input_confirm,
     echo: Callable[[str], None] = print,
 ) -> str:
@@ -276,17 +279,25 @@ def recover_task(
 
     Refused — :class:`ApprovalError`, nothing written — when the task
     isn't parked on a ``stale_base``/``pr_closed`` escalation holding a
-    PR link (the same gate the sweep's transitions enforce).
+    PR link (the same gate the sweep's transitions enforce), or when
+    GitHub does not report the PR **closed** (round-6 finding 3): an
+    open PR holds the concurrency slot, so queueing a fix round under
+    it would park the task in an endless named ``concurrency_wait``.
+    A dependency that regressed while the task was parked routes the
+    move to ``blocked`` instead (round-6 finding 4), exactly as
+    approval would.
 
     Args:
         queue: The queue to write through (its only writer path).
         task_id: Task to recover.
         assume_yes: Skip the confirmation prompt.
+        pr_state: GitHub PR-state seam (default
+            :func:`factory.mergeorder.gh_pr_state`); injected in tests.
         confirm: Interactive confirmation callable; injected in tests.
         echo: Output callable for the summary; injected in tests.
 
     Returns:
-        The new status: ``ready``.
+        The new status: ``ready`` or ``blocked``.
 
     Raises:
         ApprovalError: On any refusal, or an unknown task.
@@ -302,19 +313,38 @@ def recover_task(
             "Re-open the PR on GitHub (the sweep returns it to in_review), "
             "or change the contract and re-approve."
         )
+    url = task["links"]["pr"]
+    state: str | None
+    try:
+        state = (pr_state or gh_pr_state)(url)
+    except PublishError:
+        state = None  # unreachable: fail closed like the concurrency limit
+    if state != "closed":
+        shown = state if state is not None else "unreachable (gh failed)"
+        raise ApprovalError(
+            f"{task_id}: recover queues a fix round, but GitHub reports "
+            f"the PR {shown} — close the PR first (an open PR holds the "
+            "concurrency slot and the fix round would wait on it forever; "
+            "for a stale_base task, just closing it lets the next run's "
+            "sweep queue the fix round on its own)."
+        )
     attempts = task.get("attempts") or []
     echo(
         f"{task_id}: {task.get('title')}\n"
         f"  escalation: {attempts[-1].get('escalation')}\n"
-        f"  PR: {task['links']['pr']}\n"
+        f"  PR: {url} (closed)\n"
         "  recover queues a fix round: the next run re-implements from "
         "the current default head on a fresh branch (work pushed to the "
         "old PR branch is not reused)."
     )
     if not assume_yes and not confirm(f"Queue fix round for {task_id}?"):
         raise ApprovalDeclined(f"{task_id}: recovery declined")
-    queue.transition(task_id, "ready")  # the gated edge (state enforces)
-    return "ready"
+    new_status = (
+        "blocked" if unmet_dependencies(task, queue.doc.get("tasks", []))
+        else "ready"
+    )
+    queue.transition(task_id, new_status)  # the gated edge (state enforces)
+    return new_status
 
 
 def _clean_entry_id(token: str) -> str:
