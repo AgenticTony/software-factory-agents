@@ -13,6 +13,12 @@ enforced, not trusted: every entry carries its number and the SHA-256 of
 the previous entry's line (a hash chain), so rewriting, dropping or
 reordering an earlier entry breaks the chain and the next read or append
 raises :class:`ProgressLogError`. The module has no edit API at all.
+
+Vent entries (F-27, ``kind: "vent"``) share the same chain: each
+``vent(category, text)`` tool call a session made becomes exactly one
+entry, flushed by the orchestrator when the session returns. They are
+telemetry for the owner, `factory status` (F-11) and the F-19 review —
+never rendered into fresh-session prompts (:meth:`ProgressLog.render`).
 """
 
 from __future__ import annotations
@@ -35,7 +41,10 @@ def _digest(line: str) -> str:
     return hashlib.sha256(line.encode()).hexdigest()
 
 
-def _safe(name: str) -> str:
+def safe_name(name: str) -> str:
+    """Filesystem-safe form of a project/task id (public: F-27's vent
+    reader walks the same ``progress/<project>/`` layout as
+    :meth:`ProgressLog.for_task`)."""
     return re.sub(r"[^A-Za-z0-9._-]", "_", name)
 
 
@@ -48,7 +57,10 @@ class ProgressLog:
     @classmethod
     def for_task(cls, factory_root: Path | str, project: str, task_id: str) -> "ProgressLog":
         """The canonical log location for a task (outside every clone)."""
-        return cls(Path(factory_root) / "progress" / _safe(project) / f"{_safe(task_id)}.jsonl")
+        return cls(
+            Path(factory_root) / "progress" / safe_name(project)
+            / f"{safe_name(task_id)}.jsonl"
+        )
 
     def _read(self) -> tuple[list[dict], str]:
         """Parse and chain-verify every entry; return (entries, last digest)."""
@@ -128,10 +140,18 @@ class ProgressLog:
         outcome, escalation, run id — still renders: F-10 AC-10, every
         round receives entries 1..N.
 
+        Vent entries (``kind: "vent"``, F-27) do NOT render: they are
+        owner telemetry for `factory status` (F-11) and the F-19 review,
+        not fresh-session context — a vent says what friction the last
+        sessions hit, which the round entries already summarise better.
+
         Args:
             omit_last_findings: Drop the newest entry's findings field.
         """
-        entries = self.entries()
+        entries = [
+            record for record in self.entries()
+            if record.get("kind") != "vent"
+        ]
         if not entries:
             return ""
         blocks = []

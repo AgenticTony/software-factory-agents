@@ -31,6 +31,13 @@ Seats:
   prompt-bypassed like the implementer (a default-mode Bash call would
   wait forever for an approval nobody can give).
 
+Both seats carry one extra tool (F-27): ``vent(category, text)``, an
+in-process SDK tool (``factory.vent``) listed in ``allowed_tools``. The
+handler runs inside this sandboxed runner, so it only appends to an
+in-memory collector; the vents ride the record out and the orchestrator
+flushes them into the task's progress log. Venting never touches the
+outcome, the attempt record or the budget.
+
 Clock: the wall clock (:func:`asyncio.wait_for` around each message
 receive, budgeted by the remaining deadline) covers **only** the message
 stream — setup and record-building sit outside it, so a session's budget
@@ -68,6 +75,7 @@ from pathlib import Path
 from typing import Any, NamedTuple, Sequence
 
 from claude_agent_sdk import (
+    AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKError,
     HookMatcher,
@@ -82,6 +90,7 @@ from factory.sandbox import (
     run_sandboxed,
     write_settings,
 )
+from factory.vent import VENT_TOOL_NAME, VentCollector, vent_server
 
 DEFAULT_BASE_URL = "https://api.z.ai/api/anthropic"
 DEFAULT_TIMEOUT_MS = 600_000
@@ -291,12 +300,18 @@ class SeatConfig:
 SEATS: dict[str, SeatConfig] = {
     "implementer": SeatConfig(
         name="implementer",
+        # Both seats carry the vent tool (F-27 AC-1): a grant-list entry
+        # (allowed_tools auto-allows without prompting; it restricts
+        # nothing), with the in-process server attached per session by
+        # build_options from the run's collector.
+        allowed_tools=("vent",),
         # See the module docstring: the sandbox is the permission system;
         # prompts are bypassed, hooks + srt enforce the policy.
         permission_mode="bypassPermissions",
     ),
     "reviewer": SeatConfig(
         name="reviewer",
+        allowed_tools=("vent",),
         # WO: "the reviewer gets no Write/Edit". NotebookEdit is the same
         # class of tool, so it goes too — a reviewer that cannot mutate.
         disallowed_tools=("Write", "Edit", "NotebookEdit"),
@@ -707,6 +722,7 @@ def build_options(
     cli_path: Path | None = None,
     model: str | None = None,
     system_prompt: str | None = None,
+    vent_collector: VentCollector | None = None,
 ) -> ClaudeAgentOptions:
     """Build the per-seat ClaudeAgentOptions (WO F-06 options list).
 
@@ -718,6 +734,12 @@ def build_options(
     ``factory.prompts``); it overrides the seat's static default, which
     stays empty because the prompt *files* are unreadable inside the
     sandbox — the orchestrator assembles them outside and passes the text.
+
+    ``vent_collector`` (F-27): attach the in-process ``vent`` tool closed
+    over this run's collector. Both seats list the tool in
+    ``allowed_tools`` (a grant, no restriction); without a collector no
+    server is attached and the grant is inert — the option-shape tests
+    build this way.
     """
     seat_config = _seat(seat)
     options = ClaudeAgentOptions(
@@ -738,6 +760,8 @@ def build_options(
             ]
         },
     )
+    if vent_collector is not None:
+        options.mcp_servers = {VENT_TOOL_NAME: vent_server(vent_collector)}
     if cli_path is not None:
         options.cli_path = str(Path(cli_path).expanduser().resolve())
     if model is not None:
@@ -748,7 +772,14 @@ def build_options(
 @dataclass
 class SessionRecord:
     """What a session recorded, distilled from the ResultMessage (WO F-06
-    "Record" list). F-10 writes this into ``attempts[]``."""
+    "Record" list). F-10 writes this into ``attempts[]``.
+
+    ``vents`` (F-27) is the one field that never reaches ``attempts[]``:
+    the vent tool's records, gathered in the sandboxed runner and carried
+    out on this record's stdout channel; the orchestrator flushes them
+    into the task's progress log. Empty when a session never vented —
+    including every record built before F-27 (``from_dict`` defaults it).
+    """
 
     seat: str
     status: str  # completed | failed | aborted
@@ -765,6 +796,7 @@ class SessionRecord:
     total_cost_usd: float | None = None
     result: str | None = None
     permission_denials: list[Any] | None = None
+    vents: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -837,6 +869,9 @@ async def run_session(
     cli_path: Path | None = None,
     model: str | None = None,
     system_prompt: str | None = None,
+    run_id: str | None = None,
+    task_id: str | None = None,
+    vent_collector: VentCollector | None = None,
 ) -> SessionRecord:
     """Run one seat's session and return what it recorded.
 
@@ -863,14 +898,27 @@ async def run_session(
         model: Optional model override.
         system_prompt: The assembled seat prompt (F-09), overriding the
             seat's static default.
+        run_id/task_id: What a vent is recorded against (F-27 AC-2): the
+            task's run, stamped into every ``vent(category, text)`` call
+            this session's tool collects. Both seats get the tool whether
+            or not the ids are known.
+        vent_collector: Tests may pass the collector the session should
+            use; default is a fresh one stamped with ``run_id``/``task_id``.
 
     Returns:
         The record: ``completed`` / ``failed`` (with reason) / ``aborted``
-        (wall clock). Never raises on a session outcome.
+        (wall clock). Never raises on a session outcome. Whatever the
+        outcome, ``record.vents`` carries every vent collected up to that
+        point (AC-3: venting never changes the outcome, and an aborted
+        session's friction still reaches the log).
     """
     _seat(seat)  # unknown seat → SessionConfigError before anything runs
     if query_fn is None:
         query_fn = sdk_query
+    if vent_collector is None:
+        vent_collector = VentCollector(
+            run_id=run_id or "", task_id=task_id or "", seat=seat
+        )
     options = build_options(
         seat,
         cwd,
@@ -882,7 +930,14 @@ async def run_session(
         cli_path=cli_path,
         model=model,
         system_prompt=system_prompt,
+        vent_collector=vent_collector,
     )
+
+    def _carry(record: SessionRecord) -> SessionRecord:
+        # Every exit path ships the vents (F-27 AC-3): outcome untouched,
+        # friction never lost — including aborts.
+        record.vents = list(vent_collector.vents)
+        return record
 
     result_message: ResultMessage | None = None
     stream = None
@@ -927,22 +982,28 @@ async def run_session(
                         break
                     except asyncio.TimeoutError as exc:
                         raise _WallClock() from exc
+                    if isinstance(message, AssistantMessage):
+                        # The turn a vent lands in (F-27): assistant turns
+                        # counted as they stream past, so the in-process
+                        # tool handler — invoked between messages on this
+                        # same loop — stamps the current turn.
+                        vent_collector.turn += 1
                     if isinstance(message, ResultMessage):
                         result_message = message
             except _WallClock:
-                return SessionRecord(
+                return _carry(SessionRecord(
                     seat=seat,
                     status="aborted",
                     reason="wall_clock",
                     duration_ms=int((time.monotonic() - started) * 1000),
-                )
+                ))
             except ClaudeSDKError as exc:
-                return SessionRecord(
+                return _carry(SessionRecord(
                     seat=seat,
                     status="failed",
                     reason=f"{type(exc).__name__}: {exc}",
                     duration_ms=int((time.monotonic() - started) * 1000),
-                )
+                ))
             finally:
                 # Every exit path closes the stream (review round 2): the
                 # three explicit calls missed non-SDK raises, which
@@ -958,13 +1019,13 @@ async def run_session(
 
     duration_ms = int((time.monotonic() - started) * 1000)
     if result_message is None:
-        return SessionRecord(
+        return _carry(SessionRecord(
             seat=seat,
             status="failed",
             reason="no_result_message",
             duration_ms=duration_ms,
-        )
-    return _record_from(result_message, seat, duration_ms)
+        ))
+    return _carry(_record_from(result_message, seat, duration_ms))
 
 
 async def _close_stream(stream: Any) -> None:
@@ -1015,6 +1076,8 @@ def run_session_sandboxed(
     cli_path: Path | None = None,
     srt_bin_path: Path | None = None,
     teardown_grace_sec: float = 120.0,
+    run_id: str | None = None,
+    task_id: str | None = None,
 ) -> SessionRecord:
     """Run one session with the whole runner process inside the F-05 sandbox.
 
@@ -1118,6 +1181,7 @@ def run_session_sandboxed(
             token=token, cli_path=cli_path, srt_bin_path=srt_bin_path,
             teardown_grace_sec=teardown_grace_sec,
             read_only=review_guard, writable_roots=reviewer_writable,
+            run_id=run_id, task_id=task_id,
         )
     finally:
         try:
@@ -1159,6 +1223,8 @@ def _run_prepared(
     teardown_grace_sec: float,
     read_only: bool,
     writable_roots: "Sequence[Path]",
+    run_id: str | None = None,
+    task_id: str | None = None,
 ) -> SessionRecord:
     """Stage the runner, write settings, run the sandboxed entry and parse
     its record. :func:`run_session_sandboxed` wraps this in the reviewer
@@ -1194,6 +1260,10 @@ def _run_prepared(
                 "model": model,
                 "system_prompt": system_prompt,
                 "cli_path": str(cli),
+                # F-27: what a vent is recorded against — the in-sandbox
+                # collector stamps both on every vent(category, text) call.
+                "run_id": run_id,
+                "task_id": task_id,
             }
         )
     )
@@ -1272,6 +1342,8 @@ def _main(argv: list[str] | None = None) -> int:
                 model=spec.get("model"),
                 system_prompt=spec.get("system_prompt"),
                 cli_path=Path(spec["cli_path"]) if spec.get("cli_path") else None,
+                run_id=spec.get("run_id"),
+                task_id=spec.get("task_id"),
             )
         )
     except (OSError, json.JSONDecodeError, KeyError, SessionConfigError) as exc:

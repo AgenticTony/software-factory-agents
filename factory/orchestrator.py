@@ -31,6 +31,10 @@ Trust boundaries, each enforced in code rather than prose:
   implementer's account is rendered as inert fenced text below them.
 * **Fresh sessions get the task's progress log** (``factory.progress``),
   entries 1..N, read-only, from outside the clone.
+* **Sessions can vent** (F-27, ``factory.vent``): each seat's
+  ``vent(category, text)`` calls are flushed into the task's progress log
+  the moment the session returns — telemetry for `factory status` (F-11)
+  and the F-19 review, never part of the attempt record or the budget.
 
 Escalation rules (VALIDATOR-SPEC "Rounds and escalation"): L0's
 credential, protected-path, sentinel-failure, new-dependency and
@@ -100,6 +104,7 @@ from factory.state import (
     recovery_task_eligible,
     unmet_dependencies,
 )
+from factory.vent import flush_vents
 
 __all__ = [
     "LoopResult",
@@ -1480,9 +1485,14 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                     factory_root=ctx.factory_root, max_turns=budget["max_turns"],
                     timeout_min=remaining_min, protected=protected,
                     system_prompt=implementer_system, srt_bin_path=ctx.srt_bin_path,
+                    run_id=work.run_id, task_id=task_id,
                 )
                 session_seconds += time.monotonic() - t0
                 records = [impl]
+                # F-27: the session's vents reach the task's progress log
+                # the moment the session returns — before any gate can
+                # crash, and whatever the session's outcome was.
+                flush_vents(log, impl.vents)
                 if _is_quota(impl):
                     attempt = attempt_record(attempt_no, started, "aborted", records, None,
                                              escalation="quota_exhausted", note=impl.reason)
@@ -1601,9 +1611,13 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                 max_turns=budget["max_turns"], timeout_min=remaining_review,
                                 protected=protected, system_prompt=reviewer_system,
                                 srt_bin_path=ctx.srt_bin_path,
+                                # The reviewer sits in the clean gate clone,
+                                # but its vents belong to the task's run.
+                                run_id=work.run_id, task_id=task_id,
                             )
                             session_seconds += time.monotonic() - t0
                             records.append(review)
+                            flush_vents(log, review.vents)  # F-27, as above
                             if _is_quota(review):
                                 attempt = attempt_record(
                                     attempt_no, started, "aborted", records, None,
