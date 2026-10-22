@@ -101,22 +101,26 @@ ALLOWED_TRANSITIONS: dict[tuple[str, str], str] = {
     ("needs_human", "draft"): "contract changed",
     ("done", "draft"): "contract changed (human reopen)",
 }
-# F-26 recovery edges (round-4 findings 1+2) sit OUTSIDE the general
-# table on purpose: the table is status-pair-only, and these edges are
-# legal only for a task whose last attempt escalated stale_base/pr_closed
-# and which still holds links.pr. The one writer is the stale-PR sweep,
-# which applies them from GitHub's PR state — the owner re-opens a
-# pr_closed PR (→ in_review) or closes a stale_base PR to reject it
-# (→ in_progress; the next run's reclaim_abandoned re-queues the fix
-# round). No other needs_human task (credential_added,
+# F-26 recovery edges (rounds 4+5) sit OUTSIDE the general table on
+# purpose: the table is status-pair-only, and these edges are legal only
+# for a task whose last attempt escalated stale_base/pr_closed and which
+# still holds links.pr. The writers are the stale-PR sweep — which
+# reads the owner's GitHub actions: a re-opened (or merged) pr_closed /
+# stale_base PR → in_review; a closed stale_base PR was the rejection →
+# ready, directly, with no lease-less in_progress hop (round-5 finding
+# 3) — and `factory recover`, the owner's explicit fix-round word for a
+# pr_closed task (round-5 finding 2): its PR was already closed at
+# escalation, so GitHub has no signal left to distinguish re-open from
+# reject. No other needs_human task (credential_added,
 # protected_path_touched, attempts_exhausted, …) may exit through them.
 RECOVERY_ESCALATIONS = ("stale_base", "pr_closed")
 RECOVERY_TRANSITIONS: dict[tuple[str, str], str] = {
     ("needs_human", "in_review"):
-        "owner re-opened the escalated PR (F-26 recovery, sweep-applied)",
-    ("needs_human", "in_progress"):
-        "owner rejected the escalated PR; fix round (F-26 recovery, "
+        "owner re-opened (or merged) the escalated PR (F-26 recovery, "
         "sweep-applied)",
+    ("needs_human", "ready"):
+        "owner rejected the escalated PR; fix round (F-26 recovery, "
+        "sweep- or recover-applied)",
 }
 
 LEGAL_TARGETS: dict[str, frozenset[str]] = {
@@ -608,8 +612,8 @@ class TaskQueue:
         current = task.get("status")
         if (current, new_status) in RECOVERY_TRANSITIONS:
             # F-26 recovery edges: gated on the task, not just the pair
-            # (round-4 finding 2) — only the sweep writes them, and only
-            # for an eligible escalation.
+            # (round-4 finding 2) — only the sweep and `factory recover`
+            # write them, and only for an eligible escalation.
             check_recovery_transition(task, new_status)
         else:
             check_transition(current, new_status)

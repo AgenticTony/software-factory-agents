@@ -14,6 +14,7 @@ from factory.approve import (
     approve_task,
     default_approver,
     reconcile_bootstrap,
+    recover_task,
 )
 from factory.config import ConfigError, load_config
 from factory.contract import ContractError
@@ -68,7 +69,20 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument(
         "--queue",
         default=".factory/tasks.json",
-        help="queue path (default: %(default)s)",
+        help="queue file (default: .factory/tasks.json)",
+    )
+
+    recover = sub.add_parser(
+        "recover", help="queue a fix round for a parked F-26 escalation")
+    recover.add_argument(
+        "task_id", help="task id to recover (stale_base/pr_closed only)")
+    recover.add_argument(
+        "--yes", action="store_true",
+        help="non-interactive confirmation",
+    )
+    recover.add_argument(
+        "--queue", default=".factory/tasks.json",
+        help="queue file (default: .factory/tasks.json)",
     )
     approve.add_argument(
         "--ledger",
@@ -129,6 +143,22 @@ def _run_approve(args: argparse.Namespace) -> int:
         return 1
     except KeyboardInterrupt:
         print("factory approve: interrupted", file=sys.stderr)
+        return 130
+
+
+def _run_recover(args: argparse.Namespace) -> int:
+    """Dispatch the recover subcommand; refusals exit 1, never a traceback."""
+    try:
+        status = recover_task(
+            TaskQueue(args.queue), args.task_id, assume_yes=args.yes
+        )
+        print(f"{args.task_id}: needs_human -> {status} (fix round queued)")
+        return 0
+    except (ApprovalError, ContractError) as exc:
+        print(f"factory recover: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("factory recover: interrupted", file=sys.stderr)
         return 130
 
 
@@ -216,6 +246,8 @@ def main(argv: list | None = None) -> int:
                 "plain markdown, so reconcile confirms every entry interactively"
             )
         return _run_approve(args)
+    if args.command == "recover":
+        return _run_recover(args)
     if args.command in ("run", "loop"):
         return _run_orchestrator(args)
     if args.command == "tick":

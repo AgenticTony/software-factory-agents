@@ -42,7 +42,13 @@ from collections.abc import Callable
 from pathlib import Path
 
 from factory.contract import NON_EXECUTABLE_KINDS, ContractError, acceptance_hash
-from factory.state import TaskQueue, now_iso, open_owner_steps, unmet_dependencies
+from factory.state import (
+    TaskQueue,
+    now_iso,
+    open_owner_steps,
+    recovery_task_eligible,
+    unmet_dependencies,
+)
 
 # Ledger grammar (.factory/BOOTSTRAP.md):
 #   ## <task-id> — <title>                     starts an entry
@@ -248,6 +254,67 @@ def approve_task(
     )
     queue.transition(task_id, new_status)
     return new_status
+
+
+def recover_task(
+    queue: TaskQueue,
+    task_id: str,
+    *,
+    assume_yes: bool = False,
+    confirm: Callable[[str], bool] = input_confirm,
+    echo: Callable[[str], None] = print,
+) -> str:
+    """Queue a fix round for a parked escalation (F-26 round-5 finding 2).
+
+    ``factory recover`` is the owner's explicit fix-round word — the one
+    recovery intent GitHub cannot express for a ``pr_closed`` task: its
+    PR was already closed at escalation, so no later GitHub state
+    distinguishes "re-open it" from "reject it". The sweep reads what
+    GitHub can say (a re-opened or merged PR goes back to ``in_review``;
+    a closed ``stale_base`` PR re-queues ``ready`` on its own); this
+    command writes the gated ``needs_human → ready`` edge directly.
+
+    Refused — :class:`ApprovalError`, nothing written — when the task
+    isn't parked on a ``stale_base``/``pr_closed`` escalation holding a
+    PR link (the same gate the sweep's transitions enforce).
+
+    Args:
+        queue: The queue to write through (its only writer path).
+        task_id: Task to recover.
+        assume_yes: Skip the confirmation prompt.
+        confirm: Interactive confirmation callable; injected in tests.
+        echo: Output callable for the summary; injected in tests.
+
+    Returns:
+        The new status: ``ready``.
+
+    Raises:
+        ApprovalError: On any refusal, or an unknown task.
+        ApprovalDeclined: When the human answers no (or the prompt hits
+            EOF).
+        ContractError: If the resulting queue wouldn't validate.
+    """
+    task = queue.get(task_id)  # StateError (a ContractError) if unknown
+    if not recovery_task_eligible(task):
+        raise ApprovalError(
+            f"{task_id}: not recoverable — only a stale_base/pr_closed "
+            "escalation holding a PR link can take the fix-round edge. "
+            "Re-open the PR on GitHub (the sweep returns it to in_review), "
+            "or change the contract and re-approve."
+        )
+    attempts = task.get("attempts") or []
+    echo(
+        f"{task_id}: {task.get('title')}\n"
+        f"  escalation: {attempts[-1].get('escalation')}\n"
+        f"  PR: {task['links']['pr']}\n"
+        "  recover queues a fix round: the next run re-implements from "
+        "the current default head on a fresh branch (work pushed to the "
+        "old PR branch is not reused)."
+    )
+    if not assume_yes and not confirm(f"Queue fix round for {task_id}?"):
+        raise ApprovalDeclined(f"{task_id}: recovery declined")
+    queue.transition(task_id, "ready")  # the gated edge (state enforces)
+    return "ready"
 
 
 def _clean_entry_id(token: str) -> str:

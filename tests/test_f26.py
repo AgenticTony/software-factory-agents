@@ -1049,16 +1049,16 @@ def test_review24_an_idle_tick_only_queries_open_prs(tmp_path: Path):
 
 
 def test_review25_recovery_edges_are_legal_and_documented(tmp_path: Path):
-    """Round-3 finding 8 (rewritten for round-4 finding 2's gate): the
-    recovery edges are legal for an escalated task holding a PR link —
-    applied through the queue, which enforces the gate — and
-    TASK-CONTRACT carries both rows."""
+    """Round-3 finding 8 (rewritten for round-4 f2's gate and round-5 f3's
+    ready target): the recovery edges are legal for an escalated task
+    holding a PR link — applied through the queue, which enforces the
+    gate — and TASK-CONTRACT carries both rows."""
     env = Env(tmp_path, tasks=[_task("T-1")])
     assert env.run(Seats()).outcome == "pr_opened"
     env.advance_remote_main("def answer():\n    return 99\n",
                             message="conflicting remote change")
     assert env.run(Seats()).outcome == "needs_human"  # stale_base, PR linked
-    TaskQueue(env.queue_path).transition("T-1", "in_progress")  # eligible
+    TaskQueue(env.queue_path).transition("T-1", "ready")  # eligible (f3 target)
 
     env2 = Env(tmp_path / "b", tasks=[_task("T-1")])
     assert env2.run(Seats()).outcome == "pr_opened"
@@ -1068,7 +1068,7 @@ def test_review25_recovery_edges_are_legal_and_documented(tmp_path: Path):
 
     doc = (REPO_ROOT / "TASK-CONTRACT.md").read_text()
     assert "`needs_human → in_review`" in doc
-    assert "`needs_human → in_progress`" in doc
+    assert "`needs_human → ready`" in doc
 
 
 # --------------------------- round 4 (owner review) ------------------------
@@ -1092,9 +1092,11 @@ def test_review26_a_reopened_pr_is_recovered_by_the_sweep(tmp_path: Path):
 
 
 def test_review27_a_rejected_stale_pr_returns_for_a_fix_round(tmp_path: Path):
-    """Round-4 findings 1+7: the stale_base fix-round remedy is the sweep
-    reading your rejection (the closed PR). The round re-runs from the
-    current default head — no owner branch update is promised or used."""
+    """Round-4 f1 + round-5 f3: the stale_base fix-round remedy is the sweep
+    reading your rejection (the closed PR), and it re-queues the task
+    READY directly — no lease-less in_progress hop for the next run's
+    reclaim to clean up. The round re-runs from the current default
+    head; no owner branch update is promised or used."""
     env = Env(tmp_path, tasks=[_task("T-1")])  # 3 attempts: run + escalation + fix round
     assert env.run(Seats()).outcome == "pr_opened"
     env.advance_remote_main("def answer():\n    return 99\n",
@@ -1105,10 +1107,10 @@ def test_review27_a_rejected_stale_pr_returns_for_a_fix_round(tmp_path: Path):
     rejected = env.run(Seats(), pr_state=lambda url: "closed")
 
     assert rejected.outcome == "idle"  # pick ran before the sweep: none
-    assert env.task()["status"] == "in_progress"  # sweep queued the fix round
+    assert env.task()["status"] == "ready"  # round-5 f3: ready, not in_progress
     assert any(e.get("outcome") == "recovered" for e in env.log().entries())
 
-    result = env.run(Seats(), pr_state=lambda url: "closed")  # reclaim→ready
+    result = env.run(Seats(), pr_state=lambda url: "closed")  # no reclaim hop
     assert result.outcome == "pr_opened"
     assert len(env.prs) == 2
     assert env.task()["links"]["pr"] != old_pr
@@ -1124,7 +1126,9 @@ def test_review28_recovery_edges_are_gated_to_f26_escalations(tmp_path: Path):
     with pytest.raises(TransitionError):
         check_transition("needs_human", "in_review")
     with pytest.raises(TransitionError):
-        check_transition("needs_human", "in_progress")
+        check_transition("needs_human", "in_progress")  # left entirely in round 5
+    with pytest.raises(TransitionError):
+        check_transition("needs_human", "ready")  # gated recovery edge
 
     env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
     assert env.run(Seats()).outcome == "pr_opened"
@@ -1149,7 +1153,7 @@ def test_review28_recovery_edges_are_gated_to_f26_escalations(tmp_path: Path):
         with pytest.raises(TransitionError):
             TaskQueue(env.queue_path).transition("T-2", target)
 
-    TaskQueue(env.queue_path).transition("T-1", "in_progress")  # eligible
+    TaskQueue(env.queue_path).transition("T-1", "ready")  # eligible (f3)
     q = TaskQueue(env.queue_path)
     q.get("T-1")["status"] = "needs_human"  # back for the no-link half
     q.get("T-1")["links"] = {}
@@ -1255,3 +1259,142 @@ def test_review32_the_documented_remedies_are_the_sweeps():
     assert "updates the branch" not in doc
     assert "is not reused" in doc
     assert "the next run's sweep moves the task back" in doc
+
+
+# --------------------------- round 5 (owner review) ------------------------
+
+
+def test_review33_sweep_escalations_do_not_burn_the_budget(tmp_path: Path):
+    """Round-5 finding 1: stale_base/pr_closed attempts are session-less
+    sweep records, not spent work — the recovery fix round starts with
+    its slot unspent. max_attempts=2: pass (1) + stale_base escalation
+    must still leave the fix round attempt 2, not attempt 3."""
+    env = Env(tmp_path, tasks=[_task(
+        "T-1", budget={"size": "S", "max_attempts": 2, "max_turns": 20,
+                       "wall_clock_min": 10})])
+    assert env.run(Seats()).outcome == "pr_opened"        # attempt 1 (pass)
+    env.advance_remote_main("def answer():\n    return 99\n",
+                            message="conflicting remote change")
+    assert env.run(Seats()).outcome == "needs_human"      # sweep attempt 2
+    # You rejected the PR; queue the fix round through the gated edge
+    # (what the sweep applies on a closed stale_base PR — isolated here
+    # so only the budget is under test).
+    TaskQueue(env.queue_path).transition("T-1", "ready")
+
+    result = env.run(Seats(), pr_state=lambda url: "closed")  # old PR closed
+
+    assert result.outcome == "pr_opened"  # red: attempts_exhausted before
+
+
+def test_review34_a_pr_closed_task_can_be_recovered_for_a_fix_round(
+        tmp_path: Path):
+    """Round-5 finding 2: closing a healthy in_review PR escalates
+    pr_closed, and GitHub then has no signal left to mean 'fix round'
+    (the PR was already closed at escalation) — `factory recover` is the
+    owner's explicit fix-round word, and it refuses anything not gated
+    eligible."""
+    from factory.approve import ApprovalError, recover_task
+    from factory.cli import main
+
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
+    assert env.run(Seats()).outcome == "pr_opened"
+    assert env.run(Seats(), pr_state=lambda url: "closed").escalation \
+        == "pr_closed"
+
+    # A credential_added escalation with a PR link: recover refuses.
+    q = TaskQueue(env.queue_path)
+    t2 = q.get("T-2")
+    t2["status"] = "needs_human"
+    t2["links"] = {"pr": "https://github.com/fixture/fixture/pull/7"}
+    t2["attempts"] = [{
+        "run_id": "r1", "slice_id": "T-2", "started": "2026-10-18T10:00:00Z",
+        "outcome": "escalated", "escalation": "credential_added",
+        "prompt_versions": {}, "skills": [],
+    }]
+    q.save()
+    with pytest.raises(ApprovalError):
+        recover_task(TaskQueue(env.queue_path), "T-2", assume_yes=True)
+    assert main(["recover", "T-2", "--queue", str(env.queue_path),
+                 "--yes"]) == 1
+
+    assert main(["recover", "T-1", "--queue", str(env.queue_path),
+                 "--yes"]) == 0
+    assert env.task("T-1")["status"] == "ready"
+
+    result = env.run(Seats(), pr_state=lambda url: "closed")
+    assert result.outcome == "pr_opened"  # the fix round actually runs
+    assert len(env.prs) == 2
+    doc = (REPO_ROOT / "TASK-CONTRACT.md").read_text()
+    assert "factory recover" in doc  # the remedy is documented
+
+
+def test_review35_a_merged_escalated_pr_returns_to_review(tmp_path: Path):
+    """Round-5 finding 4: an owner who resolves a stale_base conflict on
+    GitHub and merges leaves the task parked needs_human with shipped
+    code — the merged recovery moves it back in_review (the standard
+    merged story: reconcile owns it from there) instead of stranding it
+    and every task depending on it."""
+    env = Env(tmp_path, tasks=[_task("T-1")])
+    assert env.run(Seats()).outcome == "pr_opened"
+    env.advance_remote_main("def answer():\n    return 99\n",
+                            message="conflicting remote change")
+    assert env.run(Seats()).outcome == "needs_human"  # stale_base
+
+    # You resolve the conflict in GitHub's UI and merge the PR.
+    result = env.run(Seats(), pr_state=lambda url: "merged")
+
+    assert result.outcome == "idle"  # nothing to pick; recovery is the story
+    assert env.task("T-1")["status"] == "in_review"
+    entries = env.log().entries()
+    assert any("merged" in (e.get("note") or "") for e in entries)
+
+
+def test_review36_the_merge_timeout_names_the_local_pathology(
+        tmp_path: Path, monkeypatch):
+    """Round-5 finding 5: the sweep's merge is local (both commits were
+    already fetched) — a timeout there means a pathological merge or a
+    disk problem, and the RunError must say so, not blame credentials
+    or the network."""
+    import factory.orchestrator as orch
+    from factory.runs import RunError
+
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
+    assert env.run(Seats()).outcome == "pr_opened"
+    env.advance_remote_main("def answer():\n    return 99\n",
+                            message="conflicting remote change")
+
+    real_run = subprocess.run
+
+    def hang_merge(args, **kwargs):
+        if "merge" in args and "--no-edit" in args:
+            raise subprocess.TimeoutExpired(args, 300)
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(orch, "subprocess", SimpleNamespace(
+        run=hang_merge, TimeoutExpired=subprocess.TimeoutExpired))
+    with pytest.raises(RunError) as excinfo:
+        env.run(Seats())
+    assert "local merge" in str(excinfo.value)
+    # and it must not send the owner debugging the wrong layer
+    assert "credential" not in str(excinfo.value)
+
+
+def test_review37_the_recovery_scan_runs_once_per_run(tmp_path, monkeypatch):
+    """Round-5 finding 6: the eligible set is computed once per run and
+    passed into the sweep — no second scan whose answer could drift from
+    the resolved URLs if the queue changed in between."""
+    import factory.orchestrator as orch
+
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
+    assert env.run(Seats()).outcome == "pr_opened"
+
+    real_recovery = orch._recovery_tasks
+    calls: list = []
+
+    def counting(queue):
+        calls.append(queue.doc["project"])
+        return real_recovery(queue)
+
+    monkeypatch.setattr(orch, "_recovery_tasks", counting)
+    assert env.run(Seats()).outcome in ("idle", "concurrency_wait")
+    assert len(calls) == 1

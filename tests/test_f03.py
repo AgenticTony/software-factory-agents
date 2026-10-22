@@ -132,10 +132,10 @@ ILLEGAL_EDGE_CLASSES = {
     "exit_from_needs_human": [
         ("needs_human", "ready"),
         ("needs_human", "done"),
-        # in_review / in_progress left the general table in F-26 round 4:
-        # they are recovery edges, legal only for a stale_base/pr_closed
-        # escalation holding a PR link — queue.transition enforces the
-        # gate (tested in tests/test_f26.py).
+        # in_review / ready left the general table as F-26 recovery
+        # edges (in_progress left entirely in round 5): legal only for a
+        # stale_base/pr_closed escalation holding a PR link —
+        # queue.transition enforces the gate; tested in tests/test_f26.py.
         ("needs_human", "in_review"),
         ("needs_human", "in_progress"),
     ],

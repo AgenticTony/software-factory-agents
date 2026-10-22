@@ -93,6 +93,7 @@ from factory.runs import (
 from factory.sandbox import build_settings, run_sandboxed, write_settings
 from factory.session import DEFAULT_BASE_URL, SessionRecord, run_session_sandboxed
 from factory.state import (
+    RECOVERY_ESCALATIONS,
     RunInProgressError,
     TaskQueue,
     now_iso,
@@ -676,15 +677,17 @@ def run_once(
     # resolves only the open-PR (in_review) links plus the
     # recovery-eligible needs_human ones (round-4 finding 1: the owner's
     # GitHub action must be readable even when nothing is pickable) — a
-    # build-up of other old links adds no gh round-trips.
+    # build-up of other old links adds no gh round-trips. The eligible
+    # set is computed ONCE and handed to the sweep (round-5 finding 6):
+    # one scan, and the URLs resolved are exactly the set swept.
+    recovery = _recovery_tasks(queue)
     states = _resolve_pr_states(list(dict.fromkeys(
         _pr_urls(queue, ("in_review",))
-        + [task["links"]["pr"] for task in _recovery_tasks(queue)])),
-        pr_state)
+        + [task["links"]["pr"] for task in recovery])), pr_state)
     stale = _sweep_stale_prs(
         queue, profile, factory_root=factory_root,
         srt_bin_path=srt_bin_path, gate_timeout_sec=gate_timeout_sec,
-        states=states,
+        states=states, recovery=recovery,
     )
     if stale is not None:
         return stale
@@ -829,6 +832,10 @@ _PR_STATES_STATUSES = ("ready", "in_progress", "in_review", "needs_human")
 # hold the run lease forever on a username prompt (round-3 finding 3).
 _GIT_NET_ENV = {"GIT_TERMINAL_PROMPT": "0"}
 _NET_TIMEOUT_SEC = 300
+# Round-5 finding 5: the sweep's merge is LOCAL — both commits were
+# already fetched — so its timeout is its own constant and its failure
+# wording names the local pathology, never the network.
+_MERGE_TIMEOUT_SEC = 300
 
 
 def _pr_urls(queue: TaskQueue, statuses: tuple) -> list[str]:
@@ -987,6 +994,7 @@ def _sweep_escalation(
 def _sweep_stale_prs(
     queue: TaskQueue, profile: dict, *, factory_root: Path,
     srt_bin_path: Path | None, gate_timeout_sec: int, states: dict,
+    recovery: list[dict],
 ) -> RunResult | None:
     """F-26 AC-3: bring every open factory PR's readiness up to date.
 
@@ -1005,12 +1013,16 @@ def _sweep_stale_prs(
     what GitHub enforces at merge time.
 
     Round-4 finding 1: before any of that, the sweep also applies the
-    F-26 recovery edges from GitHub's PR state — the one writer these
-    edges have (reconcile skips non-draft tasks; tasks.json is never
-    hand-edited). A re-opened ``pr_closed`` PR goes back to ``in_review``
-    (and is then re-validated below); a closed ``stale_base`` PR was your
-    rejection — the task goes to ``in_progress`` and the next run's
-    ``reclaim_abandoned`` re-queues the fix round.
+    F-26 recovery edges from GitHub's PR state — one of the two writers
+    they have (reconcile skips non-draft tasks; tasks.json is never
+    hand-edited; the other is `factory recover`). A re-opened or merged
+    escalated PR goes back to ``in_review`` (a merged one then rides the
+    standard reconcile story — round-5 finding 4); a closed stale_base
+    PR was your rejection — the task goes straight to ``ready`` for its
+    fix round (round-5 finding 3: no lease-less ``in_progress`` hop for
+    the next run's reclaim to clean up). A pr_closed task's PR was
+    already closed at escalation, so the sweep reads no new intent from
+    it — its fix-round word is ``factory recover``.
 
     Returns:
         A ``needs_human`` result when a stale PR failed re-validation, or
@@ -1023,22 +1035,35 @@ def _sweep_stale_prs(
     project = profile["name"]
     source = Path(repo_cfg["path"]).expanduser()
     default_branch = repo_cfg["default_branch"]
-    for task in _recovery_tasks(queue):
+    for task in recovery:
         state = states.get(task["links"]["pr"])
         escalation = task["attempts"][-1].get("escalation")
-        if state == "open" and escalation == "pr_closed":
+        if state == "merged":
+            # Round-5 finding 4: you resolved the conflict on GitHub and
+            # merged — shipped code must not strand the task (and its
+            # dependants) in needs_human. Back to in_review, the standard
+            # merged story; the loop below then skips it (state merged)
+            # until reconcile moves it on.
             new_status = "in_review"
+            note = (f"GitHub shows {task['links']['pr']} merged: "
+                    f"{escalation} recovery — back to in_review for "
+                    f"reconcile")
+        elif state == "open" and escalation == "pr_closed":
+            new_status = "in_review"
+            note = (f"GitHub shows {task['links']['pr']} open again: "
+                    f"{escalation} recovery — {task['id']} → in_review")
         elif state == "closed" and escalation == "stale_base":
-            new_status = "in_progress"
+            new_status = "ready"
+            note = (f"GitHub shows {task['links']['pr']} closed (your "
+                    f"rejection): {escalation} recovery — {task['id']} → "
+                    f"ready for a fix round")
         else:
-            continue  # no owner action to read; merged is F-28's story
+            continue  # no owner action to read
         queue.transition(task["id"], new_status)
         ProgressLog.for_task(factory_root, project, task["id"]).append({
             "run_id": new_run_id(),
             "outcome": "recovered",
-            "note": (f"GitHub shows {task['links']['pr']} "
-                     f"{'open again' if state == 'open' else 'closed'}: "
-                     f"{escalation} recovery — {task['id']} → {new_status}"),
+            "note": note,
         })
     open_prs = [
         task for task in queue.doc.get("tasks", [])
@@ -1103,31 +1128,34 @@ def _sweep_stale_prs(
 
             # Stale: merge the PR onto the new base; a conflict is itself
             # a re-validation failure (the merge a human would attempt).
-            # The merge runs under LC_ALL=C (deterministic note text)
-            # with prompts disabled and a timeout (round-3 finding 3);
-            # conflicts are read from the index, not from git's localized
-            # messages (round-2 finding 2); any other failure is
-            # infrastructure, not the PR.
             hardened_git(work.root, "checkout", "-q", "--detach", pr_sha)
             try:
+                # LC_ALL=C (deterministic note text), prompts disabled as
+                # defense in depth: the scratch clone is blobless, and an
+                # unexpectedly missing blob would trigger a lazy fetch
+                # from the local source — prompt-free keeps even that
+                # path safe. Conflicts are read from the index, not from
+                # git's localized messages (round-2 finding 2); any
+                # other failure is infrastructure, not the PR.
                 merge = subprocess.run(
                     ["git", *GIT_HARDENING, "-C", str(work.root), *_IDENTITY,
                      "merge", "--no-edit", default_sha],
                     capture_output=True, text=True,
                     env={**os.environ, "LC_ALL": "C", "LANG": "C",
                          **_GIT_NET_ENV},
-                    timeout=_NET_TIMEOUT_SEC,
+                    timeout=_MERGE_TIMEOUT_SEC,
                 )
             except subprocess.TimeoutExpired as exc:
-                # Round-4 finding 5: same shape as _fetch_sha — a timeout
-                # is a clean RunError (exit 2, message), never a raw
-                # TimeoutExpired traceback out of the CLI.
+                # Round-4 finding 5 + round-5 finding 5: a timeout is a
+                # clean RunError (exit 2, message), never a traceback —
+                # and this merge is local, so the message names the local
+                # pathology, not credentials or the network.
                 raise RunError(
                     f"git merge of {branch} onto "
                     f"{default_branch}@{default_sha[:12]} timed out after "
-                    f"{_NET_TIMEOUT_SEC}s (GIT_TERMINAL_PROMPT=0 was set: a "
-                    "hung credential helper or an unreachable remote, not "
-                    "a prompt waiting for you)"
+                    f"{_MERGE_TIMEOUT_SEC}s — a local merge (both commits "
+                    "were already fetched): pathological merge or disk "
+                    "problem, not the network"
                 ) from exc
             reports: dict = {"L0": None, "L1": None, "L2": None}
             note: str | None = None
@@ -1258,6 +1286,12 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
     used = sum(
         1 for a in task.get("attempts") or []
         if a.get("slice_id") == slice_id and a.get("outcome") != "aborted"
+        # Round-5 finding 1: stale_base/pr_closed attempts are the
+        # sweep's session-less records, not spent work — the recovery
+        # fix round starts with its slot unspent (a stale_base
+        # escalation after a passing round must not exhaust the budget
+        # before the fix round's session can run).
+        and a.get("escalation") not in RECOVERY_ESCALATIONS
     )
     versions = prompt_versions(profile)
     log = ProgressLog.for_task(ctx.factory_root, project, task_id)
