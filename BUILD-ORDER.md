@@ -220,12 +220,14 @@ PR body shape adapted from mattpocock/skills `pr` (its Summary visuals credit De
 Write a markdown summary per project:
 - done, in review, needs you (with reasons), awaiting owner
 - quota used this week
+- the week's vents by category (F-27)
 - metrics from DESIGN §9
 
 Acceptance:
 - AC-1 For a fixture `tasks.json`, the summary lists every `needs_human` task with its escalation reason.
 - AC-2 Metrics computed from `attempts` match hand-computed values for the fixture.
 - AC-3 The summary reports outcome measures only (RESEARCH-SOFTWARE-FACTORY §9): interventions per task, review rounds per attempt, tokens per merged PR, time from approval to merge, and the share of merged factory PRs later reverted (a revert commit naming the PR's merge commit). It never reports lines of code or PR counts as a measure of success.
+- AC-4 `factory status` lists the week's vents grouped by category, from the F-27 `weeks_vents` seam (no second implementation).
 
 ### F-12 — Importer (`factory import`)
 An importer session reads a project's planning docs and proposes `tasks.json`. Every task is `draft`. The orchestrator shows the full diff; nothing is written without confirmation.
@@ -281,7 +283,7 @@ Lovable's pattern, via Cursor: give agents a tool to complain. The complaints be
 - AC-1 Implementer and reviewer sessions have one extra tool, `vent(category, text)`, an in-process SDK tool listed in `allowed_tools`. Categories: missing_tool, unclear_contract, flaky_check, environment, other.
 - AC-2 Each call appends one record (run id, task id, seat, turn, category, text) to the run's progress log outside the clone. The tool can write nothing else, and text is length-capped.
 - AC-3 Venting never changes a run's outcome or budget (a test vents mid-run and asserts the attempt record is otherwise identical).
-- AC-4 `factory status` (F-11) lists the week's vents grouped by category, and F-19's review reads them.
+- AC-4 The week's vents are readable grouped by category through the read-only `weeks_vents` seam, whose docstring names its consumers: `factory status` (F-11) lists them, F-19's review reads them.
 
 ### F-30 — Run trace: live event log per run
 Today a run is visible only after it ends: the session loop (`factory/session.py`) keeps the `ResultMessage` and drops every other SDK message, so tool calls, gate evidence and per-phase spend are never recorded, and nobody can see what a session is doing while it runs. Seen in IndyDevDan's Super Simple Software Factory (github.com/disler/super-simple-software-factory): every event is written while the agent works, and every gate records what it checked, not only the verdict. We take the trace and leave the rest (it runs on `main` with no sandbox; its gates check the agent's claims against themselves).
@@ -375,12 +377,13 @@ A Sentry-alert → triage-session pipeline. That session has no secrets, can't p
 ## Phase 4 — Self-improvement and gate dial-down
 
 ### F-19 — Meta loop
-A weekly review of escalations and L2 findings → PRs with **itemised delta edits** to prompt files. Edits target what actually caused failures. Every attempt records which prompt versions and skills it used (F-10 AC-6), and the review traces failures back to them. This is a non-trained version of the credit-assignment idea in market-based post-training ([arXiv 2610.22322](https://arxiv.org/abs/2610.22322)).
+A weekly review of escalations, L2 findings and the week's vents → PRs with **itemised delta edits** to prompt files. Edits target what actually caused failures. Every attempt records which prompt versions and skills it used (F-10 AC-6), and the review traces failures back to them. This is a non-trained version of the credit-assignment idea in market-based post-training ([arXiv 2610.22322](https://arxiv.org/abs/2610.22322)).
 - AC-1 A PR that touches validators, holdouts, contract tests or schemas is rejected by L0.
 - AC-2 Edits are additions, removals or changes to individual items, never whole-file rewrites (a diff-size check).
 - AC-3 The weekly review groups failed and escalated attempts by `prompt_versions` and `skills`, and reports each version's failure share. Each proposed edit names the version it targets and the evidence (attempt run ids) behind it.
 - AC-4 The review also reads the session transcripts of the attempts it samples, because agents push through friction that never shows up as a failure. Every proposal cites the run id and turn it comes from.
 - AC-5 A proposal that targets anything other than a prompt file (a new check, CI, `standards`, steering files) comes out as a `draft` task for you, never as a meta-loop PR. Agents can't edit what judges them (Principle 5).
+- AC-6 The weekly review reads the week's vents (the F-27 `weeks_vents` seam) alongside failures and transcripts, so friction that never became a failure still reaches you.
 
 Review categories adapted from mattpocock/skills `retro`: navigation, automated checks, coding standards, steering-file bloat and no-ops, tool economy, information access. His warning applies too: a fully automated retro loop chases false positives, which is why every output is a proposal you review.
 
