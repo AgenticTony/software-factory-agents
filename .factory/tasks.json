@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-23T13:59:49Z",
+  "updated_at": "2026-10-23T21:05:49Z",
   "tasks": [
     {
       "id": "F-00",
@@ -2204,7 +2204,7 @@
       "source": "BUILD-ORDER.md#f-33--sentinel-false-positive-corpus",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-25"
       ],
@@ -2265,7 +2265,10 @@
         "wall_clock_min": 150
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "acceptance_hash": "8fe0db50cec682e986e8ebb29a49535c05f2cf9d466c3f0a3f50a47f72703cb0",
+      "approved_at": "2026-10-23T21:05:49Z",
+      "approved_by": "Anthony"
     }
   ]
 }
