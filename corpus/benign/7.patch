@@ -1,0 +1,1548 @@
+diff --git a/.factory/BOOTSTRAP.md b/.factory/BOOTSTRAP.md
+index 6475b98..51c702d 100644
+--- a/.factory/BOOTSTRAP.md
++++ b/.factory/BOOTSTRAP.md
+@@ -57,3 +57,27 @@ Entries record evidence, not claims. Each criterion is marked proven, pending, o
+ - **AC-6** proven: `test_ac_6` — `os.replace` crashing mid-write leaves the previous `tasks.json` byte-identical, loadable, and no temp junk behind; `test_crash_during_serialisation_leaves_file_intact` covers the earlier crash window.
+ - **Extra invariants tested:** append-only `attempts` (rewrite, clear, and task-removal each refused with file intact), `save` refuses schema-invalid state, attempts are schema-validated on append, `updated_at` stamped per write, slice selection (first incomplete / fall-through fully merged / unsliced = one unit), concurrency (both a lost-append and a lost-transition scenario), non-ASCII round-trip, duplicate-id rejection, error hierarchy, new edges, `reclaim_abandoned`, `sync_readiness`.
+ - **Status to set at reconcile:** `done` once this PR's CI is green (ruff + pytest on 3.11 + 3.13) and you merge it. No deploy target, so L4 doesn't apply.
++
++---
++
++## F-04 — `factory approve`
++
++- **Commits:** `feat/f04-approve` → PR (this one). Red-first: the suite failed on the missing `factory.approve` module before implementation.
++- **Built:** 2026-10-16. Interactive session, then this ledger entry.
++- **Design notes:** new `factory/approve.py` — `approve_task` (render contract → checks → confirm → freeze `acceptance_hash`/`approved_at`/`approved_by` → `draft -> ready|blocked` per the picker's dependency rule) and `reconcile_bootstrap` (parse BOOTSTRAP.md, per interactive entry approve + validate the legal F-03 path to the recorded status, written in one save — see review round). Wired into `factory/cli.py` as a real subcommand (`--yes`, `--reconcile-bootstrap`, `--queue`, `--ledger`, `--approved-by`; refusals exit 1, never a traceback). `factory/state.py` gained public `unmet_dependencies` (the §4 rule, named for reuse) and `now_iso` (renamed from `_now_iso` so approval stamps timestamps in the queue's style). `gates.spec_approval` is **not** touched by approval: every task in this repo's queue already carries `true` at draft, so it reads as "this gate applies", not "approved" — the frozen-contract markers are the three fields above.
++  - Reconcile rules beyond the literal WO text, recorded for review: a criterion the ledger never mentions also blocks `done` (evidence per criterion is what the ledger exists to record); entries whose dependency isn't reconciled yet fail with the dep named (reconcile runs in file = dependency order); already-reconciled entries are skipped, so a re-run after a partial reconcile is safe; a declined entry is skipped, and its dependents then fail on the open dependency.
++- **AC-1** proven: `tests/test_f04.py::test_ac_1` — empty `acceptance` refused with a readable error, file byte-identical.
++- **AC-2** proven: `test_ac_2` — dep-free → `ready`; open dep → `blocked`; done dep → `ready`; hash = the F-02 formula, `approved_at`/`approved_by` stamped. Cross-repo dep stays `blocked` (extra test).
++- **AC-3** proven: `test_ac_3` — `--yes` on a risk-flagged task refused before anything is printed or written; interactive confirmation approves it.
++- **AC-4** proven: `test_ac_4` — fixture ledger: F-1/F-2 reconciled to `done` through legal transitions in dependency order, one interactive confirmation per entry that gets that far; the pending entry is refused *before* asking (no point confirming a refusal), stays `draft`, no hash. Extra tests: unmentioned criterion also blocks `done`; declined entry skipped with dependents failing on the dep; second run skips; intermediate target (`in_review`) walks the full path; risk-flagged entry confirms interactively; the parser and a full reconcile run against **this repo's real** BOOTSTRAP.md + tasks.json (F-01..F-03 → done, F-04 untouched).
++- **Extra coverage:** non-draft and non-executable-kind refusals, declined confirmation writes nothing, contract rendering includes ids/texts/checks, CLI end-to-end (`--yes` exit 0, risk `--yes` exit 1, `--reconcile-bootstrap`, task-id/reconcile exclusivity).
++- **Smoke-tested by hand** on a copy of the real queue: `approve F-04 --yes` → `blocked` (F-03 still draft); interactive `y` on F-11 → `blocked`; `approve F-05 --yes` (risk) → refused, exit 1; `--reconcile-bootstrap` with three `y`s → F-01..F-03 `done`.
++- **Review round (10 findings, all fixed on this PR; 3 reproduced):**
++  - **Stranding + lease bypass + save churn (reproduced, one structural fix):** reconcile no longer persists approval and each walk step as separate saves — a failure partway left an approved task stranded at an intermediate status that a re-run then skipped, and the transient `in_progress` never held the run lease (F-03's `reclaim_abandoned` could grab it mid-walk). New `TaskQueue.transition_path(statuses)`: validates every consecutive edge + final-status guards, applies only the final status in **one** atomic save. Proven by `test_reconcile_failure_writes_nothing` (the reviewer's unmerged-slice repro: entry fails, file byte-identical, re-run re-asks) and `test_reconcile_writes_once_per_entry` (2 entries → 2 saves).
++  - **`done` with open owner steps (reproduced):** F-03 gained an owner-step guard — `done` is refused while any `owner_step` is open, and `awaiting_owner` is refused when none are (it would wait on nothing). Reconcile routes a recorded `done` with open steps to `awaiting_owner`, with the reroute named in the result detail. `test_l4_branches_from_deploying` now ticks the step before `done` (the edge was legal before; the semantics weren't enforced). Real case: F-06 can't close over its Z.ai owner step.
++  - **EOF crash (reproduced):** `input()` at EOF now declines instead of raising `EOFError` past the CLI's error handling; the CLI catches `KeyboardInterrupt` → exit 130. `factory approve X < /dev/null` exits 1 with "approval declined".
++  - **`--reconcile-bootstrap --yes` (defeated AC-4's per-entry confirmation):** now a usage error at the parser — reconcile is always interactive, every entry, because the ledger is plain markdown this command turns into `done` tasks.
++  - **Pending criteria beyond `done`:** the all-proven requirement now covers every recorded status that asserts the build passed validation (`in_review`, `deploying`, `awaiting_owner`, `done`); `needs_human` stays exempt (escalation is where unproven criteria honestly land).
++  - **Parser hardening:** heading ids stripped of trailing punctuation (`## F-05: …` → `F-05`), and a status marker that fails to parse (backticks missing, say) still counts as an entry with `status=None`, so reconcile fails it visibly instead of silently dropping a work order.
++  - **Cleanups:** unreachable post-approval dependency check deleted (subsumed by the pre-check once the save is atomic); dead `dependencies_met` removed (one public spelling of the rule now: `unmet_dependencies`).
++- **Status to set at reconcile:** `done` once this PR's CI is green (ruff + pytest on 3.11 + 3.13) and you merge it. No deploy target, so L4 doesn't apply.
+diff --git a/factory/approve.py b/factory/approve.py
+new file mode 100644
+index 0000000..3863844
+--- /dev/null
++++ b/factory/approve.py
+@@ -0,0 +1,470 @@
++"""``factory approve`` — the human spec-approval gate (F-04).
++
++Approval is the moment a draft becomes a contract: a human reads the
++acceptance items, confirms, and the queue freezes them —
++``acceptance_hash``, ``approved_at``, ``approved_by`` (TASK-CONTRACT
++§2). Any later edit to the acceptance text changes the hash and F-03
++sends the task back to ``draft``; re-approving then overwrites the stale
++fields.
++
++The command is deliberately human-paced:
++
++- the contract is printed before anything is asked,
++- a risk-flagged task can never be approved with ``--yes`` (AC-3) — the
++  point of a risk flag is that a human looks at the task,
++- approval routes to ``ready`` or ``blocked`` strictly per the picker's
++  dependency rule, so an approved-but-blocked task can never be picked,
++- EOF on the prompt (no TTY, stdin closed) counts as a decline, never a
++  crash.
++
++``--reconcile-bootstrap`` (AC-4) turns the bootstrap ledger
++(``.factory/BOOTSTRAP.md``) into queue state: each entry names a task,
++its criterion markers and the status the evidence supports. Every entry
++is confirmed interactively — there is no ``--yes`` for reconcile,
++because the ledger is plain markdown and this command turns it into
++``done`` tasks. On confirmation the entry's final status is computed and
++applied through :meth:`TaskQueue.transition_path`: the whole path is
++validated as legal F-03 transitions and written in **one** atomic save,
++so a refused entry writes nothing (no half-approved task stranded at an
++intermediate status, and never a persisted ``in_progress`` without the
++run lease). A criterion marked pending — or not met, or never mentioned
++— can never produce a status that asserts the build passed validation
++(``in_review`` and beyond); the entry is refused and the task stays
++``draft``. A recorded ``done`` whose owner steps are still open is
++routed to ``awaiting_owner``, which is what the evidence supports.
++"""
++
++import getpass
++import re
++import subprocess
++from collections import namedtuple
++from collections.abc import Callable
++from pathlib import Path
++
++from factory.contract import NON_EXECUTABLE_KINDS, ContractError, acceptance_hash
++from factory.state import TaskQueue, now_iso, open_owner_steps, unmet_dependencies
++
++# Ledger grammar (.factory/BOOTSTRAP.md):
++#   ## <task-id> — <title>                     starts an entry
++#   - **AC-n** proven|pending|not met: ...     criterion markers
++#   **Status to set at reconcile:** `<status>`  the status evidence supports
++_STATUS_MARKER = "Status to set at reconcile"
++_CRITERION_RE = re.compile(
++    r"^\s*-\s+\*\*(AC-\d+)\*\*\s+(proven|pending|not\s+met)\b", re.MULTILINE
++)
++_RECORDED_STATUS_RE = re.compile(
++    r"\*\*Status to set at reconcile:\*\*\s*`([a-z_]+)`"
++)
++
++# The forward lifecycle after approval, in order. A reconcile path is
++# replayed history validated edge by edge, so every step is a legal F-03
++# transition; ``awaiting_owner`` sits off the direct path: done comes
++# straight from deploying when the owner steps are closed.
++_FORWARD_CHAIN = ("ready", "in_progress", "in_review", "deploying")
++_WALK_CHAIN = _FORWARD_CHAIN[1:]  # approval already reached "ready"
++
++# Recorded statuses that assert the build passed validation. Reconciling
++# to any of these requires every acceptance criterion to be proven in the
++# ledger entry; needs_human is exempt because escalation is exactly where
++# unproven criteria honestly land.
++_PROVEN_REQUIRED_TARGETS = frozenset(
++    {"in_review", "deploying", "awaiting_owner", "done"}
++)
++
++# One reconcile outcome per ledger entry: what happened, and why.
++ReconcileResult = namedtuple("ReconcileResult", ["task_id", "action", "detail"])
++
++
++class ApprovalError(ContractError):
++    """An approval or reconcile was refused. The message is for humans."""
++
++
++class ApprovalDeclined(ApprovalError):
++    """The human answered no to the confirmation prompt."""
++
++
++def render_contract(task: dict) -> str:
++    """Render the contract a human is about to approve.
++
++    Everything the approval decision depends on, nothing else: identity,
++    risk, dependencies, the acceptance items with their checks, owner
++    steps and slices. Open owner steps list first — they cap how far the
++    task can ever be advanced.
++
++    Args:
++        task: The task record.
++
++    Returns:
++        The contract as plain text, one fact per line.
++    """
++    budget = task.get("budget") or {}
++    risk = task.get("risk") or []
++    deps = task.get("depends_on") or []
++    lines = [
++        f"{task.get('id')} — {task.get('title')}",
++        "  kind: {}   priority: {}   budget: {} (max {} attempts)".format(
++            task.get("kind"),
++            task.get("priority"),
++            budget.get("size", "?"),
++            budget.get("max_attempts", "?"),
++        ),
++        f"  source: {task.get('source')}",
++        f"  risk: {', '.join(risk) if risk else '(none)'}",
++        f"  depends_on: {', '.join(deps) if deps else '(none)'}",
++        "  acceptance (frozen on approval):",
++    ]
++    for item in task.get("acceptance") or []:
++        check = item.get("check", {})
++        lines.append(f"    {item.get('id')}: {item.get('text')}")
++        if check.get("ref"):
++            lines.append(f"      check: {check.get('type')} {check.get('ref')}")
++    for step in task.get("owner_steps") or []:
++        mark = "x" if step.get("done") else " "
++        lines.append(f"  owner step [{mark}]: {step.get('text')}")
++    for slice_ in task.get("slices") or []:
++        lines.append(
++            f"  slice {slice_.get('id')} [{slice_.get('status')}]: {slice_.get('text')}"
++        )
++    return "\n".join(lines)
++
++
++def default_approver() -> str:
++    """Best-effort identity for ``approved_by``.
++
++    Returns:
++        ``git config user.name`` in the current repository, else the OS
++        user name. Overridable with ``--approved-by``.
++    """
++    try:
++        result = subprocess.run(
++            ["git", "config", "user.name"], capture_output=True, text=True, check=True
++        )
++        name = result.stdout.strip()
++    except (OSError, subprocess.CalledProcessError):
++        name = ""
++    return name or getpass.getuser()
++
++
++def _input_confirm(question: str) -> bool:
++    """Ask a yes/no question on the terminal; anything but y/yes declines.
++
++    EOF (no TTY, stdin closed or piped) also declines: approval without
++    an interactive human is a refusal, not a crash.
++    """
++    try:
++        answer = input(f"{question} [y/N] ").strip().lower()
++    except EOFError:
++        return False
++    return answer in ("y", "yes")
++
++
++def _check_approvable(task: dict) -> None:
++    """Refusals that apply to any approval, single or reconcile.
++
++    Args:
++        task: The task record.
++
++    Raises:
++        ApprovalError: When the task is not a draft, is of a
++            non-executable kind, or has no acceptance items (AC-1).
++    """
++    task_id = task.get("id")
++    kind = task.get("kind")
++    if kind in NON_EXECUTABLE_KINDS:
++        raise ApprovalError(
++            f"{task_id}: kind={kind} is never executed, so approving it has "
++            "no meaning — it is surfaced to you, not run"
++        )
++    status = task.get("status")
++    if status != "draft":
++        raise ApprovalError(
++            f"{task_id}: only draft contracts can be approved; it is {status}"
++        )
++    if not task.get("acceptance"):
++        raise ApprovalError(
++            f"{task_id}: refusing to approve a contract with no acceptance "
++            "items — there is nothing to hold the work to"
++        )
++
++
++def _freeze_contract(task: dict, approved_by: str) -> None:
++    """Stamp the three contract-freezing fields (TASK-CONTRACT §2)."""
++    task["acceptance_hash"] = acceptance_hash(task["acceptance"])
++    task["approved_at"] = now_iso()
++    task["approved_by"] = approved_by
++
++
++def approve_task(
++    queue: TaskQueue,
++    task_id: str,
++    *,
++    approved_by: str,
++    assume_yes: bool = False,
++    confirm: Callable[[str], bool] = _input_confirm,
++    echo: Callable[[str], None] = print,
++) -> str:
++    """Print a draft task's contract, confirm, freeze it, and route it.
++
++    Refused — :class:`ApprovalError`, nothing written — when the task is
++    not a draft, is of a non-executable kind, has no acceptance items
++    (AC-1), or is risk-flagged while ``assume_yes`` is set (AC-3). On
++    confirmation the contract is frozen (``acceptance_hash``,
++    ``approved_at``, ``approved_by``) and the task moves
++    ``draft -> ready`` or ``draft -> blocked`` per the picker's
++    dependency rule (AC-2) in a single validated save.
++
++    Args:
++        queue: The queue to write through (its only writer path).
++        task_id: Task to approve.
++        approved_by: Name recorded as the approver.
++        assume_yes: Skip the confirmation prompt; never allowed for
++            risk-flagged tasks.
++        confirm: Interactive confirmation callable; injected in tests.
++        echo: Output callable for the contract; injected in tests.
++
++    Returns:
++        The new status: ``ready`` or ``blocked``.
++
++    Raises:
++        ApprovalError: On any refusal, or an unknown task.
++        ApprovalDeclined: When the human answers no (or the prompt hits
++            EOF).
++        ContractError: If the resulting queue wouldn't validate.
++    """
++    task = queue.get(task_id)  # StateError (a ContractError) if unknown
++    _check_approvable(task)
++    risk = task.get("risk") or []
++    if assume_yes and risk:
++        raise ApprovalError(
++            f"{task_id}: risk flags ({', '.join(risk)}) require interactive "
++            "approval; --yes is not accepted for risk-flagged tasks"
++        )
++    echo(render_contract(task))
++    if not assume_yes and not confirm(f"Approve {task_id}?"):
++        raise ApprovalDeclined(f"{task_id}: approval declined")
++    _freeze_contract(task, approved_by)
++    new_status = (
++        "blocked" if unmet_dependencies(task, queue.doc.get("tasks", [])) else "ready"
++    )
++    queue.transition(task_id, new_status)
++    return new_status
++
++
++def _clean_entry_id(token: str) -> str:
++    """Strip heading punctuation from a ledger entry id.
++
++    ``## F-05: Clone manager`` yields the token ``F-05:``; the trailing
++    colon is heading punctuation, not part of the id.
++    """
++    return token.rstrip(":,.").rstrip("：，。")
++
++
++def parse_bootstrap_ledger(text: str) -> list:
++    """Parse a BOOTSTRAP.md ledger into reconcile entries.
++
++    A ``## <task-id> ...`` heading starts an entry (trailing punctuation
++    on the id token is stripped); within its section, criterion bullets
++    ``- **AC-n** proven|pending|not met`` are collected (``not met``
++    normalised to its spaced form), and the first backticked status
++    after ``**Status to set at reconcile:**`` is the recorded status.
++
++    Sections with criteria, a parseable status, or a status marker that
++    failed to parse (backticks missing, say) are entries — the last kind
++    carries ``status=None`` so reconcile reports it as a failure instead
++    of silently dropping a work order the ledger meant to record. Pure
++    prose sections (no criteria, no status marker) are not entries.
++
++    Args:
++        text: The ledger's full text.
++
++    Returns:
++        Entries in file order, ``{id, criteria: {AC-id: marker}, status}``;
++        ``status`` is None when the entry records none or unparseably.
++    """
++    entries = []
++    sections = re.split(r"^##\s+", text, flags=re.MULTILINE)
++    for section in sections[1:]:
++        first_line, _, body = section.partition("\n")
++        words = first_line.split()
++        entry_id = _clean_entry_id(words[0]) if words else ""
++        criteria = {
++            match.group(1): re.sub(r"\s+", " ", match.group(2))
++            for match in _CRITERION_RE.finditer(body)
++        }
++        status_match = _RECORDED_STATUS_RE.search(body)
++        if entry_id and (criteria or status_match or _STATUS_MARKER in body):
++            entries.append(
++                {
++                    "id": entry_id,
++                    "criteria": criteria,
++                    "status": status_match.group(1) if status_match else None,
++                }
++            )
++    return entries
++
++
++def _unproven_criteria(task: dict, entry: dict) -> list:
++    """Task acceptance ids not marked ``proven`` in the ledger entry.
++
++    A criterion the entry never mentions is not proven either — evidence
++    per criterion is what the ledger exists to record.
++    """
++    markers = entry.get("criteria", {})
++    return [
++        item.get("id", "?")
++        for item in task.get("acceptance") or []
++        if markers.get(item.get("id")) != "proven"
++    ]
++
++
++def _walk_path(target: str) -> list:
++    """The legal statuses between approval (``ready``/``blocked``) and target."""
++    if target in ("ready", "blocked"):
++        return []
++    if target in _WALK_CHAIN:
++        return list(_WALK_CHAIN[: _WALK_CHAIN.index(target) + 1])
++    if target in ("awaiting_owner", "done"):
++        return [*_WALK_CHAIN, target]
++    if target == "needs_human":
++        return ["in_progress", "needs_human"]
++    raise ApprovalError(
++        f"cannot reconcile to {target!r}: not a status the ledger may record"
++    )
++
++
++def _reconcile_route(task: dict, tasks: list, target: str) -> tuple:
++    """Compute one entry's final status and the legal path to it.
++
++    A recorded ``done`` with owner steps still open is routed to
++    ``awaiting_owner`` — the F-03 owner-step guard refuses ``done`` in
++    that case, and awaiting_owner is what the evidence supports until
++    you tick the steps. The path starts at the approval routing
++    (``ready``, or ``blocked`` when a dependency is open) and continues
++    along the forward chain; only its final status is ever persisted
++    (:meth:`TaskQueue.transition_path`).
++
++    Args:
++        task: The task record.
++        tasks: The queue's ``tasks`` array.
++        target: The ledger-recorded status.
++
++    Returns:
++        ``(final_status, path)``; the path lists every status to move
++        through, starting from the approval routing.
++    """
++    final = target
++    if target == "done" and open_owner_steps(task):
++        final = "awaiting_owner"
++    start = "blocked" if unmet_dependencies(task, tasks) else "ready"
++    return final, [start, *_walk_path(final)]
++
++
++def _reconcile_entry(
++    queue: TaskQueue,
++    entry: dict,
++    approved_by: str,
++    confirm: Callable[[str], bool],
++    echo: Callable[[str], None],
++) -> ReconcileResult:
++    """Reconcile one ledger entry; never raises, failures become results."""
++    tid = entry["id"]
++    target = entry["status"]
++    try:
++        task = queue.get(tid)
++    except ContractError as exc:
++        return ReconcileResult(tid, "failed", f"no such task: {exc}")
++    if target is None:
++        return ReconcileResult(tid, "failed", "ledger entry records no status to set")
++    if task.get("status") != "draft":
++        return ReconcileResult(
++            tid, "skipped", f"already {task.get('status')}; nothing to reconcile"
++        )
++    if target in _PROVEN_REQUIRED_TARGETS and (bad := _unproven_criteria(task, entry)):
++        return ReconcileResult(
++            tid,
++            "failed",
++            f"a criterion marked pending (or not proven) cannot produce "
++            f"{target}: {', '.join(bad)}",
++        )
++    if target != "blocked" and (
++        open_deps := unmet_dependencies(task, queue.doc.get("tasks", []))
++    ):
++        return ReconcileResult(
++            tid,
++            "failed",
++            f"dependency not met ({', '.join(open_deps)}); reconcile entries "
++            "in dependency order",
++        )
++    echo(render_contract(task))
++    markers = ", ".join(f"{ac}={m}" for ac, m in sorted(entry["criteria"].items()))
++    echo(f"Ledger evidence: {markers or '(no criterion markers)'}")
++    echo(f"Recorded status to set: {target}")
++    if not confirm(f"Approve {tid} and advance it to {target}?"):
++        return ReconcileResult(tid, "skipped", "declined")
++    try:
++        # One atomic save: freeze the contract, then move through the
++        # whole validated path to the final status. A refusal anywhere
++        # leaves the file untouched — no half-approved task.
++        _check_approvable(task)
++        _freeze_contract(task, approved_by)
++        final, path = _reconcile_route(task, queue.doc.get("tasks", []), target)
++        queue.transition_path(tid, path)
++    except ContractError as exc:
++        return ReconcileResult(tid, "failed", str(exc))
++    detail = f"approved and advanced to {final}"
++    if final != target:
++        detail += f" (recorded {target}, but owner steps are open)"
++    return ReconcileResult(tid, "reconciled", detail)
++
++
++def reconcile_bootstrap(
++    queue: TaskQueue,
++    ledger_path: Path | str,
++    *,
++    approved_by: str,
++    confirm: Callable[[str], bool] = _input_confirm,
++    echo: Callable[[str], None] = print,
++) -> list:
++    """Approve and advance the tasks named by the bootstrap ledger (AC-4).
++
++    For each ledger entry, in file order: print the contract and the
++    entry's evidence markers, confirm interactively (reconcile has no
++    ``--yes`` — the ledger is plain markdown and this command turns it
++    into ``done`` tasks), then freeze the contract and apply the entry's
++    final status through :meth:`TaskQueue.transition_path` — the whole
++    path validated as legal F-03 transitions, written in one atomic
++    save, never persisting intermediate statuses. A recorded status that
++    asserts the build passed validation (``in_review`` and beyond)
++    requires every acceptance criterion to be marked ``proven``;
++    pending, not met, or unmentioned criteria refuse the entry. A
++    recorded ``done`` with owner steps still open reconciles to
++    ``awaiting_owner``. Entries whose task is no longer draft are
++    skipped, so re-running after a partial reconcile is safe. One
++    entry's failure never stops the others; every outcome is reported in
++    the returned summary.
++
++    Args:
++        queue: The queue to write through.
++        ledger_path: Path to ``.factory/BOOTSTRAP.md``.
++        approved_by: Name recorded as the approver of every entry.
++        confirm: Interactive confirmation callable; injected in tests.
++        echo: Output callable for contracts and summaries; injected in
++            tests.
++
++    Returns:
++        One :class:`ReconcileResult` per entry, in ledger order; action
++        is ``reconciled``, ``skipped`` or ``failed``.
++
++    Raises:
++        ApprovalError: If the ledger itself cannot be read.
++    """
++    try:
++        text = Path(ledger_path).read_text(encoding="utf-8")
++    except OSError as exc:
++        raise ApprovalError(
++            f"{ledger_path}: cannot read bootstrap ledger: {exc}"
++        ) from exc
++    return [
++        _reconcile_entry(queue, entry, approved_by, confirm, echo)
++        for entry in parse_bootstrap_ledger(text)
++    ]
+diff --git a/factory/cli.py b/factory/cli.py
+index a51fc1b..73ca296 100644
+--- a/factory/cli.py
++++ b/factory/cli.py
+@@ -1,15 +1,23 @@
+ """Factory CLI — the control-plane entry point.
+ 
+-F-01 scaffolds the command surface only. Each subcommand is a stub that
+-names the work order which implements it (BUILD-ORDER.md).
++``approve`` is real (F-04). Every other subcommand is a stub naming the
++work order that implements it (BUILD-ORDER.md).
+ """
+ 
+ import argparse
+ import sys
+ 
++from factory.approve import (
++    ApprovalError,
++    approve_task,
++    default_approver,
++    reconcile_bootstrap,
++)
++from factory.contract import ContractError
++from factory.state import TaskQueue
++
+ # subcommand -> the work order that implements it
+ STUBS: dict[str, str] = {
+-    "approve": "F-04",
+     "run": "F-10",
+     "loop": "F-10",
+     "status": "F-11",
+@@ -24,21 +32,86 @@ def build_parser() -> argparse.ArgumentParser:
+         description="Local agent software factory control plane.",
+     )
+     sub = parser.add_subparsers(dest="command", required=True)
++
++    approve = sub.add_parser("approve", help="approve a task contract (F-04)")
++    approve.add_argument("task_id", nargs="?", help="task id to approve, e.g. F-04")
++    approve.add_argument(
++        "--yes",
++        action="store_true",
++        help="non-interactive confirmation (refused for risk-flagged tasks)",
++    )
++    approve.add_argument(
++        "--reconcile-bootstrap",
++        action="store_true",
++        help="approve and advance every entry in the bootstrap ledger",
++    )
++    approve.add_argument(
++        "--queue",
++        default=".factory/tasks.json",
++        help="queue path (default: %(default)s)",
++    )
++    approve.add_argument(
++        "--ledger",
++        default=".factory/BOOTSTRAP.md",
++        help="bootstrap ledger path for --reconcile-bootstrap (default: %(default)s)",
++    )
++    approve.add_argument(
++        "--approved-by", default=None, help="approver name (default: git user.name)"
++    )
++
+     for name, wo in STUBS.items():
+         sub.add_parser(name, help=f"stub — implemented in {wo}")
+     return parser
+ 
+ 
+-def main(argv: list[str] | None = None) -> int:
++def _run_approve(args: argparse.Namespace) -> int:
++    """Dispatch the approve subcommand; refusals exit 1, never a traceback."""
++    try:
++        approver = args.approved_by or default_approver()
++        queue = TaskQueue(args.queue)
++        if args.reconcile_bootstrap:
++            # No --yes here by design (see main): every entry is confirmed
++            # interactively.
++            results = reconcile_bootstrap(queue, args.ledger, approved_by=approver)
++            for result in results:
++                print(f"{result.task_id}: {result.action} — {result.detail}")
++            return 1 if any(r.action == "failed" for r in results) else 0
++        status = approve_task(
++            queue, args.task_id, approved_by=approver, assume_yes=args.yes
++        )
++        print(f"{args.task_id}: approved -> {status}")
++        return 0
++    except (ApprovalError, ContractError) as exc:
++        print(f"factory approve: {exc}", file=sys.stderr)
++        return 1
++    except KeyboardInterrupt:
++        print("factory approve: interrupted", file=sys.stderr)
++        return 130
++
++
++def main(argv: list | None = None) -> int:
+     """Parses arguments and dispatches a subcommand.
+ 
+     Args:
+         argv: Arguments without the program name; defaults to sys.argv[1:].
+ 
+     Returns:
+-        Process exit code. Stubs return 2 (not implemented).
++        Process exit code. Stubs return 2 (not implemented); approve
++        returns 0 on success and 1 on any refusal or decline.
+     """
+-    args = build_parser().parse_args(argv)
++    parser = build_parser()
++    args = parser.parse_args(argv)
++    if args.command == "approve":
++        if bool(args.task_id) == bool(args.reconcile_bootstrap):
++            parser.error(
++                "approve takes exactly one of: a task id, or --reconcile-bootstrap"
++            )
++        if args.reconcile_bootstrap and args.yes:
++            parser.error(
++                "--yes is not accepted with --reconcile-bootstrap: the ledger is "
++                "plain markdown, so reconcile confirms every entry interactively"
++            )
++        return _run_approve(args)
+     print(
+         f"factory {args.command}: not implemented yet (scheduled in {STUBS[args.command]})",
+         file=sys.stderr,
+diff --git a/factory/state.py b/factory/state.py
+index 597dd39..6f2701e 100644
+--- a/factory/state.py
++++ b/factory/state.py
+@@ -221,29 +221,70 @@ def _unmerged_slices(task: dict) -> list:
+     return [s for s in (task.get("slices") or []) if s.get("status") != "merged"]
+ 
+ 
+-def _deps_met(task: dict, by_id: dict) -> bool:
+-    """Check ``depends_on`` against this queue (TASK-CONTRACT §2).
++def _unmet_by_id(task: dict, by_id: dict) -> list:
++    """The task's open dependency ids against a prebuilt {id: task} index.
+ 
+-    A ``repo:id`` dependency (anything with a colon) is cross-repo and is
+-    never met automatically — a human must mark it met. A same-repo
+-    dependency is met only when the referenced task is ``done`` in this
+-    queue; a dependency on an id not in the queue counts as unmet.
++    Implements the TASK-CONTRACT §2/§4 dependency rule: a ``repo:id``
++    dependency (anything with a colon) is cross-repo and is never met
++    automatically — a human must mark it met; a same-repo dependency is
++    met only when the referenced task is ``done`` in this queue; a
++    dependency on an id not in the queue counts as unmet.
+ 
+     Args:
+         task: The task whose dependencies to check.
+         by_id: Queue index {id: task}, built once by the caller.
+     """
++    open_: list = []
+     for dep in task.get("depends_on", []):
+         if not isinstance(dep, str) or ":" in dep:
+-            return False
++            open_.append(dep)
++            continue
+         target = by_id.get(dep)
+         if target is None or target.get("status") != "done":
+-            return False
+-    return True
++            open_.append(dep)
++    return open_
++
++
++def _deps_met(task: dict, by_id: dict) -> bool:
++    """True when every ``depends_on`` is met (see ``_unmet_by_id``)."""
++    return not _unmet_by_id(task, by_id)
++
++
++def unmet_dependencies(task: dict, tasks: list) -> list:
++    """The task's open dependencies against a plain task list.
++
++    Public read-only view of the picker's dependency rule, used by F-04
++    to route approval to ``ready`` or ``blocked`` and to name what a
++    task is waiting on.
++
++    Args:
++        task: The task whose dependencies to check.
++        tasks: The queue's ``tasks`` array.
++
++    Returns:
++        The unmet dependency ids, in declared order.
++    """
++    return _unmet_by_id(task, {t.get("id"): t for t in tasks})
++
+ 
++def open_owner_steps(task: dict) -> list:
++    """The task's owner steps that aren't ticked yet (TASK-CONTRACT §2).
+ 
+-def _now_iso() -> str:
+-    """UTC now in the queue's timestamp style (second precision, Z)."""
++    Args:
++        task: The task record.
++
++    Returns:
++        The open ``owner_steps`` entries, in declared order.
++    """
++    return [step for step in (task.get("owner_steps") or []) if not step.get("done")]
++
++
++def now_iso() -> str:
++    """UTC now in the queue's timestamp style (second precision, Z).
++
++    Public so every writer stamps timestamps identically (F-04 approval
++    fields, queue ``updated_at``).
++    """
+     return (
+         datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+     )
+@@ -349,6 +390,38 @@ def _check_slice_rules(task: dict, new_status: str) -> None:
+         )
+ 
+ 
++def _check_owner_step_rules(task: dict, new_status: str) -> None:
++    """Enforce the owner-step semantics of ``done`` / ``awaiting_owner``.
++
++    TASK-CONTRACT §3: ``deploying -> awaiting_owner`` is "L4 passed,
++    owner steps still open", ``deploying -> done`` is "L4 passed, no
++    open owner steps", and ``awaiting_owner -> done`` is "owner steps
++    ticked" — so ``done`` asserts every step is ticked, and
++    ``awaiting_owner`` exists only while at least one is open (with none
++    open it would wait on nothing; the task resolves to ``done``).
++
++    Args:
++        task: The task record.
++        new_status: The requested status.
++
++    Raises:
++        TransitionError: If the owner-step state contradicts the status.
++    """
++    tid = task.get("id")
++    open_steps = open_owner_steps(task)
++    if new_status == "done" and open_steps:
++        texts = "; ".join(step.get("text", "?") for step in open_steps)
++        raise TransitionError(
++            f"{tid}: owner step(s) still open: {texts}; the task is "
++            "awaiting_owner until you tick them, never done"
++        )
++    if new_status == "awaiting_owner" and not open_steps:
++        raise TransitionError(
++            f"{tid}: no owner steps are open; awaiting_owner would wait on "
++            "nothing — resolve the task to done instead"
++        )
++
++
+ class TaskQueue:
+     """The orchestrator's handle on a ``tasks.json`` — its only writer.
+ 
+@@ -403,16 +476,53 @@ def transition(self, task_id: str, new_status: str) -> None:
+         Raises:
+             StateError: If the task doesn't exist.
+             TransitionError: If the edge isn't in the table, or the slice
+-                state contradicts it (see ``_check_slice_rules``).
++                or owner-step state contradicts it.
+             ContractError: If the resulting queue wouldn't validate.
+             ConcurrentWriteError: If another writer changed the file.
+         """
+         task = self.get(task_id)
+         check_transition(task.get("status"), new_status)
+         _check_slice_rules(task, new_status)
++        _check_owner_step_rules(task, new_status)
+         task["status"] = new_status
+         self.save()
+ 
++    def transition_path(self, task_id: str, statuses: list) -> None:
++        """Move a task through a sequence of legal transitions in one save.
++
++        Every consecutive edge is validated against the table, and the
++        slice and owner-step guards run on the final status, before
++        anything is written; only the final status is persisted.
++        Intermediate statuses in a path are history being replayed, not
++        state to publish: persisting each would mean a full locked save
++        per step, a crash window that strands a half-moved task, and a
++        transient ``in_progress`` that never held the run lease.
++        Reconcile (F-04) is the intended caller.
++
++        Args:
++            task_id: Task id.
++            statuses: The statuses to move through, in order; the last
++                one is the resulting status. Must be non-empty.
++
++        Raises:
++            StateError: If the task doesn't exist or ``statuses`` is empty.
++            TransitionError: If any consecutive edge isn't in the table,
++                or the guards refuse the final status.
++            ContractError: If the resulting queue wouldn't validate.
++            ConcurrentWriteError: If another writer changed the file.
++        """
++        if not statuses:
++            raise StateError(f"{task_id}: transition_path needs at least one status")
++        task = self.get(task_id)
++        current = task.get("status")
++        for new_status in statuses:
++            check_transition(current, new_status)
++            current = new_status
++        _check_slice_rules(task, statuses[-1])
++        _check_owner_step_rules(task, statuses[-1])
++        task["status"] = statuses[-1]
++        self.save()
++
+     def append_attempt(self, task_id: str, attempt: dict) -> None:
+         """Append one attempt record to a task's append-only log.
+ 
+@@ -629,7 +739,7 @@ def save(self) -> None:
+             OSError: If the write fails; the previous file is intact.
+         """
+         candidate = copy.deepcopy(self.doc)
+-        candidate["updated_at"] = _now_iso()
++        candidate["updated_at"] = now_iso()
+         try:
+             validate_queue(candidate, str(self.path), self._schema_path)
+             with self._exclusive_lock():
+diff --git a/tests/test_f03.py b/tests/test_f03.py
+index 9eb9095..fa36ade 100644
+--- a/tests/test_f03.py
++++ b/tests/test_f03.py
+@@ -173,7 +173,8 @@ def test_blocked_round_trip_then_escalation_is_legal(tmp_path):
+ 
+ def test_l4_branches_from_deploying(tmp_path):
+     # live check FAIL -> needs_human; PASS with open owner steps ->
+-    # awaiting_owner -> done (steps ticked)
++    # awaiting_owner -> done (steps ticked; the guard refuses done
++    # while a step is open)
+     path = _queue_file(tmp_path, [_task(id="T-FAIL", status="deploying")])
+     TaskQueue(path).transition("T-FAIL", "needs_human")
+ 
+@@ -190,10 +191,85 @@ def test_l4_branches_from_deploying(tmp_path):
+     )
+     queue = TaskQueue(path)
+     queue.transition("T-OWNER", "awaiting_owner")
++    queue.get("T-OWNER")["owner_steps"][0]["done"] = True  # you tick the step
+     queue.transition("T-OWNER", "done")
+     assert TaskQueue(path).get("T-OWNER")["status"] == "done"
+ 
+ 
++def test_owner_step_guards(tmp_path):
++    # done asserts every owner step is ticked; awaiting_owner with none
++    # open would wait on nothing (added in the F-04 review round —
++    # reconcile must not close a task its owner steps hold open).
++    path = _queue_file(
++        tmp_path,
++        [
++            _task(
++                id="T-OPEN",
++                status="deploying",
++                owner_steps=[{"text": "answer Z.ai", "done": False}],
++            )
++        ],
++    )
++    queue = TaskQueue(path)
++    with pytest.raises(TransitionError, match="owner step"):
++        queue.transition("T-OPEN", "done")
++    queue.transition("T-OPEN", "awaiting_owner")  # legal: a step is open
++    with pytest.raises(TransitionError, match="never done"):
++        TaskQueue(path).transition("T-OPEN", "done")
++    queue.get("T-OPEN")["owner_steps"][0]["done"] = True
++    queue.transition("T-OPEN", "done")
++    assert TaskQueue(path).get("T-OPEN")["status"] == "done"
++
++    path = _queue_file(tmp_path, [_task(id="T-CLOSED", status="deploying")], name="t2.json")
++    with pytest.raises(TransitionError, match="would wait on nothing"):
++        TaskQueue(path).transition("T-CLOSED", "awaiting_owner")
++    TaskQueue(path).transition("T-CLOSED", "done")
++
++
++# --- Multi-edge transitions (F-04 reconcile) ------------------------------
++
++
++def test_transition_path_applies_the_final_status_in_one_save(tmp_path, monkeypatch):
++    saves = []
++    original = TaskQueue.save
++
++    def counting_save(self):
++        saves.append(1)
++        original(self)
++
++    monkeypatch.setattr(TaskQueue, "save", counting_save)
++    path = _queue_file(tmp_path, [_task(id="T-1", status="draft")])
++    TaskQueue(path).transition_path("T-1", ["ready", "in_progress", "in_review"])
++    assert TaskQueue(path).get("T-1")["status"] == "in_review"
++    assert len(saves) == 1
++
++
++def test_transition_path_refuses_illegal_or_guarded_paths_without_writing(tmp_path):
++    path = _queue_file(tmp_path, [_task(id="T-1", status="draft")])
++    before = path.read_text()
++    queue = TaskQueue(path)
++    with pytest.raises(TransitionError, match="illegal transition ready -> in_review"):
++        queue.transition_path("T-1", ["ready", "in_review"])
++    with pytest.raises(StateError):
++        queue.transition_path("T-1", [])
++    assert path.read_text() == before
++
++    # Guards run on the final status: done needs every slice merged.
++    sliced = _task(
++        id="T-SLICED",
++        status="draft",
++        slices=[{"id": "S-1", "text": "only slice", "status": "todo"}],
++    )
++    path = _queue_file(tmp_path, [sliced], name="tasks2.json")
++    before = path.read_text()
++    with pytest.raises(TransitionError, match="slice"):
++        TaskQueue(path).transition_path(
++            "T-SLICED",
++            ["ready", "in_progress", "in_review", "deploying", "done"],
++        )
++    assert path.read_text() == before
++
++
+ @pytest.mark.parametrize("start", sorted(CONTRACT_FROZEN_STATUSES))
+ def test_contract_change_edge_returns_to_draft(tmp_path, start):
+     # The X -> draft edges exist solely for "contract changed" (§2); they are
+diff --git a/tests/test_f04.py b/tests/test_f04.py
+new file mode 100644
+index 0000000..e60e340
+--- /dev/null
++++ b/tests/test_f04.py
+@@ -0,0 +1,624 @@
++"""F-04 acceptance tests — BUILD-ORDER.md, work order F-04.
++
++Contract rule (CLAUDE.md): an acceptance ref ``tests/test_f04.py::test_ac_N``
++means a test function with exactly that name. The extra descriptive tests
++below cover paths the acceptance refs don't name: non-draft and
++non-executable kinds, declined confirmation, cross-repo dependencies at
++approval, the ledger parser against this repo's real BOOTSTRAP.md, and
++reconcile edge cases (idempotency, declining, intermediate targets,
++unmentioned criteria).
++"""
++
++import copy
++import json
++import shutil
++from pathlib import Path
++
++import pytest
++
++from factory.approve import (
++    ApprovalDeclined,
++    ApprovalError,
++    approve_task,
++    parse_bootstrap_ledger,
++    reconcile_bootstrap,
++)
++from factory.cli import main
++from factory.contract import acceptance_hash
++from factory.state import TaskQueue
++
++REPO = Path(__file__).resolve().parent.parent
++
++ACCEPTANCE = [
++    {
++        "id": "AC-1",
++        "text": "it works",
++        "check": {"type": "test", "ref": "tests/x.py::test_works"},
++    },
++    {
++        "id": "AC-2",
++        "text": "it is nice",
++        "check": {"type": "command", "ref": "make check"},
++    },
++]
++
++
++def _task(**overrides):
++    base = {
++        "id": "T-1",
++        "title": "fixture task",
++        "source": "docs/fixture.md#t-1",
++        "kind": "build",
++        "priority": "P2",
++        "status": "draft",
++        "depends_on": [],
++        "risk": [],
++        "gates": {"spec_approval": True, "merge": "human", "deploy": "human"},
++        "acceptance": copy.deepcopy(ACCEPTANCE),
++        "budget": {"size": "S", "max_attempts": 3, "max_turns": 80, "wall_clock_min": 60},
++    }
++    base.update(overrides)
++    return base
++
++
++def _queue_file(tmp_path, tasks, name="tasks.json"):
++    path = tmp_path / name
++    path.write_text(
++        json.dumps({"version": 1, "project": "fixture", "tasks": tasks}, indent=2)
++    )
++    return path
++
++
++def _ledger_file(tmp_path, text, name="BOOTSTRAP.md"):
++    path = tmp_path / name
++    path.write_text(text)
++    return path
++
++
++def say_yes(_question):
++    return True
++
++
++def say_no(_question):
++    return False
++
++
++LEDGER = """# Bootstrap ledger
++
++Intro prose that must be ignored by the parser.
++
++---
++
++## F-1 — first task
++
++- **Commits:** `abc123` on main.
++- **Built:** 2026-10-16.
++- **AC-1** proven: `tests/test_x.py::test_ac_1` passes.
++- **AC-2** proven: CI green on PR #1.
++- **Status to set at reconcile:** `done`. No deploy target.
++
++---
++
++## F-2 — second task
++
++- **AC-1** proven: `tests/test_x.py::test_ac_1` passes.
++- **AC-2** proven: CI green on PR #2.
++- **Status to set at reconcile:** `done`.
++
++---
++
++## F-3 — pending task
++
++- **AC-1** proven: passes.
++- **AC-2** pending: waiting on CI.
++- **Status to set at reconcile:** `done`.
++"""
++
++
++# --- AC-1: no acceptance items -> refused --------------------------------
++
++
++def test_ac_1(tmp_path):
++    path = _queue_file(tmp_path, [_task(acceptance=[])])
++    before = path.read_text()
++    queue = TaskQueue(path)
++    with pytest.raises(ApprovalError, match="no acceptance items"):
++        approve_task(queue, "T-1", approved_by="Tester", assume_yes=True)
++    assert queue.get("T-1")["status"] == "draft"
++    assert path.read_text() == before
++
++
++# --- AC-2: ready or blocked per dependencies -----------------------------
++
++
++def test_ac_2(tmp_path):
++    # No dependencies -> ready, with the contract frozen on approval.
++    path = _queue_file(tmp_path, [_task()])
++    queue = TaskQueue(path)
++    assert approve_task(queue, "T-1", approved_by="Tester", assume_yes=True) == "ready"
++    task = TaskQueue(path).get("T-1")
++    assert task["status"] == "ready"
++    assert task["acceptance_hash"] == acceptance_hash(ACCEPTANCE)
++    assert task["approved_by"] == "Tester"
++    assert task["approved_at"]
++
++    # An open same-repo dependency -> blocked.
++    path = _queue_file(
++        tmp_path,
++        [_task(id="T-DEP", status="draft"), _task(id="T-2", depends_on=["T-DEP"])],
++    )
++    queue = TaskQueue(path)
++    assert approve_task(queue, "T-2", approved_by="Tester", assume_yes=True) == "blocked"
++    assert TaskQueue(path).get("T-2")["status"] == "blocked"
++
++    # A done dependency -> ready.
++    path = _queue_file(
++        tmp_path,
++        [
++            _task(id="T-DEP", status="done", acceptance_hash="x", approved_at="y"),
++            _task(id="T-2", depends_on=["T-DEP"]),
++        ],
++    )
++    queue = TaskQueue(path)
++    assert approve_task(queue, "T-2", approved_by="Tester", assume_yes=True) == "ready"
++
++
++# --- AC-3: --yes refused for risk-flagged tasks --------------------------
++
++
++def test_ac_3(tmp_path):
++    path = _queue_file(tmp_path, [_task(risk=["auth", "payments"])])
++    before = path.read_text()
++    queue = TaskQueue(path)
++    with pytest.raises(ApprovalError, match="auth, payments"):
++        approve_task(queue, "T-1", approved_by="Tester", assume_yes=True)
++    assert queue.get("T-1")["status"] == "draft"
++    assert path.read_text() == before
++
++    # Interactive confirmation is the only way to approve a risk-flagged task.
++    assert (
++        approve_task(queue, "T-1", approved_by="Tester", confirm=say_yes) == "ready"
++    )
++    assert TaskQueue(path).get("T-1")["status"] == "ready"
++
++
++# --- AC-4: --reconcile-bootstrap ------------------------------------------
++
++
++def test_ac_4(tmp_path):
++    tasks = [
++        _task(id="F-1"),
++        _task(id="F-2", depends_on=["F-1"]),
++        _task(id="F-3", depends_on=["F-2"]),
++    ]
++    path = _queue_file(tmp_path, tasks)
++    ledger = _ledger_file(tmp_path, LEDGER)
++    asked: list[str] = []
++
++    def confirm(question):
++        asked.append(question)
++        return True
++
++    results = reconcile_bootstrap(
++        TaskQueue(path), ledger, approved_by="Tester", confirm=confirm
++    )
++
++    # One interactive confirmation per entry that gets that far: the
++    # pending entry is refused before any question is asked.
++    assert len(asked) == 2
++
++    # F-1 and F-2 reconcile through legal transitions to done.
++    assert [r.action for r in results] == ["reconciled", "reconciled", "failed"]
++    on_disk = {t["id"]: t for t in json.loads(path.read_text())["tasks"]}
++    assert on_disk["F-1"]["status"] == "done"
++    assert on_disk["F-2"]["status"] == "done"
++    for tid in ("F-1", "F-2"):
++        assert on_disk[tid]["acceptance_hash"] == acceptance_hash(ACCEPTANCE)
++        assert on_disk[tid]["approved_by"] == "Tester"
++
++    # A criterion marked pending can never produce done: the task stays
++    # draft, untouched.
++    assert on_disk["F-3"]["status"] == "draft"
++    assert "acceptance_hash" not in on_disk["F-3"]
++    assert "pending" in results[2].detail
++
++
++# --- Extra: approval refusals ----------------------------------------------
++
++
++def test_non_draft_task_cannot_be_reapproved(tmp_path):
++    path = _queue_file(
++        tmp_path,
++        [
++            _task(
++                status="ready",
++                acceptance_hash=acceptance_hash(ACCEPTANCE),
++                approved_at="2026-10-16T00:00:00Z",
++                approved_by="Before",
++            )
++        ],
++    )
++    before = path.read_text()
++    queue = TaskQueue(path)
++    with pytest.raises(ApprovalError, match="only draft"):
++        approve_task(queue, "T-1", approved_by="Tester", assume_yes=True)
++    assert path.read_text() == before
++
++
++def test_non_executable_kind_cannot_be_approved(tmp_path):
++    path = _queue_file(tmp_path, [_task(kind="decision")])
++    with pytest.raises(ApprovalError, match="decision"):
++        approve_task(TaskQueue(path), "T-1", approved_by="Tester", assume_yes=True)
++
++
++def test_declined_confirmation_writes_nothing(tmp_path):
++    path = _queue_file(tmp_path, [_task()])
++    before = path.read_text()
++    queue = TaskQueue(path)
++    with pytest.raises(ApprovalDeclined):
++        approve_task(queue, "T-1", approved_by="Tester", confirm=say_no)
++    assert path.read_text() == before
++
++
++def test_cross_repo_dependency_blocks(tmp_path):
++    path = _queue_file(tmp_path, [_task(depends_on=["other-repo:WO-9"])])
++    queue = TaskQueue(path)
++    assert (
++        approve_task(queue, "T-1", approved_by="Tester", assume_yes=True) == "blocked"
++    )
++
++
++def test_contract_is_printed_before_confirmation(tmp_path):
++    path = _queue_file(tmp_path, [_task()])
++    printed: list[str] = []
++    approve_task(
++        TaskQueue(path),
++        "T-1",
++        approved_by="Tester",
++        assume_yes=True,
++        echo=printed.append,
++    )
++    text = "".join(printed)
++    assert "T-1" in text and "fixture task" in text
++    assert "AC-1" in text and "it works" in text and "tests/x.py::test_works" in text
++
++
++# --- Extra: ledger parsing --------------------------------------------------
++
++
++def test_parser_reads_this_repos_ledger():
++    entries = parse_bootstrap_ledger((REPO / ".factory" / "BOOTSTRAP.md").read_text())
++    by_id = {e["id"]: e for e in entries}
++    assert set(by_id) >= {"F-01", "F-02", "F-03"}
++    for entry_id in ("F-01", "F-02", "F-03"):
++        assert by_id[entry_id]["status"] == "done"
++        assert by_id[entry_id]["criteria"]
++        assert all(
++            marker == "proven" for marker in by_id[entry_id]["criteria"].values()
++        ), f"{entry_id} should be fully proven by now"
++
++
++def test_parser_normalises_not_met_marker(tmp_path):
++    ledger = _ledger_file(
++        tmp_path,
++        "## W-1 — x\n\n- **AC-1** not met: reproduced.\n"
++        "- **Status to set at reconcile:** `needs_human`.\n",
++    )
++    entry = parse_bootstrap_ledger(ledger.read_text())[0]
++    assert entry["criteria"] == {"AC-1": "not met"}
++    assert entry["status"] == "needs_human"
++
++
++# --- Extra: reconcile edge cases -------------------------------------------
++
++
++def test_reconcile_unmentioned_criterion_never_reaches_done(tmp_path):
++    # AC-2 exists on the task but the ledger entry never mentions it: the
++    # criterion is not proven, so done is refused.
++    ledger = _ledger_file(
++        tmp_path,
++        "## T-1 — x\n\n- **AC-1** proven: yes.\n"
++        "- **Status to set at reconcile:** `done`.\n",
++    )
++    path = _queue_file(tmp_path, [_task()])
++    results = reconcile_bootstrap(
++        TaskQueue(path), ledger, approved_by="Tester", confirm=say_yes
++    )
++    assert results[0].action == "failed"
++    assert TaskQueue(path).get("T-1")["status"] == "draft"
++
++
++def test_reconcile_declined_entry_is_skipped_and_dependents_fail(tmp_path):
++    tasks = [
++        _task(id="F-1"),
++        _task(id="F-2", depends_on=["F-1"]),
++        _task(id="F-3", depends_on=["F-2"]),
++    ]
++    path = _queue_file(tmp_path, tasks)
++    ledger = _ledger_file(tmp_path, LEDGER)
++
++    def confirm(question):
++        return "F-2" not in question
++
++    results = reconcile_bootstrap(
++        TaskQueue(path), ledger, approved_by="Tester", confirm=confirm
++    )
++    assert [r.action for r in results] == ["reconciled", "skipped", "failed"]
++    on_disk = {t["id"]: t["status"] for t in json.loads(path.read_text())["tasks"]}
++    assert on_disk == {"F-1": "done", "F-2": "draft", "F-3": "draft"}
++
++
++def test_reconcile_is_idempotent_on_a_second_run(tmp_path):
++    tasks = [
++        _task(id="F-1"),
++        _task(id="F-2", depends_on=["F-1"]),
++        _task(id="F-3", depends_on=["F-2"]),
++    ]
++    path = _queue_file(tmp_path, tasks)
++    ledger = _ledger_file(tmp_path, LEDGER)
++    reconcile_bootstrap(TaskQueue(path), ledger, approved_by="Tester", confirm=say_yes)
++    results = reconcile_bootstrap(
++        TaskQueue(path), ledger, approved_by="Tester", confirm=say_yes
++    )
++    assert [r.action for r in results] == ["skipped", "skipped", "failed"]
++    on_disk = {t["id"]: t["status"] for t in json.loads(path.read_text())["tasks"]}
++    assert on_disk == {"F-1": "done", "F-2": "done", "F-3": "draft"}
++
++
++def test_reconcile_walks_to_an_intermediate_status(tmp_path):
++    ledger = _ledger_file(
++        tmp_path,
++        "## T-1 — x\n\n- **AC-1** proven: yes.\n- **AC-2** proven: yes.\n"
++        "- **Status to set at reconcile:** `in_review`.\n",
++    )
++    path = _queue_file(tmp_path, [_task()])
++    reconcile_bootstrap(TaskQueue(path), ledger, approved_by="Tester", confirm=say_yes)
++    task = TaskQueue(path).get("T-1")
++    assert task["status"] == "in_review"
++    assert task["approved_by"] == "Tester"
++
++
++def test_reconcile_risk_flagged_entry_confirms_interactively(tmp_path):
++    # Reconcile has no --yes at all (see the CLI test below); a
++    # risk-flagged entry reconciles after its interactive confirmation,
++    # mirroring AC-3's interactive path for single approvals.
++    ledger = _ledger_file(
++        tmp_path,
++        "## T-1 — x\n\n- **AC-1** proven: yes.\n- **AC-2** proven: yes.\n"
++        "- **Status to set at reconcile:** `done`.\n",
++    )
++    path = _queue_file(tmp_path, [_task(risk=["payments"])])
++    results = reconcile_bootstrap(
++        TaskQueue(path), ledger, approved_by="Tester", confirm=say_yes
++    )
++    assert results[0].action == "reconciled"
++    assert TaskQueue(path).get("T-1")["status"] == "done"
++
++
++# --- Extra: review-round regressions (PR #7 findings) ----------------------
++
++
++def test_reconcile_failure_writes_nothing(tmp_path):
++    # Reviewer repro: an entry refused partway (an unmerged slice can't
++    # reach done) must leave the file byte-identical — no approved task
++    # stranded at an intermediate status that a re-run then skips.
++    task = _task(slices=[{"id": "S-1", "text": "only slice", "status": "todo"}])
++    path = _queue_file(tmp_path, [task])
++    ledger = _ledger_file(
++        tmp_path,
++        "## T-1 — x\n\n- **AC-1** proven: yes.\n- **AC-2** proven: yes.\n"
++        "- **Status to set at reconcile:** `done`.\n",
++    )
++    before = path.read_text()
++    results = reconcile_bootstrap(
++        TaskQueue(path), ledger, approved_by="Tester", confirm=say_yes
++    )
++    assert results[0].action == "failed"
++    assert "slice" in results[0].detail
++    assert path.read_text() == before
++
++
++def test_reconcile_routes_open_owner_steps_to_awaiting_owner(tmp_path):
++    # Reviewer repro: a recorded done with owner steps still open is
++    # awaiting_owner (TASK-CONTRACT §3), never done.
++    task = _task(owner_steps=[{"text": "answer Z.ai before scheduling", "done": False}])
++    path = _queue_file(tmp_path, [task])
++    ledger = _ledger_file(
++        tmp_path,
++        "## T-1 — x\n\n- **AC-1** proven: yes.\n- **AC-2** proven: yes.\n"
++        "- **Status to set at reconcile:** `done`.\n",
++    )
++    results = reconcile_bootstrap(
++        TaskQueue(path), ledger, approved_by="Tester", confirm=say_yes
++    )
++    assert results[0].action == "reconciled"
++    assert "owner steps are open" in results[0].detail
++    on_disk = TaskQueue(path).get("T-1")
++    assert on_disk["status"] == "awaiting_owner"
++    assert on_disk["acceptance_hash"] == acceptance_hash(ACCEPTANCE)
++
++
++@pytest.mark.parametrize(
++    "target", ["in_review", "deploying", "awaiting_owner", "done"]
++)
++def test_reconcile_pending_criteria_block_post_build_targets(tmp_path, target):
++    # Every recorded status that asserts the build passed validation
++    # requires all criteria proven — not just done.
++    path = _queue_file(tmp_path, [_task()])
++    ledger = _ledger_file(
++        tmp_path,
++        "## T-1 — x\n\n- **AC-1** proven: yes.\n- **AC-2** pending: not yet.\n"
++        f"- **Status to set at reconcile:** `{target}`.\n",
++    )
++    results = reconcile_bootstrap(
++        TaskQueue(path), ledger, approved_by="Tester", confirm=say_yes
++    )
++    assert results[0].action == "failed"
++    assert "pending" in results[0].detail
++    assert TaskQueue(path).get("T-1")["status"] == "draft"
++
++
++def test_reconcile_pending_criteria_can_still_escalate(tmp_path):
++    # needs_human is the honest recorded status for unproven work.
++    path = _queue_file(tmp_path, [_task()])
++    ledger = _ledger_file(
++        tmp_path,
++        "## T-1 — x\n\n- **AC-1** proven: yes.\n- **AC-2** pending: not yet.\n"
++        "- **Status to set at reconcile:** `needs_human`.\n",
++    )
++    results = reconcile_bootstrap(
++        TaskQueue(path), ledger, approved_by="Tester", confirm=say_yes
++    )
++    assert results[0].action == "reconciled"
++    assert TaskQueue(path).get("T-1")["status"] == "needs_human"
++
++
++def test_reconcile_writes_once_per_entry(tmp_path, monkeypatch):
++    # One atomic save per entry: no intermediate statuses hit disk (the
++    # crash window the reviewer's stranding repro exploited) and no
++    # transient in_progress without the run lease.
++    tasks = [_task(id="F-1"), _task(id="F-2", depends_on=["F-1"])]
++    path = _queue_file(tmp_path, tasks)
++    ledger = _ledger_file(tmp_path, LEDGER)
++    saves = []
++    original = TaskQueue.save
++
++    def counting_save(self):
++        saves.append(1)
++        original(self)
++
++    monkeypatch.setattr(TaskQueue, "save", counting_save)
++    results = reconcile_bootstrap(
++        TaskQueue(path), ledger, approved_by="Tester", confirm=say_yes
++    )
++    assert [r.action for r in results[:2]] == ["reconciled", "reconciled"]
++    assert TaskQueue(path).get("F-2")["status"] == "done"
++    assert len(saves) == 2
++
++
++def test_parser_cleans_heading_punctuation():
++    entries = parse_bootstrap_ledger(
++        "## F-05: Clone manager\n\n- **AC-1** proven: yes.\n"
++        "- **Status to set at reconcile:** `done`.\n"
++    )
++    assert entries[0]["id"] == "F-05"
++    assert entries[0]["status"] == "done"
++
++
++def test_parser_surfaces_a_malformed_status_line():
++    # A status marker without parseable backticks still counts as an
++    # entry (status None), so reconcile fails it visibly instead of the
++    # work order silently staying draft.
++    entries = parse_bootstrap_ledger(
++        "## W-9 — x\n\n- **Status to set at reconcile:** done, no backticks\n"
++    )
++    assert entries and entries[0]["id"] == "W-9"
++    assert entries[0]["status"] is None
++
++
++def test_eof_on_prompt_declines(tmp_path, monkeypatch):
++    # No TTY / closed stdin is a decline, never an EOFError traceback.
++    def raise_eof(_prompt):
++        raise EOFError
++
++    monkeypatch.setattr("builtins.input", raise_eof)
++    path = _queue_file(tmp_path, [_task()])
++    queue = TaskQueue(path)
++    with pytest.raises(ApprovalDeclined):
++        approve_task(queue, "T-1", approved_by="Tester")
++    assert TaskQueue(path).get("T-1")["status"] == "draft"
++
++
++def test_reconcile_on_this_repos_real_files(tmp_path):
++    # The real BOOTSTRAP.md against a copy of the real queue: the merged,
++    # fully-proven prefix F-01..F-03 reconciles to done in dependency
++    # order. Entries beyond that depend on where the bootstrap stands
++    # (their PR may not be merged yet), so their outcomes aren't pinned;
++    # F-00 (owner_only, never in the ledger) must stay draft regardless.
++    queue_path = tmp_path / "tasks.json"
++    shutil.copy(REPO / ".factory" / "tasks.json", queue_path)
++    ledger = tmp_path / "BOOTSTRAP.md"
++    shutil.copy(REPO / ".factory" / "BOOTSTRAP.md", ledger)
++    results = reconcile_bootstrap(
++        TaskQueue(queue_path), ledger, approved_by="Tester", confirm=say_yes
++    )
++    reconciled = [r.task_id for r in results if r.action == "reconciled"]
++    assert reconciled[:3] == ["F-01", "F-02", "F-03"]
++    on_disk = {t["id"]: t for t in json.loads(queue_path.read_text())["tasks"]}
++    assert on_disk["F-01"]["status"] == "done"
++    assert on_disk["F-02"]["status"] == "done"
++    assert on_disk["F-03"]["status"] == "done"
++    assert on_disk["F-00"]["status"] == "draft"
++
++
++# --- Extra: CLI ------------------------------------------------------------
++
++
++def test_cli_approves_with_yes(tmp_path, capsys):
++    path = _queue_file(tmp_path, [_task()])
++    code = main(["approve", "T-1", "--queue", str(path), "--yes", "--approved-by", "CI"])
++    assert code == 0
++    task = TaskQueue(path).get("T-1")
++    assert task["status"] == "ready" and task["approved_by"] == "CI"
++    assert "approved -> ready" in capsys.readouterr().out
++
++
++def test_cli_refuses_yes_on_risk(tmp_path, capsys):
++    path = _queue_file(tmp_path, [_task(risk=["auth"])])
++    code = main(["approve", "T-1", "--queue", str(path), "--yes"])
++    assert code == 1
++    assert "auth" in capsys.readouterr().err
++    assert TaskQueue(path).get("T-1")["status"] == "draft"
++
++
++def test_cli_reconcile_bootstrap(tmp_path, capsys, monkeypatch):
++    queue_path = tmp_path / "tasks.json"
++    shutil.copy(REPO / ".factory" / "tasks.json", queue_path)
++    ledger = tmp_path / "BOOTSTRAP.md"
++    shutil.copy(REPO / ".factory" / "BOOTSTRAP.md", ledger)
++    monkeypatch.setattr("builtins.input", lambda _prompt: "y")
++    code = main(
++        [
++            "approve",
++            "--reconcile-bootstrap",
++            "--queue",
++            str(queue_path),
++            "--ledger",
++            str(ledger),
++        ]
++    )
++    # Exit is 0 unless some entry failed; entries beyond the merged
++    # F-01..F-03 prefix depend on bootstrap state, so only the prefix
++    # and the never-reconciled owner task are pinned.
++    statuses = {t["id"]: t["status"] for t in json.loads(queue_path.read_text())["tasks"]}
++    assert statuses["F-01"] == "done" and statuses["F-03"] == "done"
++    assert statuses["F-00"] == "draft"
++    out = capsys.readouterr().out
++    assert "F-01: reconciled" in out and "F-03: reconciled" in out
++    assert code == (1 if ": failed" in out else 0)
++
++
++def test_cli_requires_a_task_id_or_reconcile():
++    with pytest.raises(SystemExit):
++        main(["approve"])
++    with pytest.raises(SystemExit):
++        main(["approve", "T-1", "--reconcile-bootstrap"])
++
++
++def test_cli_refuses_yes_with_reconcile_bootstrap():
++    # AC-4: reconcile confirms every entry interactively; --yes would
++    # turn plain markdown into done tasks with nobody reading them.
++    with pytest.raises(SystemExit):
++        main(["approve", "--reconcile-bootstrap", "--yes"])
++
++
++def test_cli_eof_on_prompt_exits_cleanly(tmp_path, capsys, monkeypatch):
++    def raise_eof(_prompt):
++        raise EOFError
++
++    monkeypatch.setattr("builtins.input", raise_eof)
++    path = _queue_file(tmp_path, [_task()])
++    code = main(["approve", "T-1", "--queue", str(path)])
++    assert code == 1
++    assert "declined" in capsys.readouterr().err
++    assert TaskQueue(path).get("T-1")["status"] == "draft"

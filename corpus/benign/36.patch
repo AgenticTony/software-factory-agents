@@ -1,0 +1,34 @@
+diff --git a/.factory/tasks.json b/.factory/tasks.json
+index 4f4e6a0..b163a7a 100644
+--- a/.factory/tasks.json
++++ b/.factory/tasks.json
+@@ -1,7 +1,7 @@
+ {
+   "version": 1,
+   "project": "software-factory",
+-  "updated_at": "2026-10-20T14:54:38Z",
++  "updated_at": "2026-10-21T06:26:37Z",
+   "tasks": [
+     {
+       "id": "F-00",
+@@ -1498,7 +1498,7 @@
+       "source": "BUILD-ORDER.md#f-23--review-convergence",
+       "kind": "build",
+       "priority": "P1",
+-      "status": "draft",
++      "status": "done",
+       "depends_on": [
+         "F-09",
+         "F-10"
+@@ -1552,7 +1552,10 @@
+         "wall_clock_min": 150
+       },
+       "attempts": [],
+-      "links": {}
++      "links": {},
++      "acceptance_hash": "e4df273174bb25569c344ada3990e5154700da8f76daf96c01333076e91fd277",
++      "approved_at": "2026-10-21T06:26:37Z",
++      "approved_by": "Anthony"
+     },
+     {
+       "id": "F-24",

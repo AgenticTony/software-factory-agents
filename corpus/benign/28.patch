@@ -1,0 +1,909 @@
+diff --git a/.factory/BOOTSTRAP.md b/.factory/BOOTSTRAP.md
+index dc95582..9741c08 100644
+--- a/.factory/BOOTSTRAP.md
++++ b/.factory/BOOTSTRAP.md
+@@ -369,3 +369,20 @@ A readiness run of the factory's own gates on a clean clone of JobFinderOS (`ori
+ - **(2) Sandboxed commands inherited home dirs on PATH (F-05):** the ambient PATH starts with `~/.local/bin`, `~/.pyenv/shims` and so on, which the sandbox denies reading. npm's lifecycle spawn hit a denied dir first and died with `spawn EPERM`. `sandbox_env` now drops inherited PATH entries under the home dir (either spelling) and literal `~` entries, keeping order; an explicit caller PATH is left as given. `tests/test_f05.py::test_rehearsal_ambient_path_drops_home_entries` and `::test_rehearsal_sandboxed_child_sees_no_home_path_entries`. On JobFinderOS, `setup` (pip + `npm install`) passed inside the sandbox with no workaround.
+ - **(3) The run built on the local checkout's stale `main` (F-10):** the work clone came from the local repo at `default_branch`, which was a week behind GitHub (`b0e2417` against `9daedd1`). `_build_on_remote_default` now fetches the remote's default branch with hardened git and detaches there before branching; if the fetch fails the run refuses with `RunError` before any session. `tests/test_f10.py::test_rehearsal_run_builds_on_the_remote_default_branch` and `::test_rehearsal_run_refuses_when_the_remote_is_unreachable`.
+ - **Evidence:** 5 new tests, all red against `75e8b6d` for the reported reasons; 359 total passing locally, ruff clean. The JobFinderOS readiness run against the fixed code: L0 `pass` in 139s (setup, lint, typecheck, 738 backend tests, dev_lock, flow, frontend_unit, migration_single_head), no escalations, no simulated workarounds.
++
++---
++
++## F-29 — Owner-step tick (`factory tick`)
++
++- **Commits:** `feat/f29-owner-step-tick`, stacked on `chore/reconcile-bootstrap` (PR #27). Red-first: `tests/test_f29.py` failed at collection on the missing `factory.tick` module, and `test_ac_5` failed on the F-04 tests still pinning F-00 to `draft`.
++- **Built:** 2026-10-19. Interactive session, owner-requested after the reconcile left F-06 at `awaiting_owner` and F-09/F-10 refused behind it.
++- **Design notes:** new `factory/tick.py` (`tick_steps`, `TickError`) and `factory tick <id> <step...> --evidence <text> [--done-by]`. All refusals run through one shared `state.check_tick` before any confirmation, so a bad step number or blank evidence is caught before you are asked anything. Each step is confirmed on its own (no `--yes`); then `TaskQueue.tick_owner_steps` applies the ticks and any closing transition to a copy of the task and writes once. Two new table edges, `draft -> not_buildable` and `not_buildable -> done`, are guarded by `_check_kind_rules` in `transition`, `transition_path` and the tick path: without the guard a build task could skip validation via `draft -> not_buildable -> done`. Schema: owner steps gain `done_at`, `done_by`, `evidence`, required together with `done: true`; an `owner_only` task that is `done` is exempt from the frozen-contract rule but must have at least one step, every one ticked (schema and `contract.py` agree). Decision and research kinds keep the old rule.
++- **Changed existing tests (behaviour changed on purpose):** `tests/test_f03.py` — the illegal `exit_from_not_buildable` class swaps `not_buildable -> done` (now legal for owner_only) for `not_buildable -> in_progress`; the two hand-ticked fixtures carry the new audit fields. `tests/test_f04.py` — the real-files reconcile tests assert F-00 is unchanged by reconcile instead of `draft` (AC-5).
++- **Rehearsal on a copy of the real queue:** ticking F-00 steps 1–6 → `done`; F-06 step 1 → `done`; reconcile then took F-09 and F-10 to `done`.
++- **AC-1** proven: `tests/test_f29.py::test_ac_1` — one confirmation per step naming the step text; the ticked step carries `done_by`, `evidence`, a `Z` timestamp; untouched steps unchanged; `done: true` without audit fields refused at load; CLI ticks two steps with `--done-by`, refuses a missing `--evidence` and any `--yes`.
++- **AC-2** proven: `test_ac_2` (unknown task, step 0 and 3 out of range, blank evidence, declined, one bad step among good ones) plus `test_ac_2_already_ticked` and `test_ac_2_cli_refusal_exits_nonzero` — the file is byte-identical after every refusal; the CLI exits 1 with the reason on stderr.
++- **AC-3** proven: `test_ac_3` — `awaiting_owner` stays until its last step, then `done` in the same save; `ready`, `in_progress`, `in_review`, `deploying` record the ticks and keep their status.
++- **AC-4** proven: `test_ac_4` (owner_only from `draft` and from `not_buildable` closes to `done`), `test_ac_4_executable_kind_cannot_enter_not_buildable[build|docs]`, `test_ac_4_executable_kind_cannot_leave_not_buildable_to_done[build|docs]`, `test_ac_4_owner_only_needs_every_step_ticked`, `test_ac_4_owner_only_done_on_disk_needs_ticked_steps`.
++- **AC-5** proven: `test_ac_5` — reconcile over copies of the real files leaves every owner_only task identical, and the F-04 real-files tests no longer pin F-00 to `draft`.
++- **Owner follow-up after merge:** `factory tick F-00 1 2 3 4 5 6 --evidence "..."`, `factory tick F-06 1 --evidence "..."`, then `factory approve --reconcile-bootstrap` for F-09, F-10 and this entry.
++- **Status to set at reconcile:** `done` once this PR's CI is green (ruff + pytest on 3.11 + 3.13) and you merge it. No deploy target, so L4 doesn't apply.
+diff --git a/.factory/tasks.json b/.factory/tasks.json
+index f6af8b9..0110fa6 100644
+--- a/.factory/tasks.json
++++ b/.factory/tasks.json
+@@ -1786,7 +1786,8 @@
+         "F-23",
+         "F-24",
+         "F-25",
+-        "F-26"
++        "F-26",
++        "F-29"
+       ],
+       "risk": [],
+       "gates": {
+@@ -1825,6 +1826,76 @@
+           "done": false
+         }
+       ]
++    },
++    {
++      "id": "F-29",
++      "title": "Owner-step tick (factory tick)",
++      "source": "BUILD-ORDER.md#f-29--owner-step-tick-factory-tick",
++      "kind": "build",
++      "priority": "P1",
++      "status": "draft",
++      "depends_on": [
++        "F-03",
++        "F-04"
++      ],
++      "risk": [
++        "factory_control"
++      ],
++      "gates": {
++        "spec_approval": true,
++        "merge": "human",
++        "deploy": "human"
++      },
++      "acceptance": [
++        {
++          "id": "AC-1",
++          "text": "`factory tick <id> <step> [<step> ...] --evidence <text>` shows each named owner step (1-based) and asks for confirmation per step. A confirmed step gets `done: true`, `done_at`, `done_by` and `evidence` (additive schema fields; `done: true` without the other three is refused at load). `--evidence` is required and non-blank; there is no `--yes`.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f29.py::test_ac_1"
++          }
++        },
++        {
++          "id": "AC-2",
++          "text": "An unknown task, a step number out of range, an already-ticked step, a blank evidence string, or a declined confirmation each leaves `tasks.json` byte-identical and exits non-zero with a message naming the problem. One tick call is one atomic save: a refusal on any named step writes none of them.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f29.py::test_ac_2"
++          }
++        },
++        {
++          "id": "AC-3",
++          "text": "Ticking the last open step of an `awaiting_owner` task moves it to `done` in the same save. Ticking a step of a task in any other status records the tick and never changes the status.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f29.py::test_ac_3"
++          }
++        },
++        {
++          "id": "AC-4",
++          "text": "An `owner_only` task whose last step is ticked moves `draft → not_buildable → done` through two new table edges. Both are guarded: only a non-executable kind may enter `not_buildable` from `draft`, and only an `owner_only` task with at least one step and every step ticked may go `not_buildable → done`. A `build` or `docs` task taking either edge raises (one test per edge).",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f29.py::test_ac_4"
++          }
++        },
++        {
++          "id": "AC-5",
++          "text": "Reconcile leaves `owner_only` tasks untouched: the real-files reconcile tests assert F-00 is unchanged by the run, not that it is `draft`, so they keep passing after F-00 is ticked to `done`.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f29.py::test_ac_5"
++          }
++        }
++      ],
++      "budget": {
++        "size": "S",
++        "max_attempts": 3,
++        "max_turns": 120,
++        "wall_clock_min": 90
++      },
++      "attempts": [],
++      "links": {}
+     }
+   ]
+ }
+diff --git a/BUILD-ORDER.md b/BUILD-ORDER.md
+index e61084a..ec0c0ae 100644
+--- a/BUILD-ORDER.md
++++ b/BUILD-ORDER.md
+@@ -40,9 +40,10 @@ The factory's own build plan, written in the format the factory will consume: on
+ | **F-25** | Sensitive-path sentinels | 1b | F-07 | factory_control | M |
+ | **F-26** | Merges in order | 1b | F-10 | factory_control | S |
+ | **F-27** | Vent tool | 1b | F-06, F-10 | factory_control | S |
+-| **F-28** | Dogfood pilot: the factory builds its own safe WOs | 1b | F-23, F-24, F-25, F-26 | — | owner |
++| **F-28** | Dogfood pilot: the factory builds its own safe WOs | 1b | F-23, F-24, F-25, F-26, F-29 | — | owner |
++| **F-29** | Owner-step tick (`factory tick`) | 1b | F-03, F-04 | factory_control | S |
+ 
+-Order to build in: **F-00 (in parallel) → F-01 → F-02 → F-03 → F-04 → F-07 → F-08 → F-05 → F-06 → F-09 → F-10** (done), **then F-24 → F-23 → F-25 → F-26 → F-27 → F-28 → F-11 → F-12 → F-16 → F-22 → F-13.** The deterministic core (F-02–F-04, F-07, F-08) went first: it's pure Python and testable without any model. Hardening comes next, rehearsal fixture first so every later change is checked against a realistic repo. F-28 then runs the factory on its own F-11 and F-12. F-16 measures how much each layer catches before any outside project depends on it.
++Order to build in: **F-00 (in parallel) → F-01 → F-02 → F-03 → F-04 → F-07 → F-08 → F-05 → F-06 → F-09 → F-10** (done), **then F-29 → F-24 → F-23 → F-25 → F-26 → F-27 → F-28 → F-11 → F-12 → F-16 → F-22 → F-13.** The deterministic core (F-02–F-04, F-07, F-08) went first: it's pure Python and testable without any model. F-29 comes first because nothing else can close without it: F-00 and F-06 are stuck on owner steps no command can tick, and F-09/F-10 can't reconcile until F-06 is done. Hardening comes next, rehearsal fixture first so every later change is checked against a realistic repo. F-28 then runs the factory on its own F-11 and F-12. F-16 measures how much each layer catches before any outside project depends on it.
+ 
+ F-14 (live checks) and F-15 (holdouts) need a deployed project with real users, which the factory itself is not, so they arrive with the first outside project (Phase 2). F-21 stays last: it unlocks only on numbers F-11, F-14 and F-16 produce from real merges.
+ 
+@@ -235,6 +236,14 @@ Acceptance:
+ 
+ The research's rollout order (RESEARCH-SOFTWARE-FACTORY §12; RESEARCH-AI-LAB-INTERNAL-FACTORIES §8) is: get ready, build the control plane, add verification depth, then let the loop run — on something narrow where a mistake is cheap. The 2026-10-18 JobFinderOS readiness rehearsal found three factory bugs no toy-repo test could catch (PR #24), before any agent ran. So before any outside project goes through the factory: harden what exists (F-23 to F-27, built interactively, because they touch what judges agents), then prove the loop on the factory's own safe work orders (F-28). Outside projects come after (F-13).
+ 
++### F-29 — Owner-step tick (`factory tick`)
++Owner steps can be recorded but never ticked: no command writes `done: true`, so F-06 sits at `awaiting_owner` after reconcile (its step is confirmed in the ledger), F-09/F-10 can't reconcile behind it, and F-00 (`owner_only`) has no path to `done` at all. F-13 and F-28 depend on both. The tick is a human action, so it is interactive and leaves evidence, like approval.
++- AC-1 `factory tick <id> <step> [<step> ...] --evidence <text>` shows each named owner step (1-based) and asks for confirmation per step. A confirmed step gets `done: true`, `done_at`, `done_by` and `evidence` (additive schema fields; `done: true` without the other three is refused at load). `--evidence` is required and non-blank; there is no `--yes`.
++- AC-2 An unknown task, a step number out of range, an already-ticked step, a blank evidence string, or a declined confirmation each leaves `tasks.json` byte-identical and exits non-zero with a message naming the problem. One tick call is one atomic save: a refusal on any named step writes none of them.
++- AC-3 Ticking the last open step of an `awaiting_owner` task moves it to `done` in the same save. Ticking a step of a task in any other status records the tick and never changes the status.
++- AC-4 An `owner_only` task whose last step is ticked moves `draft → not_buildable → done` through two new table edges. Both are guarded: only a non-executable kind may enter `not_buildable` from `draft`, and only an `owner_only` task with at least one step and every step ticked may go `not_buildable → done`. A `build` or `docs` task taking either edge raises (one test per edge).
++- AC-5 Reconcile leaves `owner_only` tasks untouched: the real-files reconcile tests assert F-00 is unchanged by the run, not that it is `draft`, so they keep passing after F-00 is ticked to `done`.
++
+ ### F-23 — Review convergence
+ Rounds are already capped by `max_attempts`, but every L2 round re-reviews the whole diff from scratch. Findings drift to pre-existing code, repeat, or chase the last fix's regression. Our own review record: F-05 took 5 rounds, F-09 4, F-10 3, several finding bugs the previous round's fix introduced. The Claude Code team reports one PR that went through 50+ overnight rounds before they changed the loop: re-review only the delta, never repeat a finding, fix the class not the instance.
+ - AC-1 Every L2 finding is stored per attempt with a stable key (file, rule or category, normalised summary). A finding whose key was raised in an earlier round and is unchanged in the diff since is not re-raised; the reviewer's verdict lists it as carried, not new.
+diff --git a/factory/approve.py b/factory/approve.py
+index 3863844..a353c48 100644
+--- a/factory/approve.py
++++ b/factory/approve.py
+@@ -145,7 +145,7 @@ def default_approver() -> str:
+     return name or getpass.getuser()
+ 
+ 
+-def _input_confirm(question: str) -> bool:
++def input_confirm(question: str) -> bool:
+     """Ask a yes/no question on the terminal; anything but y/yes declines.
+ 
+     EOF (no TTY, stdin closed or piped) also declines: approval without
+@@ -200,7 +200,7 @@ def approve_task(
+     *,
+     approved_by: str,
+     assume_yes: bool = False,
+-    confirm: Callable[[str], bool] = _input_confirm,
++    confirm: Callable[[str], bool] = input_confirm,
+     echo: Callable[[str], None] = print,
+ ) -> str:
+     """Print a draft task's contract, confirm, freeze it, and route it.
+@@ -422,7 +422,7 @@ def reconcile_bootstrap(
+     ledger_path: Path | str,
+     *,
+     approved_by: str,
+-    confirm: Callable[[str], bool] = _input_confirm,
++    confirm: Callable[[str], bool] = input_confirm,
+     echo: Callable[[str], None] = print,
+ ) -> list:
+     """Approve and advance the tasks named by the bootstrap ledger (AC-4).
+diff --git a/factory/cli.py b/factory/cli.py
+index 6bda31b..fca51bb 100644
+--- a/factory/cli.py
++++ b/factory/cli.py
+@@ -1,6 +1,6 @@
+ """Factory CLI — the control-plane entry point.
+ 
+-``approve`` (F-04), ``run`` and ``loop`` (F-10) are real. Every other
++``approve`` (F-04), ``run`` and ``loop`` (F-10) and ``tick`` (F-29) are real. Every other
+ subcommand is a stub naming the work order that implements it
+ (BUILD-ORDER.md).
+ """
+@@ -26,6 +26,7 @@
+ from factory.sandbox import SandboxError
+ from factory.session import SessionConfigError
+ from factory.state import TaskQueue
++from factory.tick import TickError, tick_steps
+ 
+ # run/loop exit codes: 0 = a PR opened, nothing to do, or the peak window;
+ # 1 = an escalation needs you; 3 = the quota stop; 2 = the orchestrator
+@@ -76,6 +77,15 @@ def build_parser() -> argparse.ArgumentParser:
+         "--approved-by", default=None, help="approver name (default: git user.name)"
+     )
+ 
++    tick = sub.add_parser("tick", help="tick owner steps of a task (F-29)")
++    tick.add_argument("task_id", help="task id, e.g. F-00")
++    tick.add_argument("steps", nargs="+", type=int, help="1-based owner-step numbers")
++    tick.add_argument("--evidence", required=True,
++                      help="what you checked; recorded on every ticked step")
++    tick.add_argument("--queue", default=".factory/tasks.json",
++                      help="queue path (default: %(default)s)")
++    tick.add_argument("--done-by", default=None, help="your name (default: git user.name)")
++
+     for name, text in (
+         ("run", "pick the next ready task and take it to a PR (F-10)"),
+         ("loop", "run until the queue is empty, quota, peak window or escalation (F-10)"),
+@@ -120,6 +130,23 @@ def _run_approve(args: argparse.Namespace) -> int:
+         return 130
+ 
+ 
++def _run_tick(args: argparse.Namespace) -> int:
++    """Dispatch the tick subcommand; refusals exit 1, never a traceback."""
++    try:
++        status = tick_steps(
++            TaskQueue(args.queue), args.task_id, args.steps,
++            evidence=args.evidence, done_by=args.done_by or default_approver(),
++        )
++    except (TickError, ContractError) as exc:
++        print(f"factory tick: {exc}", file=sys.stderr)
++        return 1
++    except KeyboardInterrupt:
++        print("factory tick: interrupted", file=sys.stderr)
++        return 130
++    print(f"{args.task_id}: ticked step(s) {', '.join(map(str, args.steps))} -> {status}")
++    return 0
++
++
+ def _run_orchestrator(args: argparse.Namespace) -> int:
+     """Dispatch run/loop; known failures exit 2 with a message, not a traceback."""
+     try:
+@@ -154,7 +181,7 @@ def main(argv: list | None = None) -> int:
+ 
+     Returns:
+         Process exit code. Stubs return 2 (not implemented); approve
+-        returns 0 on success and 1 on any refusal or decline; run/loop
++        and tick return 0 on success and 1 on any refusal or decline; run/loop
+         per ``_EXIT`` (2 when the orchestrator itself failed).
+     """
+     parser = build_parser()
+@@ -172,6 +199,8 @@ def main(argv: list | None = None) -> int:
+         return _run_approve(args)
+     if args.command in ("run", "loop"):
+         return _run_orchestrator(args)
++    if args.command == "tick":
++        return _run_tick(args)
+     print(
+         f"factory {args.command}: not implemented yet (scheduled in {STUBS[args.command]})",
+         file=sys.stderr,
+diff --git a/factory/contract.py b/factory/contract.py
+index 418d069..9da1042 100644
+--- a/factory/contract.py
++++ b/factory/contract.py
+@@ -131,7 +131,15 @@ def _check_semantics(tasks: Any, origin: str) -> None:
+                 f"{origin}: task {tid} is kind={kind} but status={shown}; "
+                 f"{kind} tasks are never executable — allowed statuses: {allowed}"
+             )
+-        if status in POST_APPROVAL_STATUSES:
++        if kind == "owner_only" and status == "done":
++            # F-29: no contract to freeze; done means every owner step ticked.
++            steps = task.get("owner_steps") or []
++            if not steps or not all(step.get("done") for step in steps):
++                raise ContractError(
++                    f"{origin}: task {tid} is an owner_only task marked done, but "
++                    "it needs at least one owner step and every one ticked (factory tick)"
++                )
++        elif status in POST_APPROVAL_STATUSES:
+             missing = [k for k in ("acceptance_hash", "approved_at") if not task.get(k)]
+             if missing:
+                 raise ContractError(
+diff --git a/factory/state.py b/factory/state.py
+index 70bc79b..28b554b 100644
+--- a/factory/state.py
++++ b/factory/state.py
+@@ -45,6 +45,7 @@
+ from pathlib import Path
+ 
+ from factory.contract import (
++    NON_EXECUTABLE_KINDS,
+     POST_APPROVAL_STATUSES,
+     ContractError,
+     acceptance_hash,
+@@ -93,6 +94,8 @@
+     ("deploying", "ready"): "previous slice merged; more slices remain",
+     ("deploying", "draft"): "contract changed",
+     ("awaiting_owner", "done"): "owner steps ticked",
++    ("draft", "not_buildable"): "non-executable kind surfaced to the owner (F-29)",
++    ("not_buildable", "done"): "owner-only task: every owner step ticked (F-29)",
+     ("awaiting_owner", "draft"): "contract changed",
+     ("needs_human", "draft"): "contract changed",
+     ("done", "draft"): "contract changed (human reopen)",
+@@ -390,6 +393,78 @@ def _check_slice_rules(task: dict, new_status: str) -> None:
+         )
+ 
+ 
++def check_tick(task: dict, step_numbers: list, *, evidence: str, done_by: str) -> None:
++    """Refusals for ticking owner steps, checked before anything changes (F-29).
++
++    Args:
++        task: The task record.
++        step_numbers: 1-based owner-step numbers.
++        evidence: What the owner checked.
++        done_by: Who is ticking.
++
++    Raises:
++        StateError: Blank evidence or done_by, no steps, a duplicate step,
++            a step out of range, or a step already ticked.
++    """
++    task_id = task.get("id")
++    steps = task.get("owner_steps") or []
++    if not evidence or not evidence.strip():
++        raise StateError(f"{task_id}: evidence must say what you checked; it is blank")
++    if not done_by or not done_by.strip():
++        raise StateError(f"{task_id}: done_by is blank")
++    if not step_numbers:
++        raise StateError(f"{task_id}: name at least one owner step to tick")
++    if len(set(step_numbers)) != len(step_numbers):
++        raise StateError(f"{task_id}: a step is named twice")
++    for number in step_numbers:
++        if not 1 <= number <= len(steps):
++            raise StateError(
++                f"{task_id}: owner step {number} is out of range "
++                f"(the task has {len(steps)})"
++            )
++        if steps[number - 1].get("done"):
++            raise StateError(f"{task_id}: owner step {number} is already ticked")
++
++
++def _check_kind_rules(task: dict, current: str, new_status: str) -> None:
++    """Guard the two edges that only non-executable kinds may take (F-29).
++
++    ``draft -> not_buildable`` is how a decision, research or owner-only
++    task is parked as "surfaced to you, never run"; an executable kind
++    (``build``, ``docs``) parked there could never be picked. And
++    ``not_buildable -> done`` closes an owner-only task, whose whole
++    content is its owner steps — so it needs at least one step, all
++    ticked. Without the guard a build task could skip validation
++    entirely by going ``draft -> not_buildable -> done``.
++
++    Args:
++        task: The task record.
++        current: The status the edge starts from.
++        new_status: The status the edge goes to.
++
++    Raises:
++        TransitionError: If the task's kind or owner steps forbid the edge.
++    """
++    tid = task.get("id")
++    kind = task.get("kind")
++    if new_status == "not_buildable" and kind not in NON_EXECUTABLE_KINDS:
++        raise TransitionError(
++            f"{tid}: kind={kind} is executable; only decision, research or "
++            "owner_only tasks may be not_buildable"
++        )
++    if current == "not_buildable" and new_status == "done":
++        if kind != "owner_only":
++            raise TransitionError(
++                f"{tid}: not_buildable -> done closes owner_only tasks only; "
++                f"this one is kind={kind}"
++            )
++        if not task.get("owner_steps"):
++            raise TransitionError(
++                f"{tid}: an owner_only task needs at least one owner step to "
++                "be done — there is nothing to show it was"
++            )
++
++
+ def _check_owner_step_rules(task: dict, new_status: str) -> None:
+     """Enforce the owner-step semantics of ``done`` / ``awaiting_owner``.
+ 
+@@ -482,6 +557,7 @@ def transition(self, task_id: str, new_status: str) -> None:
+         """
+         task = self.get(task_id)
+         check_transition(task.get("status"), new_status)
++        _check_kind_rules(task, task.get("status"), new_status)
+         _check_slice_rules(task, new_status)
+         _check_owner_step_rules(task, new_status)
+         task["status"] = new_status
+@@ -517,12 +593,69 @@ def transition_path(self, task_id: str, statuses: list) -> None:
+         current = task.get("status")
+         for new_status in statuses:
+             check_transition(current, new_status)
++            _check_kind_rules(task, current, new_status)
+             current = new_status
+         _check_slice_rules(task, statuses[-1])
+         _check_owner_step_rules(task, statuses[-1])
+         task["status"] = statuses[-1]
+         self.save()
+ 
++    def tick_owner_steps(
++        self, task_id: str, step_numbers: list, *, evidence: str, done_by: str
++    ) -> str:
++        """Tick owner steps and close the task if that was the last one (F-29).
++
++        Every step is checked before anything changes, and the ticks plus
++        any resulting status change go out in one save: a refusal on any
++        step writes nothing. The last open step of an ``awaiting_owner``
++        task moves it to ``done``; an ``owner_only`` task closes through
++        ``draft -> not_buildable -> done``. A task in any other status
++        records the tick and keeps its status.
++
++        Args:
++            task_id: Task id.
++            step_numbers: 1-based owner-step numbers, in any order.
++            evidence: What the owner checked; must not be blank.
++            done_by: Who ticked the steps.
++
++        Returns:
++            The task's status after the save.
++
++        Raises:
++            StateError: Unknown task, step out of range, step already
++                ticked, duplicate step, or blank evidence/done_by.
++            TransitionError: If the closing transition is refused.
++            ContractError: If the resulting queue wouldn't validate.
++            ConcurrentWriteError: If another writer changed the file.
++        """
++        task = self.get(task_id)
++        check_tick(task, step_numbers, evidence=evidence, done_by=done_by)
++        candidate = copy.deepcopy(task)
++        stamp = now_iso()
++        for number in step_numbers:
++            candidate["owner_steps"][number - 1].update(
++                done=True, done_at=stamp, done_by=done_by, evidence=evidence.strip()
++            )
++        current = candidate.get("status")
++        path: list = []
++        if not open_owner_steps(candidate):
++            if current == "awaiting_owner":
++                path = ["done"]
++            elif candidate.get("kind") == "owner_only" and current in ("draft", "not_buildable"):
++                path = ["not_buildable", "done"] if current == "draft" else ["done"]
++        for new_status in path:
++            check_transition(current, new_status)
++            _check_kind_rules(candidate, current, new_status)
++            current = new_status
++        if path:
++            _check_slice_rules(candidate, current)
++            _check_owner_step_rules(candidate, current)
++            candidate["status"] = current
++        task.clear()
++        task.update(candidate)
++        self.save()
++        return current
++
+     def append_attempt(self, task_id: str, attempt: dict) -> None:
+         """Append one attempt record to a task's append-only log.
+ 
+diff --git a/factory/tick.py b/factory/tick.py
+new file mode 100644
+index 0000000..ff526d2
+--- /dev/null
++++ b/factory/tick.py
+@@ -0,0 +1,72 @@
++"""``factory tick`` — the owner ticks owner steps (F-29).
++
++Owner steps are things only the owner can do (TASK-CONTRACT §2). Ticking
++one is a human statement that it was done, so like approval it is
++deliberately human-paced:
++
++- each named step is printed and confirmed on its own; there is no
++  ``--yes``,
++- every tick carries evidence (what the owner checked), who ticked it and
++  when, so the queue says why a step is closed,
++- all refusals happen before anything is written, and the ticks plus any
++  resulting status change go out in one atomic save.
++
++Ticking the last open step closes the task: ``awaiting_owner -> done``,
++or ``draft -> not_buildable -> done`` for an ``owner_only`` task.
++"""
++
++from collections.abc import Callable
++
++from factory.approve import input_confirm
++from factory.state import StateError, TaskQueue, TransitionError, check_tick
++
++
++class TickError(Exception):
++    """A tick was refused or declined; nothing was written."""
++
++
++def tick_steps(
++    queue: TaskQueue,
++    task_id: str,
++    step_numbers: list,
++    *,
++    evidence: str,
++    done_by: str,
++    confirm: Callable[[str], bool] = input_confirm,
++) -> str:
++    """Confirm and tick owner steps of one task.
++
++    Args:
++        queue: The loaded queue.
++        task_id: Task id.
++        step_numbers: 1-based owner-step numbers to tick.
++        evidence: What the owner checked; must not be blank.
++        done_by: Who is ticking.
++        confirm: Asks one yes/no question; the default reads the terminal,
++            and EOF declines.
++
++    Returns:
++        The task's status after the save.
++
++    Raises:
++        TickError: On any refusal or a declined confirmation; the queue
++            file is unchanged.
++    """
++    try:
++        task = queue.get(task_id)
++        check_tick(task, step_numbers, evidence=evidence, done_by=done_by)
++    except StateError as exc:
++        raise TickError(str(exc)) from exc
++    steps = task["owner_steps"]
++    for number in step_numbers:
++        question = (
++            f"{task_id} owner step {number}: {steps[number - 1].get('text')}\n"
++            f"  evidence: {evidence.strip()}\n"
++            "Tick this step as done?"
++        )
++        if not confirm(question):
++            raise TickError(f"{task_id}: owner step {number} declined; nothing was ticked")
++    try:
++        return queue.tick_owner_steps(task_id, step_numbers, evidence=evidence, done_by=done_by)
++    except (StateError, TransitionError) as exc:
++        raise TickError(str(exc)) from exc
+diff --git a/schema/tasks.schema.json b/schema/tasks.schema.json
+index d8b3125..a187808 100644
+--- a/schema/tasks.schema.json
++++ b/schema/tasks.schema.json
+@@ -113,7 +113,15 @@
+             "type": "object",
+             "required": ["text", "done"],
+             "additionalProperties": false,
+-            "properties": { "text": { "type": "string" }, "done": { "type": "boolean" } }
++            "properties": {
++              "text": { "type": "string" },
++              "done": { "type": "boolean" },
++              "done_at": { "type": "string", "format": "date-time" },
++              "done_by": { "type": "string", "minLength": 1 },
++              "evidence": { "type": "string", "pattern": "\\S", "description": "What the owner checked; required with done: true (F-29)" }
++            },
++            "if": { "properties": { "done": { "const": true } } },
++            "then": { "required": ["done_at", "done_by", "evidence"] }
+           }
+         },
+         "slices": { "type": "array", "items": { "$ref": "#/$defs/slice" } },
+@@ -146,9 +154,17 @@
+           "then": { "properties": { "gates": { "properties": { "merge": { "const": "human" } } } } }
+         },
+         {
+-          "if": { "properties": { "status": { "enum": ["ready", "in_progress", "in_review", "deploying", "awaiting_owner", "done"] } } },
++          "if": {
++            "properties": { "status": { "enum": ["ready", "in_progress", "in_review", "deploying", "awaiting_owner", "done"] } },
++            "not": { "properties": { "kind": { "const": "owner_only" }, "status": { "const": "done" } }, "required": ["kind", "status"] }
++          },
+           "then": { "required": ["acceptance_hash", "approved_at"], "properties": { "acceptance": { "minItems": 1 } } }
+         },
++        {
++          "$comment": "F-29: an owner_only task has no contract to freeze; it is done when it has owner steps and every one is ticked.",
++          "if": { "properties": { "kind": { "const": "owner_only" }, "status": { "const": "done" } }, "required": ["kind", "status"] },
++          "then": { "required": ["owner_steps"], "properties": { "owner_steps": { "minItems": 1, "items": { "properties": { "done": { "const": true } } } } } }
++        },
+         {
+           "if": { "properties": { "kind": { "enum": ["decision", "research", "owner_only"] } } },
+           "then": { "properties": { "status": { "enum": ["draft", "not_buildable", "done"] } } }
+diff --git a/tests/test_f03.py b/tests/test_f03.py
+index fa36ade..68dc0ff 100644
+--- a/tests/test_f03.py
++++ b/tests/test_f03.py
+@@ -134,10 +134,12 @@ def test_ac_1(tmp_path):
+         ("needs_human", "in_review"),
+         ("needs_human", "done"),
+     ],
++    # not_buildable -> done exists since F-29, guarded to owner_only tasks
++    # with every step ticked (tests/test_f29.py); every other exit is illegal.
+     "exit_from_not_buildable": [
+         ("not_buildable", "draft"),
+         ("not_buildable", "ready"),
+-        ("not_buildable", "done"),
++        ("not_buildable", "in_progress"),
+     ],
+ }
+ 
+@@ -191,7 +193,9 @@ def test_l4_branches_from_deploying(tmp_path):
+     )
+     queue = TaskQueue(path)
+     queue.transition("T-OWNER", "awaiting_owner")
+-    queue.get("T-OWNER")["owner_steps"][0]["done"] = True  # you tick the step
++    queue.get("T-OWNER")["owner_steps"][0].update(
++        done=True, done_at="2026-10-19T00:00:00Z", done_by="Tester", evidence="ticked"
++    )  # F-29: a tick carries its audit fields
+     queue.transition("T-OWNER", "done")
+     assert TaskQueue(path).get("T-OWNER")["status"] == "done"
+ 
+@@ -216,7 +220,9 @@ def test_owner_step_guards(tmp_path):
+     queue.transition("T-OPEN", "awaiting_owner")  # legal: a step is open
+     with pytest.raises(TransitionError, match="never done"):
+         TaskQueue(path).transition("T-OPEN", "done")
+-    queue.get("T-OPEN")["owner_steps"][0]["done"] = True
++    queue.get("T-OPEN")["owner_steps"][0].update(
++        done=True, done_at="2026-10-19T00:00:00Z", done_by="Tester", evidence="ticked"
++    )  # F-29: a tick carries its audit fields
+     queue.transition("T-OPEN", "done")
+     assert TaskQueue(path).get("T-OPEN")["status"] == "done"
+ 
+diff --git a/tests/test_f04.py b/tests/test_f04.py
+index 0e706c4..56cd10e 100644
+--- a/tests/test_f04.py
++++ b/tests/test_f04.py
+@@ -534,9 +534,11 @@ def test_reconcile_on_this_repos_real_files(tmp_path):
+     # fully-proven prefix F-01..F-03 reconciles to done in dependency
+     # order. Entries beyond that depend on where the bootstrap stands
+     # (their PR may not be merged yet), so their outcomes aren't pinned;
+-    # F-00 (owner_only, never in the ledger) must stay draft regardless.
++    # F-00 (owner_only, never in the ledger) is left exactly as it was —
++    # draft before its steps are ticked, done after (F-29).
+     queue_path = tmp_path / "tasks.json"
+     shutil.copy(REPO / ".factory" / "tasks.json", queue_path)
++    f00_before = next(t for t in json.loads(queue_path.read_text())["tasks"] if t["id"] == "F-00")
+     ledger = tmp_path / "BOOTSTRAP.md"
+     shutil.copy(REPO / ".factory" / "BOOTSTRAP.md", ledger)
+     results = reconcile_bootstrap(
+@@ -554,7 +556,7 @@ def test_reconcile_on_this_repos_real_files(tmp_path):
+     assert on_disk["F-01"]["status"] == "done"
+     assert on_disk["F-02"]["status"] == "done"
+     assert on_disk["F-03"]["status"] == "done"
+-    assert on_disk["F-00"]["status"] == "draft"
++    assert on_disk["F-00"] == f00_before
+ 
+ 
+ # --- Extra: CLI ------------------------------------------------------------
+@@ -582,6 +584,7 @@ def test_cli_reconcile_bootstrap(tmp_path, capsys, monkeypatch):
+     shutil.copy(REPO / ".factory" / "tasks.json", queue_path)
+     ledger = tmp_path / "BOOTSTRAP.md"
+     shutil.copy(REPO / ".factory" / "BOOTSTRAP.md", ledger)
++    f00_before = next(t for t in json.loads(queue_path.read_text())["tasks"] if t["id"] == "F-00")
+     monkeypatch.setattr("builtins.input", lambda _prompt: "y")
+     code = main(
+         [
+@@ -596,9 +599,9 @@ def test_cli_reconcile_bootstrap(tmp_path, capsys, monkeypatch):
+     # Exit is 0 unless some entry failed; entries beyond the merged
+     # F-01..F-03 prefix depend on bootstrap state, so only the prefix
+     # and the never-reconciled owner task are pinned.
+-    statuses = {t["id"]: t["status"] for t in json.loads(queue_path.read_text())["tasks"]}
+-    assert statuses["F-01"] == "done" and statuses["F-03"] == "done"
+-    assert statuses["F-00"] == "draft"
++    tasks = {t["id"]: t for t in json.loads(queue_path.read_text())["tasks"]}
++    assert tasks["F-01"]["status"] == "done" and tasks["F-03"]["status"] == "done"
++    assert tasks["F-00"] == f00_before
+     out = capsys.readouterr().out
+     for tid in ("F-01", "F-03"):
+         assert f"{tid}: reconciled" in out or f"{tid}: skipped — already done" in out
+diff --git a/tests/test_f29.py b/tests/test_f29.py
+new file mode 100644
+index 0000000..887007b
+--- /dev/null
++++ b/tests/test_f29.py
+@@ -0,0 +1,242 @@
++"""F-29 acceptance tests — BUILD-ORDER.md, work order F-29 (owner-step tick).
++
++Contract rule (CLAUDE.md): an acceptance ref ``tests/test_f29.py::test_ac_N``
++means a test function with exactly that name. Extra tests cover the CLI
++wiring and the reconcile interaction on this repo's real files.
++"""
++
++import copy
++import json
++import shutil
++from pathlib import Path
++
++import pytest
++
++from factory.approve import reconcile_bootstrap
++from factory.cli import main
++from factory.contract import ContractError, acceptance_hash, load_tasks
++from factory.state import TaskQueue, TransitionError
++from factory.tick import TickError, tick_steps
++
++REPO = Path(__file__).resolve().parent.parent
++
++ACCEPTANCE = [
++    {"id": "AC-1", "text": "it works", "check": {"type": "test", "ref": "tests/x.py::test_works"}},
++]
++
++
++def _steps(*texts):
++    return [{"text": text, "done": False} for text in texts]
++
++
++def _task(**overrides):
++    base = {
++        "id": "T-1",
++        "title": "fixture task",
++        "source": "docs/fixture.md#t-1",
++        "kind": "build",
++        "priority": "P2",
++        "status": "awaiting_owner",
++        "depends_on": [],
++        "risk": [],
++        "gates": {"spec_approval": True, "merge": "human", "deploy": "human"},
++        "acceptance": copy.deepcopy(ACCEPTANCE),
++        "acceptance_hash": acceptance_hash(ACCEPTANCE),
++        "approved_at": "2026-10-19T00:00:00Z",
++        "approved_by": "Tester",
++        "owner_steps": _steps("deploy it", "confirm a real send"),
++        "budget": {"size": "S", "max_attempts": 3, "max_turns": 80, "wall_clock_min": 60},
++    }
++    base.update(overrides)
++    return base
++
++
++def _owner_only(**overrides):
++    base = {
++        "id": "O-1",
++        "title": "owner prerequisites",
++        "source": "docs/fixture.md#o-1",
++        "kind": "owner_only",
++        "priority": "P1",
++        "status": "draft",
++        "depends_on": [],
++        "risk": [],
++        "gates": {"spec_approval": True, "merge": "human", "deploy": "human"},
++        "acceptance": [],
++        "owner_steps": _steps("email support", "turn on branch protection"),
++        "budget": {"size": "S", "max_attempts": 1, "max_turns": 80, "wall_clock_min": 60},
++    }
++    base.update(overrides)
++    return base
++
++
++def _queue_file(tmp_path, tasks):
++    path = tmp_path / "tasks.json"
++    path.write_text(json.dumps({"version": 1, "project": "fixture", "tasks": tasks}, indent=2))
++    return path
++
++
++def _tick(path, task_id, steps, evidence="checked 2026-10-19", confirm=lambda _q: True):
++    return tick_steps(TaskQueue(path), task_id, steps, evidence=evidence,
++                      done_by="Tester", confirm=confirm)
++
++
++def _on_disk(path, task_id):
++    return next(t for t in json.loads(path.read_text())["tasks"] if t["id"] == task_id)
++
++
++def test_ac_1(tmp_path, monkeypatch, capsys):
++    """AC-1: a confirmed tick records done, done_at, done_by and evidence."""
++    path = _queue_file(tmp_path, [_task(status="in_review")])
++    asked = []
++    _tick(path, "T-1", [2], confirm=lambda q: asked.append(q) or True)
++    assert len(asked) == 1 and "confirm a real send" in asked[0]
++    step1, step2 = _on_disk(path, "T-1")["owner_steps"]
++    assert step1 == {"text": "deploy it", "done": False}
++    assert step2["done"] is True
++    assert step2["done_by"] == "Tester"
++    assert step2["evidence"] == "checked 2026-10-19"
++    assert step2["done_at"].endswith("Z")
++
++    # done: true without the audit fields is refused at load.
++    bare_dir = tmp_path / "bare"
++    bare_dir.mkdir()
++    bare = _task(owner_steps=[{"text": "deploy it", "done": True}], status="in_review")
++    with pytest.raises(ContractError):
++        load_tasks(_queue_file(bare_dir, [bare]))
++
++    # CLI: one confirmation per named step, evidence required, no --yes.
++    path = _queue_file(tmp_path, [_task(status="in_review")])
++    answers = iter(["y", "y"])
++    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
++    code = main(["tick", "T-1", "1", "2", "--queue", str(path),
++                 "--evidence", "both done", "--done-by", "Owner"])
++    assert code == 0
++    assert all(s["done"] and s["done_by"] == "Owner" for s in _on_disk(path, "T-1")["owner_steps"])
++    with pytest.raises(SystemExit):
++        main(["tick", "T-1", "1", "--queue", str(path)])  # --evidence missing
++    with pytest.raises(SystemExit):
++        main(["tick", "T-1", "1", "--queue", str(path), "--evidence", "x", "--yes"])
++
++
++@pytest.mark.parametrize(
++    ("task_id", "steps", "evidence", "answer", "needle"),
++    [
++        ("NOPE", [1], "e", True, "unknown task"),
++        ("T-1", [3], "e", True, "out of range"),
++        ("T-1", [0], "e", True, "out of range"),
++        ("T-1", [1], "   ", True, "evidence"),
++        ("T-1", [1], "e", False, "declined"),
++        ("T-1", [1, 3], "e", True, "out of range"),  # one bad step writes none
++    ],
++)
++def test_ac_2(tmp_path, task_id, steps, evidence, answer, needle):
++    """AC-2: every refusal leaves tasks.json byte-identical, names the problem."""
++    path = _queue_file(tmp_path, [_task(status="in_review")])
++    before = path.read_bytes()
++    with pytest.raises(TickError, match=needle):
++        _tick(path, task_id, steps, evidence=evidence, confirm=lambda _q: answer)
++    assert path.read_bytes() == before
++
++
++def test_ac_2_already_ticked(tmp_path):
++    """AC-2: an already-ticked step is refused and nothing is written."""
++    path = _queue_file(tmp_path, [_task(status="in_review")])
++    _tick(path, "T-1", [1])
++    before = path.read_bytes()
++    with pytest.raises(TickError, match="already ticked"):
++        _tick(path, "T-1", [1])
++    assert path.read_bytes() == before
++
++
++def test_ac_2_cli_refusal_exits_nonzero(tmp_path, monkeypatch, capsys):
++    path = _queue_file(tmp_path, [_task(status="in_review")])
++    before = path.read_bytes()
++    monkeypatch.setattr("builtins.input", lambda _prompt: "n")
++    assert main(["tick", "T-1", "1", "--queue", str(path), "--evidence", "e"]) == 1
++    assert "declined" in capsys.readouterr().err
++    assert path.read_bytes() == before
++
++
++def test_ac_3(tmp_path):
++    """AC-3: the last open step of awaiting_owner closes the task; others never move."""
++    path = _queue_file(tmp_path, [_task()])
++    assert _tick(path, "T-1", [1]) == "awaiting_owner"
++    assert _on_disk(path, "T-1")["status"] == "awaiting_owner"
++    assert _tick(path, "T-1", [2]) == "done"
++    assert _on_disk(path, "T-1")["status"] == "done"
++
++    for status in ("ready", "in_progress", "in_review", "deploying"):
++        path = _queue_file(tmp_path, [_task(status=status)])
++        assert _tick(path, "T-1", [1, 2]) == status
++        assert _on_disk(path, "T-1")["status"] == status
++
++
++def test_ac_4(tmp_path):
++    """AC-4: owner_only closes draft -> not_buildable -> done; build/docs never can."""
++    path = _queue_file(tmp_path, [_owner_only()])
++    assert _tick(path, "O-1", [1]) == "draft"
++    assert _tick(path, "O-1", [2]) == "done"
++    assert _on_disk(path, "O-1")["status"] == "done"
++
++    path = _queue_file(tmp_path, [_owner_only(status="not_buildable")])
++    assert _tick(path, "O-1", [1, 2]) == "done"
++
++
++@pytest.mark.parametrize("kind", ["build", "docs"])
++def test_ac_4_executable_kind_cannot_enter_not_buildable(tmp_path, kind):
++    task = _task(kind=kind, status="draft", owner_steps=[])
++    for field in ("acceptance_hash", "approved_at", "approved_by"):
++        task.pop(field)
++    queue = TaskQueue(_queue_file(tmp_path, [task]))
++    with pytest.raises(TransitionError, match="not_buildable"):
++        queue.transition("T-1", "not_buildable")
++
++
++@pytest.mark.parametrize("kind", ["build", "docs"])
++def test_ac_4_executable_kind_cannot_leave_not_buildable_to_done(tmp_path, kind):
++    # Hand-written state the importer would never produce: an executable
++    # kind parked in not_buildable must still not be able to reach done.
++    task = _task(kind=kind, status="not_buildable", owner_steps=[])
++    queue = TaskQueue(_queue_file(tmp_path, [task]))
++    with pytest.raises(TransitionError, match="owner_only"):
++        queue.transition("T-1", "done")
++
++
++def test_ac_4_owner_only_done_on_disk_needs_ticked_steps(tmp_path):
++    # Written by hand, an owner_only task marked done with an open step (or
++    # no steps) is refused at load: done has to mean every step was ticked.
++    for steps in (_steps("email support"), []):
++        path = _queue_file(tmp_path, [_owner_only(status="done", owner_steps=steps)])
++        with pytest.raises(ContractError):
++            load_tasks(path)
++
++
++def test_ac_4_owner_only_needs_every_step_ticked(tmp_path):
++    queue = TaskQueue(_queue_file(tmp_path, [_owner_only(status="not_buildable")]))
++    with pytest.raises(TransitionError):
++        queue.transition("O-1", "done")
++    queue = TaskQueue(_queue_file(tmp_path, [_owner_only(status="not_buildable", owner_steps=[])]))
++    with pytest.raises(TransitionError, match="at least one"):
++        queue.transition("O-1", "done")
++
++
++def test_ac_5(tmp_path):
++    """AC-5: reconcile on the real files leaves owner_only tasks exactly as they were."""
++    queue_path = tmp_path / "tasks.json"
++    shutil.copy(REPO / ".factory" / "tasks.json", queue_path)
++    ledger = tmp_path / "BOOTSTRAP.md"
++    shutil.copy(REPO / ".factory" / "BOOTSTRAP.md", ledger)
++    before = {t["id"]: t for t in json.loads(queue_path.read_text())["tasks"]
++              if t["kind"] == "owner_only"}
++    assert "F-00" in before
++    reconcile_bootstrap(TaskQueue(queue_path), ledger, approved_by="Tester",
++                        confirm=lambda _q: True)
++    after = {t["id"]: t for t in json.loads(queue_path.read_text())["tasks"]
++             if t["kind"] == "owner_only"}
++    assert after == before
++
++    # The F-04 real-files tests no longer pin F-00 to draft.
++    f04 = (REPO / "tests" / "test_f04.py").read_text()
++    assert 'on_disk["F-00"]["status"] == "draft"' not in f04
++    assert 'statuses["F-00"] == "draft"' not in f04

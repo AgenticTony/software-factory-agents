@@ -25,6 +25,9 @@ paths:
     - "TASK-CONTRACT.md"
     - "VALIDATOR-SPEC.md"
     - "CLAUDE.md"
+    # F-33: the corpus that judges the sentinels is itself evidence a
+    # session must not edit.
+    - "corpus/**"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 

@@ -261,8 +261,13 @@ def _name_status_rows(status_out: str, head_ref: str) -> list:
         status = re.match(r"^[A-Z]+", parts[0]).group()
         if status == "U":
             raise GateError(f"unmerged path in diff of {head_ref}: {row}")
-        path = parts[-1]
-        old_path = parts[1] if status == "R" and len(parts) == 3 else None
+        # Exotic paths arrive quoted (single-quoted C style); decode so
+        # the rows merge with the hunk parser's decoded paths.
+        path = _unquote_git_path(parts[-1])
+        old_path = (
+            _unquote_git_path(parts[1]) if status == "R" and len(parts) == 3
+            else None
+        )
         changes.append(FileChange(path, status, old_path))
     return changes
 
@@ -314,9 +319,69 @@ def diff_file_changes(repo: Path, base_ref: str, head_ref: str) -> list:
     return changes
 
 
+def _unquote_git_path(token: str) -> str:
+    """Decode a git-quoted path token; unquoted tokens pass through.
+
+    Git quotes paths holding non-ASCII or special characters and emits
+    the bytes as C escapes: ``"t\\303\\253st.py"`` is ``tëst.py``.
+    Diff headers quote with double quotes, ``--name-status`` rows with
+    single; both decode the same way. Octal escapes are raw UTF-8
+    bytes; ``\\"``, ``\\\\``, ``\\n`` and ``\\t`` are their literals.
+    """
+    if len(token) < 2 or token[0] not in "\"'" or token[-1] != token[0]:
+        return token
+    body = token[1:-1]
+    out = bytearray()
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch == "\\" and i + 1 < len(body):
+            esc = body[i + 1]
+            if esc in ('"', "\\"):
+                out += esc.encode()
+                i += 2
+                continue
+            if esc == "n":
+                out += b"\n"
+                i += 2
+                continue
+            if esc == "t":
+                out += b"\t"
+                i += 2
+                continue
+            digits = body[i + 1:i + 4]
+            if len(digits) == 3 and all(c in "01234567" for c in digits):
+                out.append(int(digits, 8))
+                i += 4
+                continue
+        out += ch.encode("utf-8")
+        i += 1
+    return out.decode("utf-8", "replace")
+
+
+def _diff_path(token: str, prefix: str) -> str | None:
+    """The path from an ``---``/``+++`` token; None for ``/dev/null``.
+
+    The token may be git-quoted; the ``a/``/``b/`` prefix is stripped
+    after decoding (kept when the producer emitted none).
+    """
+    path = _unquote_git_path(token.strip())
+    if path == "/dev/null":
+        return None
+    if path.startswith(f"{prefix}/"):
+        return path[2:]
+    return path
+
+
 def _parse_unified_diff(text: str) -> dict:
     """Key a unified diff by its b-side path, tracking line numbers.
 
+    The ``+++`` line is the authoritative file name: git quotes exotic
+    paths (``+++ "b/t\\303\\253st.py"``) and an unquoted path can itself
+    contain `` b/``, which the ``diff --git`` header cannot express
+    unambiguously (PR #47 review finding 7). A deletion keys by its
+    a-side path — ``+++ /dev/null`` names no file, and
+    :func:`diff_file_changes` merges hunks under that same path.
     Context lines advance both counters, or every location after the
     first context line drifts.
 
@@ -324,18 +389,28 @@ def _parse_unified_diff(text: str) -> dict:
         ``{path: (added, removed)}`` where each list holds
         ``(line_number, line_text)`` (new-file / old-file numbering).
     """
-    header = re.compile(r"^diff --git a/(.*) b/(.*)$")
     hunk = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
     result: dict[str, tuple[list, list]] = {}
     key = None
+    pending_old = None
     in_hunk = False
     new_no = old_no = 0
     for line in text.splitlines():
-        m = header.match(line)
-        if m:
-            key = m.group(2)
+        if line.startswith("diff --git "):
+            key = None
+            pending_old = None
             in_hunk = False
-            result.setdefault(key, ([], []))
+            continue
+        if not in_hunk and key is None and line.startswith("--- "):
+            path = _diff_path(line[4:], "a")
+            if path is not None:
+                pending_old = path
+            continue
+        if not in_hunk and key is None and line.startswith("+++ "):
+            path = _diff_path(line[4:], "b")
+            key = path if path is not None else pending_old
+            if key is not None:
+                result.setdefault(key, ([], []))
             continue
         m = hunk.match(line)
         if m:
@@ -358,3 +433,97 @@ def _parse_unified_diff(text: str) -> dict:
             removed.append((old_no, line[1:]))
             old_no += 1
     return result
+
+
+def changes_from_patch(text: str) -> list:
+    """``FileChange`` list parsed from a unified-diff patch, no repo.
+
+    The F-33 corpus replay reads ``gh pr diff`` output through here.
+    Statuses come from the git headers (``new file mode``, ``deleted
+    file mode``, ``rename from``/``rename to``, ``copy from``/``copy
+    to`` — anything else is a modification). Paths come from the
+    authoritative lines, decoded when git quotes them (PR #47 review
+    finding 7): ``+++ b/x`` first — a ``/dev/null`` falls back to the
+    ``--- a/x`` of a deletion — then ``rename to``/``copy to`` for the
+    no-hunk blocks, and only as a last resort the ``diff --git``
+    header, which cannot express a quoted or `` b/``-containing path
+    unambiguously. Line detail reuses :func:`_parse_unified_diff`, so
+    a replayed patch and :func:`diff_file_changes` can never disagree
+    about hunk line numbers.
+
+    Args:
+        text: The patch text (``git diff`` / ``gh pr diff`` output).
+
+    Returns:
+        ``FileChange`` list, one per ``diff --git`` block, in patch order.
+    """
+    changes: list[FileChange] = []
+    headers: list[str] = []
+    pending_old = None
+    for line in text.splitlines():
+        if line.startswith("diff --git "):
+            changes.append(FileChange("", "M"))
+            headers.append(line)
+            pending_old = None
+            continue
+        if not changes:
+            continue
+        change = changes[-1]
+        if line.startswith("new file mode"):
+            change.status = "A"
+        elif line.startswith("deleted file mode"):
+            change.status = "D"
+        elif line.startswith("rename from "):
+            change.old_path = _unquote_git_path(line[len("rename from "):].strip())
+            change.status = "R"
+        elif line.startswith("rename to "):
+            change.path = _unquote_git_path(line[len("rename to "):].strip())
+        elif line.startswith("copy from "):
+            change.old_path = _unquote_git_path(line[len("copy from "):].strip())
+            change.status = "C"
+        elif line.startswith("copy to "):
+            change.path = _unquote_git_path(line[len("copy to "):].strip())
+        elif line.startswith("--- "):
+            path = _diff_path(line[4:], "a")
+            if path is not None:
+                pending_old = path
+        elif line.startswith("+++ "):
+            path = _diff_path(line[4:], "b")
+            if path is not None:
+                change.path = path
+            elif not change.path and pending_old is not None:
+                change.path = pending_old  # a deletion's +++ is /dev/null
+    hunks = _parse_unified_diff(text)
+    named = []
+    for change, header in zip(changes, headers):
+        if not change.path:
+            change.path = _header_paths(header)[1] or change.old_path or ""
+        if not change.path:
+            continue  # nothing named the file and it has no hunks
+        change.added_lines, change.removed_lines = hunks.get(
+            change.path, ([], [])
+        )
+        named.append(change)
+    return named
+
+
+def _header_paths(header: str) -> tuple:
+    """Best-effort a/b paths from a ``diff --git`` header line.
+
+    Unreliable BY DESIGN of the format when a path is quoted or contains
+    `` b/`` — the ``---``/``+++`` lines are authoritative, and this only
+    backs up blocks that carry neither (no hunks, no rename lines).
+    """
+    tail = header[len("diff --git "):].strip()
+    quoted = re.fullmatch(r'("(?:\\.|[^"\\])*") ("(?:\\.|[^"\\])*")', tail)
+    if quoted:
+        a, b = _unquote_git_path(quoted.group(1)), _unquote_git_path(quoted.group(2))
+    elif " b/" in tail:
+        a, _, b = tail.rpartition(" b/")
+        b = f"b/{b}" if not b.startswith("b/") else b
+    else:
+        return "", ""  # not a two-path header; nothing to fall back to
+    return (
+        a[2:] if a.startswith("a/") else a,
+        b[2:] if b.startswith("b/") else b,
+    )

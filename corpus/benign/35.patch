@@ -1,0 +1,2301 @@
+diff --git a/.factory/BOOTSTRAP.md b/.factory/BOOTSTRAP.md
+index 1b643b7..50bd4a4 100644
+--- a/.factory/BOOTSTRAP.md
++++ b/.factory/BOOTSTRAP.md
+@@ -437,3 +437,69 @@ A readiness run of the factory's own gates on a clean clone of JobFinderOS (`ori
+ - **The newline-rejection branch in `_env_guard_source` had no test, and raised the wrong exception:** the build-time rejection of a home path containing a newline raised `RehearsalError` — the "not ready" exception — for what is a fixture-build error that fires before anything has run. It now raises a plain `ValueError` (docstring states why: an invalid build input must not speak F-28's readiness vocabulary), and `test_review10_env_guard_rejects_newline_home_paths` covers the branch — red before the fix (the branch raised `RehearsalError` where the test demands `ValueError`), green after, with the message's diagnostic pinned (names the newline and the offending path).
+ - **Evidence:** 12 F-24 tests / **389 total** passing locally, ruff clean.
+ - **Status to set at reconcile:** unchanged — `done` once this PR's CI is green and you merge it.
++
++---
++
++## F-23 — Review convergence
++
++- **Commits:** `feat/f23-review-convergence`, branched off `chore/reconcile-f24` (`9fe41ff`, the F-24 reconcile that origin/main doesn't have yet).
++- **Built:** 2026-10-20. Interactive session, per BUILD-ORDER Phase 1b (hardening WOs change what judges agents).
++- **Design notes:** the convergence machinery lives in `factory/l2.py` with the rest of the orchestrator side of the L2 contract, not in a new module. `finding_key` hashes (file, axis, normalised summary) — deliberately excluding `line` (drifts as the diff moves) and `severity` (the same defect re-rated is the same finding); the key is computed at parse time so every stored report carries it. `apply_convergence` classifies one round's verdict: a **prior key whose file the delta didn't touch** (or with no raise sha / no file — raised in an earlier run) is `state: "carried"` — still in the findings, so a carried *blocking* finding still fails the round, but never listed as new; a prior key on a file the delta *did* touch is a repeat after a failed fix — it stands as the round's finding and its key still counts as already raised; in delta mode a **new** finding outside the delta needs `missed_earlier` or is dropped with the reason recorded in `dropped`. The effective verdict is recomputed over what survives (a declared `fail` and a parse error both stand; a declared `pass` whose only blocker was dropped becomes the pass the reviewer declared). The orchestrator keeps the per-run state: `prior` (key → raise sha) seeded from the task's progress-log `finding_keys` entries (cross-run: sha None), `raised` (this run's findings for the next round's carried list), `last_reviewed` (the head L2 last saw). The fix prompt (round 2+ of a run) renders the failed round's numbered findings under `## Findings to fix` with the fix-the-class instruction; the round-2+ review prompt carries the carried list, the delta as `## Delta since the last review (primary scope)` and the full diff as reference. `reviewer.md` gains the standing "Fix rounds" section (pin updated in `tests/test_f09.py`, the sanctioned route). `review_not_converging` added to the schema enum and to TASK-CONTRACT.md's escalation line with its owner action (the F-10 review7 sweep test forced the doc, as designed).
++- **AC-1** proven: `tests/test_f23.py::test_ac_1` — the key is stable across re-parse and text noise (case, collapsed whitespace), moves with file or axis; `apply_convergence` marks a repeat whose file the delta didn't touch `carried` in the report while its blocking severity still fails the round, and a same-key finding on a delta-touched file stays the round's own finding. Integration: a two-round run (identical impl both rounds, so the head never moves) stores `key` in each attempt's validator report, marks round 2's finding `carried`, and records `finding_keys` in both progress-log entries. `test_carried_keys_survive_text_normalisation_across_rounds` repeats the round-2 finding with different casing/spacing.
++- **AC-2** proven: `test_ac_2` — unit: in delta mode a new out-of-delta finding without `missed_earlier` is dropped (`out_of_delta_without_missed_earlier` recorded) and a declared `pass` whose only blocker was dropped becomes `pass`; with a justification, and inside the delta, findings stand; round one (no delta) drops nothing. Integration: a moving-head run's round-2 reviewer prompt carries `## Delta since the last review (primary scope)` (containing only round 2's change) and `## Full diff (base...head, reference only)`; the one blocking round-2 finding cites a file outside the delta without justification, is dropped, and the run opens the PR. `test_missed_earlier_is_parsed_onto_the_finding` covers the field's parsing.
++- **AC-3** proven: `test_ac_3` — round 2's implementer prompt carries `## Findings to fix` with the finding text, `sibling` and `defect class` (round 1 has no such section); round 2's reviewer prompt carries the explicit sibling check (`reviewer.md` documents it standing).
++- **AC-4** proven: `test_ac_4` — schema half: a queue whose attempt escalates `review_not_converging` loads through the real `load_tasks` (red against the pre-WO schema: `ContractError … 'review_not_converging' is not one of […]`, run with the enum line stashed). Orchestrator half: a reviewer repeating round 1's finding verbatim (head moving each round — the repeat is on changed code, the stronger case) escalates `review_not_converging` after exactly 2 rounds with budget for a third unspent, `needs_human`, no PR. Contrast: a genuinely new finding each round runs all 3 rounds to `attempts_exhausted`; a mixed round (one carried + one new) continues and passes in round 3.
++- **Cross-run seeding** proven: `test_prior_keys_seed_from_an_earlier_runs_progress_log` — a progress log from an earlier run carrying `finding_keys` makes the next run's round 1 carry the same key and, when the FAIL contains nothing else, escalate `review_not_converging` in the first round.
++- **Changed existing tests (behaviour changed on purpose):** `tests/test_f10.py::test_reviewer_fail_is_retried_then_exhausted` — its scenario (the reviewer re-failing with the identical finding forever) is exactly what F-23 stops: it now scripts a genuinely new finding per round to keep proving the retry-to-exhausted path, and asserts `attempts_exhausted`; the repeat case is F-23's own AC-4 test. `tests/test_f09.py` — the `reviewer.md` pin (content-hash change from the new Fix-rounds section).
++- **Evidence (red-first):** the suite was red at collection on the missing `factory.l2.apply_convergence`/`finding_key` (all four refs) before any F-23 code; the schema half of AC-4 additionally proven red against the pre-change enum (ContractError above). After: 7 F-23 tests / 396 total passing locally (macOS, real srt; stub seats — no model spend), ruff clean.
++- **Status to set at reconcile:** `done` once this PR's CI is green (ruff + pytest on 3.11 + 3.13) and you merge it. No deploy target, so L4 doesn't apply.
++
++### F-23 owner review round (PR #35; 9 findings — all fixed red-first under `test_review1`–`test_review9`)
++
++All ten review tests (`review1` and `review1b` cover finding 1's two halves) were red against `1d525a3` for the reported reasons before any fix. Two needed fixture corrections during the green phase (review5's "fresh finding" case was scripted with an empty delta — a file-naming finding there is legitimately dropped; review8's pass-round verdict defaulted to declared-fail); the code fixes were unchanged by those corrections.
++
++- **(1) The review frontier advanced on reviews that never happened** (correctness): `last_reviewed` and the `prior` raise-shas now move only when the reviewer session completed AND the verdict parsed (`parse_error is None`). A crashed, timed-out or invalid review reviews nothing: the next round's delta still covers that head, so code no reviewer ever saw cannot become "outside the delta" and be dropped. `test_review1_an_invalid_review_does_not_advance_the_frontier` (garbage verdict JSON) and `test_review1b_failed_session_variant` (failed session): round 2's prompt carries `## Diff (base...head)`, not the delta section.
++- **(2) The delta diff crashed on rewritten history** (correctness): `_commit_work` only checks descent from base, so an amended/reset earlier round leaves `last_reviewed` unreachable in the fresh partial clone. New `_is_ancestor` (merge-base rc semantics, GIT_HARDENING; any non-zero — including a missing object — reads as "no") gates the delta: not an ancestor → this round falls back to full-diff scope (delta mode off, nothing dropped). `test_review2_delta_survives_a_rewritten_prior_round`: a round-2 `git commit --amend` now ends `pr_opened` with a full-diff review prompt, not `orchestrator_error`.
++- **(3) The stop fired after one genuine fix attempt** (correctness): the stop is no longer raw key membership. `apply_convergence` computes `L2Report.no_progress` and a repeat on a file the delta **touched** is an attempt in progress (state `new`), not a bounce; only repeats on **untouched** files count. `test_review3_a_repeat_on_a_fixed_file_is_not_the_stop`: same finding re-raised three rounds on a moving head → `attempts_exhausted` after 3 rounds, not `review_not_converging` after 2.
++- **(4) Fix findings duplicated; hashes leaked into history** (efficiency): `ProgressLog.render` never renders `finding_keys` (machine data for the next run's seeding) and takes `omit_last_findings` — on a fix round the newest entry renders without its findings, because the `## Findings to fix` block carries them with the sibling instruction. The entry itself still renders: F-10 AC-10 (every round receives entries 1..N) keeps its test unchanged (`test_progress_log_reaches_every_round` caught my first cut, which dropped the whole entry). `test_review4_fix_prompt_carries_the_findings_once_and_no_key_hashes`: the finding text appears exactly once in round 2's implementer prompt and no 64-hex hash appears at all.
++- **(5) Four parallel structures for "already raised"** (simplification): `already_raised` snapshot, the ordering-coupled `prior` mutation, `raised` and `round_keys` are gone as separate concepts. The stop is decided inside `apply_convergence` where the pre-update prior set is in hand (`no_progress` on the report, asserted by `test_review5_the_stop_is_decided_where_the_prior_set_lives` for the in-run/touched/cross-run/fresh cases); the orchestrator reads one flag, and `round_keys`/`raised` are derived from the classified report in the single block that advances the frontier.
++- **(6) Declared fail with everything dropped retried with nothing** (correctness): a FAIL whose every finding was dropped and whose declared fail stands with zero findings now sets `no_progress` (the all-dropped case), so the run escalates instead of burning the budget. `test_review6_declared_fail_with_everything_dropped_stops`: round 2 declares fail with one out-of-delta finding → `review_not_converging` after 2 rounds, round 3 never spent (red: `attempts_exhausted` after 3).
++- **(7) Fileless findings were always dropped in delta rounds** (correctness): a finding that names no file cannot be shown to sit in unchanged code, and contract-level findings (missing test, unmet AC) rarely name one. The drop rule now requires a named file outside the delta; fileless findings are never dropped. `test_review7_fileless_findings_are_never_dropped`: a declared pass with a blocking fileless finding no longer flips to PASS at round 2 — the finding stands, the round fails, the PR opens only after round 3 genuinely passes.
++- **(8) Log-seeded keys triggered the stop on a fresh run's first round; pass rounds logged keys** (correctness): cross-run carries (raise sha `None`) no longer count toward `no_progress` — only carries raised inside **this** run do, so a re-queued task's first review is a normal round even when it re-raises an old key (the rewritten `test_prior_keys_seed_from_an_earlier_runs_progress_log`: round 1 carried but not stopped; round 2, same key now with an in-run sha on an untouched file, is the bounce and stops). And the pass path no longer logs `finding_keys` (`test_review8_a_pass_round_does_not_log_finding_keys`): a passed round's findings were accepted as non-blocking; recording their keys would poison a later rejected-PR fix round. Failed rounds still log them — that is the seed.
++- **(9) Dropped findings never reached the human** (correctness): `_numbered_findings` emits dropped L2 findings as marked lines (`[L2 dropped R-1] … out of scope, no missed_earlier — for the record, not to fix`), so they ride the numbered findings into the log; and `prbody`'s Validator report section pulls them out above the JSON blob as "**Reviewer findings dropped as out of scope** … read them before merging". `test_review9_dropped_findings_reach_the_human` asserts both the PR-body callout and the log line.
++- **Also changed:** `reviewer.md`'s standing drop rule now says "a new finding **on a file** outside the delta" and states fileless findings are never dropped (pin updated through `PROMPT_PINS`); `test_f10.py::test_reviewer_fail_is_retried_then_exhausted`'s scripted findings are fileless now — the stub writes identical content each round, so the delta is empty and a file-naming new finding would be dropped (all-dropped → the finding-6 stop), changing what that test proves; fileless findings stand, keeping it a 3-round retry-to-exhaustion proof.
++- **Evidence (review round):** 10 review tests, all red against `1d525a3` (review7 after its fileless fixture was corrected to actually pass `file=None`); after the fixes 17 F-23 tests / **406 total** passing locally (macOS, real srt), ruff clean.
++
++### F-23 owner review round 2 (PR #35, head `116e16b`; 9 findings — all fixed red-first under `test_review10`–`test_review17` + the reworked F-10 retry test)
++
++All eight new F-23 review tests were red against `116e16b` for the reported reasons before any fix (review12 after its assertion was scoped to the `## Findings to fix` section — the progress log legitimately repeats old findings, so a whole-prompt check could not see the mismatch). The ninth finding (test coverage) is the F-10 test rework itself, red the moment the l2 rule changed landed.
++
++- **(1) The rewrite fallback re-introduced the finding-3 bug** (correctness): in the fallback the round reviews the full diff with no delta, and an empty `delta_files` made every in-run repeat "untouched" → carried → stop, though the implementer had just rewritten those files. `apply_convergence` now requires **a real delta** to demote an in-run repeat to carried: without one the repeat is an attempt in progress (`state: "new"`, no stop). Cross-run carries (raise sha `None`) still carry — no continuity ever existed. `test_review10_fallback_round_does_not_carry_repeats_as_untouched`: an amending implementer re-flagged on impl.py now runs 3 rounds to `attempts_exhausted` (red: `review_not_converging` after 2).
++- **(2) Dropped findings reached the implementer's fix block** (correctness): `_numbered_findings` grew `include_dropped=False`, and the next round's fix list is built with it (`_fix_findings`) — dropped findings stay in the round's full numbered record (log, PR evidence, the human's read) and never in `## Findings to fix`, where "fix the defect class" of an out-of-scope finding would pull edits into code the round ruled untouchable. `test_review11_dropped_findings_stay_out_of_the_fix_block`: round 3's fix section carries the actionable finding, not the dropped one; the log entry keeps both.
++- **(3) A failed review left the carried list and the fix list describing different rounds** (correctness): a round whose review produced no verdict contributes no L2 lines to the fix list (the invalid-verdict marker is the reviewer's failure, not work); the last valid review's findings are substituted instead (`last_valid_l2`), so the reviewer's "already recorded" list and the implementer's fix list describe the same round. `test_review12_a_failed_review_keeps_the_fix_list_and_carried_list_together`: after a garbage round-2 review, round 3's fix section still carries round 1's open finding (red: only the invalid-verdict marker).
++- **(4) The stop ignored the round's own L0/L1 verdicts** (correctness): new `_round_stuck(l0, l1, l2)` gates the escalation on L0 and L1 both passing — the ordering "L2 runs last" becomes enforced fact instead of wiring accident; a future advisory L1 can no longer discard fresh deterministic work as "not converging". `test_review13_the_stop_requires_l0_and_l1_to_have_passed`: pass/pass/stuck stops; fail-pass/stuck and pass/None/stuck do not.
++- **(5) The stop reason was re-derived in the orchestrator** (simplification): `apply_convergence` now returns `no_progress_reason` (`carried_repeats` | `all_dropped`), and the orchestrator renders the note from a fixed mapping (`_NO_PROGRESS_NOTES`) — the classifier owns which case fired, so a future third branch can't have its note name the wrong reason. `test_review14_the_stop_reason_comes_from_the_classifier`.
++- **(6) `_is_ancestor` bypassed the git helper and had no timeout** (reuse): new `factory.gates.git_rc` — hardened like `git` but rc-returning (never raises; the "no" answer must be representable), timeout-bounded (124 on expiry, so a stalled object fetch cannot hang a round). The orchestrator's local subprocess copy is deleted. `test_review15_git_rc_returns_the_code_without_raising`: 0 / 1 / fatal all come back as codes.
++- **(7) Dropped finding text entered the PR body unfenced** (security): `_validator_section` whitespace-collapses every reviewer-controlled field (`_flat`) before it enters the markdown — a newline in a finding's text can no longer start a `## ` line, which could either forge a duplicate section heading (`check_pr_body` refusing the body after a passing round) or plant spoofed merge-risk text in front of the human. Inside the JSON fence the same text was always safe (newlines escaped). `test_review16_dropped_finding_text_cannot_inject_pr_headings`: a dropped finding whose text carries `\n## Merge Danger\n**Door:** …` still opens the PR, with exactly one Merge Danger heading (red: `publish_refused`).
++- **(8) Fileless findings bypassed delta scoping entirely** (correctness): a fileless finding now keys by its acceptance-item references when it quotes any (`AC-2 has no test` ≡ `AC-2 is still untested` — same identity however re-worded), and a fileless finding with **no** AC anchor is subject to the delta drop rule like any out-of-delta finding (needs `missed_earlier`). The contract-level channel the round-1 fix protected stays open — anchored findings are never dropped and carried blocking still fails the round — while the re-worded unanchored bounce ("error handling in parser is weak", fresh key each round, never carried) now drops or stops instead of running to exhaustion. `test_review17_fileless_findings_anchor_or_justify`: AC-anchored keying, unanchored drop, justified stand, round-one exemption, and the integration stop.
++- **(9) The F-10 retry test was rescripted fileless to dodge the new rule** (test coverage): `test_reviewer_fail_is_retried_then_exhausted` now has the implementer write different (still green) content each round — a real delta — and the findings name `impl.py`: the common file-named retry path is exercised as such. Verified red under the round-2 l2 rules with the old stub (identical content → empty delta → new findings dropped → the all-dropped stop) before the rework.
++- **Also changed:** `reviewer.md` documents the anchoring rule (fileless findings must quote the AC id or carry `missed_earlier` in fix rounds; pin `3a42c5a1…`), and its carried-list wording no longer assumes a delta section exists.
++- **Evidence (round 2):** 8 review tests red against `116e16b`; after the fixes 25 F-23 tests / **414 total** passing locally (macOS, real srt), ruff clean. Dogfood `run_l1` re-proven on the round-2 head `95f19d3` (scratch clone, base `9fe41ff`, node_modules-padded, unconfined): verdict `pass` — red exit 4 (collection) on base, green exit 0 on head, all four contract refs.
++- **Status to set at reconcile:** unchanged — `done` once this PR's CI is green and you merge it.
++
++### F-23 owner review round 3 (PR #35, head `95f19d3`; 9 findings — AC anchoring reverted per the owner's ruling, all fixed red-first under `test_review18`–`test_review23` + the rewritten `test_review17` and tightened `test_review7`)
++
++The owner's mid-turn advice to revert the anchoring before push arrived after `95f19d3` had already been committed and pushed in one command; this round reverts it exactly as ruled. Their words govern the semantics now: findings with no file are never dropped and key by their wording; an in-run repeat of one is an attempt in progress, so a stuck fileless thread runs out at `attempts_exhausted` instead of stopping early. If contract anchoring is ever wanted, it belongs in the verdict schema as an explicit `ac` field validated at parse time — not a regex over prose.
++
++- **(1) Same-AC different-defect repeats carried → stop** (correctness, reverted): `finding_key` keys every finding by (file, axis, wording) again — "AC-2's test asserts the wrong value" after "AC-2 has no test" is a new thread. `test_review18_a_different_defect_on_the_same_ac_is_not_a_carry`: 3 rounds → `attempts_exhausted` (red on `95f19d3`: `review_not_converging` after 2).
++- **(2) Unanchored fileless blocker dropped → declared pass opened a PR** (correctness, reverted): fileless findings are never dropped, restoring round-1 finding 7. `test_review19_an_unanchored_fileless_blocker_does_not_flip_a_pass`: "the new endpoint has no auth check" (no file, no AC id) + declared pass → round fails, no PR (red on `95f19d3`: PR opened). `test_review7`'s fixture no longer leans on "AC-1" in its text — the owner's point that it was hiding this bug is now the test's own comment.
++- **(3) Mentioning any AC id bypassed the drop** (correctness, reverted): `_AC_REF` is gone; an AC id in prose is just wording. `test_review20_mentioning_an_ac_changes_nothing`: "Unrelated to AC-3, the parser is weak" keys differently from "AC-3 is untested" and both stand in a delta round.
++- **(4) Key-scheme change orphaned logged cross-run keys** (correctness, moot + noted): wording keys are restored, and `95f19d3` never ran outside tests (no unattended loop exists before F-28), so no production progress log ever carried an AC key — nothing to orphan. `test_review17`'s unit half pins wording keying for fileless (same wording ⇒ same key across re-parse; different wording ⇒ different thread).
++- **(5) Anchoring inferred by regex over prose** (altitude, reverted): with the anchoring gone there is no inference; the schema-field route is recorded above and in `finding_key`'s docstring for whenever anchoring is revisited.
++- **(6) An L0/L1-failed round dropped the last review's findings from the fix list** (correctness): `_fix_findings` now substitutes `last_valid_l2` whenever this round produced no verdict of its own — invalid review **or L2 never ran** — so the fix list and the reviewer's carried list describe the same findings in both gaps. `test_review21_an_l0l1_failed_round_keeps_the_open_l2_findings`: round 2 breaks the contract test (L1 fail, no review); round 3's fix section still carries round 1's open finding (red on `95f19d3`).
++- **(7) An unreviewed round was hidden from the next implementer** (correctness): a round whose review session ran but produced no verdict prepends an explicit line to the fix list: "[L2 unreviewed] this round's review produced no verdict — the change was not reviewed; do not assume it was accepted." `test_review22_an_unreviewed_round_is_announced_to_the_implementer` (red on `95f19d3`: the fix block replayed round 1's findings with no sign round 2 went unreviewed).
++- **(8) `include_dropped` check inside the dropped loop** (simplification): the loop is now guarded once (`if not include_dropped: continue` before it) — shape only, no behaviour change.
++- **(9) Flattened dropped text still rendered live markdown/HTML** (security): the dropped list now rides inside a ```text fence — the same treatment the implementer's notes get. Flattening stays (a newline inside a fence could close it); the fence kills inline HTML and links (`<!--` could hide the JSON report and How to revert in GitHub's rendered view while `check_pr_body`'s raw regex passed; `[see fix](https://evil)` planted a link in front of the merger). `test_review23_dropped_text_is_fenced_not_just_flattened`: a `<!--` + link payload opens the PR with the payload visible as literal text inside the fence and exactly one How-to-revert heading (red on `95f19d3`: unfenced).
++- **Also changed:** `reviewer.md`'s fix-round rule restored to the round-1 wording ("a finding that names no file is never dropped"); its pin is `dbab8437…` — byte-identical to the pre-anchoring state, a clean revert marker. `test_review17` rewritten from anchor-or-justify to stand-and-key-by-wording (never dropped anchored or not; in-run same-wording repeat → `new`, cross-run → `carried`; a stuck fileless thread runs out at `attempts_exhausted`).
++- **Evidence (round 3):** 8 tests red against `95f19d3` (review7 with its unanchored fixture among them — proving the owner's point that the old fixture hid finding 2); after the fixes 31 F-23 tests / **420 total** passing locally (macOS, real srt), ruff clean. Dogfood `run_l1` re-proven on the round-3 head (scratch clone, base `9fe41ff`, node_modules-padded, unconfined): verdict `pass` — red exit 4 on base, green exit 0 on head, all four contract refs.
++- **Status to set at reconcile:** unchanged — `done` once this PR's CI is green and you merge it.
+diff --git a/.factory/tasks.json b/.factory/tasks.json
+index e84827a..4f4e6a0 100644
+--- a/.factory/tasks.json
++++ b/.factory/tasks.json
+@@ -1,7 +1,7 @@
+ {
+   "version": 1,
+   "project": "software-factory",
+-  "updated_at": "2026-10-19T10:12:08Z",
++  "updated_at": "2026-10-20T14:54:38Z",
+   "tasks": [
+     {
+       "id": "F-00",
+@@ -1560,7 +1560,7 @@
+       "source": "BUILD-ORDER.md#f-24--realistic-rehearsal-fixture-in-ci",
+       "kind": "build",
+       "priority": "P1",
+-      "status": "draft",
++      "status": "done",
+       "depends_on": [
+         "F-05",
+         "F-07",
+@@ -1624,7 +1624,10 @@
+         "wall_clock_min": 150
+       },
+       "attempts": [],
+-      "links": {}
++      "links": {},
++      "acceptance_hash": "01c70b4187f8f8ec19b8a524c59fff1b9b525becc9363af389196dfdf1132b84",
++      "approved_at": "2026-10-20T14:54:38Z",
++      "approved_by": "Anthony"
+     },
+     {
+       "id": "F-25",
+diff --git a/TASK-CONTRACT.md b/TASK-CONTRACT.md
+index 36ef60a..f51203f 100644
+--- a/TASK-CONTRACT.md
++++ b/TASK-CONTRACT.md
+@@ -76,7 +76,7 @@ Recovery and continuation edges (same allowed-transition table, kept out of the
+ | `deploying → ready` | the previous slice merged and live-verified and more slices remain. Owner-step and `done` evaluation waits until the last slice merges; a task can only be `done`/`awaiting_owner` with every slice merged. |
+ | `ready → blocked` | a dependency regressed (its task was reopened or demoted). `sync_readiness` reconciles both directions. |
+ 
+-Escalation reasons (enum): `attempts_exhausted`, `budget_exhausted`, `risk_path_touched`, `new_dependency`, `protected_path_touched`, `contract_ambiguous`, `quota_exhausted`, `live_check_failed`, `cross_repo`, `pr_create_failed`, `orchestrator_error`, `publish_refused`.
++Escalation reasons (enum): `attempts_exhausted`, `budget_exhausted`, `risk_path_touched`, `new_dependency`, `protected_path_touched`, `contract_ambiguous`, `quota_exhausted`, `live_check_failed`, `cross_repo`, `pr_create_failed`, `orchestrator_error`, `publish_refused`, `review_not_converging`.
+ 
+ The three orchestrator-side reasons (F-10):
+ 
+@@ -84,6 +84,8 @@ The three orchestrator-side reasons (F-10):
+ - `orchestrator_error`: the orchestrator itself failed mid-round (a gate crash, a reviewer timeout). The attempt counts against the budget, the task re-queues, and `loop` stops. Look at the attempt's `note` before running again.
+ - `publish_refused`: the push fence or the PR-body gate refused, which retrying can't change. The task is `needs_human`; the attempt's `note` says which rule fired.
+ 
++`review_not_converging` (F-23): a review round's FAIL contained only findings already raised in an earlier round — the loop is bouncing the same findings back and forth, and another round cannot fix that. Re-review now scopes to the delta since the last review and carries repeats instead of re-raising them (BUILD-ORDER F-23); reaching this escalation means those mechanisms see no progress. A human decides whether the findings are real, the reviewer is wrong, or the contract is the problem.
++
+ ## 4. Picking the next task
+ 
+ ```
+diff --git a/factory/gates.py b/factory/gates.py
+index 4c2e9f6..093d2a0 100644
+--- a/factory/gates.py
++++ b/factory/gates.py
+@@ -193,6 +193,26 @@ def git(repo: Path, *args: str) -> str:
+     return proc.stdout
+ 
+ 
++def git_rc(repo: Path, *args: str, timeout_sec: int = 60) -> int:
++    """Hardened git whose answer IS the exit code — it never raises.
++
++    For the questions git encodes in its status (``merge-base
++    --is-ancestor``: 0 yes, 1 no), where raising on non-zero would make
++    the "no" answer unrepresentable. Any non-zero — including a missing
++    object's fatal — comes back as the code; the caller decides which
++    codes mean what. ``timeout_sec`` bounds the call so a stalled object
++    fetch can never hang the round (124 on timeout, like ``sh``).
++    """
++    try:
++        proc = subprocess.run(
++            ["git", *GIT_HARDENING, "-C", str(repo), *args],
++            capture_output=True, text=True, timeout=timeout_sec,
++        )
++    except subprocess.TimeoutExpired:
++        return 124
++    return proc.returncode
++
++
+ def _text(data) -> str:
+     """Normalise captured output: POSIX ``TimeoutExpired`` carries raw bytes
+     (or ``None``) even when the run asked for text."""
+diff --git a/factory/l2.py b/factory/l2.py
+index 3a12ed9..5ef3545 100644
+--- a/factory/l2.py
++++ b/factory/l2.py
+@@ -1,4 +1,4 @@
+-"""L2 adversarial review — verdict parsing and enforcement (F-09).
++"""L2 adversarial review — verdict parsing and enforcement (F-09, F-23).
+ 
+ The only model-judged layer (VALIDATOR-SPEC L2): a fresh reviewer session
+ reads the approved contract, the diff and the L0/L1 output — never the
+@@ -30,15 +30,39 @@
+   the verdict. A dup anywhere in the object makes that candidate
+   malformed.
+ 
++F-23 adds review convergence across rounds. Every finding gets a **stable
++key** — sha256 of its file, axis and normalised summary — at parse time, so
++a finding raised in one round is recognisable in the next.
++:func:`apply_convergence` then classifies a round's verdict against the
++keys raised before it: a repeat whose subject is provably untouched since
++it was raised — a real delta shows the named file unchanged, and a repeat
++from an earlier run has no continuity at all — is **carried**: listed as
++carried, never as new, because re-raising it adds no information. Any
++other in-run repeat (the file was touched, or the finding names no file)
++is an **attempt in progress** and stands as the round's own finding. In a
++delta round a *new* finding on a file the delta didn't change is
++**dropped** unless it says why the earlier round missed it; a finding that
++names no file is never dropped — it cannot be shown to sit in unchanged
++code, and dropping it could flip a declared pass carrying a real
++contract-level blocker into an opened PR. The function also computes the
++round's **no-progress** verdict (``no_progress`` +
++``no_progress_reason``): a FAIL the next round cannot act on — every
++finding a carried repeat from this run on untouched code, or everything
++dropped — so the orchestrator escalates instead of spending the round.
++The effective verdict is recomputed over what survives, which is how a
++declared pass whose only out-of-scope blocker was dropped becomes the
++pass the reviewer actually declared.
++
+ Running the reviewer session itself is F-10's wiring; everything here is
+ pure parsing and judgement over the text a session produced.
+ """
+ 
+ from __future__ import annotations
+ 
++import hashlib
+ import json
+ import re
+-from dataclasses import dataclass
++from dataclasses import dataclass, field, replace
+ from typing import Any, ClassVar
+ 
+ from factory.gates import Finding, GateReport
+@@ -54,10 +78,14 @@
+ @dataclass
+ class L2Finding:
+     """One reviewer finding. Same shape as the deterministic layers'
+-    :class:`~factory.gates.Finding` plus the two L2-only fields: ``axis``
+-    (``spec`` | ``standards``) and ``severity`` (one of the four values
++    :class:`~factory.gates.Finding` plus the L2-only fields: ``axis``
++    (``spec`` | ``standards``), ``severity`` (one of the four values
+     the seat prompt documents; only the exact value ``blocking`` carries
+-    verdict weight)."""
++    verdict weight), the F-23 convergence fields — ``key`` (the stable
++    finding identity, set at parse time), ``missed_earlier`` (the
++    reviewer's justification for a new finding outside the delta) and
++    ``state`` (``new`` or ``carried``, set by :func:`apply_convergence`)
++    — and the shared location fields."""
+ 
+     id: str
+     text: str
+@@ -65,6 +93,35 @@ class L2Finding:
+     severity: str | None = None
+     file: str | None = None
+     line: int | None = None
++    key: str | None = None
++    missed_earlier: str | None = None
++    state: str = "new"
++
++
++def _normalise_summary(text: str) -> str:
++    """Collapse whitespace runs and case: the same finding re-raised with
++    different spacing or casing must key identically across rounds."""
++    return " ".join(text.split()).casefold()
++
++
++def finding_key(finding: L2Finding) -> str:
++    """The stable identity of a finding: sha256 of file, axis (the rule
++    category) and normalised summary (F-23 AC-1). Deliberately excludes
++    ``line`` (line numbers drift as the diff moves) and ``severity`` (the
++    same defect re-rated a round later is the same finding).
++
++    A fileless finding keys the same way — by its wording. An earlier
++    revision keyed fileless findings by any ``AC-n`` ids their text
++    mentions; the owner review reverted it: different defects on one
++    acceptance item merged into one thread and stopped the run after a
++    single fix attempt, while an unanchored contract blocker got dropped
++    and flipped a declared pass into a PR. If contract anchoring is ever
++    wanted, it belongs in the verdict schema as an explicit ``ac`` field
++    validated at parse time — not inferred from prose."""
++    material = "\x00".join(
++        (finding.file or "", finding.axis or "", _normalise_summary(finding.text))
++    )
++    return hashlib.sha256(material.encode()).hexdigest()
+ 
+ 
+ @dataclass
+@@ -73,11 +130,25 @@ class L2Report(GateReport):
+ 
+     ``parse_error`` is set iff the reviewer's output was not valid verdict
+     JSON; the verdict is then ``fail`` with a single
+-    ``invalid_verdict_json`` finding, per the AC-1 rule.
++    ``invalid_verdict_json`` finding, per the AC-1 rule. ``declared`` is
++    what the reviewer actually said (kept so convergence can recompute the
++    effective verdict after dropping out-of-scope findings). ``dropped``
++    lists the findings :func:`apply_convergence` removed as out of delta,
++    with the reason — a dropped finding never reaches the verdict, but the
++    human reading the report still sees it. ``no_progress`` is the F-23
++    stop verdict, computed by :func:`apply_convergence` where the prior
++    set is in hand: True means this round's FAIL gives the next round
++    nothing it can fix. ``no_progress_reason`` says which case fired
++    (``carried_repeats`` or ``all_dropped``) — the orchestrator renders
++    the escalation note from it instead of re-deriving the branch.
+     """
+ 
+     layer: ClassVar[str] = "L2"
+     parse_error: str | None = None
++    declared: str | None = None
++    dropped: list = field(default_factory=list)
++    no_progress: bool = False
++    no_progress_reason: str | None = None
+ 
+     def to_dict(self) -> dict:
+         return {
+@@ -86,6 +157,10 @@ def to_dict(self) -> dict:
+             "findings": self.findings_as_dicts(),
+             "commands": self.commands_as_dicts(),
+             "parse_error": self.parse_error,
++            "declared": self.declared,
++            "dropped": self.dropped,
++            "no_progress": self.no_progress,
++            "no_progress_reason": self.no_progress_reason,
+         }
+ 
+ 
+@@ -232,21 +307,29 @@ def _validated_report(data: Any) -> L2Report:
+         line = item.get("line")
+         if line is not None and not isinstance(line, int):
+             raise _InvalidVerdict(f"finding {index} has a non-integer line")
+-        findings.append(
+-            L2Finding(
+-                id=str(item.get("id") or f"L2-{index + 1}"),
+-                text=text,
+-                axis=axis,
+-                severity=severity,
+-                file=item.get("file"),
+-                line=line,
++        missed = item.get("missed_earlier")
++        if missed is not None and (not isinstance(missed, str) or not missed.strip()):
++            raise _InvalidVerdict(
++                f"finding {index} missed_earlier must be a non-empty string "
++                "explaining why the earlier round missed it"
+             )
++        finding = L2Finding(
++            id=str(item.get("id") or f"L2-{index + 1}"),
++            text=text,
++            axis=axis,
++            severity=severity,
++            file=item.get("file"),
++            line=line,
++            missed_earlier=missed,
+         )
++        finding.key = finding_key(finding)
++        findings.append(finding)
+         if severity.strip().lower() == "blocking":
+             blocking = True
+ 
+-    verdict = "fail" if declared.strip().lower() == "fail" or blocking else "pass"
+-    return L2Report(verdict=verdict, findings=findings)
++    declared = declared.strip().lower()
++    verdict = "fail" if declared == "fail" or blocking else "pass"
++    return L2Report(verdict=verdict, findings=findings, declared=declared)
+ 
+ 
+ def parse_verdict(output: Any) -> L2Report:
+@@ -276,3 +359,155 @@ def parse_verdict(output: Any) -> L2Report:
+         return _validated_report(_extract_json(output))
+     except _InvalidVerdict as exc:
+         return _invalid(str(exc))
++
++
++def apply_convergence(
++    report: L2Report,
++    prior: dict[str, str | None],
++    delta_files: set[str] | frozenset[str],
++    *,
++    delta_mode: bool,
++) -> L2Report:
++    """Classify one round's verdict against the keys raised before it (F-23).
++
++    The orchestrator calls this right after :func:`parse_verdict`, with the
++    keys of every earlier round's findings (``prior``: key -> the reviewed
++    sha that raised it, ``None`` when it was raised in an earlier run and
++    no sha survives), the files the delta changed since the last review,
++    and whether this round runs in delta mode (a review happened before it
++    in this run).
++
++    The classification, per finding:
++
++    * **Prior key from an earlier run → carried.** No diff continuity ever
++      existed for it, so a re-raise is always the same finding. It stays
++      in the findings — a carried *blocking* finding still fails the
++      round, because it is an unresolved problem — but is listed
++      ``state: "carried"``, never as new.
++    * **In-run prior key, provably untouched → carried.** Only a real
++      delta can prove "untouched since", and only a named file can be
++      shown untouched: the finding's file is one the delta didn't change.
++      Without a delta (the round fell back to the full diff after the
++      implementer rewrote the reviewed history), an in-run repeat is an
++      attempt in progress — the rewrite touched the history those
++      findings live in — and stands as this round's own finding
++      (``state: "new"``); it must not trigger the stop.
++    * **In-run prior key on a file the delta touched, or with no file at
++      all → a repeat in progress.** The implementer changed the code the
++      finding concerns — or, with no file, no delta can ever show the
++      finding's subject untouched, so an honest re-raise after a fix
++      attempt must not be mistaken for a bounce. Same rule:
++      ``state: "new"``, no stop. A genuinely stuck fileless thread runs
++      out at ``attempts_exhausted``; that is the accepted cost of never
++      dropping contract-level findings.
++    * **New finding on a file outside the delta → needs a why.** In delta
++      mode, a finding whose key was never raised and whose file the delta
++      didn't change must carry ``missed_earlier`` explaining what the
++      earlier round missed; without it, it is dropped as
++      ``out_of_delta_without_missed_earlier`` and recorded in ``dropped``.
++      A finding that names **no file** is never dropped: it cannot be
++      shown to sit in unchanged code, and the contract-level findings
++      (a missing test, an unmet acceptance item) rarely name one — a
++      declared pass whose only blocker is a fileless finding must not be
++      flipped into an opened PR. Rounds without a delta (the first review
++      of a run, or the rewrite fallback) drop nothing: the full diff is
++      the scope.
++    * The effective verdict is recomputed over what survives: a declared
++      ``fail`` stands, and so does a parse error (an invalid verdict is a
++      FAIL before and after convergence); a declared ``pass`` whose only
++      blocking finding was dropped becomes the pass the reviewer declared.
++
++    **No progress** (``no_progress`` on the returned report) means a FAIL
++    the next round cannot act on, either because every finding is a
++    carried repeat from **this run** on untouched code (the bounce the
++    stop exists for — a carry seeded from an earlier run doesn't count:
++    this run's implementer has only just attempted it), or because every
++    finding was dropped and the declared fail stands with nothing left to
++    fix.
++
++    Args:
++        report: The freshly parsed verdict of this round.
++        prior: Keys raised in earlier rounds, -> their raise sha or None.
++        delta_files: Paths changed since the last reviewed sha.
++        delta_mode: True when an earlier review in this run exists.
++
++    Returns:
++        The classified :class:`L2Report` — a new report with new finding
++        objects; the input is left untouched, so one parsed verdict can be
++        classified against different deltas (tests do exactly that).
++    """
++    active: list = []
++    dropped: list = []
++    for finding in report.findings:
++        if not isinstance(finding, L2Finding):
++            # The invalid-verdict finding: nothing to key or classify.
++            active.append(finding)
++            continue
++        if finding.key in prior:
++            if prior[finding.key] is None:
++                # Raised in an earlier run: no diff continuity ever existed,
++                # so it is always the same finding being re-raised.
++                finding = replace(finding, state="carried")
++            elif (
++                delta_mode
++                and finding.file is not None
++                and finding.file not in delta_files
++            ):
++                # Raised in this run and provably untouched since: only a
++                # real delta over a named file can prove that. Without a
++                # delta (the history-rewrite fallback), or without a file
++                # (a contract-level finding), the repeat is an attempt in
++                # progress, not a carry.
++                finding = replace(finding, state="carried")
++            active.append(finding)
++        elif (
++            delta_mode
++            and finding.file is not None
++            and finding.file not in delta_files
++            and not (finding.missed_earlier or "").strip()
++        ):
++            # A named file the delta didn't touch, without a why. A
++            # fileless finding is never dropped: it cannot be shown to
++            # sit in unchanged code (round-1 finding 7).
++            dropped.append(
++                {
++                    "finding": dict(finding.__dict__),
++                    "reason": "out_of_delta_without_missed_earlier",
++                }
++            )
++        else:
++            active.append(finding)
++    blocking = any(
++        isinstance(f, L2Finding) and (f.severity or "").strip().lower() == "blocking"
++        for f in active
++    )
++    verdict = (
++        "fail"
++        if report.parse_error is not None or report.declared == "fail" or blocking
++        else "pass"
++    )
++    l2_findings = [f for f in active if isinstance(f, L2Finding)]
++    only_this_runs_carries = (
++        l2_findings
++        and len(l2_findings) == len(active)
++        and all(
++            f.state == "carried" and prior.get(f.key) is not None
++            for f in l2_findings
++        )
++    )
++    everything_dropped = not active and bool(dropped)
++    no_progress = verdict == "fail" and (
++        only_this_runs_carries or everything_dropped
++    )
++    reason = None
++    if no_progress:
++        reason = "all_dropped" if everything_dropped else "carried_repeats"
++    return L2Report(
++        verdict=verdict,
++        findings=active,
++        declared=report.declared,
++        dropped=dropped,
++        parse_error=report.parse_error,
++        no_progress=no_progress,
++        no_progress_reason=reason,
++    )
+diff --git a/factory/orchestrator.py b/factory/orchestrator.py
+index 6141d0e..783306a 100644
+--- a/factory/orchestrator.py
++++ b/factory/orchestrator.py
+@@ -37,9 +37,15 @@
+ retrying can't make them safe. A failed round goes back to the implementer
+ with numbered findings until ``budget.max_attempts`` attempts (counted
+ across runs; ``aborted`` ones excluded) are spent, then ``needs_human`` with
+-``attempts_exhausted``. A quota/429 error is not the task's fault: the
+-attempt is recorded ``aborted`` with escalation ``quota_exhausted``, the
+-task re-queues (``ready``) and ``loop`` stops without retrying.
++``attempts_exhausted``. A FAIL the next round cannot act on escalates
++``review_not_converging`` instead of spending another round (F-23: re-review
++scopes to the delta since the last real review, repeats are carried rather
++than re-raised, and the fix prompt says to fix the defect class, not the
++instance; the stop fires when every finding is a carried repeat from this
++run on untouched code, or everything was dropped as out of scope). A
++quota/429 error is not the task's fault: the attempt is recorded ``aborted``
++with escalation ``quota_exhausted``, the task re-queues (``ready``) and
++``loop`` stops without retrying.
+ """
+ 
+ from __future__ import annotations
+@@ -57,11 +63,11 @@
+ 
+ from factory.config import CONFIG_FILE, FactoryConfig, in_peak_window, load_config
+ from factory.contract import load_profile
+-from factory.gates import CommandResult, diff_name_status
++from factory.gates import CommandResult, diff_name_status, git_rc
+ from factory.gates import git as hardened_git
+ from factory.l0 import run_l0
+ from factory.l1 import run_l1
+-from factory.l2 import parse_verdict
++from factory.l2 import L2Finding, apply_convergence, parse_verdict
+ from factory.prbody import PRBodyError, build_pr_body, check_pr_body
+ from factory.progress import ProgressLog
+ from factory.prompts import (
+@@ -262,20 +268,87 @@ def _compact(report: dict | None, tail: int) -> dict | None:
+     return report
+ 
+ 
+-def _numbered_findings(reports: dict, extra: list[str]) -> list[str]:
++def _numbered_findings(reports: dict, extra: list[str],
++                       include_dropped: bool = True) -> list[str]:
++    """The round's numbered finding lines.
++
++    ``include_dropped=False`` builds the implementer's fix list: dropped
++    findings are out of scope by the orchestrator's own ruling — telling
++    the implementer to "fix the defect class" of one would pull edits
++    into code the round ruled untouchable, and those edits would put the
++    file into the next delta. The full list (default) is the round's
++    record: log, PR evidence, the human's read.
++    """
+     lines: list[str] = list(extra)
+     for layer in ("L0", "L1", "L2"):
+-        report = reports.get(layer)
+-        for finding in (report or {}).get("findings") or []:
++        report = reports.get(layer) or {}
++        for finding in report.get("findings") or []:
+             where = ""
+             if finding.get("file"):
+                 where = f" ({finding['file']}:{finding.get('line') or ''})"
+             lines.append(f"[{layer} {finding.get('id')}] {finding.get('text')}{where}")
++        if not include_dropped:
++            continue
++        # Dropped L2 findings ride the record marked, not actionable: the
++        # log (and the human reading it) sees what the reviewer flagged
++        # even though the orchestrator ruled it out of scope.
++        for entry in report.get("dropped") or []:
++            finding = entry.get("finding") or {}
++            lines.append(
++                f"[{layer} dropped {finding.get('id')}] {finding.get('text')} "
++                f"({finding.get('file') or 'no file'}; out of scope, no "
++                "missed_earlier — for the record, not to fix)"
++            )
+     return [f"{i}. {text}" for i, text in enumerate(lines, start=1)]
+ 
+ 
++def _fix_findings(reports: dict, extra: list[str], l2, reviewed: bool,
++                  last_valid_l2: dict | None) -> list[str]:
++    """The next round's fix list: actionable findings only.
++
++    Dropped findings are excluded (out of scope — fixing their defect
++    class would pull edits into code the round ruled untouchable, and
++    those edits would put the file into the next delta).
++
++    Whenever this round produced no verdict of its own — the review
++    failed to parse, **or L2 never ran because L0/L1 stopped the round** —
++    the last valid review's findings are still the open work and are
++    substituted for this round's L2 lines, keeping the fix list and the
++    reviewer's carried list describing the same findings. A round whose
++    review session ran but produced no verdict also prepends an explicit
++    note: the implementer must hear that the change went unreviewed, not
++    silently replay the older findings as if they had been accepted.
++    """
++    if reviewed:
++        return _numbered_findings(reports, extra, include_dropped=False)
++    if l2 is not None:  # a review ran, but produced no verdict
++        extra = [
++            "[L2 unreviewed] this round's review produced no verdict — the "
++            "change was not reviewed; do not assume it was accepted",
++            *extra,
++        ]
++    fix_reports = {**reports, "L2": last_valid_l2}
++    return _numbered_findings(fix_reports, extra, include_dropped=False)
++
++
++# The stop's note comes from the classifier's reason, never re-derived
++# here: if apply_convergence grows a third branch, the note follows it.
++_NO_PROGRESS_NOTES = {
++    "carried_repeats": (
++        "every L2 finding is a carried repeat from an earlier round of "
++        "this run, on files untouched since: another round has nothing "
++        "new to fix"
++    ),
++    "all_dropped": (
++        "every L2 finding was dropped as out of scope; the declared fail "
++        "stands with nothing left to fix"
++    ),
++}
++
++
+ def _implementer_prompt(task: dict, slice_: dict | None, branch: str, history: str,
+-                        attempt: int, max_attempts: int) -> str:
++                        attempt: int, max_attempts: int,
++                        fix_findings: list[str] | None = None) -> str:
+     contract = {
+         "acceptance": task.get("acceptance", []),
+         "out_of_scope": task.get("out_of_scope", []),
+@@ -308,6 +381,18 @@ def _implementer_prompt(task: dict, slice_: dict | None, branch: str, history: s
+         "",
+         f"This is attempt {attempt} of {max_attempts}.",
+     ]
++    if fix_findings:
++        parts += [
++            "",
++            "## Findings to fix",
++            "",
++            *fix_findings,
++            "",
++            "Each finding above names one instance of a defect class. Fix the class, "
++            "not the instance: search the codebase for sibling sites with the same "
++            "defect class and fix them in this round too. The next review "
++            "explicitly checks the siblings.",
++        ]
+     if history:
+         parts += [
+             "",
+@@ -318,7 +403,8 @@ def _implementer_prompt(task: dict, slice_: dict | None, branch: str, history: s
+     return "\n".join(parts) + "\n"
+ 
+ 
+-def _review_prompt(task: dict, diff: str, l0: dict, l1: dict) -> str:
++def _review_prompt(task: dict, diff: str, l0: dict, l1: dict, delta: str | None = None,
++                   carried: list[dict] | None = None) -> str:
+     contract = {
+         "id": task["id"],
+         "title": task.get("title"),
+@@ -328,7 +414,7 @@ def _review_prompt(task: dict, diff: str, l0: dict, l1: dict) -> str:
+     }
+     if len(diff) > _REVIEW_DIFF_CAP:
+         diff = diff[:_REVIEW_DIFF_CAP] + f"\n[... diff cut at {_REVIEW_DIFF_CAP} chars ...]\n"
+-    return "\n".join([
++    parts = [
+         "Review this change. Return only the verdict JSON your instructions define.",
+         "",
+         "## Contract",
+@@ -348,14 +434,90 @@ def _review_prompt(task: dict, diff: str, l0: dict, l1: dict) -> str:
+         "```json",
+         json.dumps(_compact(l1, _REVIEW_OUTPUT_TAIL), indent=2, ensure_ascii=False),
+         "```",
++    ]
++    if delta is None and not carried:
++        parts += ["", "## Diff (base...head)", "", "```diff", diff, "```", ""]
++        return "\n".join(parts)
++    # A fix round (F-23): findings from earlier rounds are listed so the
++    # reviewer carries them instead of re-raising them, and the delta (when
++    # the implementer didn't rewrite the reviewed history) is the primary
++    # scope with the full diff as reference. Without a delta — the history
++    # was rewritten, or the last review never produced a verdict — the
++    # full diff stays the scope and nothing is out of it.
++    if delta is not None and len(delta) > _REVIEW_DIFF_CAP:
++        delta = delta[:_REVIEW_DIFF_CAP] + f"\n[... delta cut at {_REVIEW_DIFF_CAP} chars ...]\n"
++    carried_lines = [
++        f"- [{c.get('severity')}] {c.get('file') or '(no file)'}: {c['text']}"
++        for c in carried or []
++    ] or ["- (none stood in this run's earlier rounds)"]
++    parts += [
++        "",
++        "## Findings from earlier rounds (already recorded — do not re-raise)",
++        "",
++        "These were raised in an earlier round and are already recorded. Do not "
++        "re-raise them as new findings; if the changes below changed the code "
++        "they concern and they still stand, raise them again and say what "
++        "changed. The implementer was told to fix each finding's defect class, "
++        "not just the named instance — explicitly check the sibling sites of "
++        "every finding below.",
++        "",
++        *carried_lines,
++    ]
++    if delta is None:
++        parts += ["", "## Diff (base...head)", "", "```diff", diff, "```", ""]
++        return "\n".join(parts)
++    parts += [
++        "",
++        "## Delta since the last review (primary scope)",
+         "",
+-        "## Diff (base...head)",
++        "A new finding on a file outside this delta must carry `missed_earlier`: "
++        "why the earlier round missed it. Without that, the orchestrator drops "
++        "the finding as out of scope.",
++        "",
++        "```diff",
++        delta,
++        "```",
++        "",
++        "## Full diff (base...head, reference only)",
+         "",
+         "```diff",
+         diff,
+         "```",
+         "",
+-    ])
++    ]
++    return "\n".join(parts)
++
++
++def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
++    """Whether ``ancestor`` is reachable from ``descendant`` in ``repo``.
++
++    rc 0 = yes, rc 1 = no; anything else — including the object being
++    absent from a ``--filter=blob:none`` clone after the implementer
++    amended or reset the round it names — also reads as no, because the
++    caller's fallback (full-diff review scope) is always safe. Runs
++    through the hardened, timeout-bounded :func:`factory.gates.git_rc`.
++    """
++    return git_rc(repo, "merge-base", "--is-ancestor", ancestor, descendant) == 0
++
++
++def _round_stuck(l0, l1, l2) -> bool:
++    """Whether the no-progress stop applies to this round (F-23).
++
++    It is not enough that ``l2.no_progress`` is set: the stop may only
++    spend a round the deterministic gates passed. Today L2 runs solely
++    after L0 and L1 pass, but that ordering is a property of the wiring,
++    not of the data — a future advisory L1 or a reordered pipeline would
++    otherwise escalate `review_not_converging` on a round whose L0/L1
++    findings are fresh, actionable work.
++    """
++    return bool(
++        l2 is not None
++        and l2.no_progress
++        and l0 is not None
++        and l0.verdict == "pass"
++        and l1 is not None
++        and l1.verdict == "pass"
++    )
+ 
+ 
+ def _git_out(repo: Path, *args: str) -> str:
+@@ -568,6 +730,20 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
+     reviewer_system = assemble_reviewer_prompt(profile)
+     session_seconds = 0.0
+ 
++    # F-23 review-convergence state, living across this run's rounds. The
++    # prior finding keys seed from the task's progress log (an earlier run
++    # or a rejected-PR fix round), so a finding raised there is carried
++    # here; their raise shas are gone with the old clone, hence None.
++    prior: dict[str, str | None] = {}
++    for entry in log.entries():
++        for key in entry.get("finding_keys") or []:
++            prior.setdefault(key, None)
++    raised: list[dict] = []  # this run's findings, for the next round's prompt
++    last_reviewed: str | None = None  # the head sha L2 last saw
++    last_valid_l2: dict | None = None  # the last parseable verdict's report
++    prev_findings: list[str] | None = None  # the failed round's fix list
++    round_no = 0
++
+     work = create_run(project, source, factory_root=ctx.factory_root, ref=default_branch)
+     try:
+         _build_on_remote_default(work, repo_cfg["remote"], default_branch)
+@@ -600,15 +776,20 @@ def attempt_record(attempt_no, started, outcome, records, report_path, **extra):
+             record.update({k: v for k, v in extra.items() if v is not None})
+             return record
+ 
+-        def finish(attempt, status, findings, **result):
+-            queue.append_attempt(task_id, attempt)
+-            log.append({
++        def finish(attempt, status, findings, finding_keys=None, **result):
++            entry = {
+                 "run_id": attempt["run_id"],
+                 "attempt": attempt["rounds"],
+                 "outcome": attempt["outcome"],
+                 "escalation": attempt.get("escalation"),
+                 "findings": findings,
+-            })
++            }
++            if finding_keys:
++                # F-23: the stable keys of this round's L2 findings, so the
++                # next run seeds its carried set from the log.
++                entry["finding_keys"] = finding_keys
++            queue.append_attempt(task_id, attempt)
++            log.append(entry)
+             if status is not None:
+                 queue.transition(task_id, status)
+             return result
+@@ -636,6 +817,7 @@ def finish(attempt, status, findings, **result):
+ 
+             # This round's state, initialised before anything can raise: the
+             # error path below records its attempt from whatever exists.
++            round_no += 1
+             records: list = []
+             reports: dict = {"L0": None, "L1": None, "L2": None}
+             extra_findings: list[str] = []
+@@ -645,10 +827,18 @@ def finish(attempt, status, findings, **result):
+             path = None
+             pushed = False
+             opened = False
++            round_keys: list = []  # this round's L2 finding keys (F-23)
++            reviewed = False  # did this round's review produce a verdict?
+             try:
+                 # ---- implementer
+-                prompt = _implementer_prompt(task, slice_, branch, log.render(),
+-                                             attempt_no, max_attempts)
++                # The fix block below carries the newest entry's findings,
++                # so that entry renders without them (read once, not
++                # twice — the entry itself still renders, F-10 AC-10) and
++                # no entry ever renders the seeding hashes.
++                prompt = _implementer_prompt(
++                    task, slice_, branch,
++                    log.render(omit_last_findings=prev_findings is not None),
++                    attempt_no, max_attempts, fix_findings=prev_findings)
+                 t0 = time.monotonic()
+                 impl = ctx.session_runner(
+                     "implementer", prompt, work.root, profile,
+@@ -740,11 +930,35 @@ def finish(attempt, status, findings, **result):
+                                        ["1. wall-clock budget spent before the L2 review"])
+                                 return RunResult("needs_human", task_id,
+                                                  escalation="budget_exhausted", reports=reports)
+-                            diff = hardened_git(clean.root, "diff", "--no-color", "--no-ext-diff",
++                            diff = hardened_git(clean.root, "diff", "--no-color",
++                                                "--no-ext-diff",
+                                                 f"{base_sha}...{head_sha}")
++                            # F-23: from this run's second review on, the
++                            # delta since the last reviewed sha is the
++                            # reviewer's primary scope and the convergence
++                            # rules (carried repeats, out-of-delta drops)
++                            # apply — but only if that sha still exists in
++                            # this clone: an implementer that amended or
++                            # reset the reviewed round's commit makes it
++                            # unreachable, and this round falls back to the
++                            # full diff instead of dying on a bad object.
++                            delta = delta_files = None
++                            if last_reviewed is not None and _is_ancestor(
++                                    clean.root, last_reviewed, head_sha):
++                                delta = hardened_git(
++                                    clean.root, "diff", "--no-color", "--no-ext-diff",
++                                    f"{last_reviewed}...{head_sha}")
++                                delta_files = frozenset(
++                                    path
++                                    for change in diff_name_status(
++                                        clean.root, last_reviewed, head_sha)
++                                    for path in (change.path, change.old_path)
++                                    if path
++                                )
+                             t0 = time.monotonic()
+                             review_prompt = _review_prompt(
+-                                task, diff, reports["L0"], reports["L1"])
++                                task, diff, reports["L0"], reports["L1"],
++                                delta=delta, carried=raised)
+                             review = ctx.session_runner(
+                                 "reviewer", review_prompt,
+                                 clean.root, profile, factory_root=ctx.factory_root,
+@@ -762,14 +976,43 @@ def finish(attempt, status, findings, **result):
+                                 finish(attempt, "ready", [f"1. quota: {review.reason}"])
+                                 return RunResult("quota_exhausted", task_id,
+                                                  escalation="quota_exhausted", reports=reports)
+-                            l2 = parse_verdict(review.result if review.status == "completed"
+-                                               else None)
++                            l2 = apply_convergence(
++                                parse_verdict(
++                                    review.result if review.status == "completed"
++                                    else None),
++                                prior,
++                                delta_files if delta_files is not None else frozenset(),
++                                delta_mode=delta is not None,
++                            )
+                             if review.status != "completed":
+                                 extra_findings.append(
+                                     f"[session {review.status}] the reviewer session ended: "
+                                     f"{review.reason}"
+                                 )
+                             reports["L2"] = l2.to_dict()
++                            # Only a review that produced a parseable verdict
++                            # moves the frontier. A crashed, timed-out or
++                            # invalid review reviewed nothing: the next
++                            # round's delta must still cover this head, or
++                            # code no reviewer ever saw would become "outside
++                            # the delta" and its findings dropped.
++                            reviewed = (
++                                review.status == "completed" and l2.parse_error is None
++                            )
++                            if reviewed:
++                                last_valid_l2 = l2.to_dict()
++                                round_keys = [
++                                    f.key for f in l2.findings
++                                    if isinstance(f, L2Finding) and f.key
++                                ]
++                                raised = [
++                                    {"key": f.key, "file": f.file,
++                                     "severity": f.severity, "text": f.text}
++                                    for f in l2.findings if isinstance(f, L2Finding)
++                                ]
++                                for key in round_keys:
++                                    prior[key] = head_sha
++                                last_reviewed = head_sha
+                         changed = [c.path for c in diff_name_status(clean.root, base_sha, head_sha)]
+                     finally:
+                         cleanup_run(clean)
+@@ -802,6 +1045,9 @@ def finish(attempt, status, findings, **result):
+                     opened = True
+                     attempt = attempt_record(attempt_no, started, "pass", records, path, pr=url)
+                     queue.append_attempt(task_id, attempt)
++                    # A passed round's findings were accepted as non-blocking:
++                    # recording their keys would poison a later fix round
++                    # after a rejected PR (only failed reviews seed).
+                     log.append({"run_id": work.run_id, "attempt": attempt_no, "outcome": "pass",
+                                 "pr": url, "findings": findings})
+                     task = queue.get(task_id)
+@@ -809,15 +1055,39 @@ def finish(attempt, status, findings, **result):
+                     queue.transition(task_id, "in_review")
+                     return RunResult("pr_opened", task_id, pr=url, reports=reports)
+ 
++                # F-23 no-progress stop: apply_convergence decided, where
++                # the prior set was in hand, that this FAIL gives the next
++                # round nothing it can fix — every finding is a carried
++                # repeat from this run on untouched code (the bounce the
++                # stop exists for; a carry seeded from an earlier run does
++                # not count, and a repeat on a file the fix touched is an
++                # attempt in progress), or every finding was dropped as
++                # out of scope and the declared fail stands with nothing
++                # left. Escalate instead of spending the round — and only
++                # when the round's own L0/L1 passed (_round_stuck): fresh
++                # deterministic findings are actionable work, whatever the
++                # review repeats.
++                if _round_stuck(l0, l1, l2):
++                    note = _NO_PROGRESS_NOTES[l2.no_progress_reason]
++                    attempt = attempt_record(
++                        attempt_no, started, "escalated", records, path,
++                        escalation="review_not_converging", note=note,
++                    )
++                    finish(attempt, "needs_human", findings, finding_keys=round_keys)
++                    return RunResult("needs_human", task_id,
++                                     escalation="review_not_converging", reports=reports)
++
+                 used += 1
+                 if attempt_no >= max_attempts:
+                     attempt = attempt_record(attempt_no, started, "escalated", records, path,
+                                              escalation="attempts_exhausted")
+-                    finish(attempt, "needs_human", findings)
++                    finish(attempt, "needs_human", findings, finding_keys=round_keys)
+                     return RunResult("needs_human", task_id, escalation="attempts_exhausted",
+                                      reports=reports)
+                 attempt = attempt_record(attempt_no, started, "fail", records, path)
+-                finish(attempt, None, findings)
++                finish(attempt, None, findings, finding_keys=round_keys)
++                prev_findings = _fix_findings(
++                    reports, extra_findings, l2, reviewed, last_valid_l2)
+                 task = queue.get(task_id)
+             except Exception as exc:
+                 # The orchestrator itself failed mid-round (gh after the push,
+diff --git a/factory/prbody.py b/factory/prbody.py
+index fc1905c..e946961 100644
+--- a/factory/prbody.py
++++ b/factory/prbody.py
+@@ -227,14 +227,60 @@ def build_pr_body(
+         "Evidence": build_evidence(task, l1_report),
+         "Merge Danger": "\n".join(merge_danger),
+         "Contract": fence(json.dumps(contract, indent=2, ensure_ascii=False), "json"),
+-        "Validator report": fence(json.dumps(reports, indent=2, ensure_ascii=False), "json")
+-        + "\n\nL3 holdouts: not run (F-15). L4 live verification runs after deploy (F-14).",
++        "Validator report": _validator_section(reports),
+         "How to revert": how_to_revert(task, profile, extra_flags),
+     }
+     body = "\n\n".join(f"## {name}\n\n{sections[name]}" for name in REQUIRED_SECTIONS)
+     return body + "\n\n---\nOpened by the software factory. A human reviews and merges.\n"
+ 
+ 
++def _validator_section(reports: dict) -> str:
++    """The gate reports as JSON, with the L2 round's dropped findings —
++    if any — pulled out above the blob (F-23 finding 9: a reviewer
++    finding the orchestrator dropped as out of scope still belongs in
++    front of the human merging the PR, not buried in the JSON).
++
++    The dropped list is reviewer-controlled text, so it rides inside a
++    ``text`` fence — the same treatment the implementer's notes get. The
++    fence is what makes the payload inert: it is one backtick longer than
++    any run in the text and indents every line, so nothing inside can
++    close it or start a ``## `` heading (a ``<!--`` could otherwise hide
++    everything after it in GitHub's rendered view while
++    :func:`check_pr_body`'s raw regex still passed, and links would plant
++    in front of the merger). Flattening keeps each finding on one line of
++    the list — readability, not containment; the fence alone would hold a
++    multiline payload. Inside the JSON fence the same text was always
++    safe (newlines escaped there)."""
++    section = fence(json.dumps(reports, indent=2, ensure_ascii=False), "json")
++    dropped = (reports.get("L2") or {}).get("dropped") or []
++    if dropped:
++        lines = [
++            f"- [{_flat(d.get('finding', {}).get('severity'))}] "
++            f"{_flat(d.get('finding', {}).get('file')) or '(no file)'}: "
++            f"{_flat(d.get('finding', {}).get('text'))}"
++            for d in dropped
++        ]
++        section = (
++            "**Reviewer findings dropped as out of scope** (no "
++            "`missed_earlier` justification; not counted in the verdict — "
++            "read them before merging):\n\n"
++            + fence("\n".join(lines), "text")
++            + "\n\n" + section
++        )
++    return (
++        section
++        + "\n\nL3 holdouts: not run (F-15). L4 live verification runs after "
++        "deploy (F-14)."
++    )
++
++
++def _flat(value) -> str:
++    """Reviewer-controlled text as one line: all whitespace runs (newlines
++    included) collapse to single spaces, so each dropped finding renders
++    as a single readable list line inside the fence that holds it."""
++    return " ".join(str(value or "").split())
++
++
+ def check_pr_body(body: str) -> None:
+     """Refuse a body unless every required section appears exactly once.
+ 
+diff --git a/factory/progress.py b/factory/progress.py
+index 89ed391..edfd8c1 100644
+--- a/factory/progress.py
++++ b/factory/progress.py
+@@ -115,14 +115,31 @@ def append(self, entry: dict) -> dict:
+             finally:
+                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+ 
+-    def render(self) -> str:
+-        """The entries as prompt text for a fresh session ('' when empty)."""
++    def render(self, omit_last_findings: bool = False) -> str:
++        """The entries as prompt text for a fresh session ('' when empty).
++
++        ``finding_keys`` is machine data for the next run's convergence
++        seeding, never prompt content — the implementer can do nothing
++        with 64-char hashes. ``omit_last_findings`` renders the newest
++        entry without its ``findings`` field: the orchestrator sets it on
++        a fix round, where the prompt's "Findings to fix" block already
++        carries that round's findings (with the sibling instruction), so
++        the implementer reads them once, not twice. The entry itself —
++        outcome, escalation, run id — still renders: F-10 AC-10, every
++        round receives entries 1..N.
++
++        Args:
++            omit_last_findings: Drop the newest entry's findings field.
++        """
+         entries = self.entries()
+         if not entries:
+             return ""
+         blocks = []
+-        for record in entries:
+-            body = {k: v for k, v in record.items() if k not in ("n", "prev")}
++        for index, record in enumerate(entries):
++            exclude = ("n", "prev", "finding_keys")
++            if omit_last_findings and index == len(entries) - 1:
++                exclude = exclude + ("findings",)
++            body = {k: v for k, v in record.items() if k not in exclude}
+             blocks.append(
+                 f"### entry {record['n']}\n\n```json\n"
+                 + json.dumps(body, indent=2, sort_keys=True, ensure_ascii=False)
+diff --git a/prompts/reviewer.md b/prompts/reviewer.md
+index a5a9f93..389b3ee 100644
+--- a/prompts/reviewer.md
++++ b/prompts/reviewer.md
+@@ -89,6 +89,29 @@ missing, not that behaviour was checked):
+   internal collaborators, private methods or call counts? Mocks belong
+   only at system boundaries (external APIs, time, randomness).
+ 
++## Fix rounds: review the delta
++
++After the first round, the prompt hands you three scope sections instead
++of one diff:
++
++- **Findings from earlier rounds** — already recorded. Do not re-raise
++  them as new findings; the orchestrator carries them. If the delta
++  changed the code a carried finding concerns and it still stands, raise
++  it again and say what changed.
++- **Delta since the last review (primary scope)** — what changed since
++  you last reviewed. New findings belong here. A new finding on a file
++  outside the delta must carry a `missed_earlier` field saying why the
++  earlier round missed it; without that, the orchestrator drops it as
++  out of scope. A finding that names no file is never dropped — it
++  cannot be shown to sit in unchanged code.
++- **Full diff (reference only)** — context for judging the delta, not a
++  licence to re-open settled code.
++
++The implementer was told to fix each finding's defect class, not just the
++named instance. Explicitly check for sibling sites: where the delta fixed
++one site of a class, look for the same defect elsewhere and raise what
++survives.
++
+ ## Verdict
+ 
+ Return exactly one JSON object and nothing else that could be mistaken
+@@ -104,7 +127,8 @@ for one:
+       "severity": "blocking, major, minor or note",
+       "file": "path/from/the/diff",
+       "line": 12,
+-      "text": "what is wrong, with the evidence"
++      "text": "what is wrong, with the evidence",
++      "missed_earlier": "only on fix rounds: why round one missed a finding outside the delta"
+     }
+   ]
+ }
+diff --git a/schema/tasks.schema.json b/schema/tasks.schema.json
+index a187808..133bfa7 100644
+--- a/schema/tasks.schema.json
++++ b/schema/tasks.schema.json
+@@ -20,7 +20,7 @@
+       "enum": ["auth", "payments", "rls", "migration", "safety", "privacy", "new_dependency", "deploy", "cross_repo", "external_service", "factory_control"]
+     },
+     "escalation": {
+-      "enum": ["attempts_exhausted", "budget_exhausted", "risk_path_touched", "new_dependency", "protected_path_touched", "contract_ambiguous", "quota_exhausted", "live_check_failed", "cross_repo", "pr_create_failed", "orchestrator_error", "publish_refused"]
++      "enum": ["attempts_exhausted", "budget_exhausted", "risk_path_touched", "new_dependency", "protected_path_touched", "contract_ambiguous", "quota_exhausted", "live_check_failed", "cross_repo", "pr_create_failed", "orchestrator_error", "publish_refused", "review_not_converging"]
+     },
+     "check": {
+       "type": "object",
+diff --git a/tests/test_f09.py b/tests/test_f09.py
+index 813b016..ab4860e 100644
+--- a/tests/test_f09.py
++++ b/tests/test_f09.py
+@@ -50,7 +50,7 @@ def _sha(text: str) -> str:
+ # prompt edit can never ride a green run.
+ PROMPT_PINS = {
+     IMPLEMENTER_FILE: "15f5a0206c3016334173471786af4a4efbd28b1cd0b3b3981cb29b39dca316d6",
+-    REVIEWER_FILE: "829ba5a377e0d6be1e231c38b69b86ed252c0600b4ad69899db5aa366c0c3bb8",
++    REVIEWER_FILE: "dbab8437904a53e2256ff942167a9c01d689460f05a48384f4fb70f18cf9f6e7",
+ }
+ 
+ 
+diff --git a/tests/test_f10.py b/tests/test_f10.py
+index 4f1a19b..d853955 100644
+--- a/tests/test_f10.py
++++ b/tests/test_f10.py
+@@ -343,14 +343,42 @@ def test_budget_counts_earlier_attempts(tmp_path: Path):
+ 
+ 
+ def test_reviewer_fail_is_retried_then_exhausted(tmp_path: Path):
+-    review = json.dumps({"verdict": "fail", "findings": [
+-        {"id": "R1", "axis": "spec", "severity": "blocking", "text": "scope creep"}]})
++    """A reviewer FAIL goes back with numbered findings until the budget is
++    spent. The implementer writes different (still green) content each
++    round so the review delta is real, and the findings name impl.py —
++    the common file-named-retry path, in the delta, exercised as such
++    (an identical round-2 finding on the untouched file would rightly
++    escalate review_not_converging instead: F-23)."""
+     env = Env(tmp_path)
+-    seats = Seats(review=review)
+-    result = env.run(seats)
++    seats = Seats()
++
++    def varying(seat, prompt, run_dir, profile, **kwargs):
++        if seat == "implementer":
++            seats.calls.append((seat, prompt, Path(run_dir), kwargs))
++            round_no = sum(1 for s, *_ in seats.calls if s == "implementer")
++            (Path(run_dir) / "impl.py").write_text(
++                f"def answer():\n    return 42  # fix round {round_no}\n")
++            (Path(run_dir) / "tests" / "test_feature.py").write_text(TEST_SOURCE)
++            return SessionRecord(
++                seat=seat, status="completed", num_turns=3, model="stub-model",
++                tokens={"input_tokens": 120, "output_tokens": 40},
++                result="Implemented answer().",
++            )
++        seats.calls.append((seat, prompt, Path(run_dir), kwargs))
++        call_no = sum(1 for s, *_ in seats.calls if s == "reviewer")
++        return SessionRecord(
++            seat=seat, status="completed", num_turns=1, model="stub-model",
++            tokens={"input_tokens": 60, "output_tokens": 10},
++            result=json.dumps({"verdict": "fail", "findings": [
++                {"id": "R1", "axis": "spec", "severity": "blocking",
++                 "file": "impl.py", "text": f"scope creep {call_no}"}]}),
++        )
++
++    result = env.run(varying)
+     assert result.outcome == "needs_human"
+     assert [c[0] for c in seats.calls] == ["implementer", "reviewer"] * 3
+-    assert "scope creep" in seats.prompts("implementer")[1]
++    assert "scope creep 1" in seats.prompts("implementer")[1]
++    assert env.task()["attempts"][-1]["escalation"] == "attempts_exhausted"
+     assert env.prs == []
+ 
+ 
+diff --git a/tests/test_f23.py b/tests/test_f23.py
+new file mode 100644
+index 0000000..34e2336
+--- /dev/null
++++ b/tests/test_f23.py
+@@ -0,0 +1,1095 @@
++"""F-23 acceptance tests — BUILD-ORDER.md, work order F-23.
++
++Contract rule (CLAUDE.md): an acceptance ref ``tests/test_f23.py::test_ac_N``
++means a test function with exactly that name.
++
++What is real and what is stubbed: same split as the F-10 tests — the git
++fixture (local repo + bare remote + factory root), the clone manager, the
++queue, L0 and L1 through the real pinned srt sandbox are real; only the
++model seats are stubbed. The stubs here are *scripted per round*: the
++implementer writes a different (or deliberately identical) impl.py each
++round, and the reviewer returns one verdict per call, because F-23 is
++entirely about what happens between rounds — which findings repeat, what
++the next review is scoped to, and when the loop refuses another round.
++"""
++
++import json
++import re
++import shlex
++import subprocess
++import sys
++import textwrap
++from datetime import datetime
++from pathlib import Path
++from zoneinfo import ZoneInfo
++
++from factory.contract import acceptance_hash, load_tasks
++from factory.l2 import apply_convergence, finding_key, parse_verdict
++from factory.orchestrator import PullRequest, run_once
++from factory.progress import ProgressLog
++from factory.session import SessionRecord
++from factory.state import TaskQueue
++
++STOCKHOLM = ZoneInfo("Europe/Stockholm")
++# A Sunday afternoon: outside every default peak window, so runs may start.
++OFF_PEAK = datetime(2026, 10, 18, 15, 0, tzinfo=STOCKHOLM)
++REF = "tests/test_feature.py::test_ac_1"
++
++TEST_SOURCE = textwrap.dedent(
++    """
++    from impl import answer
++
++
++    def test_ac_1():
++        assert answer() == 42
++    """
++)
++
++
++def _git(repo: Path, *args: str) -> str:
++    return subprocess.run(
++        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
++    ).stdout.strip()
++
++
++def _task(task_id: str = "T-1", **overrides) -> dict:
++    acceptance = [
++        {"id": "AC-1", "text": "answer() returns 42", "check": {"type": "test", "ref": REF}}
++    ]
++    task = {
++        "id": task_id,
++        "title": f"Make answer() return 42 ({task_id})",
++        "source": f"docs/{task_id}.md",
++        "kind": "build",
++        "priority": "P1",
++        "status": "ready",
++        "depends_on": [],
++        "risk": [],
++        "gates": {"spec_approval": True, "merge": "human", "deploy": "human"},
++        "acceptance": acceptance,
++        "acceptance_hash": acceptance_hash(acceptance),
++        "approved_at": "2026-10-18T10:00:00Z",
++        "approved_by": "owner",
++        "budget": {"size": "S", "max_attempts": 3, "max_turns": 20, "wall_clock_min": 10},
++        "attempts": [],
++    }
++    task.update(overrides)
++    return task
++
++
++def _finding(text="scope creep", file="impl.py", axis="spec",
++             severity="blocking", **extra) -> dict:
++    item = {"id": "R-1", "axis": axis, "severity": severity, "file": file, "text": text}
++    item.update(extra)
++    return item
++
++
++def _verdict(*findings: dict, declared: str | None = None) -> str:
++    payload = {"verdict": declared or ("fail" if findings else "pass"),
++               "findings": list(findings)}
++    return json.dumps(payload)
++
++
++class Env:
++    """One fixture project: local repo + bare remote + factory root."""
++
++    def __init__(self, tmp_path: Path, tasks: list | None = None):
++        self.tmp = tmp_path
++        self.root = tmp_path / "factory-root"
++        (self.root / "holdouts" / "fixture").mkdir(parents=True)
++        self.repo = tmp_path / "proj"
++        self.remote = tmp_path / "remote.git"
++        self.repo.mkdir()
++        _git(self.repo, "init", "-b", "main")
++        _git(self.repo, "config", "user.email", "fixture@example.com")
++        _git(self.repo, "config", "user.name", "Fixture")
++        (self.repo / "impl.py").write_text("def answer():\n    return 0\n")
++        (self.repo / "tests").mkdir()
++        (self.repo / "tests" / "test_base.py").write_text("def test_base():\n    assert True\n")
++        self.profile = {
++            "name": "fixture",
++            "repo": {
++                "path": str(self.repo),
++                "default_branch": "main",
++                "remote": str(self.remote),
++                "merge_method": "squash",
++            },
++            "commands": {
++                "setup": "true",
++                "test": f"{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider",
++            },
++            "paths": {"risk": {}, "protected": [".factory/**"]},
++            "dependency_manifests": ["pyproject.toml"],
++            "deploy": {"mechanism": "none", "auto_on_merge": False},
++            "live_checks": {},
++            "docs_allowlist": [],
++        }
++        factory_dir = self.repo / ".factory"
++        factory_dir.mkdir()
++        import yaml
++
++        (factory_dir / "project.yaml").write_text(yaml.safe_dump(self.profile))
++        self.queue_path = factory_dir / "tasks.json"
++        doc = {"version": 1, "project": "fixture", "tasks": tasks or [_task()]}
++        self.queue_path.write_text(json.dumps(doc, indent=2) + "\n")
++        (self.repo / ".gitignore").write_text(".factory/*.lock\n")
++        _git(self.repo, "add", "-A")
++        _git(self.repo, "commit", "-m", "base")
++        subprocess.run(
++            ["git", "clone", "--bare", "-q", str(self.repo), str(self.remote)], check=True
++        )
++        self.prs: list[PullRequest] = []
++
++    def open_pr(self, pr: PullRequest) -> str:
++        self.prs.append(pr)
++        return f"https://github.com/fixture/fixture/pull/{len(self.prs)}"
++
++    def task(self, task_id: str = "T-1") -> dict:
++        return TaskQueue(self.queue_path).get(task_id)
++
++    def log(self) -> ProgressLog:
++        return ProgressLog.for_task(self.root, "fixture", "T-1")
++
++    def report(self, attempt_no: int) -> dict:
++        """The stored validator report of one attempt (F-10's _store layout)."""
++        task = self.task()
++        return json.loads(Path(task["attempts"][attempt_no - 1]["validator_report"]).read_text())
++
++    def run(self, session_runner):
++        return run_once(
++            self.queue_path, factory_root=self.root, session_runner=session_runner,
++            open_pr=self.open_pr, now=lambda: OFF_PEAK,
++        )
++
++
++class Scripted:
++    """Stub seats with per-round scripted behaviour.
++
++    ``impls`` holds one impl.py body per implementer round (the last
++    repeats). The contract test must pass for L2 to run at all, so every
++    body returns 42; the *content* differs when a scenario needs a moving
++    head (a non-empty review delta) and is identical when it needs an
++    unmoved one (an empty delta). The reviewer returns ``reviews[call-1]``
++    (the last verdict repeats), so a scenario scripts exactly what each
++    round's review says.
++    """
++
++    SAME = ("def answer():\n    return 42\n",)  # identical rounds: no new commit
++    MOVING = (  # green every round, different content: the head moves each round
++        "def answer():\n    return 42\n",
++        "def answer():\n    return 42  # fix round\n",
++        "def answer():\n    return 42  # fix round 2\n",
++    )
++
++    def __init__(self, impls=SAME, reviews=(_verdict(),), result="Implemented."):
++        self.impls = list(impls)
++        self.reviews = list(reviews)
++        self.result = result
++        self.calls: list[tuple[str, str, Path, dict]] = []
++
++    def prompts(self, seat: str) -> list[str]:
++        return [prompt for s, prompt, _, _ in self.calls if s == seat]
++
++    def __call__(self, seat, prompt, run_dir, profile, **kwargs):
++        run_dir = Path(run_dir)
++        self.calls.append((seat, prompt, run_dir, kwargs))
++        if seat == "implementer":
++            round_no = sum(1 for s, *_ in self.calls if s == "implementer")
++            body = self.impls[min(round_no - 1, len(self.impls) - 1)]
++            (run_dir / "impl.py").write_text(body)
++            (run_dir / "tests" / "test_feature.py").write_text(TEST_SOURCE)
++            return SessionRecord(
++                seat=seat, status="completed", num_turns=3, model="stub-model",
++                tokens={"input_tokens": 120, "output_tokens": 40}, result=self.result,
++            )
++        call_no = sum(1 for s, *_ in self.calls if s == "reviewer")
++        return SessionRecord(
++            seat=seat, status="completed", num_turns=1, model="stub-model",
++            tokens={"input_tokens": 60, "output_tokens": 10},
++            result=self.reviews[min(call_no - 1, len(self.reviews) - 1)],
++        )
++
++
++# --- AC-1: stable finding keys; repeats are carried, not new ---------------
++
++
++def test_ac_1(tmp_path: Path):
++    # Unit half: the key is stable under text noise, and a repeat whose file
++    # the delta didn't touch is demoted to carried, not new.
++    one = parse_verdict(_verdict(_finding("Scope creep in impl.py")))
++    two = parse_verdict(_verdict(_finding("  scope   CREEP\tin impl.py ")))
++    assert one.findings[0].key == two.findings[0].key  # normalised summary
++    assert finding_key(one.findings[0]) == one.findings[0].key
++    other_file = parse_verdict(_verdict(_finding("Scope creep in impl.py", file="other.py")))
++    other_axis = parse_verdict(
++        _verdict(_finding("Scope creep in impl.py", axis="standards")))
++    assert other_file.findings[0].key != one.findings[0].key
++    assert other_axis.findings[0].key != one.findings[0].key
++
++    prior = {one.findings[0].key: "sha-of-round-1"}
++    carried = apply_convergence(two, prior, delta_files=set(), delta_mode=True)
++    assert carried.findings[0].state == "carried"
++    data = carried.to_dict()
++    assert data["findings"][0]["state"] == "carried"  # listed as carried, not new
++    assert data["verdict"] == "fail"  # an unresolved blocking finding still fails
++    # The same key on a file the delta DID touch is a repeat after a failed
++    # fix attempt: not carried, still a finding of this round.
++    moved = apply_convergence(two, prior, delta_files={"impl.py"}, delta_mode=True)
++    assert moved.findings[0].state == "new"
++
++    # Integration half: a two-round run stores keys per attempt and marks
++    # the unchanged repeat carried in round 2's stored report.
++    repeat = _finding("Scope creep in impl.py")
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.SAME,  # identical content: the head (and delta) never moves
++        reviews=(_verdict(repeat), _verdict(repeat)),
++    )
++    result = env.run(seats)
++    assert result.outcome == "needs_human"  # round 2 repeats round 1 (see AC-4)
++    first, second = env.report(1), env.report(2)
++    assert first["L2"]["findings"][0]["key"] == one.findings[0].key
++    assert second["L2"]["findings"][0]["key"] == first["L2"]["findings"][0]["key"]
++    assert first["L2"]["findings"][0]["state"] == "new"
++    assert second["L2"]["findings"][0]["state"] == "carried"
++    # Stored per attempt where the next run can seed from: the progress log.
++    entries = env.log().entries()
++    assert entries[0]["finding_keys"] == [one.findings[0].key]
++    assert entries[1]["finding_keys"] == [one.findings[0].key]
++
++
++def test_carried_keys_survive_text_normalisation_across_rounds(tmp_path: Path):
++    """The stored key is the identity: re-raised with different casing and
++    spacing, the round-2 report still demotes it to carried."""
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.SAME,
++        reviews=(
++            _verdict(_finding("Scope creep in impl.py")),
++            _verdict(_finding("scope   creep IN impl.py")),
++        ),
++    )
++    env.run(seats)
++    assert env.report(2)["L2"]["findings"][0]["state"] == "carried"
++
++
++def test_prior_keys_seed_from_an_earlier_runs_progress_log(tmp_path: Path):
++    """A finding raised in an earlier run (recorded in the progress log) is
++    carried when the next run's reviewer raises the same key again."""
++    first = parse_verdict(_verdict(_finding("Scope creep in impl.py")))
++    env = Env(tmp_path)
++    env.log().append({
++        "run_id": "earlier", "outcome": "fail", "findings": [],
++        "finding_keys": [first.findings[0].key],
++    })
++    seats = Scripted(
++        impls=Scripted.SAME,  # the head never moves: nothing either round can fix
++        reviews=(
++            _verdict(_finding("Scope creep in impl.py")),
++            _verdict(_finding("Scope creep in impl.py")),
++        ),
++    )
++    result = env.run(seats)
++    # Round 1 is carried (cross-run key) but NOT stopped — this run's
++    # implementer just made an attempt the reviewer has seen once
++    # (review finding 8). Round 2 re-raises the same key now with an
++    # in-run raise sha and an untouched file: that is the bounce the
++    # stop exists for.
++    assert result.outcome == "needs_human"
++    assert result.escalation == "review_not_converging"
++    assert len(seats.prompts("reviewer")) == 2
++    assert env.task()["attempts"][0]["outcome"] == "fail"  # round 1: a plain fail
++    assert env.task()["attempts"][0].get("escalation") is None
++    assert env.report(1)["L2"]["findings"][0]["state"] == "carried"
++
++
++# --- AC-2: delta as primary scope; out-of-delta findings need a why --------
++
++
++def test_ac_2(tmp_path: Path):
++    # Unit half: in a delta round, a NEW finding outside the delta without a
++    # missed-earlier justification is dropped; with one, and inside the
++    # delta, it stands. A declared pass whose only blocker was dropped
++    # becomes a pass.
++    outside = parse_verdict(
++        _verdict(_finding("old bug", file="tests/test_base.py"), declared="pass"))
++    dropped = apply_convergence(
++        outside, prior={}, delta_files={"impl.py"}, delta_mode=True)
++    assert not dropped.findings and dropped.verdict == "pass"
++    assert dropped.dropped[0]["reason"] == "out_of_delta_without_missed_earlier"
++
++    justified = parse_verdict(_verdict(
++        _finding("old bug", file="tests/test_base.py", missed_earlier="round 1 reviewed "
++                    "only the delta's files and missed this pre-existing break")))
++    kept = apply_convergence(
++        justified, prior={}, delta_files={"impl.py"}, delta_mode=True)
++    assert kept.findings and kept.verdict == "fail"
++
++    inside = parse_verdict(_verdict(_finding("new bug", file="impl.py")))
++    assert apply_convergence(
++        inside, prior={}, delta_files={"impl.py"}, delta_mode=True).findings
++
++    # Round one has no delta: nothing is out of scope yet.
++    first_round = apply_convergence(
++        outside, prior={}, delta_files=set(), delta_mode=False)
++    assert first_round.findings and first_round.verdict == "fail"
++
++    # Integration half: round 2's reviewer prompt scopes to the delta since
++    # the last reviewed sha, keeps the full diff for reference — and an
++    # out-of-delta finding really is dropped from the effective verdict.
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.MOVING,  # a moving head: round 2's delta is non-empty
++        reviews=(
++            _verdict(_finding("wrong value", file="impl.py")),
++            _verdict(  # declared pass; the one blocking finding is out of the delta
++                _finding("pre-existing oddity", file="tests/test_base.py"),
++                declared="pass"),
++        ),
++    )
++    result = env.run(seats)
++    assert result.outcome == "pr_opened"  # the drop flipped the effective verdict
++    round1, round2 = seats.prompts("reviewer")
++    assert "## Diff (base...head)" in round1  # round 1: the full diff is the scope
++    assert "## Delta since the last review (primary scope)" in round2
++    assert "## Full diff (base...head, reference only)" in round2
++    delta = round2.split("primary scope)", 1)[1].split("## Full diff", 1)[0]
++    assert "# fix round" in delta  # the delta carries round 2's change...
++    assert "return 0" not in delta  # ...and only that: base content is outside it
++    second = env.report(2)["L2"]
++    assert second["dropped"][0]["finding"]["file"] == "tests/test_base.py"
++
++
++def test_missed_earlier_is_parsed_onto_the_finding():
++    report = parse_verdict(_verdict(
++        _finding("old bug", file="old.py", missed_earlier="misread the first diff")))
++    assert report.findings[0].missed_earlier == "misread the first diff"
++
++
++# --- AC-3: fix the class; the next review checks the siblings --------------
++
++
++def test_ac_3(tmp_path: Path):
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.MOVING,
++        reviews=(
++            _verdict(_finding("wrong value returned", file="impl.py", severity="major")),
++            _verdict(),  # round 2 passes: PR opens
++        ),
++    )
++    result = env.run(seats)
++    assert result.outcome == "pr_opened"
++    fix_prompt = seats.prompts("implementer")[1]
++    assert "## Findings to fix" in fix_prompt
++    assert "wrong value returned" in fix_prompt
++    assert "sibling" in fix_prompt  # fix the class, not the instance
++    assert "defect class" in fix_prompt
++    # Round 1 gets no fix section: there was nothing to fix yet.
++    assert "## Findings to fix" not in seats.prompts("implementer")[0]
++    # The next round's reviewer checks the siblings explicitly.
++    assert "sibling" in seats.prompts("reviewer")[1]
++    assert "sibling" not in seats.prompts("reviewer")[0].lower().split("## diff")[0]
++
++
++# --- AC-4: no-progress stop → review_not_converging (schema, red-first) ----
++
++
++def test_ac_4(tmp_path: Path):
++    # Schema half (red-first against the pre-WO enum): the queue accepts an
++    # attempt escalated with review_not_converging.
++    task = _task(status="needs_human")
++    task["attempts"] = [{
++        "run_id": "r1", "slice_id": "T-1", "started": "2026-10-18T10:00:00Z",
++        "outcome": "escalated", "escalation": "review_not_converging",
++        "prompt_versions": {"implementer": "x", "reviewer": "y"}, "skills": [],
++    }]
++    queue = tmp_path / "tasks.json"
++    queue.write_text(json.dumps({"version": 1, "project": "fixture", "tasks": [task]}))
++    loaded = load_tasks(queue)  # ContractError before the enum lands (red)
++    assert loaded["tasks"][0]["attempts"][0]["escalation"] == "review_not_converging"
++
++    # Orchestrator half: a FAIL whose findings were all raised before and
++    # whose files nobody touched since stops the loop at that round
++    # instead of spending another one (review finding 3: a repeat on a
++    # file the fix DID touch is an attempt in progress, not a bounce).
++    repeat = _finding("wrong value returned", file="impl.py")
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.SAME,  # identical content: the finding's file is untouched
++        reviews=(_verdict(repeat), _verdict(repeat)),  # budget for a 3rd round exists
++    )
++    result = env.run(seats)
++    assert result.outcome == "needs_human"
++    assert result.escalation == "review_not_converging"
++    assert [c[0] for c in seats.calls] == ["implementer", "reviewer"] * 2  # 2, not 3
++    task = env.task()
++    assert task["status"] == "needs_human"
++    assert len(task["attempts"]) == 2
++    assert task["attempts"][-1]["escalation"] == "review_not_converging"
++    assert env.prs == []
++
++    # Contrast: a genuinely new finding each round is progress — the budget,
++    # not convergence, ends it.
++    env2 = Env(tmp_path / "contrast")
++    seats2 = Scripted(
++        impls=Scripted.MOVING,
++        reviews=(
++            _verdict(_finding("wrong value returned", file="impl.py")),
++            _verdict(_finding("also the wrong sign", file="impl.py")),
++            _verdict(_finding("and no docstring", file="impl.py")),
++        ),
++    )
++    result2 = env2.run(seats2)
++    assert result2.outcome == "needs_human"
++    assert result2.escalation == "attempts_exhausted"
++    assert len(seats2.prompts("reviewer")) == 3
++
++    # Mixed rounds continue: one carried finding plus one new one is progress.
++    env3 = Env(tmp_path / "mixed")
++    seats3 = Scripted(
++        impls=Scripted.MOVING,
++        reviews=(
++            _verdict(_finding("wrong value returned", file="impl.py")),
++            _verdict(
++                _finding("wrong value returned", file="impl.py"),
++                _finding("also the wrong sign", file="impl.py"),
++            ),
++            _verdict(),  # round 3 passes: PR opens
++        ),
++    )
++    assert env3.run(seats3).outcome == "pr_opened"
++
++
++# --- owner review round (PR #35; 9 findings — all fixed red-first) ----------
++
++
++def test_review1_an_invalid_review_does_not_advance_the_frontier(tmp_path: Path):
++    """Finding 1: a review whose output is not valid verdict JSON reviewed
++    nothing — `last_reviewed` must not move, or code no reviewer ever saw
++    becomes 'outside the delta' in the next round."""
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.MOVING,
++        reviews=("this is not verdict json at all", _verdict()),
++    )
++    result = env.run(seats)
++    # Round 2's review covers everything since the last REAL review: the
++    # full diff is the scope, not a delta against an unreviewed head.
++    prompt2 = seats.prompts("reviewer")[1]
++    assert "## Delta since the last review" not in prompt2, (
++        "the round-1 head was marked reviewed although its review "
++        "produced no verdict"
++    )
++    assert "## Diff (base...head)" in prompt2
++    assert result.outcome == "pr_opened"
++
++
++def test_review1b_failed_session_variant(tmp_path: Path):
++    """Finding 1, the timed-out-review half: a reviewer session that never
++    completed also advances nothing."""
++    env = Env(tmp_path)
++    seats = Scripted(impls=Scripted.MOVING, reviews=(_verdict(),))
++    base_call = seats.__call__
++
++    def runner(seat, prompt, run_dir, profile, **kwargs):
++        if seat != "reviewer":
++            return base_call(seat, prompt, run_dir, profile, **kwargs)
++        if not any(c[0] == "reviewer" for c in seats.calls):
++            seats.calls.append((seat, prompt, Path(run_dir), kwargs))
++            return SessionRecord(seat=seat, status="failed",
++                                 reason="error_during_execution")
++        return base_call(seat, prompt, run_dir, profile, **kwargs)
++
++    result = env.run(runner)
++    prompt2 = seats.prompts("reviewer")[1]
++    assert "## Delta since the last review" not in prompt2
++    assert "## Diff (base...head)" in prompt2
++    assert result.outcome == "pr_opened"
++
++
++def test_review2_delta_survives_a_rewritten_prior_round(tmp_path: Path):
++    """Finding 2: an implementer that amends the reviewed round's commit
++    leaves `last_reviewed` unreachable in the fresh clone; the round must
++    fall back to the full diff, not die as orchestrator_error."""
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.MOVING,
++        reviews=(
++            _verdict(_finding("wrong value", file="impl.py")),
++            _verdict(),  # round 2 passes: PR opens
++        ),
++    )
++    base_call = seats.__call__
++
++    def amender(seat, prompt, run_dir, profile, **kwargs):
++        if seat != "implementer":
++            return base_call(seat, prompt, run_dir, profile, **kwargs)
++        seats.calls.append((seat, prompt, Path(run_dir), kwargs))
++        round_no = sum(1 for s, *_ in seats.calls if s == "implementer")
++        (Path(run_dir) / "impl.py").write_text(
++            f"def answer():\n    return 42  # round {round_no}\n")
++        (Path(run_dir) / "tests" / "test_feature.py").write_text(TEST_SOURCE)
++        if round_no > 1:  # amend round 1's commit away: head loses its parent
++            subprocess.run(["git", "-C", str(run_dir), "add", "-A"], check=True)
++            subprocess.run(
++                ["git", "-c", "user.email=s@localhost", "-c", "user.name=S",
++                 "-C", str(run_dir), "commit", "--amend", "--no-edit", "-qm", "x"],
++                check=True)
++        return SessionRecord(seat=seat, status="completed", num_turns=3,
++                             model="stub-model", result="done")
++
++    result = env.run(amender)
++    assert result.outcome == "pr_opened"  # red before: orchestrator_error
++    prompt2 = seats.prompts("reviewer")[1]
++    assert "## Diff (base...head)" in prompt2  # fell back to the full diff
++    assert "## Delta since the last review" not in prompt2
++
++
++def test_review3_a_repeat_on_a_fixed_file_is_not_the_stop(tmp_path: Path):
++    """Finding 3: a prior-key finding on a file the fix DID touch is an
++    attempt in progress, not a bounce — the budget, not convergence, ends
++    the run."""
++    repeat = _finding("wrong value returned", file="impl.py")
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.MOVING,  # impl.py changes every round
++        reviews=(_verdict(repeat), _verdict(repeat), _verdict(repeat)),
++    )
++    result = env.run(seats)
++    assert result.outcome == "needs_human"
++    assert result.escalation == "attempts_exhausted"  # red before: converging
++    assert len(seats.prompts("reviewer")) == 3
++    # The repeat on a touched file stands as the round's own finding.
++    assert env.report(2)["L2"]["findings"][0]["state"] == "new"
++
++
++def test_review4_fix_prompt_carries_the_findings_once_and_no_key_hashes(
++        tmp_path: Path):
++    """Finding 4: the fix block duplicated the history's newest entry, and
++    the history rendered the 64-char finding_keys hashes."""
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.MOVING,
++        reviews=(
++            _verdict(_finding("Xyzzy unique marker finding", file="impl.py")),
++            _verdict(),
++        ),
++    )
++    assert env.run(seats).outcome == "pr_opened"
++    prompt2 = seats.prompts("implementer")[1]
++    assert prompt2.count("Xyzzy unique marker finding") == 1
++    assert not re.search(r"[0-9a-f]{64}", prompt2), (
++        "finding-key hashes leaked into the implementer prompt"
++    )
++
++
++def test_review5_the_stop_is_decided_where_the_prior_set_lives():
++    """Finding 5: apply_convergence computes the no-progress verdict itself
++    (L2Report.no_progress) — no orchestrator-side snapshot to mis-order."""
++    verdict = parse_verdict(_verdict(_finding("wrong value", file="impl.py")))
++    key = verdict.findings[0].key
++
++    untouched = apply_convergence(
++        verdict, prior={key: "sha-1"}, delta_files=set(), delta_mode=True)
++    assert untouched.no_progress is True  # in-run carry, file untouched
++
++    touched = apply_convergence(
++        verdict, prior={key: "sha-1"}, delta_files={"impl.py"}, delta_mode=True)
++    assert touched.no_progress is False  # a fix was attempted
++
++    cross_run = apply_convergence(
++        verdict, prior={key: None}, delta_files=set(), delta_mode=True)
++    assert cross_run.no_progress is False  # earlier run, not this run
++
++    fresh = apply_convergence(verdict, prior={}, delta_files={"impl.py"},
++                              delta_mode=True)
++    assert fresh.no_progress is False
++
++
++def test_review6_declared_fail_with_everything_dropped_stops(tmp_path: Path):
++    """Finding 6: a declared fail whose every finding was dropped leaves a
++    FAIL with nothing to fix — the run must stop, not burn the budget."""
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.MOVING,
++        reviews=(
++            _verdict(_finding("wrong value", file="impl.py")),
++            _verdict(  # declared fail; the one finding is out of the delta
++                _finding("old oddity", file="tests/test_base.py")),
++        ),
++    )
++    result = env.run(seats)
++    assert result.outcome == "needs_human"
++    assert result.escalation == "review_not_converging"  # red before: exhausted
++    assert len(seats.prompts("reviewer")) == 2  # round 3 never spent
++    assert env.report(2)["L2"]["verdict"] == "fail"
++    assert not env.report(2)["L2"]["findings"]
++
++
++def test_review7_fileless_findings_are_never_dropped(tmp_path: Path):
++    """Finding 7: contract-level findings rarely name a file; dropping them
++    in delta rounds could flip a declared pass into an opened PR. Round 3
++    tightened the fixture: the blocker carries no AC id either — an
++    unanchored fileless finding must stand exactly like an anchored one."""
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.MOVING,
++        reviews=(
++            _verdict(_finding("wrong value", file="impl.py")),
++            _verdict(  # declared pass; the blocker names no file, no AC id
++                _finding("the new endpoint has no auth check", file=None),
++                declared="pass"),
++            _verdict(),  # round 3 passes: PR opens
++        ),
++    )
++    result = env.run(seats)
++    assert result.outcome == "pr_opened"
++    assert len(seats.prompts("reviewer")) == 3  # red before: 2 (PR at round 2)
++    second = env.report(2)["L2"]
++    assert second["findings"] and second["verdict"] == "fail"
++    assert not second["dropped"]
++
++
++def test_review8_a_pass_round_does_not_log_finding_keys(tmp_path: Path):
++    """Finding 8 (pass-path half): a passed round's findings were accepted
++    as non-blocking; recording their keys would poison a later fix round
++    after a rejected PR. (The immediate-stop half is the rewritten
++    cross-run seeding test above.)"""
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.MOVING,
++        reviews=(
++            _verdict(_finding("wrong value", file="impl.py")),
++            _verdict(  # declared pass; the non-blocking note rides the pass
++                _finding("minor tidy-up possible", file="impl.py",
++                         severity="minor"),
++                declared="pass"),
++        ),
++    )
++    assert env.run(seats).outcome == "pr_opened"
++    last = env.log().entries()[-1]
++    assert last["outcome"] == "pass"
++    assert "finding_keys" not in last  # red before: the pass logged keys
++    # Fail rounds still log them — that is what seeds the next run.
++    assert "finding_keys" in env.log().entries()[0]
++
++
++def test_review9_dropped_findings_reach_the_human(tmp_path: Path):
++    """Finding 9: a dropped blocking finding must be visible to the merger
++    (PR body, outside the JSON blob) and in the round's numbered findings."""
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.MOVING,
++        reviews=(
++            _verdict(_finding("wrong value", file="impl.py")),
++            _verdict(  # declared pass; the one blocking finding is out of delta
++                _finding("pre-existing oddity", file="tests/test_base.py"),
++                declared="pass"),
++        ),
++    )
++    result = env.run(seats)
++    assert result.outcome == "pr_opened"
++    body = env.prs[0].body
++    assert "dropped as out of scope" in body  # red before: JSON blob only
++    assert "pre-existing oddity" in body
++    round2_findings = env.log().entries()[1]["findings"]
++    assert any("[L2 dropped" in line for line in round2_findings)
++
++
++# --- owner review round 2 (PR #35; 9 findings on 116e16b — all fixed) ------
++
++
++def _fix_section(prompt: str) -> str:
++    """The text of a prompt's '## Findings to fix' section. The progress
++    log (history) legitimately repeats old findings — including dropped
++    ones, for the record — so fix-block assertions must scope here."""
++    section = prompt.split("## Findings to fix", 1)
++    assert len(section) == 2, "no fix section in prompt"
++    return section[1].split("\n## ", 1)[0]
++
++
++def test_review10_fallback_round_does_not_carry_repeats_as_untouched(tmp_path: Path):
++    """Finding 1: when the history was rewritten the round reviews the full
++    diff with no delta — an in-run repeat there is an attempt in progress
++    (the implementer touched those files by rewriting), not a provably
++    untouched carry. The stop must not fire through the fallback path."""
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.MOVING,
++        reviews=(
++            _verdict(_finding("wrong value", file="impl.py")),
++            _verdict(_finding("wrong value", file="impl.py")),
++            _verdict(_finding("wrong value", file="impl.py")),
++        ),
++    )
++    base_call = seats.__call__
++
++    def amender(seat, prompt, run_dir, profile, **kwargs):
++        if seat != "implementer":
++            return base_call(seat, prompt, run_dir, profile, **kwargs)
++        seats.calls.append((seat, prompt, Path(run_dir), kwargs))
++        round_no = sum(1 for s, *_ in seats.calls if s == "implementer")
++        (Path(run_dir) / "impl.py").write_text(
++            f"def answer():\n    return 42  # round {round_no}\n")
++        (Path(run_dir) / "tests" / "test_feature.py").write_text(TEST_SOURCE)
++        if round_no > 1:  # rewrite history every later round: fallback path
++            subprocess.run(["git", "-C", str(run_dir), "add", "-A"], check=True)
++            subprocess.run(
++                ["git", "-c", "user.email=s@localhost", "-c", "user.name=S",
++                 "-C", str(run_dir), "commit", "--amend", "--no-edit", "-qm", "x"],
++                check=True)
++        return SessionRecord(seat=seat, status="completed", num_turns=3,
++                             model="stub-model", result="done")
++
++    result = env.run(amender)
++    assert result.outcome == "needs_human"
++    # Red on 116e16b: review_not_converging after 2 rounds (the fallback's
++    # empty delta_files marked the impl.py repeat carried → untouched).
++    assert result.escalation == "attempts_exhausted"
++    assert len(seats.prompts("reviewer")) == 3
++    assert env.report(2)["L2"]["findings"][0]["state"] == "new"
++
++
++def test_review11_dropped_findings_stay_out_of_the_fix_block(tmp_path: Path):
++    """Finding 2: dropped findings are for the log and the human, never for
++    the implementer's 'Findings to fix' — fixing their defect class would
++    expand scope into code the orchestrator ruled out."""
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.MOVING,
++        reviews=(
++            _verdict(_finding("wrong value", file="impl.py")),
++            _verdict(  # round 2: one actionable + one out-of-delta dropped
++                _finding("wrong value still", file="impl.py"),
++                _finding("legacy oddity", file="tests/test_base.py"),
++            ),
++            _verdict(),
++        ),
++    )
++    result = env.run(seats)
++    assert result.outcome == "pr_opened"
++    fix3 = _fix_section(seats.prompts("implementer")[2])
++    assert "wrong value still" in fix3
++    assert "legacy oddity" not in fix3, (
++        "a dropped (out-of-scope) finding reached the implementer's fix block"
++    )
++    # ...while the round's log entry keeps it for the record.
++    assert any("[L2 dropped" in line for line in env.log().entries()[1]["findings"])
++
++
++def test_review12_a_failed_review_keeps_the_fix_list_and_carried_list_together(
++        tmp_path: Path):
++    """Finding 3: a round whose review produced no verdict adds nothing
++    actionable — the next fix block must still carry the last valid
++    review's findings, or the reviewer is told 'do not re-raise A' while
++    the implementer is no longer told to fix A."""
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.MOVING,
++        reviews=(
++            _verdict(_finding("wrong value", file="impl.py")),
++            "not verdict json at all",  # round 2's review fails to parse
++            _verdict(),  # round 3 passes: PR opens
++        ),
++    )
++    result = env.run(seats)
++    assert result.outcome == "pr_opened"
++    fix3 = _fix_section(seats.prompts("implementer")[2])
++    assert "wrong value" in fix3, (
++        "the open finding from the last valid review vanished from the fix "
++        "block after a failed review"
++    )
++
++
++def test_review13_the_stop_requires_l0_and_l1_to_have_passed():
++    """Finding 4: the no-progress stop is gated on the round's own L0 and L1
++    passing — not on the accident that L2 happens to run last."""
++    from factory.l0 import L0Report
++    from factory.l1 import L1Report
++    from factory.orchestrator import _round_stuck
++
++    stuck = parse_verdict(_verdict(_finding("wrong value", file="impl.py")))
++    stuck = apply_convergence(
++        stuck, prior={stuck.findings[0].key: "sha"}, delta_files=set(),
++        delta_mode=True)
++    assert stuck.no_progress
++    ok_l0 = L0Report(verdict="pass")
++    ok_l1 = L1Report(verdict="pass")
++    assert _round_stuck(ok_l0, ok_l1, stuck) is True
++    assert _round_stuck(L0Report(verdict="fail"), ok_l1, stuck) is False
++    assert _round_stuck(ok_l0, None, stuck) is False  # L1 never ran
++    assert _round_stuck(None, None, None) is False
++
++
++def test_review14_the_stop_reason_comes_from_the_classifier():
++    """Finding 5: apply_convergence says WHY the round is stuck; the
++    orchestrator must not re-derive the branch from report fields."""
++    carried = parse_verdict(_verdict(_finding("wrong value", file="impl.py")))
++    key = carried.findings[0].key
++    report = apply_convergence(
++        carried, prior={key: "sha"}, delta_files=set(), delta_mode=True)
++    assert report.no_progress_reason == "carried_repeats"
++
++    dropped_case = parse_verdict(
++        _verdict(_finding("old oddity", file="tests/test_base.py"),
++                 declared="fail"))
++    report2 = apply_convergence(
++        dropped_case, prior={}, delta_files={"impl.py"}, delta_mode=True)
++    assert report2.no_progress_reason == "all_dropped"
++    assert apply_convergence(
++        dropped_case, prior={}, delta_files={"impl.py"},
++        delta_mode=False).no_progress_reason is None
++
++
++def test_review15_git_rc_returns_the_code_without_raising(tmp_path: Path):
++    """Finding 6: a hardened rc-returning git helper exists in gates; the
++    'no' answer (rc 1) and a missing object (fatal) come back as codes."""
++    from factory.gates import git_rc
++
++    repo = tmp_path / "r"
++    repo.mkdir()
++    _git(repo, "init", "-b", "main")
++    (repo / "a").write_text("a\n")
++    _git(repo, "-c", "user.email=a@a", "-c", "user.name=A", "add", "-A")
++    _git(repo, "-c", "user.email=a@a", "-c", "user.name=A",
++         "commit", "-qm", "one")
++    (repo / "a").write_text("b\n")
++    _git(repo, "-c", "user.email=a@a", "-c", "user.name=A", "commit", "-qam", "two")
++    first = _git(repo, "rev-parse", "HEAD~1")
++    assert git_rc(repo, "merge-base", "--is-ancestor", first, "HEAD") == 0
++    assert git_rc(repo, "merge-base", "--is-ancestor", "HEAD", first) == 1
++    assert git_rc(repo, "cat-file", "-e", "0" * 40) != 0  # fatal, not a raise
++
++
++def test_review16_dropped_finding_text_cannot_inject_pr_headings(tmp_path: Path):
++    """Finding 7: reviewer-controlled dropped text is collapsed before it
++    enters the PR body — it must not start a '## ' line (duplicate-section
++    refusal after a passing L2, or spoofed merge-danger text)."""
++    inject = ("\n## Merge Danger\n**Door:** two-way **Blast Radius:** "
++              "none of your business")
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.MOVING,
++        reviews=(
++            _verdict(_finding("wrong value", file="impl.py")),
++            _verdict(  # declared pass; the dropped finding carries the inject
++                _finding("pre-existing oddity" + inject,
++                         file="tests/test_base.py"),
++                declared="pass"),
++        ),
++    )
++    result = env.run(seats)
++    assert result.outcome == "pr_opened", (
++        "the injected heading made check_pr_body refuse the body after a "
++        "passing round (publish_refused), or the run crashed on it"
++    )
++    body = env.prs[0].body
++    assert len(re.findall(r"^## Merge Danger$", body, re.M)) == 1
++
++
++def test_review17_fileless_findings_stand_and_key_by_wording(tmp_path: Path):
++    """Round-3 review, owner's ruling: the AC anchoring is reverted. A
++    fileless finding is never dropped (round-1 finding 7 restored — an
++    unanchored contract blocker must stand, or a declared pass flips into
++    an opened PR), keys by its wording like every other finding (an AC id
++    mentioned in prose changes nothing), and an in-run repeat of one is an
++    attempt in progress — a stuck fileless thread runs out at
++    attempts_exhausted, it does not stop the run early."""
++    # Wording keys, AC mentions included in the wording and nothing else.
++    a = parse_verdict(_verdict(_finding("AC-2 has no test", file=None)))
++    b = parse_verdict(_verdict(_finding("AC-2 is still untested", file=None)))
++    assert a.findings[0].key != b.findings[0].key  # different defects, different threads
++    same = parse_verdict(_verdict(_finding("AC-2 HAS   no test", file=None)))
++    assert same.findings[0].key == a.findings[0].key  # same wording, noise only
++
++    # Never dropped in a delta round — anchored, unanchored, or hostile prose.
++    for text in ("AC-2 has no test", "the new endpoint has no auth check",
++                 "Unrelated to AC-3, the parser's error handling is weak"):
++        report = parse_verdict(_verdict(_finding(text, file=None)))
++        stands = apply_convergence(
++            report, prior={}, delta_files={"impl.py"}, delta_mode=True)
++        assert stands.findings and not stands.dropped, text
++
++    # In-run same-wording repeat: an attempt in progress, not a carry —
++    # never the stop; the budget ends it.
++    carried = apply_convergence(
++        a, prior={a.findings[0].key: "sha-1"}, delta_files=set(),
++        delta_mode=True)
++    assert carried.findings[0].state == "new"  # red on 95f19d3: carried
++    assert carried.no_progress is False
++
++    # Cross-run repeats still carry (listed, not new) — they always did.
++    cross = apply_convergence(
++        a, prior={a.findings[0].key: None}, delta_files=set(), delta_mode=True)
++    assert cross.findings[0].state == "carried"
++
++    # Integration: a stuck fileless thread runs out, it does not stop.
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.SAME,
++        reviews=(
++            _verdict(_finding("AC-1 has no test", file=None)),
++            _verdict(_finding("AC-1 has no test", file=None)),
++            _verdict(_finding("AC-1 has no test", file=None)),
++        ),
++    )
++    result = env.run(seats)
++    assert result.outcome == "needs_human"
++    assert result.escalation == "attempts_exhausted"  # red on 95f19d3: converging
++
++
++# --- owner review round 3 (PR #35; 9 findings on 95f19d3 — anchoring reverted) --
++
++
++def test_review18_a_different_defect_on_the_same_ac_is_not_a_carry(tmp_path: Path):
++    """Finding 1: AC-keyed fileless repeats carried after a real fix
++    attempt — the finding-3 bug for contract-level findings. With wording
++    keys restored, 'AC-2's test asserts the wrong value' after 'AC-2 has
++    no test' is a new thread, not a carry of the old one."""
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.MOVING,  # the implementer works on it every round
++        reviews=(
++            _verdict(_finding("AC-2 has no test", file=None)),
++            _verdict(_finding("AC-2's test asserts the wrong value", file=None)),
++            _verdict(_finding("AC-2's test asserts the wrong value", file=None)),
++        ),
++    )
++    result = env.run(seats)
++    assert result.outcome == "needs_human"
++    assert result.escalation == "attempts_exhausted"  # red on 95f19d3: converging
++    assert len(seats.prompts("reviewer")) == 3
++    assert env.report(2)["L2"]["findings"][0]["state"] == "new"
++
++
++def test_review19_an_unanchored_fileless_blocker_does_not_flip_a_pass(tmp_path: Path):
++    """Finding 2: the anchoring undid round-1 finding 7 — a declared pass
++    whose only blocker is a fileless finding with no AC id was dropped
++    and the PR opened. Never dropping fileless findings is restored."""
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.MOVING,
++        reviews=(
++            _verdict(_finding("wrong value", file="impl.py")),
++            _verdict(
++                _finding("the new endpoint has no auth check", file=None),
++                declared="pass"),
++        ),
++    )
++    result = env.run(seats)
++    # Red on 95f19d3: the drop flipped the verdict and the PR opened.
++    assert result.outcome == "needs_human"
++    assert result.escalation == "attempts_exhausted"
++    second = env.report(2)["L2"]
++    assert second["findings"] and second["verdict"] == "fail"
++    assert not second["dropped"]
++    assert env.prs == []
++
++
++def test_review20_mentioning_an_ac_changes_nothing(tmp_path: Path):
++    """Finding 3: `_AC_REF` over free text let any mention of an AC id
++    bypass the drop rule and merge threads. With the anchoring gone, an
++    AC id in prose is just wording: no bypass (nothing fileless is
++    dropped anyway) and no thread merging (wording keys)."""
++    # 'Unrelated to AC-3, the parser is weak' is NOT the thread 'AC-3 is
++    # untested' — different wording, different key.
++    a = parse_verdict(_verdict(_finding("AC-3 is untested", file=None)))
++    b = parse_verdict(_verdict(
++        _finding("Unrelated to AC-3, the parser's error handling is weak",
++                 file=None)))
++    assert a.findings[0].key != b.findings[0].key
++    # And both stand in a delta round, mention or no mention.
++    for report in (a, b):
++        stands = apply_convergence(
++            report, prior={}, delta_files={"impl.py"}, delta_mode=True)
++        assert stands.findings and not stands.dropped
++
++
++def test_review21_an_l0l1_failed_round_keeps_the_open_l2_findings(tmp_path: Path):
++    """Finding 6 (orchestrator): when L0/L1 fail a round, L2 never runs
++    and the fix list lost the last valid review's findings — while the
++    next reviewer was still told 'do not re-raise' them. The same
++    substitution a failed review gets."""
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.MOVING,
++        reviews=(
++            _verdict(_finding("wrong value", file="impl.py")),
++            _verdict(),  # (review 2 never runs: round 2 breaks the contract test)
++            _verdict(),  # round 3 passes: PR opens
++        ),
++    )
++    base_call = seats.__call__
++
++    def breaker(seat, prompt, run_dir, profile, **kwargs):
++        if seat != "implementer":
++            return base_call(seat, prompt, run_dir, profile, **kwargs)
++        seats.calls.append((seat, prompt, Path(run_dir), kwargs))
++        round_no = sum(1 for s, *_ in seats.calls if s == "implementer")
++        answer = 41 if round_no == 2 else 42  # round 2 breaks the test: L1 fail
++        (Path(run_dir) / "impl.py").write_text(
++            f"def answer():\n    return {answer}  # r{round_no}\n")
++        (Path(run_dir) / "tests" / "test_feature.py").write_text(TEST_SOURCE)
++        return SessionRecord(seat=seat, status="completed", num_turns=3,
++                             model="stub-model", result="done")
++
++    result = env.run(breaker)
++    assert result.outcome == "pr_opened"
++    fix3 = _fix_section(seats.prompts("implementer")[2])
++    assert "wrong value" in fix3, (
++        "the open L2 finding vanished from the fix list after a round L2 "
++        "never ran"
++    )
++
++
++def test_review22_an_unreviewed_round_is_announced_to_the_implementer(tmp_path: Path):
++    """Finding 7: after an unparseable review, the implementer was never
++    told this round's change went unreviewed — the fix list replayed the
++    older findings as if nothing happened."""
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.MOVING,
++        reviews=(
++            _verdict(_finding("wrong value", file="impl.py")),
++            "not verdict json at all",  # round 2's change goes unreviewed
++            _verdict(),  # round 3 passes: PR opens
++        ),
++    )
++    result = env.run(seats)
++    assert result.outcome == "pr_opened"
++    fix3 = _fix_section(seats.prompts("implementer")[2])
++    assert "was not reviewed" in fix3
++    assert "do not assume it was accepted" in fix3
++
++
++def test_review23_dropped_text_is_fenced_not_just_flattened(tmp_path: Path):
++    """Finding 9: flattening removed newlines but left live markdown/HTML —
++    '<!--' opened an HTML comment GitHub renders as hiding everything
++    after it (JSON report, How to revert), and links planted in front of
++    the merger, while check_pr_body's raw regex still passed. The dropped
++    list is fenced like the implementer's notes."""
++    payload = ("<!-- everything below is hidden " 
++               "[see fix](https://evil.example)")
++    env = Env(tmp_path)
++    seats = Scripted(
++        impls=Scripted.MOVING,
++        reviews=(
++            _verdict(_finding("wrong value", file="impl.py")),
++            _verdict(  # declared pass; the dropped finding carries the payload
++                _finding("pre-existing oddity " + payload,
++                         file="tests/test_base.py"),
++                declared="pass"),
++        ),
++    )
++    result = env.run(seats)
++    assert result.outcome == "pr_opened"
++    body = env.prs[0].body
++    # The dropped list rides inside a text fence: the payload is visible
++    # as literal text, inert as markdown/HTML.
++    validator = body.split("## Validator report", 1)[1].split("\n## ", 1)[0]
++    assert "```text" in validator
++    fenced = validator.split("```text", 1)[1].split("```", 1)[0]
++    assert payload in fenced
++    # And the raw regex gate still sees exactly one of each section.
++    assert len(re.findall(r"^## How to revert$", body, re.M)) == 1

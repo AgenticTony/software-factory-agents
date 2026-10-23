@@ -1,0 +1,28 @@
+diff --git a/tests/test_f10.py b/tests/test_f10.py
+index 9098c64..4f1a19b 100644
+--- a/tests/test_f10.py
++++ b/tests/test_f10.py
+@@ -839,16 +839,22 @@ def test_ac_12_killed_run_is_cleaned_by_next_loop(tmp_path: Path):
+     script.write_text(textwrap.dedent(
+         f"""
+         import os, signal, sys
++        from datetime import datetime
+         from pathlib import Path
++        from zoneinfo import ZoneInfo
+         sys.path.insert(0, {str(REPO_ROOT)!r})
+         from factory.orchestrator import run_once
+ 
++        # Fixed off-peak clock: on the real clock a weekday morning falls in the
++        # default peak window, so no session would start and nothing gets killed.
++        OFF_PEAK = datetime(2026, 10, 18, 15, 0, tzinfo=ZoneInfo("Europe/Stockholm"))
++
+         def seat(seat, prompt, run_dir, profile, **kwargs):
+             Path({str(marker)!r}).write_text(str(run_dir))
+             os.kill(os.getpid(), signal.SIGKILL)  # killed mid-session
+ 
+         run_once(Path({str(env.queue_path)!r}), factory_root=Path({str(env.root)!r}),
+-                 session_runner=seat, open_pr=lambda pr: "never")
++                 session_runner=seat, open_pr=lambda pr: "never", now=lambda: OFF_PEAK)
+         """
+     ))
+     proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)

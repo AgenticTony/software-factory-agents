@@ -1,0 +1,494 @@
+diff --git a/.factory/BOOTSTRAP.md b/.factory/BOOTSTRAP.md
+index 68ad9e8..148d1fe 100644
+--- a/.factory/BOOTSTRAP.md
++++ b/.factory/BOOTSTRAP.md
+@@ -15,6 +15,17 @@ Entries record evidence, not claims. Each criterion is marked proven, pending, o
+   - Review fixes on `fix/f01-review`.
+ - **Built:** 2026-10-16. Interactive session, then a code review (10 findings) the same day.
+ - **AC-1** proven: `tests/test_f01.py::test_ac_1` passes locally.
+-- **AC-2** proven: the CI `test` job passed on [PR #1](https://github.com/AgenticTony/software-factory-agents/pull/1) (ruff + pytest, Python 3.12). The review changed CI to a 3.11 + 3.13 matrix, so the fix PR's CI run must also pass before reconcile.
++- **AC-2** proven: the CI `test` job passed on [PR #1](https://github.com/AgenticTony/software-factory-agents/pull/1) (ruff + pytest, Python 3.12), and again on the review-fix [PR #2](https://github.com/AgenticTony/software-factory-agents/pull/2) under the 3.11 + 3.13 matrix (all checks SUCCESS; merged).
+ - **AC-3** proven: `tests/test_f01.py::test_ac_3` passes locally.
+-- **Status to set at reconcile:** `done` once the fix PR's CI is green and you merge it. There's no deploy target, so L4 doesn't apply.
++- **Status to set at reconcile:** `done`. AC-2's matrix-CI contingency cleared with PR #2's green run and merge; no deploy target, so L4 doesn't apply.
++
++---
++
++## F-02 — Contract loading and validation
++
++- **Commits:** `f-02/contract-loading` → [PR #4](https://github.com/AgenticTony/software-factory-agents/pull/4). First push drew 10 review findings (test names not matching contract refs; two inputs crashed instead of raising ContractError — unhashable `kind`, missing file; ledger not updated); all fixed on the same PR.
++- **Built:** 2026-10-16. Interactive session, red-first (suite failed on the missing `factory.contract` module before implementation), then a code review the same day.
++- **AC-1** proven: `tests/test_f02.py::test_ac_1` passes — the four named rejections, each with a task-named readable error. Crash paths from the review are covered by `test_missing_and_malformed_files_are_refused_not_raised` and `test_unhashable_field_values_are_refused_not_crashed`.
++- **AC-2** proven: `tests/test_f02.py::test_ac_2` passes — order-insensitive, change-sensitive, exact SHA-256/canonical-JSON formula.
++- **AC-3** proven: `tests/test_f02.py::test_ac_3` passes — the real `tasks.json` loads and validates; uniqueness/prefix asserted, contents deliberately not pinned.
++- **Status to set at reconcile:** `done` once PR #4's CI is green and you merge it. No deploy target, so L4 doesn't apply.
+diff --git a/.gitignore b/.gitignore
+index b0dad17..93cc203 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -12,6 +12,7 @@ dist/
+ 
+ # Session/agent tooling — never part of the factory
+ .remember/
++.superstack/
+ .v2c/
+ .video_agent/
+ out/
+diff --git a/factory/contract.py b/factory/contract.py
+new file mode 100644
+index 0000000..041baea
+--- /dev/null
++++ b/factory/contract.py
+@@ -0,0 +1,243 @@
++"""Contract loading and validation (F-02).
++
++The factory refuses to operate on state it cannot trust. Every load of
++``tasks.json`` or ``project.yaml`` is checked twice: first against the
++semantic rules the queue depends on (readable, task-named messages), then
++against the JSON Schemas as the general backstop. The schemas are the
++authoritative rule set; the semantic layer is a readable front-end that
++mirrors the subset needing human-readable messages and must stay
++scope-matched to them (see the mirror notes below).
++
++Any failure — unreadable file, bad parse, semantic violation, schema
++violation — raises ContractError with a message a human can act on.
++"""
++
++import functools
++import hashlib
++import json
++from pathlib import Path
++from typing import Any
++
++import jsonschema
++import yaml
++from jsonschema.exceptions import best_match
++
++SCHEMA_DIR = Path(__file__).resolve().parent.parent / "schema"
++
++# Kinds the factory never executes (TASK-CONTRACT §2).
++# MIRRORS the schema's task allOf rule 3 (non-executable kinds limited to
++# these statuses). Keep both in sync.
++NON_EXECUTABLE_KINDS = {"decision", "research", "owner_only"}
++NON_EXECUTABLE_STATUSES = {"draft", "not_buildable", "done"}
++
++# Statuses that require a frozen contract. MIRRORS the schema's task allOf
++# rule 2 (post-approval statuses require acceptance_hash + approved_at).
++# Keep both in sync.
++POST_APPROVAL_STATUSES = {
++    "ready",
++    "in_progress",
++    "in_review",
++    "deploying",
++    "awaiting_owner",
++    "done",
++}
++
++
++class ContractError(Exception):
++    """Invalid contract state. The message is written for humans."""
++
++
++def canonical_json(value: Any) -> str:
++    """Canonicalise to the hashing form.
++
++    Args:
++        value: Any JSON-serialisable value.
++
++    Returns:
++        Canonical JSON string: sorted keys, no whitespace.
++    """
++    return json.dumps(value, sort_keys=True, separators=(",", ":"))
++
++
++def acceptance_hash(acceptance: list) -> str:
++    """Hash a task's acceptance list.
++
++    Frozen at spec approval (F-04); any later edit to the acceptance text
++    changes the hash and sends the task back to draft (F-03).
++
++    Args:
++        acceptance: The task's ``acceptance`` list.
++
++    Returns:
++        Hex SHA-256 digest of the canonical JSON of ``acceptance``.
++    """
++    return hashlib.sha256(canonical_json(acceptance).encode("utf-8")).hexdigest()
++
++
++def _field(task: dict, key: str) -> Any:
++    """Read a task field only when it is a string.
++
++    Non-string values are returned as None so set membership and equality
++    checks below never crash on unhashable input; the schema then describes
++    the actual type error.
++    """
++    value = task.get(key)
++    return value if isinstance(value, str) else None
++
++
++def _check_semantics(tasks: Any, origin: str) -> None:
++    """Readable front-end for the schema rules the queue depends on.
++
++    Runs before schema validation so the named failure cases get task-specific
++    messages instead of jsonschema's. Non-list/non-dict shapes are left to
++    the schema, which reports them with structure.
++
++    Args:
++        tasks: The parsed ``tasks`` array.
++        origin: File name for error messages.
++
++    Raises:
++        ContractError: On the first semantic violation found.
++    """
++    if not isinstance(tasks, list):
++        return
++    for task in tasks:
++        if not isinstance(task, dict):
++            continue
++        tid = task.get("id")
++        tid = tid if isinstance(tid, str) else "<missing id>"
++        risk = task.get("risk")
++        gates = task.get("gates") if isinstance(task.get("gates"), dict) else {}
++
++        if risk and gates.get("merge") == "auto":
++            raise ContractError(
++                f"{origin}: task {tid} has risk flags {risk} but gates.merge=auto; "
++                "any risk flag forces human merge (TASK-CONTRACT §2)"
++            )
++        kind = _field(task, "kind")
++        status = _field(task, "status")
++        if kind in NON_EXECUTABLE_KINDS and status not in NON_EXECUTABLE_STATUSES:
++            shown = status if status is not None else "<missing>"
++            allowed = ", ".join(sorted(NON_EXECUTABLE_STATUSES))
++            raise ContractError(
++                f"{origin}: task {tid} is kind={kind} but status={shown}; "
++                f"{kind} tasks are never executable — allowed statuses: {allowed}"
++            )
++        if status in POST_APPROVAL_STATUSES:
++            missing = [k for k in ("acceptance_hash", "approved_at") if not task.get(k)]
++            if missing:
++                raise ContractError(
++                    f"{origin}: task {tid} is {status} but has no {' or '.join(missing)}; "
++                    "approve the spec first so the contract is frozen (factory approve)"
++                )
++
++
++def _read(path: Path, origin: str) -> str:
++    """Read a file, refusing unreadable/non-UTF-8 input.
++
++    Args:
++        path: File to read.
++        origin: File name for error messages.
++
++    Returns:
++        The file's text.
++
++    Raises:
++        ContractError: If the file is missing, unreadable, or not UTF-8.
++    """
++    try:
++        return path.read_text()
++    except OSError as exc:
++        raise ContractError(f"{origin}: cannot read file: {exc}") from exc
++    except UnicodeDecodeError as exc:
++        raise ContractError(f"{origin}: file is not valid UTF-8: {exc}") from exc
++
++
++@functools.lru_cache(maxsize=None)
++def _validator(schema_path: Path) -> jsonschema.Draft202012Validator:
++    """Build (once) the validator for a schema file.
++
++    Args:
++        schema_path: Path to the JSON Schema file.
++
++    Returns:
++        A cached validator for that schema.
++
++    Raises:
++        ContractError: If the schema file is missing, unreadable, or not JSON.
++    """
++    try:
++        schema = json.loads(_read(schema_path, str(schema_path)))
++    except json.JSONDecodeError as exc:
++        raise ContractError(f"schema {schema_path} is not valid JSON: {exc}") from exc
++    return jsonschema.Draft202012Validator(schema)
++
++
++def _validate(instance: Any, schema_path: Path, origin: str) -> None:
++    """Validate against a schema, raising the most relevant error.
++
++    Args:
++        instance: Parsed document to check.
++        schema_path: Path to the JSON Schema file.
++        origin: File name for error messages.
++
++    Raises:
++        ContractError: On the first (most relevant) schema violation.
++    """
++    error = best_match(_validator(schema_path).iter_errors(instance))
++    if error is not None:
++        loc = "/".join(str(part) for part in error.absolute_path) or "<root>"
++        raise ContractError(f"{origin}: schema violation at {loc}: {error.message}")
++
++
++def load_tasks(path: Path | str, schema_path: Path | None = None) -> dict:
++    """Load and fully validate a tasks.json queue.
++
++    Args:
++        path: Path to the queue file (e.g. ``.factory/tasks.json``).
++        schema_path: Optional override for the tasks schema path.
++
++    Returns:
++        The parsed queue document.
++
++    Raises:
++        ContractError: If the file is unreadable or not JSON, semantically
++            invalid, or schema-invalid.
++    """
++    path = Path(path)
++    origin = str(path)
++    try:
++        data = json.loads(_read(path, origin))
++    except json.JSONDecodeError as exc:
++        raise ContractError(f"{origin}: invalid JSON: {exc}") from exc
++    _check_semantics(data.get("tasks") if isinstance(data, dict) else None, origin)
++    _validate(data, schema_path or SCHEMA_DIR / "tasks.schema.json", origin)
++    return data
++
++
++def load_profile(path: Path | str, schema_path: Path | None = None) -> dict:
++    """Load and fully validate a project.yaml profile.
++
++    Args:
++        path: Path to the profile file (e.g. ``.factory/project.yaml``).
++        schema_path: Optional override for the profile schema path.
++
++    Returns:
++        The parsed profile mapping.
++
++    Raises:
++        ContractError: If the file is unreadable or not YAML, not a mapping,
++            or schema-invalid.
++    """
++    path = Path(path)
++    origin = str(path)
++    try:
++        data = yaml.safe_load(_read(path, origin))
++    except yaml.YAMLError as exc:
++        raise ContractError(f"{origin}: invalid YAML: {exc}") from exc
++    if not isinstance(data, dict):
++        raise ContractError(
++            f"{origin}: profile must be a YAML mapping, got {type(data).__name__}"
++        )
++    _validate(data, schema_path or SCHEMA_DIR / "project.schema.json", origin)
++    return data
+diff --git a/tests/test_f02.py b/tests/test_f02.py
+new file mode 100644
+index 0000000..9fce1db
+--- /dev/null
++++ b/tests/test_f02.py
+@@ -0,0 +1,203 @@
++"""F-02 acceptance tests — BUILD-ORDER.md, work order F-02.
++
++Contract rule (CLAUDE.md): an acceptance ref ``tests/test_f02.py::test_ac_N``
++means a test function with exactly that name. The extra descriptive tests
++below cover paths the acceptance refs don't name.
++"""
++
++import copy
++import hashlib
++import json
++from pathlib import Path
++
++import pytest
++
++from factory.contract import ContractError, acceptance_hash, load_profile, load_tasks
++
++REPO = Path(__file__).resolve().parent.parent
++
++
++def _task(**overrides):
++    base = {
++        "id": "T-1",
++        "title": "fixture task",
++        "source": "docs/fixture.md#t-1",
++        "kind": "build",
++        "priority": "P1",
++        "status": "draft",
++        "depends_on": [],
++        "risk": [],
++        "gates": {"spec_approval": True, "merge": "human", "deploy": "human"},
++        "acceptance": [
++            {
++                "id": "AC-1",
++                "text": "it works",
++                "check": {"type": "test", "ref": "tests/x.py::test_works"},
++            }
++        ],
++        "budget": {"size": "S", "max_attempts": 3, "max_turns": 80, "wall_clock_min": 60},
++    }
++    base.update(overrides)
++    return base
++
++
++def _tasks_file(tmp_path, tasks):
++    path = tmp_path / "tasks.json"
++    path.write_text(json.dumps({"version": 1, "project": "fixture", "tasks": tasks}))
++    return path
++
++
++def test_ac_1(tmp_path):
++    # a risk-flagged task with merge: auto
++    path = _tasks_file(
++        tmp_path,
++        [
++            _task(
++                id="T-RISK",
++                risk=["deploy"],
++                gates={"spec_approval": True, "merge": "auto", "deploy": "human"},
++            )
++        ],
++    )
++    with pytest.raises(ContractError, match=r"T-RISK.*risk.*human"):
++        load_tasks(path)
++
++    # a decision task in ready
++    path = _tasks_file(
++        tmp_path,
++        [
++            _task(
++                id="T-DEC",
++                kind="decision",
++                status="ready",
++                acceptance_hash="x" * 64,
++                approved_at="2026-10-16T00:00:00Z",
++            )
++        ],
++    )
++    with pytest.raises(ContractError, match=r"T-DEC.*decision.*ready"):
++        load_tasks(path)
++
++    # a ready task without acceptance_hash
++    path = _tasks_file(tmp_path, [_task(id="T-NOHASH", status="ready")])
++    with pytest.raises(ContractError, match=r"T-NOHASH.*acceptance_hash"):
++        load_tasks(path)
++
++    # an invalid YAML profile
++    profile = tmp_path / "project.yaml"
++    profile.write_text("name: [unclosed\n  bad")
++    with pytest.raises(ContractError, match="invalid YAML"):
++        load_profile(profile)
++
++
++def test_ac_2():
++    item = {
++        "id": "AC-1",
++        "text": "it works",
++        "check": {"type": "test", "ref": "tests/x.py::test_works"},
++    }
++    reordered = {
++        "check": {"ref": "tests/x.py::test_works", "type": "test"},
++        "text": "it works",
++        "id": "AC-1",
++    }
++    assert acceptance_hash([item]) == acceptance_hash([reordered])
++
++    changed = copy.deepcopy(item)
++    changed["text"] = "it works differently"
++    assert acceptance_hash([item]) != acceptance_hash([changed])
++
++    expected = hashlib.sha256(
++        json.dumps([item], sort_keys=True, separators=(",", ":")).encode()
++    ).hexdigest()
++    assert acceptance_hash([item]) == expected
++
++
++def test_ac_3(tmp_path):
++    data = load_tasks(REPO / ".factory" / "tasks.json")
++    ids = [t["id"] for t in data["tasks"]]
++    # The queue validates and parses as ours; contents are not pinned, so
++    # adding or reordering work orders doesn't redden a validation test.
++    assert ids, "queue must not be empty"
++    assert len(set(ids)) == len(ids), "task ids must be unique"
++    assert all(i.startswith("F-") for i in ids), f"unexpected ids: {ids}"
++
++
++def test_missing_and_malformed_files_are_refused_not_raised(tmp_path):
++    # missing tasks.json / profile
++    with pytest.raises(ContractError, match="cannot read"):
++        load_tasks(tmp_path / "absent-tasks.json")
++    with pytest.raises(ContractError, match="cannot read"):
++        load_profile(tmp_path / "absent-profile.yaml")
++
++    # non-UTF-8 bytes
++    binary = tmp_path / "binary.json"
++    binary.write_bytes(b"\xff\xfe\x00bad")
++    with pytest.raises(ContractError, match="not valid UTF-8"):
++        load_tasks(binary)
++
++    # top-level JSON list instead of the queue object
++    listing = tmp_path / "list.json"
++    listing.write_text(json.dumps(["not", "a", "queue"]))
++    with pytest.raises(ContractError, match="schema violation"):
++        load_tasks(listing)
++
++    # empty YAML file (parses to None, not a mapping)
++    empty = tmp_path / "empty.yaml"
++    empty.write_text("")
++    with pytest.raises(ContractError, match="must be a YAML mapping"):
++        load_profile(empty)
++
++
++def test_unhashable_field_values_are_refused_not_crashed(tmp_path):
++    # a list where a string enum belongs — must be a readable refusal,
++    # never a TypeError from the semantic pass
++    path = _tasks_file(tmp_path, [_task(id="T-KIND", kind=["build"])])
++    with pytest.raises(ContractError, match="kind"):
++        load_tasks(path)
++
++    path = _tasks_file(tmp_path, [_task(id="T-STATUS", status=["ready"])])
++    with pytest.raises(ContractError, match="status"):
++        load_tasks(path)
++
++    # task entry that is not an object at all
++    path = _tasks_file(tmp_path, [["not", "a", "task"]])
++    with pytest.raises(ContractError, match="schema violation"):
++        load_tasks(path)
++
++
++def test_post_approval_statuses_all_require_hash(tmp_path):
++    # The semantic layer must mirror the schema's full rule: ready is only
++    # the first of the statuses that require a frozen contract.
++    for status in ["in_progress", "in_review", "deploying", "awaiting_owner", "done"]:
++        path = _tasks_file(tmp_path, [_task(id=f"T-{status}", status=status)])
++        with pytest.raises(ContractError, match="acceptance_hash"):
++            load_tasks(path)
++
++
++def test_post_approval_statuses_also_require_approved_at(tmp_path):
++    # Mirrors the schema's full rule: hash AND approved_at, not just the hash.
++    path = _tasks_file(
++        tmp_path, [_task(id="T-NOAPPROVAL", status="ready", acceptance_hash="x" * 64)]
++    )
++    with pytest.raises(ContractError, match=r"T-NOAPPROVAL.*approved_at"):
++        load_tasks(path)
++
++
++def test_non_executable_message_names_every_allowed_status(tmp_path):
++    path = _tasks_file(
++        tmp_path,
++        [
++            _task(
++                id="T-RES",
++                kind="research",
++                status="in_progress",
++                acceptance_hash="x" * 64,
++                approved_at="2026-10-16T00:00:00Z",
++            )
++        ],
++    )
++    with pytest.raises(ContractError) as exc:
++        load_tasks(path)
++    for allowed in ("draft", "not_buildable", "done"):
++        assert allowed in str(exc.value)

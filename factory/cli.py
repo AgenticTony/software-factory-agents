@@ -1,8 +1,9 @@
 """Factory CLI — the control-plane entry point.
 
-``approve`` (F-04), ``run`` and ``loop`` (F-10), ``tick`` (F-29) and
-``trace`` (F-30) are real. Every other subcommand is a stub naming the
-work order that implements it (BUILD-ORDER.md).
+``approve`` (F-04), ``run`` and ``loop`` (F-10), ``tick`` (F-29),
+``trace`` (F-30) and ``sentinels replay`` (F-33) are real. Every other
+subcommand is a stub naming the work order that implements it
+(BUILD-ORDER.md).
 """
 
 import argparse
@@ -23,6 +24,7 @@ from factory.orchestrator import run_loop, run_once
 from factory.prbody import PRBodyError
 from factory.progress import ProgressLogError
 from factory.publish import PublishError, PushRefused
+from factory.replay import ReplayError, replay_lines, resolve_replay_files
 from factory.runs import FACTORY_ROOT_DEFAULT, RUN_ID_RE, RunError
 from factory.sandbox import SandboxError
 from factory.session import SessionConfigError
@@ -114,6 +116,21 @@ def build_parser() -> argparse.ArgumentParser:
                             "(default: %(default)s)")
     trace.add_argument("--factory-root", default=None,
                        help="factory root (default: ~/factory)")
+
+    sentinels = sub.add_parser(
+        "sentinels", help="built-in sentinel utilities")
+    sent_sub = sentinels.add_subparsers(dest="sentinels_command", required=True)
+    replay = sent_sub.add_parser(
+        "replay", help="run the built-in sentinels over corpus diffs (F-33)")
+    replay.add_argument(
+        "--corpus", choices=["benign", "attack"],
+        help="replay every patch under corpus/<name>/ of the profile's repo")
+    replay.add_argument(
+        "patches", nargs="*",
+        help="explicit patch files (mutually exclusive with --corpus)")
+    replay.add_argument("--queue", default=".factory/tasks.json",
+                        help="queue path; the profile is read from next to "
+                             "it (default: %(default)s)")
 
     for name, text in (
         ("run", "pick the next ready task and take it to a PR (F-10)"),
@@ -230,6 +247,27 @@ def _run_trace(args: argparse.Namespace) -> int:
         return 130
 
 
+def _run_sentinels_replay(args: argparse.Namespace) -> int:
+    """Dispatch the sentinels replay subcommand (F-33 AC-4). It reads
+    only; misuse, a missing corpus and a missing patch exit 1 with a
+    message, never a traceback."""
+    if args.corpus and args.patches:
+        print(
+            "factory sentinels replay: give --corpus or patch files, not both",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        profile = load_profile(Path(args.queue).parent / "project.yaml")
+        entries = resolve_replay_files(profile, args.corpus, args.patches)
+        for line in replay_lines(profile, entries):
+            print(line)
+        return 0
+    except (ContractError, ReplayError, OSError) as exc:
+        print(f"factory sentinels replay: {exc}", file=sys.stderr)
+        return 1
+
+
 def _run_extra(result) -> str:
     """The detail printed after a run's outcome.
 
@@ -312,6 +350,8 @@ def main(argv: list | None = None) -> int:
         return _run_tick(args)
     if args.command == "trace":
         return _run_trace(args)
+    if args.command == "sentinels":
+        return _run_sentinels_replay(args)
     print(
         f"factory {args.command}: not implemented yet (scheduled in {STUBS[args.command]})",
         file=sys.stderr,

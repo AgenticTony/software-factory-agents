@@ -1,0 +1,339 @@
+diff --git a/.factory/tasks.json b/.factory/tasks.json
+index e1365b2..05e2cd6 100644
+--- a/.factory/tasks.json
++++ b/.factory/tasks.json
+@@ -1826,7 +1826,9 @@
+         "F-24",
+         "F-25",
+         "F-26",
+-        "F-29"
++        "F-29",
++        "F-30",
++        "F-33"
+       ],
+       "risk": [],
+       "gates": {
+@@ -1938,6 +1940,310 @@
+       "acceptance_hash": "9f40c80d308231bd69d4f8652d403ac212b7a72f66414c815e6e3de267d0770b",
+       "approved_at": "2026-10-19T10:12:08Z",
+       "approved_by": "Anthony"
++    },
++    {
++      "id": "F-30",
++      "title": "Run trace: live event log per run",
++      "source": "BUILD-ORDER.md#f-30--run-trace-live-event-log-per-run",
++      "kind": "build",
++      "priority": "P1",
++      "status": "draft",
++      "depends_on": [
++        "F-06",
++        "F-07",
++        "F-08",
++        "F-10",
++        "F-25"
++      ],
++      "risk": [
++        "factory_control"
++      ],
++      "gates": {
++        "spec_approval": true,
++        "merge": "human",
++        "deploy": "human"
++      },
++      "acceptance": [
++        {
++          "id": "AC-1",
++          "text": "The orchestrator appends one event per line to `<factory_root>/trace/<project>/<run-id>.jsonl`, outside every clone and outside the sandbox's write allowlist (a test asserts the path is not writable from a session). Event types: `phase_start`/`phase_end` for setup, implementer, L0, L1, L2 and publish; `tool_call` (seat, tool name, args, result snippet, ok, started/ended); `gate_check` (layer, item, ok, note); `session_end` (seat, tokens by component, cost, turns, model). Every event carries run id, task id, attempt number and a sequence number.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f30.py::test_ac_1"
++          }
++        },
++        {
++          "id": "AC-2",
++          "text": "Events are written as they happen. A test with a fake SDK stream asserts a `tool_call` line is on disk before the stream yields its `ResultMessage`.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f30.py::test_ac_2"
++          }
++        },
++        {
++          "id": "AC-3",
++          "text": "Gate events carry evidence on pass and on fail: each L0 check, each L1 red/green proof and each L2 finding is one `gate_check` with a note saying what was looked at (one test per layer, both outcomes).",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f30.py::test_ac_3"
++          }
++        },
++        {
++          "id": "AC-4",
++          "text": "Secrets never reach the trace. Args and result snippets are length-capped, and the seat token value plus credential-shaped strings (the F-25 patterns) are replaced with `[redacted]` before the line is written. A test runs a fake tool call whose output contains the seat token and asserts the token appears nowhere in the file.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f30.py::test_ac_4"
++          }
++        },
++        {
++          "id": "AC-5",
++          "text": "Tracing never changes a run. A trace write that fails (disk full, permission) is reported once and the run continues; a test makes every write raise and asserts the attempt record is identical to an untraced run.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f30.py::test_ac_5"
++          }
++        },
++        {
++          "id": "AC-6",
++          "text": "`factory trace <run-id> [--follow]` prints the trace in order, one line per event; `--follow` keeps printing new events until the attempt ends (published, failed or aborted). It reads only.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f30.py::test_ac_6"
++          }
++        },
++        {
++          "id": "AC-7",
++          "text": "Per-phase token totals in the trace sum to the attempt's token totals in `tasks.json` for a fixture run (no second source of truth for spend).",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f30.py::test_ac_7"
++          }
++        }
++      ],
++      "budget": {
++        "size": "M",
++        "max_attempts": 3,
++        "max_turns": 200,
++        "wall_clock_min": 150
++      },
++      "attempts": [],
++      "links": {}
++    },
++    {
++      "id": "F-31",
++      "title": "Read-only dashboard (factory dashboard)",
++      "source": "BUILD-ORDER.md#f-31--read-only-dashboard-factory-dashboard",
++      "kind": "build",
++      "priority": "P2",
++      "status": "draft",
++      "depends_on": [
++        "F-11",
++        "F-30"
++      ],
++      "risk": [],
++      "gates": {
++        "spec_approval": true,
++        "merge": "human",
++        "deploy": "human"
++      },
++      "acceptance": [
++        {
++          "id": "AC-1",
++          "text": "`factory dashboard [--port N]` serves on `127.0.0.1` only (a test asserts the bound address), using the standard library HTTP server and static files shipped in the package. No new dependency.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f31.py::test_ac_1"
++          }
++        },
++        {
++          "id": "AC-2",
++          "text": "The server answers `GET` only; every other method gets 405. A test runs every route against a fixture factory root and asserts no file under it changed (mtime and hash).",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f31.py::test_ac_2"
++          }
++        },
++        {
++          "id": "AC-3",
++          "text": "Queue view: every task grouped by status, with escalation reasons for `needs_human` and the open steps for `awaiting_owner`, read from `tasks.json` after schema validation (invalid state shows an error page, never partial data).",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f31.py::test_ac_3"
++          }
++        },
++        {
++          "id": "AC-4",
++          "text": "Run view: phases as swim lanes on a time axis, tool calls inside each lane, gate checks with their evidence, tokens and cost per phase, from the F-30 trace. A running task updates by polling without a page reload.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f31.py::test_ac_4"
++          }
++        },
++        {
++          "id": "AC-5",
++          "text": "Metrics come from the F-11 functions, not a second implementation: for the F-11 fixture, the dashboard's numbers equal `factory status` output (one test).",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f31.py::test_ac_5"
++          }
++        },
++        {
++          "id": "AC-6",
++          "text": "Paths in the URL are run ids and task ids matched against the schema's id patterns; anything else is a 404. A test asserts `..` and absolute paths cannot read outside the factory root.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f31.py::test_ac_6"
++          }
++        }
++      ],
++      "budget": {
++        "size": "M",
++        "max_attempts": 3,
++        "max_turns": 200,
++        "wall_clock_min": 150
++      },
++      "attempts": [],
++      "links": {}
++    },
++    {
++      "id": "F-32",
++      "title": "Same-session correction",
++      "source": "BUILD-ORDER.md#f-32--same-session-correction",
++      "kind": "build",
++      "priority": "P2",
++      "status": "draft",
++      "depends_on": [
++        "F-23",
++        "F-30"
++      ],
++      "risk": [
++        "factory_control"
++      ],
++      "gates": {
++        "spec_approval": true,
++        "merge": "human",
++        "deploy": "human"
++      },
++      "acceptance": [
++        {
++          "id": "AC-1",
++          "text": "After an L0 or L1 failure, the orchestrator resumes the implementer's session by id and sends the numbered findings (same format as the progress log), up to `budget.max_corrections` per attempt (schema field, default 2, red-first). The resumed session runs in the same clone under the same sandbox settings as the first turn; a test asserts the settings file and run dir are unchanged between turns. Corrections count against the attempt's `max_turns` and wall clock.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f32.py::test_ac_1"
++          }
++        },
++        {
++          "id": "AC-2",
++          "text": "It falls back to today's fresh session plus progress log when the session cannot be resumed, its budget is spent, or the failure is in L2. A test covers each fallback reason and asserts the progress log gets the same entries either way.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f32.py::test_ac_2"
++          }
++        },
++        {
++          "id": "AC-3",
++          "text": "L2 never runs in a resumed implementer session: a test asserts the reviewer seat always starts fresh with its own options.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f32.py::test_ac_3"
++          }
++        },
++        {
++          "id": "AC-4",
++          "text": "The attempt record and the F-30 trace carry each correction (number, findings sent, tokens spent), so F-11 can compare tokens per merged PR before and after this WO.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f32.py::test_ac_4"
++          }
++        },
++        {
++          "id": "AC-5",
++          "text": "Resumed context and correction evidence never come from a file the session can write. The SDK session transcript lives under the session's writable HOME scratch (`<run_dir>/.home/.claude/projects/…/<session-id>.jsonl`; checked 2026-10-21 by running the CLI with a throwaway `HOME`), so the orchestrator copies it outside the sandbox write allowlist when each turn ends, and resumes only from that copy (or rebuilds from the F-30 trace). A test edits the in-sandbox transcript between turns and asserts the resumed session doesn't see the edit. F-19 AC-4 reads transcripts from the same copy.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f32.py::test_ac_5"
++          }
++        }
++      ],
++      "budget": {
++        "size": "M",
++        "max_attempts": 3,
++        "max_turns": 200,
++        "wall_clock_min": 150
++      },
++      "attempts": [],
++      "links": {}
++    },
++    {
++      "id": "F-33",
++      "title": "Sentinel false-positive corpus",
++      "source": "BUILD-ORDER.md#f-33--sentinel-false-positive-corpus",
++      "kind": "build",
++      "priority": "P1",
++      "status": "draft",
++      "depends_on": [
++        "F-25"
++      ],
++      "risk": [
++        "factory_control"
++      ],
++      "gates": {
++        "spec_approval": true,
++        "merge": "human",
++        "deploy": "human"
++      },
++      "acceptance": [
++        {
++          "id": "AC-1",
++          "text": "A benign corpus of at least 20 real merged diffs (this repo's merged PRs, stored as patch files named by PR number) on which every built-in sentinel passes: zero findings across the corpus.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f33.py::test_ac_1"
++          }
++        },
++        {
++          "id": "AC-2",
++          "text": "An attack corpus with at least one diff per built-in sentinel that the sentinel flags, kept separate from the F-25 AC-3 seed fixtures (separate files, written fresh), so tuning a pattern to its own seed can't hide a regression.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f33.py::test_ac_2"
++          }
++        },
++        {
++          "id": "AC-3",
++          "text": "CI runs every built-in sentinel over both corpora on every PR. A sentinel in `BUILTIN_SENTINELS` with no attack diff, a hit on a benign diff, or a missed attack fails the run, naming the sentinel and the corpus file.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f33.py::test_ac_3"
++          }
++        },
++        {
++          "id": "AC-4",
++          "text": "`factory sentinels replay [--corpus benign|attack] [<patch> ...]` runs the built-in sentinels over corpus diffs and prints one line per sentinel per diff. It reads only: a test asserts no file under the factory root changes.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f33.py::test_ac_4"
++          }
++        },
++        {
++          "id": "AC-5",
++          "text": "The corpus directory is added to `paths.protected` in this repo's `.factory/project.yaml` (in the same PR), so a session can't edit the evidence that judges its sentinels.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f33.py::test_ac_5"
++          }
++        }
++      ],
++      "budget": {
++        "size": "M",
++        "max_attempts": 3,
++        "max_turns": 200,
++        "wall_clock_min": 150
++      },
++      "attempts": [],
++      "links": {}
+     }
+   ]
+ }
+diff --git a/BUILD-ORDER.md b/BUILD-ORDER.md
+index 9153d2d..c4be414 100644
+--- a/BUILD-ORDER.md
++++ b/BUILD-ORDER.md
+@@ -40,7 +40,7 @@ The factory's own build plan, written in the format the factory will consume: on
+ | **F-25** | Sensitive-path sentinels | 1b | F-07 | factory_control | M |
+ | **F-26** | Merges in order | 1b | F-10 | factory_control | S |
+ | **F-27** | Vent tool | 1b | F-06, F-10 | factory_control | S |
+-| **F-28** | Dogfood pilot: the factory builds its own safe WOs | 1b | F-23, F-24, F-25, F-26, F-29, F-30 | — | owner |
++| **F-28** | Dogfood pilot: the factory builds its own safe WOs | 1b | F-23, F-24, F-25, F-26, F-29, F-30, F-33 | — | owner |
+ | **F-29** | Owner-step tick (`factory tick`) | 1b | F-03, F-04 | factory_control | S |
+ | **F-30** | Run trace: live event log per run | 1b | F-06, F-07, F-08, F-10, F-25 | factory_control | M |
+ | **F-31** | Read-only dashboard (`factory dashboard`) | 1b | F-11, F-30 | — | M |

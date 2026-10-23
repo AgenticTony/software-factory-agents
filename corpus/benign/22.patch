@@ -1,0 +1,3456 @@
+diff --git a/.factory/BOOTSTRAP.md b/.factory/BOOTSTRAP.md
+index b112ce3..5dd3e09 100644
+--- a/.factory/BOOTSTRAP.md
++++ b/.factory/BOOTSTRAP.md
+@@ -313,3 +313,50 @@ Entries record evidence, not claims. Each criterion is marked proven, pending, o
+ - **(2) Scratch symlinks leaked when setup failed** (owner-reproduced, and red here): `_reviewer_scratch` ran before the `try`, so a `build_settings`/`write_settings`/staging failure left `.home`/`.tmp` as links. Scratch creation and the baseline now sit inside the same `try`; the setup and run were extracted into `_run_prepared`. `test_review11_scratch_torn_down_when_setup_fails`.
+ - **(3) The check saw only HEAD and porcelain** (owner code-reading; red here): a new branch or tag, a branch switch onto the same commit, a stash and files written into gitignored paths were invisible. `_GitState` now also records the symbolic HEAD, every ref (`for-each-ref`, stash included) and the individual ignored files (`ls-files -o -i --exclude-standard`). `_restore_workspace` deletes created refs, restores moved ones, re-points HEAD, resets, cleans, and removes only ignored files that are new since the baseline, so a warm cache survives. `test_review11_new_branch_counts_as_mutation`, `test_review11_branch_switch_counts_as_mutation`, `test_review11_ignored_artifact_counts_as_mutation`; `test_review11_quiet_review_with_preexisting_ignored_files_passes` guards against false positives. Also checked on a real `create_run` clone with a 2,000-file warm cache: a quiet review passes in 0.27s, cache intact, status clean.
+ - **Evidence (after round 4):** 58 F-09 tests / 310 total passing locally, ruff clean. No sandbox settings changed (all orchestrator-side git), so the Linux bwrap behaviour from round 2 is unaffected; CI covers Linux.
++
++## F-10 — `factory run` / `factory loop` + PR creation
++
++- **Commits:** `feat/f10-run-loop` → PR (this one). Provenance, recorded honestly: the implementation arrived **uncommitted** in the first F-10 session's worktree (five new modules, five modified, `tests/test_f10.py`); this second session reviewed it module-by-module and verified it (full suite, ruff, AC-by-AC test read) before committing. No intermediate commits exist, so — unlike F-09 — **no red-first run is captured on the branch**; the first recorded execution here was already green, with the 310 pre-F-10 tests unchanged and passing alongside. The suite's per-AC coverage below is what was verified, not what was watched being written. (Superseded at review time: the review round's L1 run — finding 5 below — now pins all 14 refs red on base `e674eef`, `red_reason` `collection`.)
++- **Built:** 2026-10-18.
++- **Design notes:**
++  - **The run (`factory/orchestrator.py`):** reclaim orphans → pick → peak-window check → lease + `in_progress` → clone at the default branch → branch `factory/<slug>-<run_id>` → rounds. A round: implementer session (contract + progress log 1..N in the prompt) → the orchestrator commits the working tree with hardened git (`--no-verify`, factory identity) and **voids the round** (`history_rewritten`) if HEAD no longer descends from the base — the agent owns its clone's history, the orchestrator never pushes a rewrite → fresh clean clone at head → L0 + L1 through the sandboxed runner → L2 reviewer session → FAIL's numbered findings append to the progress log and the next round starts. Escalations per VALIDATOR-SPEC: L0 protected/new-dependency/risk-path hits escalate immediately (`needs_human`, one attempt, most-severe-first); quota/429 **aborts** the attempt (excluded from the budget), re-queues the task and stops the loop; `attempts_exhausted` after `budget.max_attempts` (counted across runs per slice, `aborted` excluded); the wall-clock budget spans a run's implementer+reviewer seconds and escalates `budget_exhausted` rather than starting a session that can't finish. A crashed orchestrator re-queues an `in_progress` task with no recorded outcome (the aborted-run edge), so the queue can't wedge.
++  - **Project commands are untrusted (AC-11):** `factory/gates.py` gained the `CommandRunner` seam; `run_l0`/`run_l1` take `runner=`; the orchestrator passes `sandboxed_runner(clean_run_dir, settings)` — every setup/lint/typecheck/test/test_ref command runs through `run_sandboxed` under F-05 settings for the clean clone, and the runner refuses any repo that isn't its own run dir. The gates' default stays the unconfined `run_command` for fixture tests, documented as such at the seam.
++  - **The push fence (AC-13, `factory/publish.py`):** `push_branch` pushes exactly one ref by explicit `refs/heads/X:refs/heads/X` to the profile's remote **URL** (never a configured remote name, so no `remote.*.push`/mirror config applies), `--no-follow-tags`, no force. It refuses — before any git process starts — the default branch, anything outside the `factory/` namespace, any branch the run didn't create (a `created` set), and anything that isn't a plain branch name (refspec syntax, `+`, `HEAD`, `..`, `.lock`). `gh_pr_create` opens the PR (body via a temp file outside every clone — argv limits and `ps`); the factory never merges (AC-5's grep test pins it). `gates.git` and L1's `cat-file` are hardened too: after F-10, **every** orchestrator-side git call carries `GIT_HARDENING`.
++  - **The PR body (AC-7/8/9/14, `factory/prbody.py`):** six sections — Summary, Evidence, Merge Danger, Contract, Validator report, How to revert — and `check_pr_body` refuses to open a PR missing or duplicating any. Evidence/Door/Blast Radius/How-to-revert are built from validator facts only (L1's per-ref red_reasons on base; risk flags + matched `paths.risk` globs or `contained`; Door `one-way` when the task carries `migration`/`deploy`/`external_service`/`payments`/`privacy`, else `two-way`; per-Door revert text naming each flag a revert can't undo). The implementer's account rides below as inert fenced text; command tails shrink in three passes to fit GitHub's 65,536-char body limit, then the gate still applies.
++  - **The progress log (AC-10, `factory/progress.py`):** one append-only jsonl per task under `<factory_root>/progress/<project>/<task>.jsonl` — outside every clone, fcntl-locked, hash-chained (each entry carries its number and the sha256 of the previous line; there is no edit API). Every new session — re-queued run or future fix round — receives entries 1..N rendered read-only in its prompt; rewriting, dropping or reordering an earlier entry raises on read and on the next append.
++  - **Cleanup (AC-12):** `cleanup_run` runs in `finally` for both run dirs (work clone + each gate clone) on every outcome — PR opened, `needs_human`, quota stop, exception. `reclaim_runs` removes every run dir of the project **under the new `idle_lease`** (no live run can race it; a killed run's dirs are orphans the moment the lease is free) plus stray `-runner`/`-scratch` siblings under `<root>/sandbox/`, at the start of every `run_once` — so `loop` reclaims what a killed run left.
++  - **The peak window (AC-4, `factory/config.py`):** `<factory_root>/config.yaml`, default `Europe/Stockholm` Mon–Fri 08:00–12:00 (end exclusive) — the owner's working hours, from config not code. Checked before the implementer session *and* before the reviewer session (a window reached mid-run stops before the next session and re-queues). Malformed config is a `ConfigError`, not a default: a silently mis-parsed window would spend quota at exactly the wrong hours. DST is real (ZoneInfo; the boundary test crosses Stockholm's fall-back).
++  - **CLI:** `factory run` / `factory loop` are real subcommands. Exit codes: 0 = PR opened / idle / peak window, 1 = `needs_human`, 3 = quota stop, 2 = the orchestrator itself failed (task re-queued, run dirs removed first) — known failures print a message, not a traceback.
++- **AC-1** proven: `tests/test_f10.py::test_ac_1` — full `run` on a fixture repo with a stub seat that makes a correct change: branch pushed, PR opened, task `in_review`, one attempt logged.
++- **AC-2** proven: `test_ac_2` — a stub failing three times → `needs_human` + `attempts_exhausted`, no PR. Extras: a *session* failure counts as a failed attempt (`test_session_failure_counts_as_a_failed_attempt`); attempts already spent in earlier runs count toward the budget (`test_budget_counts_earlier_attempts`); a failing reviewer is retried then exhausts (`test_reviewer_fail_is_retried_then_exhausted`); an L0 escalation stops immediately without burning retries (`test_l0_escalation_stops_immediately`).
++- **AC-3** proven: `test_ac_3` — a 429-named implementer failure stops `loop` (`quota_exhausted`), attempt recorded `aborted`, task re-queued `ready`, no retry; `test_reviewer_quota_also_stops` — the same for a reviewer 429 mid-run.
++- **AC-4** proven: `test_ac_4` — `loop` starts no session inside the window (config-supplied `Europe/Stockholm` hours); `test_peak_window_boundaries_and_dst` — inclusive start, exclusive end, DST-correct across the Stockholm fall-back; `test_bad_config_is_refused` — malformed window → `ConfigError`; `test_peak_window_reached_mid_run_stops_before_next_session` — a window reached between implementer and reviewer stops before the reviewer session.
++- **AC-5** proven: `test_ac_5` — four merge-call patterns (`gh pr merge`, `pr, merge` argv, the REST merge endpoint, `merge --`) find no match across `factory/**/*.py` **and** `prompts/**/*.md`.
++- **AC-6** proven: `test_ac_6` — every attempt carries `prompt_versions` (F-09 seat → assembled-prompt hashes) and `skills`; an attempt without them fails the tasks schema.
++- **AC-7** proven: `test_ac_7` — the opened PR's body has all five AC-7 sections, the real body passes `check_pr_body`, and renaming/removing any section, or appending a forged duplicate, raises before a PR opens.
++- **AC-8** proven: `test_ac_8` — the Evidence section is built from the L1 report: each contract ref shows red on base (with its `red_reason`) and green on head; `test_ac_8_collection_red_reason` — a collection-error red carries its reason through.
++- **AC-9** proven: `test_ac_9` — Door is `one-way` exactly for the five risk classes (and risk flags L0 added at runtime), `two-way` otherwise; Blast Radius lists flags + matched `paths.risk` globs or `contained`; implementer prose lands below, never alters either value.
++- **AC-10** proven: `test_ac_10` — a fresh session's prompt carries entries 1..N in order, the log lives outside every clone, and rewriting an earlier entry raises on read and next append; `test_progress_log_reaches_every_round` — each new round of the same run receives the log too.
++- **AC-11** proven: `test_ac_11` — L0 and L1 execute every profile command and each `test_ref` through `run_sandboxed` on the clean clone: a fixture `conftest.py` that writes outside the run dir and reads `~/factory/holdouts` is denied both at the L0 gate and in L1's red/green runs.
++- **AC-12** proven: `test_ac_12` — no run dir, settings, staged runner or scratch survives any outcome (PR, `needs_human`, quota, exception); `test_ac_12_killed_run_is_cleaned_by_next_loop` — a killed run's dirs are reclaimed by the next run's start.
++- **AC-13** proven: `test_ac_13` — pushes to the default branch, refs the run didn't create, and non-plain names all raise **before any git process starts** (every `Popen` is recorded; none may carry the bad ref), and every orchestrator git argv carries `GIT_HARDENING`; `test_agent_moving_the_default_branch_in_its_clone_is_never_pushed` — an agent that moves `main` inside its clone changes nothing the orchestrator pushes.
++- **AC-14** proven: `test_ac_14` — two-way → "revert the squash-merge commit"; one-way → a statement that reverting doesn't undo the named risk flags (task risks and L0-added flags both); an implementer's own revert section is replaced, not trusted; no PR without the section.
++- **Wiring/extras (no AC):** `test_gh_pr_create_wrapper` (real wrapper contract: refusals, temp-file body, URL extraction), `test_default_seat_runner_signature_matches` (the default seat is the real `run_session_sandboxed`, signature-pinned), `test_huge_output_still_fits_a_pr_body`, `test_cli_run_and_loop_are_wired`, `test_nothing_to_run_is_idle`.
++- **Evidence:** 32 F-10 tests / 342 total passing locally (macOS; stub seats — no model spend), ruff clean. CI runs the same suite for real on 3.11 + 3.13.
++- **Status to set at reconcile:** `done` once this PR's CI is green and you merge it. No deploy target, so L4 doesn't apply.
++
++### F-10 owner review round (PR #22; 5 findings — 2 owner-reproduced with the PR's own `Env` harness, 2 correctness, 1 conventions; all fixed in `bedf7ea`, red-first under `test_review1`–`test_review4`)
++
++- **(1) The push published the branch ref, not the validated commit** (owner-reproduced): `push_branch` pushed `refs/heads/X:refs/heads/X` from the agent-owned work clone, so whatever the branch pointed at *at push time* went public — a surviving implementer process (F-06 documents setsid escapees that outlive the killpg teardown) could commit after L0/L1/L2 validated `head_sha`, and the remote would hold the rewrite while the PR body's Evidence described the validated commit. Fix: the refspec is now `<sha>:refs/heads/<branch>` — the source is the object name, so publishing is immune to branch movement — and after the push, `ls-remote` must read the ref back as exactly that sha or the publish fails before `gh pr create` (an unconfirmed publish never becomes a PR). `sha` is a required argument validated as a full object name before any git process starts. Proven by `test_review1_push_publishes_the_validated_sha_not_the_branch` (the reviewer's exact repro: a commit lands on the work branch between validation and push; old code published `UNVALIDATED`, new code publishes the validated change) and `test_review1_push_confirms_the_remote_ref_or_refuses` (a lying ls-remote → `PublishError`). AC-13's two refspec assertions updated to the stronger contract: source is the 40-hex object and the remote rev-parses to exactly it.
++- **(2) Orchestrator errors recorded no attempt, so a persistent failure looped forever at full cost** (owner-reproduced): every exception out of `_run_task` re-queued the task with zero attempts recorded — a `gh pr create` 422 after a successful push, a gate crash, a reviewer timeout — so the attempt budget never decreased, both seats re-ran per `loop` invocation, and pushed branches piled up unnamed on the remote. Fix: the round body is wrapped; an ordinary `Exception` now records an escalated attempt from whatever state exists (sessions, reports, tokens) and either (a) after the push — the branch is already public — goes `needs_human` with escalation `pr_create_failed` and the branch kept in `links`, or (b) before the push, re-queues `ready` with the attempt spent, so a persistent failure is bounded by `attempts_exhausted` instead of looping forever. `BaseException` (a hard kill) still escapes un-recorded — that is the killed-run path `reclaim_runs` covers; `KeyboardInterrupt` proves the exception-path cleanup half of AC-12 now. Schema: `pr_create_failed` and `orchestrator_error` joined the escalation enum, red-first per the F-09 pattern (`test_review2_new_escalations_are_schema_valid` fails against the pre-round schema). Proven by `test_review2_pr_failure_after_push_escalates_instead_of_requeueing` (the reviewer's repro shape: open_pr 422 → `needs_human`, attempt `escalated`/`pr_create_failed` with the note, branch kept and named) and `test_review2_orchestrator_error_records_attempts_and_bounds_the_loop` (persistent L1 crash → error attempts → `attempts_exhausted`, loop stops, nothing ever pushed). AC-7's orchestrator-path half updated to the new semantics: a body missing a section is an `error` outcome with the attempt recorded — the invariant (no PR, nothing pushed) is unchanged.
++- **(3) A peak-window stop before the L2 review silently discarded a validated round** (correctness): the implementer's session, tokens and wall clock vanished — no attempt, no log entry — and the next run redid the work from zero, under-counting cost (AC-6, F-19 credit assignment). Fix: the stop now records an `aborted` attempt (the window is nobody's fault — it doesn't burn the budget) carrying the implementer's tokens and a note naming the validated head, and the progress log tells the next session the change existed, passed L0 and L1, and was discarded with the run. Deferred, deliberately: true commit resumption (keeping the work clone alive across runs) conflicts with AC-12's cleanup-every-outcome and the unique-branch-per-run design; what the redo needs survives in the attempt note and the on-disk L0/L1 reports. Proven by `test_review3_peak_window_before_review_records_the_aborted_round` (clock crosses into the window between implementer and reviewer: `aborted` attempt with `input_tokens` 120, note and rendered log both name the validated head and its L0/L1 pass).
++- **(4) The reviewer could start on a spent wall clock** (correctness): `timeout_min=max(remaining, 1.0)` always granted the reviewer at least a minute past the budget the implementer had already consumed, and `session_seconds` was never re-checked. Fix: the remaining budget is computed and checked before the reviewer session starts — ≤ 0 escalates `budget_exhausted` (attempt recorded, `needs_human`), exactly as the implementer path does; otherwise the reviewer gets precisely the remainder (no floor). Proven by `test_review4_reviewer_not_started_when_the_budget_is_spent` (a faked monotonic clock spends the budget in the implementer; the reviewer is never invoked and the run escalates `budget_exhausted`).
++- **(5) No red-first evidence for AC-1..AC-14** (conventions; the main entry's Commits line records why). Fixed by dogfooding F-08: `run_l1` over F-10's contract refs with base `e674eef` (main, pre-F-10) and head `bedf7ea` — run on a scratch clone whose head is padded with the pinned toolchain (`node_modules` force-added as one commit; `run_l1`'s inter-phase `git clean -fdx` removes an ignored install, which is the same reason CI runs `npm ci`; verified the padded head `a14414e` differs from `bedf7ea` by `node_modules/` paths only, so the red phase — which applies only test-file changes — is unaffected). **L1 verdict `pass`: all 14 refs red on base (exit 4, `red_reason` `collection` — the test module imports `factory.orchestrator`/`publish`/`prbody`/`progress`/`config`, absent at base) and green on head (exit 0).** The full per-ref table: every `tests/test_f10.py::test_ac_N`, N=1..14, red_reason `collection`. This pins, at review time, that each AC test genuinely fails without the F-10 code — late, but produced by the machinery the factory itself will use.
++- **Evidence (after the review round):** 7 new review tests; 39 F-10 tests / 349 total passing locally (macOS; stub seats — no model spend), ruff clean.
++
++### F-10 owner review round 2 (PR #22; 3 findings in the round-1 fixes, 2 owner-reproduced with the `Env` harness, 1 conventions; all fixed red-first under `test_review5`–`test_review7`)
++
++- **(1) A bookkeeping failure after the PR opened led to a second PR** (owner-reproduced on `fc7f3fc`): the pass attempt and PR URL were saved, then the `in_review` transition failed, `run_once`'s outer handler re-queued the task to `ready`, and the next run ran both seats again and opened PR #2. New `_finish_unrecorded_publish` runs first in every run: when the slice's latest attempt is a `pass` with a `pr` that `links.pr` doesn't match, it writes `links.pr`, moves the task to `in_review` and returns `pr_opened` without starting a session. A fix round after a rejected PR has matching `links.pr`, so it isn't caught. `test_review5_bookkeeping_failure_after_pr_never_opens_a_second_pr`: one failed `in_review` transition, then a second run; 1 PR total, 2 seat calls total, status `in_review`.
++- **(2) Push-fence and PR-body refusals were retried until the budget ran out** (owner-reproduced: 6 seat sessions over 3 runs): `PushRefused` and `PRBodyError` before the push now escalate at once with the new `publish_refused` reason (`needs_human`), and `loop` now stops on an `error` outcome. A persistent orchestrator error spends one attempt per `loop` invocation and still ends in `attempts_exhausted`. Tests: `test_review6_push_fence_refusal_escalates_immediately`, `test_review6_pr_body_refusal_escalates_immediately`, `test_review6_loop_stops_on_an_orchestrator_error`. Two earlier tests changed to the new semantics: AC-7's orchestrator half (a missing section is now `publish_refused` → `needs_human`; still no PR, nothing pushed), and the round-1 bounded-loop test (four `loop` calls stop `error`, `error`, `error`, `escalation`).
++- **(3) The new escalation reasons weren't swept into TASK-CONTRACT.md** (conventions, owner's global CLAUDE.md "sweep every surface"): line 79 now lists `pr_create_failed`, `orchestrator_error` and `publish_refused`, each with the owner action. The rule is a test, `test_review7_task_contract_lists_every_escalation_reason`, so the schema and the doc can't drift again.
++- **Evidence (after review round 2):** 5 new review tests, all red against `fc7f3fc` for the reported reasons; 44 F-10 tests / 354 total passing locally, ruff clean.
+diff --git a/TASK-CONTRACT.md b/TASK-CONTRACT.md
+index add76b5..36ef60a 100644
+--- a/TASK-CONTRACT.md
++++ b/TASK-CONTRACT.md
+@@ -76,7 +76,13 @@ Recovery and continuation edges (same allowed-transition table, kept out of the
+ | `deploying → ready` | the previous slice merged and live-verified and more slices remain. Owner-step and `done` evaluation waits until the last slice merges; a task can only be `done`/`awaiting_owner` with every slice merged. |
+ | `ready → blocked` | a dependency regressed (its task was reopened or demoted). `sync_readiness` reconciles both directions. |
+ 
+-Escalation reasons (enum): `attempts_exhausted`, `budget_exhausted`, `risk_path_touched`, `new_dependency`, `protected_path_touched`, `contract_ambiguous`, `quota_exhausted`, `live_check_failed`, `cross_repo`.
++Escalation reasons (enum): `attempts_exhausted`, `budget_exhausted`, `risk_path_touched`, `new_dependency`, `protected_path_touched`, `contract_ambiguous`, `quota_exhausted`, `live_check_failed`, `cross_repo`, `pr_create_failed`, `orchestrator_error`, `publish_refused`.
++
++The three orchestrator-side reasons (F-10):
++
++- `pr_create_failed`: the validated branch was pushed but `gh pr create` failed. The task is `needs_human` and `links.branch` names the pushed branch. Open the PR by hand from that branch, or delete it and re-queue.
++- `orchestrator_error`: the orchestrator itself failed mid-round (a gate crash, a reviewer timeout). The attempt counts against the budget, the task re-queues, and `loop` stops. Look at the attempt's `note` before running again.
++- `publish_refused`: the push fence or the PR-body gate refused, which retrying can't change. The task is `needs_human`; the attempt's `note` says which rule fired.
+ 
+ ## 4. Picking the next task
+ 
+diff --git a/factory/cli.py b/factory/cli.py
+index 73ca296..6bda31b 100644
+--- a/factory/cli.py
++++ b/factory/cli.py
+@@ -1,11 +1,13 @@
+ """Factory CLI — the control-plane entry point.
+ 
+-``approve`` is real (F-04). Every other subcommand is a stub naming the
+-work order that implements it (BUILD-ORDER.md).
++``approve`` (F-04), ``run`` and ``loop`` (F-10) are real. Every other
++subcommand is a stub naming the work order that implements it
++(BUILD-ORDER.md).
+ """
+ 
+ import argparse
+ import sys
++from pathlib import Path
+ 
+ from factory.approve import (
+     ApprovalError,
+@@ -13,13 +15,28 @@
+     default_approver,
+     reconcile_bootstrap,
+ )
++from factory.config import ConfigError, load_config
+ from factory.contract import ContractError
++from factory.gates import GateError
++from factory.orchestrator import run_loop, run_once
++from factory.prbody import PRBodyError
++from factory.progress import ProgressLogError
++from factory.publish import PublishError, PushRefused
++from factory.runs import RunError
++from factory.sandbox import SandboxError
++from factory.session import SessionConfigError
+ from factory.state import TaskQueue
+ 
++# run/loop exit codes: 0 = a PR opened, nothing to do, or the peak window;
++# 1 = an escalation needs you; 3 = the quota stop; 2 = the orchestrator
++# itself failed (the task was re-queued, every run dir removed).
++_EXIT = {"pr_opened": 0, "idle": 0, "peak_window": 0, "queue_empty": 0,
++         "needs_human": 1, "escalation": 1, "quota_exhausted": 3, "error": 2}
++_RUN_ERRORS = (ConfigError, ContractError, GateError, PRBodyError, ProgressLogError,
++               PublishError, PushRefused, RunError, SandboxError, SessionConfigError)
++
+ # subcommand -> the work order that implements it
+ STUBS: dict[str, str] = {
+-    "run": "F-10",
+-    "loop": "F-10",
+     "status": "F-11",
+     "import": "F-12",
+     "verify-live": "F-14",
+@@ -59,6 +76,20 @@ def build_parser() -> argparse.ArgumentParser:
+         "--approved-by", default=None, help="approver name (default: git user.name)"
+     )
+ 
++    for name, text in (
++        ("run", "pick the next ready task and take it to a PR (F-10)"),
++        ("loop", "run until the queue is empty, quota, peak window or escalation (F-10)"),
++    ):
++        cmd = sub.add_parser(name, help=text)
++        cmd.add_argument("--queue", default=".factory/tasks.json",
++                         help="queue path (default: %(default)s)")
++        cmd.add_argument("--profile", default=None,
++                         help="project.yaml path (default: next to the queue)")
++        cmd.add_argument("--factory-root", default=None,
++                         help="factory root (default: ~/factory)")
++        cmd.add_argument("--config", default=None,
++                         help="factory config (default: <factory-root>/config.yaml)")
++
+     for name, wo in STUBS.items():
+         sub.add_parser(name, help=f"stub — implemented in {wo}")
+     return parser
+@@ -89,6 +120,32 @@ def _run_approve(args: argparse.Namespace) -> int:
+         return 130
+ 
+ 
++def _run_orchestrator(args: argparse.Namespace) -> int:
++    """Dispatch run/loop; known failures exit 2 with a message, not a traceback."""
++    try:
++        kwargs = {"factory_root": Path(args.factory_root) if args.factory_root else None}
++        if args.config:
++            kwargs["config"] = load_config(args.config)
++        if args.command == "run":
++            result = run_once(Path(args.queue), profile_path=args.profile, **kwargs)
++            detail = f" {result.task_id}" if result.task_id else ""
++            extra = result.pr or result.escalation or ""
++            print(f"factory run: {result.outcome}{detail} {extra}".rstrip())
++            return _EXIT[result.outcome]
++        loop = run_loop(Path(args.queue), profile_path=args.profile, **kwargs)
++        for result in loop.results:
++            extra = result.pr or result.escalation or ""
++            print(f"  {result.task_id or '-'}: {result.outcome} {extra}".rstrip())
++        print(f"factory loop: stopped ({loop.stop_reason}) after {len(loop.results)} run(s)")
++        return _EXIT[loop.stop_reason]
++    except _RUN_ERRORS as exc:
++        print(f"factory {args.command}: {exc}", file=sys.stderr)
++        return 2
++    except KeyboardInterrupt:
++        print(f"factory {args.command}: interrupted", file=sys.stderr)
++        return 130
++
++
+ def main(argv: list | None = None) -> int:
+     """Parses arguments and dispatches a subcommand.
+ 
+@@ -97,7 +154,8 @@ def main(argv: list | None = None) -> int:
+ 
+     Returns:
+         Process exit code. Stubs return 2 (not implemented); approve
+-        returns 0 on success and 1 on any refusal or decline.
++        returns 0 on success and 1 on any refusal or decline; run/loop
++        per ``_EXIT`` (2 when the orchestrator itself failed).
+     """
+     parser = build_parser()
+     args = parser.parse_args(argv)
+@@ -112,6 +170,8 @@ def main(argv: list | None = None) -> int:
+                 "plain markdown, so reconcile confirms every entry interactively"
+             )
+         return _run_approve(args)
++    if args.command in ("run", "loop"):
++        return _run_orchestrator(args)
+     print(
+         f"factory {args.command}: not implemented yet (scheduled in {STUBS[args.command]})",
+         file=sys.stderr,
+diff --git a/factory/config.py b/factory/config.py
+new file mode 100644
+index 0000000..72ebdbc
+--- /dev/null
++++ b/factory/config.py
+@@ -0,0 +1,145 @@
++"""Factory-level configuration (BUILD-ORDER F-10 AC-4).
++
++Settings that belong to the factory, not to any one project: today, the
++peak window during which ``factory loop`` starts no session. The Z.ai
++Coding Plan's quota is shared with the owner's own interactive use, and
++the owner works 08:00–12:00 Mon–Fri Swedish time, so that is the default.
++
++The file is YAML at ``<factory_root>/config.yaml`` (absent = defaults)::
++
++    peak_window:
++      timezone: Europe/Stockholm
++      days: [mon, tue, wed, thu, fri]
++      start: "08:00"   # inclusive
++      end: "12:00"     # exclusive
++
++Anything malformed is refused with :class:`ConfigError` — a window that
++silently failed to parse would let the factory spend the quota at the
++exact hours the owner needs it.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from datetime import datetime, time
++from pathlib import Path
++from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
++
++import yaml
++
++DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
++CONFIG_FILE = "config.yaml"
++
++
++class ConfigError(Exception):
++    """The factory config is unreadable or malformed."""
++
++
++@dataclass(frozen=True)
++class PeakWindow:
++    """A weekly window, in one timezone, during which no session starts."""
++
++    timezone: str
++    days: tuple[str, ...]
++    start: str  # "HH:MM", inclusive
++    end: str  # "HH:MM", exclusive
++
++
++DEFAULT_PEAK_WINDOW = PeakWindow(
++    "Europe/Stockholm", ("mon", "tue", "wed", "thu", "fri"), "08:00", "12:00"
++)
++
++
++@dataclass(frozen=True)
++class FactoryConfig:
++    """The parsed factory config."""
++
++    peak_window: PeakWindow | None = field(default=DEFAULT_PEAK_WINDOW)
++
++
++def _clock(value, key: str) -> time:
++    if not isinstance(value, str):
++        raise ConfigError(f"peak_window.{key} must be an 'HH:MM' string, got {value!r}")
++    try:
++        hours, minutes = value.split(":")
++        if len(hours) != 2 or len(minutes) != 2:
++            raise ValueError
++        return time(int(hours), int(minutes))
++    except ValueError:
++        raise ConfigError(f"peak_window.{key} must be 'HH:MM', got {value!r}") from None
++
++
++def _zone(name) -> ZoneInfo:
++    try:
++        return ZoneInfo(str(name))
++    except (ZoneInfoNotFoundError, ValueError):
++        raise ConfigError(f"peak_window.timezone {name!r} is not a known IANA zone") from None
++
++
++def _peak_window(raw) -> PeakWindow | None:
++    if raw is None:
++        return None  # explicitly disabled
++    if not isinstance(raw, dict) or set(raw) != {"timezone", "days", "start", "end"}:
++        raise ConfigError(
++            "peak_window needs exactly: timezone, days, start, end "
++            f"(got {sorted(raw) if isinstance(raw, dict) else raw!r})"
++        )
++    _zone(raw["timezone"])
++    days = raw["days"]
++    if not isinstance(days, list) or not days or any(d not in DAYS for d in days):
++        raise ConfigError(f"peak_window.days must be a non-empty list of {DAYS}, got {days!r}")
++    if _clock(raw["start"], "start") >= _clock(raw["end"], "end"):
++        raise ConfigError("peak_window.start must be before peak_window.end")
++    return PeakWindow(str(raw["timezone"]), tuple(days), raw["start"], raw["end"])
++
++
++def load_config(path: Path | str | None) -> FactoryConfig:
++    """Load the factory config.
++
++    Args:
++        path: Config file path; None or a missing file yields the defaults.
++
++    Returns:
++        The parsed :class:`FactoryConfig`.
++
++    Raises:
++        ConfigError: The file is unreadable, not a mapping, has unknown
++            keys, or carries a malformed ``peak_window``.
++    """
++    if path is None or not Path(path).exists():
++        return FactoryConfig()
++    try:
++        raw = yaml.safe_load(Path(path).read_text())
++    except (OSError, yaml.YAMLError) as exc:
++        raise ConfigError(f"cannot read factory config {path}: {exc}") from exc
++    if raw is None:
++        return FactoryConfig()
++    if not isinstance(raw, dict):
++        raise ConfigError(f"factory config {path} must be a mapping")
++    unknown = sorted(set(raw) - {"peak_window"})
++    if unknown:
++        raise ConfigError(f"factory config {path}: unknown keys {unknown}")
++    if "peak_window" not in raw:
++        return FactoryConfig()
++    return FactoryConfig(peak_window=_peak_window(raw["peak_window"]))
++
++
++def in_peak_window(now: datetime, window: PeakWindow | None) -> bool:
++    """True when ``now`` falls inside the window, judged in its timezone.
++
++    Args:
++        now: An aware datetime (any zone; converted, so DST is honoured).
++        window: The window, or None (disabled: never in it).
++
++    Raises:
++        ConfigError: ``now`` is naive — a naive clock reading has no
++            defined Swedish time.
++    """
++    if window is None:
++        return False
++    if now.tzinfo is None or now.utcoffset() is None:
++        raise ConfigError("in_peak_window needs an aware datetime, not a naive one")
++    local = now.astimezone(_zone(window.timezone))
++    if DAYS[local.weekday()] not in window.days:
++        return False
++    return _clock(window.start, "start") <= local.time() < _clock(window.end, "end")
+diff --git a/factory/gates.py b/factory/gates.py
+index 877530f..4c2e9f6 100644
+--- a/factory/gates.py
++++ b/factory/gates.py
+@@ -12,7 +12,9 @@
+ import subprocess
+ from dataclasses import dataclass, field
+ from pathlib import Path
+-from typing import ClassVar
++from typing import Callable, ClassVar
++
++from factory.runs import GIT_HARDENING
+ 
+ # Conventional test-path globs, matched with fnmatch semantics (``*``
+ # crosses ``/``). ``conftest.py`` at any depth is test infrastructure:
+@@ -176,9 +178,13 @@ def contract_test_files(task: dict) -> set:
+ 
+ 
+ def git(repo: Path, *args: str) -> str:
+-    """Run git in the repo, raising GateError on any failure."""
++    """Run hardened git in the repo, raising GateError on any failure.
++
++    ``GIT_HARDENING`` (no hooks, no fsmonitor) on every call: the gates
++    run on a clone whose history an agent wrote.
++    """
+     proc = subprocess.run(
+-        ["git", "-C", str(repo), *args], capture_output=True, text=True
++        ["git", *GIT_HARDENING, "-C", str(repo), *args], capture_output=True, text=True
+     )
+     if proc.returncode != 0:
+         raise GateError(
+@@ -198,7 +204,12 @@ def _text(data) -> str:
+ 
+ 
+ def run_command(name: str, command: str, repo: Path, timeout_sec: int):
+-    """Run one shell command in the repo with a wall-clock cap."""
++    """Run one shell command in the repo with a wall-clock cap.
++
++    Unconfined: the orchestrator's own environment. Fixture tests use it;
++    F-10 passes the gates a sandboxed :data:`CommandRunner` instead, because
++    a project's commands execute the agent's code (``conftest.py``).
++    """
+     try:
+         proc = subprocess.run(
+             command,
+@@ -215,6 +226,11 @@ def run_command(name: str, command: str, repo: Path, timeout_sec: int):
+         return CommandResult(name, command, None, output, timed_out=True)
+ 
+ 
++# (name, shell command, repo, timeout_sec) -> CommandResult. The seam L0 and
++# L1 run every project command through; F-10 injects the sandboxed one.
++CommandRunner = Callable[[str, str, Path, int], "CommandResult"]
++
++
+ def _name_status_rows(status_out: str, head_ref: str) -> list:
+     """Parse ``git diff --name-status -M`` rows into bare FileChanges."""
+     changes = []
+diff --git a/factory/l0.py b/factory/l0.py
+index 7e4c1b0..eb9b247 100644
+--- a/factory/l0.py
++++ b/factory/l0.py
+@@ -76,6 +76,7 @@
+ 
+ from factory.gates import (
+     CommandResult,
++    CommandRunner,
+     Finding,
+     GateError,
+     GateReport,
+@@ -482,6 +483,7 @@ def run_l0(
+     task: dict | None = None,
+     baseline: dict | None = None,
+     timeout_sec: int = 600,
++    runner: CommandRunner | None = None,
+ ) -> L0Report:
+     """Run the full L0 gate on a checkout of the slice's branch.
+ 
+@@ -490,8 +492,9 @@ def run_l0(
+     a checkout at any other commit, or with uncommitted or untracked
+     files, raises ``GateError`` instead of gating code nobody reviewed.
+     Commands are shell strings from
+-    ``project.yaml`` and run with the orchestrator's environment — the
+-    F-05 sandbox is what confines them in production.
++    ``project.yaml`` and run through ``runner``: unconfined by default
++    (fixture tests); F-10 passes the F-05 sandboxed runner, because the
++    commands execute the agent's code.
+ 
+     Args:
+         profile: The loaded ``project.yaml`` mapping.
+@@ -502,6 +505,9 @@ def run_l0(
+         baseline: Baseline mapping; when ``None``, loaded from the
+             profile's ``baselines`` path as committed at ``base_ref``.
+         timeout_sec: Per-command wall-clock cap.
++        runner: Executes each profile command. Default: unconfined
++            :func:`~factory.gates.run_command`; F-10 passes the sandboxed
++            runner (the commands execute the agent's code).
+ 
+     Returns:
+         The ``L0Report``; verdict is ``"fail"`` iff any finding exists.
+@@ -537,7 +543,7 @@ def run_l0(
+     for name, command in ordered:
+         if not command:
+             continue
+-        result = _run_command(name, command, repo, timeout_sec)
++        result = (runner or _run_command)(name, command, repo, timeout_sec)
+         results.append(result)
+         if name == "setup" and (result.timed_out or result.exit_code != 0):
+             findings.append(
+diff --git a/factory/l1.py b/factory/l1.py
+index fc97aff..c3cb460 100644
+--- a/factory/l1.py
++++ b/factory/l1.py
+@@ -65,6 +65,7 @@
+ 
+ from factory.gates import (
+     CommandResult,
++    CommandRunner,
+     Finding,
+     GateError,
+     GateReport,
+@@ -76,6 +77,7 @@
+     ref_path,
+     run_command,
+ )
++from factory.runs import GIT_HARDENING
+ 
+ # Runs one named test. {ref} = the whole node id, {path}/{name} = its two
+ # halves (jest-style runners take them as separate arguments), {python} =
+@@ -219,7 +221,7 @@ def _clean(repo: Path) -> None:
+ def _file_on_ref(repo: Path, ref: str, path: str) -> bool:
+     """True when ``path`` exists in ``ref``'s tree."""
+     proc = subprocess.run(
+-        ["git", "-C", str(repo), "cat-file", "-e", f"{ref}:{path}"],
++        ["git", *GIT_HARDENING, "-C", str(repo), "cat-file", "-e", f"{ref}:{path}"],
+         capture_output=True,
+     )
+     return proc.returncode == 0
+@@ -257,6 +259,7 @@ def run_l1(
+     head_ref: str,
+     task: dict | None = None,
+     timeout_sec: int = 600,
++    runner: CommandRunner | None = None,
+ ) -> L1Report:
+     """Run the L1 red-first proof on a checkout of the slice's branch.
+ 
+@@ -275,6 +278,9 @@ def run_l1(
+         task: The task record whose ``check.type: test`` acceptance
+             items name the tests to prove red-first.
+         timeout_sec: Per-run wall-clock cap.
++        runner: Executes each per-ref command. Default: unconfined
++            :func:`~factory.gates.run_command`; F-10 passes the sandboxed
++            runner (the refs execute the agent's test code).
+ 
+     Returns:
+         The ``L1Report``; verdict is ``"fail"`` iff any finding exists.
+@@ -284,6 +290,7 @@ def run_l1(
+     """
+     repo = Path(repo)
+     task = task or {}
++    runner = runner or run_command
+     template = (profile.get("commands") or {}).get("test_ref") or DEFAULT_TEST_REF
+ 
+     refs = contract_test_refs(task)
+@@ -326,7 +333,7 @@ def run_l1(
+         git(repo, "checkout", "--detach", base)
+         _apply_test_changes(repo, head_ref, test_changes, ref_files)
+         for ref in provable:
+-            result = run_command(f"red:{ref}", _ref_command(template, ref), repo, timeout_sec)
++            result = runner(f"red:{ref}", _ref_command(template, ref), repo, timeout_sec)
+             results.append(result)
+             reasons[ref] = red_reason(result)
+             if result.timed_out:
+@@ -347,7 +354,7 @@ def run_l1(
+         git(repo, "checkout", "--force", head_ref)
+         _clean(repo)
+         for ref in provable:
+-            result = run_command(f"green:{ref}", _ref_command(template, ref), repo, timeout_sec)
++            result = runner(f"green:{ref}", _ref_command(template, ref), repo, timeout_sec)
+             results.append(result)
+             if result.timed_out:
+                 findings.append(
+diff --git a/factory/orchestrator.py b/factory/orchestrator.py
+new file mode 100644
+index 0000000..0c8c4fb
+--- /dev/null
++++ b/factory/orchestrator.py
+@@ -0,0 +1,868 @@
++"""``factory run`` / ``factory loop`` — the orchestrator (BUILD-ORDER F-10).
++
++One run:
++
++    reclaim orphans → pick → [lease + in_progress] → clone → branch →
++    round: implementer session → orchestrator commit → clean clone →
++           L0 + L1 (every project command sandboxed) → L2 reviewer session
++           FAIL → findings into the progress log, next round (≤ max_attempts)
++           PASS → PR body (gated) → push the run's own branch → gh pr create
++    → in_review | needs_human | ready (quota / peak window / crash)
++    → cleanup_run on every run dir, on every outcome
++
++``loop`` repeats runs until the queue is empty, a quota error, the peak
++window, or an escalation. **The factory never merges** — merging is the
++owner's act.
++
++Trust boundaries, each enforced in code rather than prose:
++
++* **Project commands are untrusted code.** L0 and L1 run the profile's
++  commands and the contract test refs, which execute the agent's
++  ``conftest.py`` and tests. They run on a fresh clone of the validated
++  head, through :func:`sandboxed_runner` (``run_sandboxed`` under the F-05
++  settings for that clone) — never in the orchestrator's environment.
++* **The agent owns its clone, including its refs.** The orchestrator reads
++  HEAD after the session, commits leftovers with hardened git, points *its*
++  branch at the result and pushes exactly that ref (``factory.publish``):
++  never the default branch, never a ref the run didn't create. Every
++  orchestrator-side git call carries ``GIT_HARDENING``.
++* **Model text is not evidence.** Evidence, Door, Blast Radius and How to
++  revert are built from validator facts (``factory.prbody``); the
++  implementer's account is rendered as inert fenced text below them.
++* **Fresh sessions get the task's progress log** (``factory.progress``),
++  entries 1..N, read-only, from outside the clone.
++
++Escalation rules (VALIDATOR-SPEC "Rounds and escalation"): L0's
++protected-path, new-dependency and risk-path hits escalate immediately —
++retrying can't make them safe. A failed round goes back to the implementer
++with numbered findings until ``budget.max_attempts`` attempts (counted
++across runs; ``aborted`` ones excluded) are spent, then ``needs_human`` with
++``attempts_exhausted``. A quota/429 error is not the task's fault: the
++attempt is recorded ``aborted`` with escalation ``quota_exhausted``, the
++task re-queues (``ready``) and ``loop`` stops without retrying.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import json
++import re
++import shutil
++import subprocess
++import time
++from dataclasses import dataclass, field
++from datetime import datetime, timezone
++from pathlib import Path
++from typing import Callable
++
++from factory.config import CONFIG_FILE, FactoryConfig, in_peak_window, load_config
++from factory.contract import load_profile
++from factory.gates import CommandResult, diff_name_status
++from factory.gates import git as hardened_git
++from factory.l0 import run_l0
++from factory.l1 import run_l1
++from factory.l2 import parse_verdict
++from factory.prbody import PRBodyError, build_pr_body, check_pr_body
++from factory.progress import ProgressLog
++from factory.prompts import (
++    assemble_implementer_prompt,
++    assemble_reviewer_prompt,
++    prompt_versions,
++)
++from factory.publish import PullRequest, PushRefused, gh_pr_create, push_branch
++from factory.runs import (
++    FACTORY_ROOT_DEFAULT,
++    GIT_HARDENING,
++    RunDir,
++    cleanup_run,
++    create_run,
++)
++from factory.sandbox import build_settings, run_sandboxed, write_settings
++from factory.session import DEFAULT_BASE_URL, SessionRecord, run_session_sandboxed
++from factory.state import RunInProgressError, TaskQueue, now_iso
++
++__all__ = [
++    "LoopResult",
++    "PullRequest",
++    "RunResult",
++    "reclaim_runs",
++    "run_loop",
++    "run_once",
++    "sandboxed_runner",
++]
++
++SessionRunner = Callable[..., SessionRecord]
++OpenPR = Callable[[PullRequest], str]
++
++# A failed session whose reason names HTTP 429, a rate limit or a quota.
++# (?<!\d)429(?!\d), not \b429\b: the runner's reason is "api_error_429",
++# and "_" is a word character.
++_QUOTA = re.compile(r"(?<!\d)429(?!\d)|rate[ _-]?limit|quota", re.IGNORECASE)
++
++# L0 escalation classes, most severe first (one escalation per attempt).
++_L0_ESCALATION_ORDER = ("protected_path_touched", "new_dependency", "risk_path_touched")
++
++# Caps on what travels into prompts and the PR body (GitHub refuses bodies
++# over 65,536 characters). The full reports stay on disk.
++_PR_OUTPUT_TAIL = 1500
++_PR_NOTES_CAP = 8000
++_PR_BODY_LIMIT = 65_000
++_REVIEW_OUTPUT_TAIL = 6000
++_REVIEW_DIFF_CAP = 200_000
++
++_IDENTITY = ("-c", "user.name=Software Factory", "-c", "user.email=factory@localhost",
++             "-c", "commit.gpgsign=false")
++
++
++@dataclass
++class RunResult:
++    """The outcome of one ``run``.
++
++    ``outcome``: ``idle`` (nothing eligible), ``pr_opened``, ``needs_human``,
++    ``quota_exhausted``, ``peak_window`` (no session was started, or the
++    run stopped before its next session), or ``error`` (the orchestrator
++    itself failed mid-round; the attempt is recorded, the task is
++    re-queued, and a persistent failure escalates via the budget).
++    """
++
++    outcome: str
++    task_id: str | None = None
++    pr: str | None = None
++    escalation: str | None = None
++    reports: dict = field(default_factory=dict)
++
++
++@dataclass
++class LoopResult:
++    """Why ``loop`` stopped, plus each run's result."""
++
++    stop_reason: str  # queue_empty | quota_exhausted | peak_window | escalation
++    results: list = field(default_factory=list)
++
++
++# ------------------------------------------------------------ the sandbox --
++
++
++def sandboxed_runner(
++    run_dir: Path, settings_path: Path, *, srt_bin_path: Path | None = None
++):
++    """A gate command runner that executes every command under srt.
++
++    The returned callable has :func:`factory.gates.run_command`'s signature
++    and refuses to run anywhere but ``run_dir`` — the clean clone the
++    settings at ``settings_path`` confine.
++    """
++    run_dir = Path(run_dir)
++
++    def run(name: str, command: str, repo: Path, timeout_sec: int) -> CommandResult:
++        if Path(repo).resolve() != run_dir.resolve():
++            raise RuntimeError(
++                f"sandboxed runner is bound to {run_dir}, refusing to run in {repo}"
++            )
++        try:
++            proc = run_sandboxed(
++                ["/bin/sh", "-c", command], run_dir, settings_path,
++                timeout=timeout_sec, srt_bin_path=srt_bin_path,
++            )
++        except subprocess.TimeoutExpired as exc:
++            output = (exc.output or "") + (exc.stderr or "")
++            if isinstance(output, bytes):
++                output = output.decode(errors="replace")
++            return CommandResult(name, command, None, output, timed_out=True)
++        return CommandResult(name, command, proc.returncode, proc.stdout + proc.stderr)
++
++    return run
++
++
++def _gate_settings(profile: dict, clean: RunDir, factory_root: Path) -> None:
++    """srt settings for the gate commands: the clean clone only, no token.
++
++    The model endpoint is on the allowlist only because ``build_settings``
++    always adds it; the gate environment carries no credential for it.
++    """
++    settings = build_settings(
++        profile, clean.root, model_endpoint=DEFAULT_BASE_URL, factory_root=factory_root
++    )
++    write_settings(settings, clean.settings_path)
++
++
++# ------------------------------------------------------------- housekeeping --
++
++_RUN_ID = r"\d{8}T\d{6}Z-[0-9a-f]{6}"
++
++
++def reclaim_runs(queue: TaskQueue, project: str, factory_root: Path) -> list[Path]:
++    """Remove run dirs (and their sandbox files) no live run lease holds.
++
++    One lease guards one queue, and every run dir of the project is
++    created while that lease is held. So if the lease is free, no session
++    of this project is alive and every run dir under
++    ``<factory_root>/runs/<project>/`` is an orphan of a killed or crashed
++    run. If the lease is held, nothing is touched.
++
++    Returns:
++        The run dirs removed (empty while a run is live).
++    """
++    factory_root = Path(factory_root)
++    runs = factory_root / "runs" / project
++    sandbox = factory_root / "sandbox"
++    removed: list[Path] = []
++    try:
++        lease = queue.idle_lease()
++        lease.__enter__()
++    except RunInProgressError:
++        return []
++    try:
++        if runs.is_dir():
++            for run_dir in sorted(p for p in runs.iterdir() if p.is_dir()):
++                cleanup_run(RunDir(project, run_dir.name, run_dir,
++                                   sandbox / f"{project}-{run_dir.name}.json"))
++                removed.append(run_dir)
++        if sandbox.is_dir():
++            stray = re.compile(rf"^{re.escape(project)}-{_RUN_ID}\.json(-runner|-scratch)?$")
++            for entry in sorted(sandbox.iterdir()):
++                if stray.match(entry.name):
++                    if entry.is_dir() and not entry.is_symlink():
++                        shutil.rmtree(entry, ignore_errors=True)
++                    else:
++                        entry.unlink(missing_ok=True)
++    finally:
++        lease.__exit__(None, None, None)
++    return removed
++
++
++# ---------------------------------------------------------------- helpers --
++
++
++def _branch_name(task_id: str, run_id: str) -> str:
++    slug = re.sub(r"[^a-z0-9]+", "-", task_id.lower()).strip("-") or "task"
++    return f"factory/{slug}-{run_id.lower()}"
++
++
++def _is_quota(record: SessionRecord) -> bool:
++    return record.status != "completed" and bool(_QUOTA.search(record.reason or ""))
++
++
++def _tokens(record: SessionRecord | None, key: str) -> int:
++    usage = (record.tokens if record else None) or {}
++    value = usage.get(key) or 0
++    return int(value) if isinstance(value, (int, float)) else 0
++
++
++def _compact(report: dict | None, tail: int) -> dict | None:
++    """A report dict with each command output cut to its last ``tail`` chars."""
++    if report is None:
++        return None
++    report = json.loads(json.dumps(report))
++    for command in report.get("commands") or []:
++        out = command.get("output") or ""
++        if len(out) > tail:
++            command["output"] = f"[... {len(out) - tail} chars cut ...]\n" + out[-tail:]
++    return report
++
++
++def _numbered_findings(reports: dict, extra: list[str]) -> list[str]:
++    lines: list[str] = list(extra)
++    for layer in ("L0", "L1", "L2"):
++        report = reports.get(layer)
++        for finding in (report or {}).get("findings") or []:
++            where = ""
++            if finding.get("file"):
++                where = f" ({finding['file']}:{finding.get('line') or ''})"
++            lines.append(f"[{layer} {finding.get('id')}] {finding.get('text')}{where}")
++    return [f"{i}. {text}" for i, text in enumerate(lines, start=1)]
++
++
++def _implementer_prompt(task: dict, slice_: dict | None, branch: str, history: str,
++                        attempt: int, max_attempts: int) -> str:
++    contract = {
++        "acceptance": task.get("acceptance", []),
++        "out_of_scope": task.get("out_of_scope", []),
++    }
++    parts = [
++        f"# Task {task['id']}: {task.get('title', '')}",
++        "",
++        f"The spec lives in the repo at `{task.get('source', '')}` — read it.",
++    ]
++    if slice_:
++        parts += ["", f"Build only slice `{slice_['id']}`: {slice_.get('text', '')}"]
++    parts += [
++        "",
++        "## The validation contract (approved, frozen)",
++        "",
++        "```json",
++        json.dumps(contract, indent=2, ensure_ascii=False),
++        "```",
++        "",
++        "## How this is judged",
++        "",
++        "- Every `test` check names a test by its exact node id. Write it there, red "
++        "first: L1 runs it on the base commit with only your test files (it must "
++        "fail) and on your branch (it must pass).",
++        "- L0 runs the project's commands on a clean clone; an L2 reviewer reads the "
++        "contract and the diff, never your account of it.",
++        f"- You are on branch `{branch}` in this directory. Commit as you go if you "
++        "like; the orchestrator commits whatever the working tree holds when you stop.",
++        "- Never push, never run `gh`, never touch protected paths.",
++        "",
++        f"This is attempt {attempt} of {max_attempts}.",
++    ]
++    if history:
++        parts += [
++            "",
++            "## Progress log (read-only; what earlier attempts did and why they failed)",
++            "",
++            history,
++        ]
++    return "\n".join(parts) + "\n"
++
++
++def _review_prompt(task: dict, diff: str, l0: dict, l1: dict) -> str:
++    contract = {
++        "id": task["id"],
++        "title": task.get("title"),
++        "acceptance": task.get("acceptance", []),
++        "out_of_scope": task.get("out_of_scope", []),
++        "risk": task.get("risk", []),
++    }
++    if len(diff) > _REVIEW_DIFF_CAP:
++        diff = diff[:_REVIEW_DIFF_CAP] + f"\n[... diff cut at {_REVIEW_DIFF_CAP} chars ...]\n"
++    return "\n".join([
++        "Review this change. Return only the verdict JSON your instructions define.",
++        "",
++        "## Contract",
++        "",
++        "```json",
++        json.dumps(contract, indent=2, ensure_ascii=False),
++        "```",
++        "",
++        "## L0 report",
++        "",
++        "```json",
++        json.dumps(_compact(l0, _REVIEW_OUTPUT_TAIL), indent=2, ensure_ascii=False),
++        "```",
++        "",
++        "## L1 report (red_reasons: how each contract test went red on base)",
++        "",
++        "```json",
++        json.dumps(_compact(l1, _REVIEW_OUTPUT_TAIL), indent=2, ensure_ascii=False),
++        "```",
++        "",
++        "## Diff (base...head)",
++        "",
++        "```diff",
++        diff,
++        "```",
++        "",
++    ])
++
++
++def _git_out(repo: Path, *args: str) -> str:
++    return hardened_git(repo, *args).strip()
++
++
++def _commit_work(
++    work: RunDir, branch: str, base_sha: str, message: str
++) -> tuple[str | None, str | None]:
++    """Commit the working tree, point the run's branch at HEAD, check out it.
++
++    Returns:
++        ``(head_sha, None)``, or ``(None, finding)`` when the agent rewrote
++        history so the head no longer descends from the base.
++    """
++    hardened_git(work.root, "add", "-A")
++    staged = subprocess.run(
++        ["git", *GIT_HARDENING, "-C", str(work.root), "diff", "--cached", "--quiet"],
++        capture_output=True,
++    )
++    if staged.returncode == 1:
++        hardened_git(work.root, *_IDENTITY, "commit", "-q", "--no-verify", "-m", message)
++    head = _git_out(work.root, "rev-parse", "--verify", "HEAD^{commit}")
++    ancestor = subprocess.run(
++        ["git", *GIT_HARDENING, "-C", str(work.root), "merge-base", "--is-ancestor",
++         base_sha, head],
++        capture_output=True,
++    )
++    if ancestor.returncode != 0:
++        return None, (
++            f"history_rewritten: HEAD {head[:12]} does not descend from the base "
++            f"{base_sha[:12]}; the round is void"
++        )
++    hardened_git(work.root, "update-ref", f"refs/heads/{branch}", head)
++    hardened_git(work.root, "checkout", "-q", "--force", branch)
++    return head, None
++
++
++# -------------------------------------------------------------- the run --
++
++
++@dataclass
++class _Ctx:
++    queue: TaskQueue
++    task_id: str
++    profile: dict
++    factory_root: Path
++    session_runner: SessionRunner
++    open_pr: OpenPR
++    config: FactoryConfig
++    now: Callable[[], datetime]
++    srt_bin_path: Path | None
++    gate_timeout_sec: int
++
++
++def run_once(
++    queue_path: Path | str,
++    profile_path: Path | str | None = None,
++    *,
++    factory_root: Path | str | None = None,
++    session_runner: SessionRunner | None = None,
++    open_pr: OpenPR | None = None,
++    config: FactoryConfig | None = None,
++    now: Callable[[], datetime] | None = None,
++    srt_bin_path: Path | None = None,
++    gate_timeout_sec: int = 600,
++) -> RunResult:
++    """Pick the next task and take it to a PR, an escalation or a stop.
++
++    Args:
++        queue_path: The project's ``.factory/tasks.json``.
++        profile_path: Its ``project.yaml`` (default: next to the queue).
++        factory_root: Default ``~/factory``: runs, sandbox settings,
++            progress logs, reports and ``config.yaml`` live there.
++        session_runner: Seat runner with ``run_session_sandboxed``'s
++            signature (the default). Tests inject stub seats.
++        open_pr: Opens the PR and returns its URL (default
++            :func:`factory.publish.gh_pr_create`).
++        config: Factory config (default: ``<factory_root>/config.yaml``).
++        now: Clock for the peak-window checks (aware datetimes).
++        srt_bin_path: srt override for tests (still pin-checked).
++        gate_timeout_sec: Per-command cap for L0/L1.
++
++    Returns:
++        The :class:`RunResult`.
++
++    Raises:
++        Whatever the orchestrator itself hits (git, PR body gate, gh). The
++        task goes back to ``ready`` and every run dir is removed first.
++    """
++    queue_path = Path(queue_path)
++    profile_path = Path(profile_path) if profile_path else queue_path.parent / "project.yaml"
++    profile = load_profile(profile_path)
++    factory_root = Path(factory_root) if factory_root else FACTORY_ROOT_DEFAULT
++    config = config if config is not None else load_config(factory_root / CONFIG_FILE)
++    now = now or (lambda: datetime.now(timezone.utc))
++
++    queue = TaskQueue(queue_path)
++    reclaim_runs(queue, profile["name"], factory_root)
++    queue.reclaim_abandoned()
++    queue.demote_changed_contracts()
++    pick = queue.pick()
++    if pick is None:
++        return RunResult("idle")
++    task_id = pick.task["id"]
++    if in_peak_window(now(), config.peak_window):
++        return RunResult("peak_window", task_id=task_id)
++
++    ctx = _Ctx(
++        queue=queue, task_id=task_id, profile=profile, factory_root=factory_root,
++        session_runner=session_runner or run_session_sandboxed,
++        open_pr=open_pr or gh_pr_create, config=config, now=now,
++        srt_bin_path=srt_bin_path, gate_timeout_sec=gate_timeout_sec,
++    )
++    with queue.begin_run(task_id):
++        try:
++            recovered = _finish_unrecorded_publish(queue, task_id, pick.slice)
++            if recovered is not None:
++                return recovered
++            return _run_task(ctx, pick.slice)
++        except BaseException:
++            # The run didn't reach a recorded end state: re-queue it (the
++            # aborted-run edge) so the queue isn't wedged until the next
++            # reclaim. If a PR was already opened, its pass attempt is on
++            # disk and the next run's _finish_unrecorded_publish completes
++            # the bookkeeping instead of opening a second PR.
++            with contextlib.suppress(Exception):
++                fresh = TaskQueue(queue_path)
++                if fresh.get(task_id).get("status") == "in_progress":
++                    fresh.transition(task_id, "ready")
++            raise
++
++
++def _finish_unrecorded_publish(
++    queue: TaskQueue, task_id: str, slice_: dict | None
++) -> RunResult | None:
++    """Complete a publish whose PR opened but whose bookkeeping didn't land.
++
++    The pass attempt, carrying the PR URL, is saved before the task's links
++    and its ``in_review`` transition. If that second save failed, the task
++    was re-queued with a PR already open. Its signature on disk: the slice's
++    latest attempt is a ``pass`` with a ``pr`` that ``links.pr`` doesn't
++    match. (A fix round after a rejected PR has ``links.pr`` equal to the
++    attempt's, so it isn't caught here.)
++
++    Returns:
++        A ``pr_opened`` result after moving the task to ``in_review``, or
++        None when there is nothing to recover.
++    """
++    task = queue.get(task_id)
++    slice_id = slice_["id"] if slice_ else task_id
++    ours = [a for a in task.get("attempts") or [] if a.get("slice_id") == slice_id]
++    if not ours:
++        return None
++    last = ours[-1]
++    url = last.get("pr")
++    if last.get("outcome") != "pass" or not url or (task.get("links") or {}).get("pr") == url:
++        return None
++    task["links"] = {**(task.get("links") or {}), "pr": url}
++    queue.transition(task_id, "in_review")
++    return RunResult("pr_opened", task_id, pr=url)
++
++
++def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
++    profile, queue, task_id = ctx.profile, ctx.queue, ctx.task_id
++    project = profile["name"]
++    repo_cfg = profile["repo"]
++    default_branch = repo_cfg["default_branch"]
++    source = Path(repo_cfg["path"]).expanduser()
++    task = queue.get(task_id)
++    slice_id = slice_["id"] if slice_ else task_id
++    budget = task["budget"]
++    max_attempts = budget["max_attempts"]
++    used = sum(
++        1 for a in task.get("attempts") or []
++        if a.get("slice_id") == slice_id and a.get("outcome") != "aborted"
++    )
++    versions = prompt_versions(profile)
++    log = ProgressLog.for_task(ctx.factory_root, project, task_id)
++    protected = list((profile.get("paths") or {}).get("protected") or [])
++    implementer_system = assemble_implementer_prompt(profile)
++    reviewer_system = assemble_reviewer_prompt(profile)
++    session_seconds = 0.0
++
++    work = create_run(project, source, factory_root=ctx.factory_root, ref=default_branch)
++    try:
++        branch = _branch_name(task_id, work.run_id)
++        created = frozenset({branch})
++        hardened_git(work.root, "checkout", "-q", "-b", branch)
++        base_sha = _git_out(work.root, "rev-parse", "--verify", "HEAD^{commit}")
++        reports_dir = ctx.factory_root / "reports" / project / re.sub(r"[^\w.-]", "_", task_id)
++        reports_dir.mkdir(parents=True, exist_ok=True)
++
++        def attempt_record(attempt_no, started, outcome, records, report_path, **extra):
++            record = {
++                "run_id": work.run_id,
++                "slice_id": slice_id,
++                "started": started,
++                "ended": now_iso(),
++                "outcome": outcome,
++                "rounds": attempt_no,
++                "turns": sum((r.num_turns or 0) for r in records if r),
++                "input_tokens": sum(_tokens(r, "input_tokens") for r in records),
++                "output_tokens": sum(_tokens(r, "output_tokens") for r in records),
++                "prompt_versions": dict(versions),
++                "skills": [],  # setting_sources=[]: sessions load no skills
++            }
++            models = [f"{r.seat}={r.model}" for r in records if r and r.model]
++            if models:
++                record["model"] = " ".join(models)
++            if report_path:
++                record["validator_report"] = str(report_path)
++            record.update({k: v for k, v in extra.items() if v is not None})
++            return record
++
++        def finish(attempt, status, findings, **result):
++            queue.append_attempt(task_id, attempt)
++            log.append({
++                "run_id": attempt["run_id"],
++                "attempt": attempt["rounds"],
++                "outcome": attempt["outcome"],
++                "escalation": attempt.get("escalation"),
++                "findings": findings,
++            })
++            if status is not None:
++                queue.transition(task_id, status)
++            return result
++
++        while True:
++            attempt_no = used + 1
++            started = now_iso()
++            if attempt_no > max_attempts:
++                attempt = attempt_record(
++                    attempt_no - 1, started, "escalated", [], None,
++                    escalation="attempts_exhausted",
++                    note="attempt budget already spent before this run",
++                )
++                finish(attempt, "needs_human", ["1. attempt budget already spent"])
++                return RunResult("needs_human", task_id, escalation="attempts_exhausted")
++            remaining_min = budget["wall_clock_min"] - session_seconds / 60.0
++            if remaining_min <= 0:
++                attempt = attempt_record(attempt_no, started, "escalated", [], None,
++                                         escalation="budget_exhausted")
++                finish(attempt, "needs_human", ["1. wall-clock budget spent"])
++                return RunResult("needs_human", task_id, escalation="budget_exhausted")
++            if in_peak_window(ctx.now(), ctx.config.peak_window):
++                queue.transition(task_id, "ready")
++                return RunResult("peak_window", task_id)
++
++            # This round's state, initialised before anything can raise: the
++            # error path below records its attempt from whatever exists.
++            records: list = []
++            reports: dict = {"L0": None, "L1": None, "L2": None}
++            extra_findings: list[str] = []
++            l0 = l1 = l2 = None
++            head_sha = None
++            changed: list[str] = []
++            path = None
++            pushed = False
++            opened = False
++            try:
++                # ---- implementer
++                prompt = _implementer_prompt(task, slice_, branch, log.render(),
++                                             attempt_no, max_attempts)
++                t0 = time.monotonic()
++                impl = ctx.session_runner(
++                    "implementer", prompt, work.root, profile,
++                    factory_root=ctx.factory_root, max_turns=budget["max_turns"],
++                    timeout_min=remaining_min, protected=protected,
++                    system_prompt=implementer_system, srt_bin_path=ctx.srt_bin_path,
++                )
++                session_seconds += time.monotonic() - t0
++                records = [impl]
++                if _is_quota(impl):
++                    attempt = attempt_record(attempt_no, started, "aborted", records, None,
++                                             escalation="quota_exhausted", note=impl.reason)
++                    finish(attempt, "ready", [f"1. quota: {impl.reason}"])
++                    return RunResult("quota_exhausted", task_id, escalation="quota_exhausted")
++
++                if impl.status != "completed":
++                    extra_findings.append(
++                        f"[session {impl.status}] the implementer session ended: {impl.reason}"
++                    )
++                else:
++                    head_sha, void = _commit_work(
++                        work, branch, base_sha, f"{task_id}: attempt {attempt_no}"
++                    )
++                    if void:
++                        extra_findings.append(void)
++
++                if head_sha is not None:
++                    clean = create_run(project, work.root, factory_root=ctx.factory_root,
++                                       ref=head_sha)
++                    try:
++                        _gate_settings(profile, clean, ctx.factory_root)
++                        runner = sandboxed_runner(clean.root, clean.settings_path,
++                                                  srt_bin_path=ctx.srt_bin_path)
++                        l0 = run_l0(profile, clean.root, base_sha, head_sha, task=task,
++                                    runner=runner, timeout_sec=ctx.gate_timeout_sec)
++                        reports["L0"] = l0.to_dict()
++                        if l0.escalations:
++                            escalation = next(e for e in _L0_ESCALATION_ORDER
++                                              if e in l0.escalations)
++                            if l0.risk_flags_added:
++                                task["risk"] = sorted(set(task.get("risk") or [])
++                                                      | set(l0.risk_flags_added))
++                                task["gates"]["merge"] = "human"
++                            path = _store(reports_dir, work.run_id, attempt_no, reports)
++                            attempt = attempt_record(
++                                attempt_no, started, "escalated", records, path,
++                                escalation=escalation,
++                                note="L0 escalations: " + ", ".join(l0.escalations),
++                            )
++                            finish(attempt, "needs_human",
++                                   _numbered_findings(reports, [f"[L0 escalation] {escalation}"]))
++                            return RunResult("needs_human", task_id, escalation=escalation,
++                                             reports=reports)
++                        if l0.verdict == "pass":
++                            l1 = run_l1(profile, clean.root, base_sha, head_sha, task=task,
++                                        runner=runner, timeout_sec=ctx.gate_timeout_sec)
++                            reports["L1"] = l1.to_dict()
++                        if l1 is not None and l1.verdict == "pass":
++                            # ---- reviewer (a session start: the checks apply)
++                            if in_peak_window(ctx.now(), ctx.config.peak_window):
++                                # The round is validated but the window stops the
++                                # next session start. The tokens and the attempt
++                                # are recorded (aborted — the window is nobody's
++                                # fault) and the next session is told the change
++                                # existed and was discarded with the run.
++                                path = _store(reports_dir, work.run_id, attempt_no, reports)
++                                attempt = attempt_record(
++                                    attempt_no, started, "aborted", records, path,
++                                    note=f"peak window before the L2 review; the change "
++                                         f"(head {head_sha[:12]}, passed L0 and L1) was "
++                                         f"discarded with the run",
++                                )
++                                finish(attempt, "ready", [
++                                    f"1. peak window stopped attempt {attempt_no} before "
++                                    f"the L2 review: its change (head {head_sha[:12]}) had "
++                                    f"passed L0 and L1 and was discarded with the run — "
++                                    f"redo it",
++                                ])
++                                return RunResult("peak_window", task_id, reports=reports)
++                            remaining_review = budget["wall_clock_min"] - session_seconds / 60.0
++                            if remaining_review <= 0:
++                                path = _store(reports_dir, work.run_id, attempt_no, reports)
++                                attempt = attempt_record(
++                                    attempt_no, started, "escalated", records, path,
++                                    escalation="budget_exhausted",
++                                    note="wall-clock budget spent before the L2 review",
++                                )
++                                finish(attempt, "needs_human",
++                                       ["1. wall-clock budget spent before the L2 review"])
++                                return RunResult("needs_human", task_id,
++                                                 escalation="budget_exhausted", reports=reports)
++                            diff = hardened_git(clean.root, "diff", "--no-color", "--no-ext-diff",
++                                                f"{base_sha}...{head_sha}")
++                            t0 = time.monotonic()
++                            review_prompt = _review_prompt(
++                                task, diff, reports["L0"], reports["L1"])
++                            review = ctx.session_runner(
++                                "reviewer", review_prompt,
++                                clean.root, profile, factory_root=ctx.factory_root,
++                                max_turns=budget["max_turns"], timeout_min=remaining_review,
++                                protected=protected, system_prompt=reviewer_system,
++                                srt_bin_path=ctx.srt_bin_path,
++                            )
++                            session_seconds += time.monotonic() - t0
++                            records.append(review)
++                            if _is_quota(review):
++                                attempt = attempt_record(
++                                    attempt_no, started, "aborted", records, None,
++                                    escalation="quota_exhausted", note=review.reason,
++                                )
++                                finish(attempt, "ready", [f"1. quota: {review.reason}"])
++                                return RunResult("quota_exhausted", task_id,
++                                                 escalation="quota_exhausted", reports=reports)
++                            l2 = parse_verdict(review.result if review.status == "completed"
++                                               else None)
++                            if review.status != "completed":
++                                extra_findings.append(
++                                    f"[session {review.status}] the reviewer session ended: "
++                                    f"{review.reason}"
++                                )
++                            reports["L2"] = l2.to_dict()
++                        changed = [c.path for c in diff_name_status(clean.root, base_sha, head_sha)]
++                    finally:
++                        cleanup_run(clean)
++
++                path = _store(reports_dir, work.run_id, attempt_no, reports)
++                findings = _numbered_findings(reports, extra_findings)
++                passed = all(x is not None and x.verdict == "pass" for x in (l0, l1, l2))
++
++                if passed:
++                    task = queue.get(task_id)
++                    for tail in (_PR_OUTPUT_TAIL, 200, 0):  # shrink outputs to fit GitHub
++                        body = build_pr_body(
++                            task, profile, branch=branch, base_sha=base_sha, head_sha=head_sha,
++                            changed_paths=changed,
++                            reports={k: _compact(v, tail) for k, v in reports.items()},
++                            l1_report=l1, extra_flags=l0.risk_flags_added,
++                            implementer_notes=(impl.result or "")[:_PR_NOTES_CAP],
++                            attempt=attempt_no,
++                        )
++                        if len(body) <= _PR_BODY_LIMIT:
++                            break
++                    check_pr_body(body)  # no PR without every section
++                    push_branch(work.root, repo_cfg["remote"], branch, sha=head_sha,
++                                created=created, default_branch=default_branch)
++                    pushed = True
++                    url = ctx.open_pr(PullRequest(
++                        remote=repo_cfg["remote"], base=default_branch, head=branch,
++                        title=f"{task_id}: {task.get('title', '')}", body=body,
++                    ))
++                    opened = True
++                    attempt = attempt_record(attempt_no, started, "pass", records, path, pr=url)
++                    queue.append_attempt(task_id, attempt)
++                    log.append({"run_id": work.run_id, "attempt": attempt_no, "outcome": "pass",
++                                "pr": url, "findings": findings})
++                    task = queue.get(task_id)
++                    task["links"] = {**(task.get("links") or {}), "pr": url, "branch": branch}
++                    queue.transition(task_id, "in_review")
++                    return RunResult("pr_opened", task_id, pr=url, reports=reports)
++
++                used += 1
++                if attempt_no >= max_attempts:
++                    attempt = attempt_record(attempt_no, started, "escalated", records, path,
++                                             escalation="attempts_exhausted")
++                    finish(attempt, "needs_human", findings)
++                    return RunResult("needs_human", task_id, escalation="attempts_exhausted",
++                                     reports=reports)
++                attempt = attempt_record(attempt_no, started, "fail", records, path)
++                finish(attempt, None, findings)
++                task = queue.get(task_id)
++            except Exception as exc:
++                # The orchestrator itself failed mid-round (gh after the push,
++                # a gate crash, a reviewer timeout, ...). The attempt is
++                # recorded so the budget is spent and a persistent failure
++                # escalates instead of re-running both seats forever (PR #22
++                # review finding 2). Once the branch is public the failure is
++                # the owner's to resolve: needs_human with the branch kept.
++                if opened:
++                    # The PR is open and its pass attempt is saved; run_once
++                    # re-queues and the next run finishes the bookkeeping
++                    # (_finish_unrecorded_publish) without a second PR.
++                    raise
++                deterministic = not pushed and isinstance(exc, (PushRefused, PRBodyError))
++                path = None
++                with contextlib.suppress(Exception):
++                    path = _store(reports_dir, work.run_id, attempt_no, reports)
++                note = f"{type(exc).__name__}: {exc}"[:500]
++                # A fence or PR-body refusal can't pass on retry (like L0's
++                # protected-path class): escalate at once instead of
++                # spending the budget re-running both seats.
++                if pushed:
++                    escalation = "pr_create_failed"
++                elif deterministic:
++                    escalation = "publish_refused"
++                else:
++                    escalation = "orchestrator_error"
++                attempt = attempt_record(attempt_no, started, "escalated", records, path,
++                                         escalation=escalation, note=note)
++                findings = _numbered_findings(reports, [f"[{escalation}] {note}"])
++                queue.append_attempt(task_id, attempt)
++                log.append({"run_id": work.run_id, "attempt": attempt_no,
++                            "outcome": attempt["outcome"], "escalation": escalation,
++                            "findings": findings})
++                if pushed:
++                    task = queue.get(task_id)
++                    task["links"] = {**(task.get("links") or {}), "branch": branch}
++                    queue.transition(task_id, "needs_human")
++                    return RunResult("needs_human", task_id,
++                                     escalation="pr_create_failed", reports=reports)
++                if deterministic:
++                    queue.transition(task_id, "needs_human")
++                    return RunResult("needs_human", task_id,
++                                     escalation="publish_refused", reports=reports)
++                queue.transition(task_id, "ready")
++                return RunResult("error", task_id,
++                                 escalation="orchestrator_error", reports=reports)
++    finally:
++        cleanup_run(work)
++
++
++def _store(reports_dir: Path, run_id: str, attempt_no: int, reports: dict) -> Path:
++    path = reports_dir / f"{run_id}-a{attempt_no}.json"
++    path.write_text(json.dumps(reports, indent=2, ensure_ascii=False) + "\n")
++    return path
++
++
++# -------------------------------------------------------------- the loop --
++
++
++def run_loop(queue_path: Path | str, profile_path: Path | str | None = None,
++             **kwargs) -> LoopResult:
++    """Run until the queue is empty, quota, the peak window, or an escalation.
++
++    Accepts :func:`run_once`'s keyword arguments. Each run starts by
++    reclaiming orphaned run dirs and abandoned ``in_progress`` tasks.
++    """
++    results: list[RunResult] = []
++    stops = {"idle": "queue_empty", "quota_exhausted": "quota_exhausted",
++             "peak_window": "peak_window", "needs_human": "escalation",
++             # A broken orchestrator stops the loop: it must not drain the
++             # attempt budget unattended (each error round spends a session).
++             "error": "error"}
++    while True:
++        result = run_once(queue_path, profile_path, **kwargs)
++        results.append(result)
++        if result.outcome in stops:
++            return LoopResult(stops[result.outcome], results)
+diff --git a/factory/prbody.py b/factory/prbody.py
+new file mode 100644
+index 0000000..fc1905c
+--- /dev/null
++++ b/factory/prbody.py
+@@ -0,0 +1,259 @@
++"""The PR body (BUILD-ORDER F-10 AC-7, AC-8, AC-9, AC-14).
++
++Shape adapted from mattpocock/skills ``pr``; the difference is that every
++section that carries a judgement is built by the orchestrator from
++validator facts, never from the agent's own account:
++
++* **Summary** — task, branch, base/head commits, changed files.
++* **Evidence** — per contract test ref: red on base (with L1's
++  ``red_reason``) and green on head, read from the L1 report's command
++  results.
++* **Merge Danger** — **Door** (``one-way`` when the task carries any of
++  :data:`ONE_WAY_FLAGS`, else ``two-way``) and **Blast Radius** (risk
++  flags plus the ``paths.risk`` globs the diff matched, or ``contained``).
++  The implementer's prose goes *below* these values, as inert fenced text.
++* **Contract** — the approved acceptance items and their hash.
++* **Validator report** — the L0/L1/L2 reports as JSON.
++* **How to revert** — per Door: revert the squash-merge commit, or, for a
++  one-way Door, a statement naming each flag a code revert can't undo.
++
++Model text is only ever rendered inside a code fence longer than any
++backtick run it contains, so no line of it can open a heading, close the
++fence, or forge a Door. :func:`check_pr_body` is the gate the orchestrator
++runs before pushing: a body missing a section (or carrying one twice) is
++never opened.
++"""
++
++from __future__ import annotations
++
++import json
++import re
++
++from factory.gates import contract_test_refs, matches
++
++REQUIRED_SECTIONS = (
++    "Summary",
++    "Evidence",
++    "Merge Danger",
++    "Contract",
++    "Validator report",
++    "How to revert",
++)
++
++# Data that leaked, money that moved, a schema that migrated, a deploy that
++# shipped, a call an external service acted on: reverting the code recalls
++# none of it.
++ONE_WAY_FLAGS = ("migration", "deploy", "external_service", "payments", "privacy")
++
++
++class PRBodyError(Exception):
++    """The PR body is missing a required section; the PR must not open."""
++
++
++def fence(text: str, info: str = "text") -> str:
++    """Wrap untrusted text in a code fence it cannot break out of.
++
++    The fence is longer than any backtick run in the text, so no line can
++    close it (CommonMark: a closing fence must be at least as long), and
++    every line is indented two spaces, so none starts with ``## `` for a
++    line-oriented reader (:func:`check_pr_body`, GitHub's own outline).
++    """
++    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
++    ticks = "`" * max(3, longest + 1)
++    inner = "\n".join("  " + line for line in text.rstrip().splitlines())
++    return f"{ticks}{info}\n{inner}\n{ticks}"
++
++
++def _flags(task: dict, extra_flags=()) -> list[str]:
++    return sorted(set(task.get("risk") or []) | set(extra_flags or []))
++
++
++def door(task: dict, extra_flags=()) -> str:
++    """``one-way`` when any effective risk flag can't be undone by a revert."""
++    return "one-way" if set(_flags(task, extra_flags)) & set(ONE_WAY_FLAGS) else "two-way"
++
++
++def blast_radius(task: dict, profile: dict, changed_paths, extra_flags=()) -> str:
++    """The risk flags plus every ``paths.risk`` glob the diff matched.
++
++    Returns:
++        ``contained`` when there is neither a flag nor a matched glob.
++    """
++    flags = _flags(task, extra_flags)
++    risk_globs = (profile.get("paths") or {}).get("risk") or {}
++    hits = []
++    for flag in sorted(risk_globs):
++        for glob in risk_globs[flag]:
++            files = sorted(p for p in changed_paths if matches(p, [glob]))
++            if files:
++                hits.append(f"`{flag}`: `{glob}` matched " + ", ".join(files))
++    if not flags and not hits:
++        return "contained"
++    parts = []
++    if flags:
++        parts.append("flags " + ", ".join(f"`{f}`" for f in flags))
++    if hits:
++        parts.append("paths " + "; ".join(hits))
++    return " — ".join(parts)
++
++
++def how_to_revert(task: dict, profile: dict, extra_flags=()) -> str:
++    """The revert instructions for this PR's Door."""
++    method = (profile.get("repo") or {}).get("merge_method") or "squash"
++    if method == "squash":
++        code = (
++            "Revert the squash-merge commit: `git revert <squash-merge-sha>` on the "
++            "default branch (or the PR's **Revert** button), then let CI run."
++        )
++    elif method == "merge":
++        code = (
++            "Revert the merge commit: `git revert -m 1 <merge-sha>` on the default "
++            "branch (or the PR's **Revert** button)."
++        )
++    else:
++        code = (
++            "Revert each rebased commit of this PR, newest first, on the default branch "
++            "(or the PR's **Revert** button)."
++        )
++    if door(task, extra_flags) == "two-way":
++        return f"Door is `two-way`. {code}"
++    one_way = [f for f in _flags(task, extra_flags) if f in ONE_WAY_FLAGS]
++    lines = [
++        f"Door is `one-way`. {code}",
++        "",
++        "Reverting the code **does not undo** what these risk flags cover — each needs "
++        "its own recovery:",
++    ]
++    lines += [f"- `{flag}`" for flag in one_way]
++    return "\n".join(lines)
++
++
++def _result(report, name: str):
++    return next((r for r in report.command_results if r.name == name), None)
++
++
++def build_evidence(task: dict, l1_report) -> str:
++    """The Evidence section: one row per contract test ref, from L1 alone."""
++    refs = contract_test_refs(task)
++    if not refs:
++        return "The contract names no `test` checks: L1 had nothing to prove red-first."
++    rows = ["| Contract test | Red on base | Green on head |", "|---|---|---|"]
++    for ref in refs:
++        red, green = _result(l1_report, f"red:{ref}"), _result(l1_report, f"green:{ref}")
++        reason = (l1_report.red_reasons or {}).get(ref)
++        if red is None:
++            red_cell = "not run"
++        elif red.timed_out:
++            red_cell = "timed out"
++        elif red.exit_code == 0:
++            red_cell = "**NOT red on base** (exit 0)"
++        else:
++            red_cell = f"red on base (exit {red.exit_code}, red_reason: {reason or 'unknown'})"
++        if green is None:
++            green_cell = "not run"
++        elif green.timed_out:
++            green_cell = "timed out"
++        elif green.exit_code == 0:
++            green_cell = "green on head (exit 0)"
++        else:
++            green_cell = f"**NOT green on head** (exit {green.exit_code})"
++        safe_ref = ref.replace("|", "\\|").replace("`", "'")
++        rows.append(f"| `{safe_ref}` | {red_cell} | {green_cell} |")
++    rows.append("")
++    rows.append(f"L1 verdict: `{l1_report.verdict}` (built from the L1 report, not model text).")
++    return "\n".join(rows)
++
++
++def build_pr_body(
++    task: dict,
++    profile: dict,
++    *,
++    branch: str,
++    base_sha: str,
++    head_sha: str,
++    changed_paths: list[str],
++    reports: dict,
++    l1_report,
++    extra_flags=(),
++    implementer_notes: str | None = None,
++    attempt: int,
++) -> str:
++    """Assemble the full PR body from validator facts.
++
++    Args:
++        task: The task record (contract, risk flags).
++        profile: The project profile (risk globs, merge method).
++        branch/base_sha/head_sha: What the PR proposes.
++        changed_paths: Files the diff touches.
++        reports: ``{"L0": dict, "L1": dict, "L2": dict}`` report dicts.
++        l1_report: The L1 report object (Evidence is built from it).
++        extra_flags: Risk flags L0 found in the diff.
++        implementer_notes: The implementer's own account — rendered fenced,
++            below the computed values, never as evidence.
++        attempt: The attempt number that passed.
++    """
++    budget = task.get("budget") or {}
++    summary = [
++        f"Task **{task['id']}** — {task.get('title', '')}".rstrip(),
++        "",
++        f"- Branch `{branch}` → `{(profile.get('repo') or {}).get('default_branch', 'main')}`",
++        f"- Base `{base_sha[:12]}`, head `{head_sha[:12]}`",
++        f"- Attempt {attempt} of {budget.get('max_attempts', '?')}; L0, L1 and L2 passed",
++        f"- Source: `{task.get('source', '')}`",
++        "",
++        "Changed files:",
++        "",
++        fence("\n".join(changed_paths) or "(none)"),
++    ]
++    merge_danger = [
++        f"**Door:** `{door(task, extra_flags)}`",
++        "",
++        f"**Blast Radius:** {blast_radius(task, profile, changed_paths, extra_flags)}",
++        "",
++        "Door and Blast Radius are computed by the orchestrator from the risk flags "
++        "and the diff; nothing below can change them.",
++        "",
++        "### Implementer notes (unverified)",
++        "",
++        fence(implementer_notes or "(none)"),
++    ]
++    contract = {
++        "acceptance": task.get("acceptance", []),
++        "acceptance_hash": task.get("acceptance_hash"),
++        "out_of_scope": task.get("out_of_scope", []),
++    }
++    sections = {
++        "Summary": "\n".join(summary),
++        "Evidence": build_evidence(task, l1_report),
++        "Merge Danger": "\n".join(merge_danger),
++        "Contract": fence(json.dumps(contract, indent=2, ensure_ascii=False), "json"),
++        "Validator report": fence(json.dumps(reports, indent=2, ensure_ascii=False), "json")
++        + "\n\nL3 holdouts: not run (F-15). L4 live verification runs after deploy (F-14).",
++        "How to revert": how_to_revert(task, profile, extra_flags),
++    }
++    body = "\n\n".join(f"## {name}\n\n{sections[name]}" for name in REQUIRED_SECTIONS)
++    return body + "\n\n---\nOpened by the software factory. A human reviews and merges.\n"
++
++
++def check_pr_body(body: str) -> None:
++    """Refuse a body unless every required section appears exactly once.
++
++    Raises:
++        PRBodyError: A section is missing or duplicated, Merge Danger
++            lacks its Door / Blast Radius values, or the body is over
++            GitHub's size limit (gh would refuse it after the push).
++    """
++    if len(body) > 65_536:
++        raise PRBodyError(f"PR body is {len(body)} chars; GitHub's limit is 65,536")
++    headings = re.findall(r"^## (.+?)\s*$", body, re.M)
++    for name in REQUIRED_SECTIONS:
++        count = headings.count(name)
++        if count != 1:
++            raise PRBodyError(
++                f"PR body must carry section '## {name}' exactly once (found {count})"
++            )
++    match = re.search(r"^## Merge Danger\n(.*?)(?=^## |\Z)", body, re.M | re.S)
++    danger = match.group(1)
++    for value in ("**Door:**", "**Blast Radius:**"):
++        if value not in danger:
++            raise PRBodyError(f"Merge Danger is missing {value}")
+diff --git a/factory/progress.py b/factory/progress.py
+new file mode 100644
+index 0000000..89ed391
+--- /dev/null
++++ b/factory/progress.py
+@@ -0,0 +1,131 @@
++"""Per-task progress log (BUILD-ORDER F-10 AC-10, VALIDATOR-SPEC "Rounds").
++
++Not every round shares a session: an aborted run re-enters the queue, and a
++rejected PR comes back as a fix round, maybe days later. A fresh session
++carries no context, so the orchestrator keeps one append-only log per task
++— each attempt's outcome and numbered findings — and hands every new
++session its entries 1..N in the prompt (a read-only copy: the session never
++sees the file).
++
++The log is orchestrator-owned and lives outside every clone, under
++``<factory_root>/progress/<project>/<task-id>.jsonl``. Append-only is
++enforced, not trusted: every entry carries its number and the SHA-256 of
++the previous entry's line (a hash chain), so rewriting, dropping or
++reordering an earlier entry breaks the chain and the next read or append
++raises :class:`ProgressLogError`. The module has no edit API at all.
++"""
++
++from __future__ import annotations
++
++import fcntl
++import hashlib
++import json
++import os
++import re
++from pathlib import Path
++
++GENESIS = "0" * 64
++
++
++class ProgressLogError(Exception):
++    """The progress log is corrupt or was rewritten."""
++
++
++def _digest(line: str) -> str:
++    return hashlib.sha256(line.encode()).hexdigest()
++
++
++def _safe(name: str) -> str:
++    return re.sub(r"[^A-Za-z0-9._-]", "_", name)
++
++
++class ProgressLog:
++    """The append-only, hash-chained progress log of one task."""
++
++    def __init__(self, path: Path | str) -> None:
++        self.path = Path(path)
++
++    @classmethod
++    def for_task(cls, factory_root: Path | str, project: str, task_id: str) -> "ProgressLog":
++        """The canonical log location for a task (outside every clone)."""
++        return cls(Path(factory_root) / "progress" / _safe(project) / f"{_safe(task_id)}.jsonl")
++
++    def _read(self) -> tuple[list[dict], str]:
++        """Parse and chain-verify every entry; return (entries, last digest)."""
++        if not self.path.exists():
++            return [], GENESIS
++        entries: list[dict] = []
++        prev = GENESIS
++        for number, line in enumerate(self.path.read_text().splitlines(), start=1):
++            try:
++                record = json.loads(line)
++            except json.JSONDecodeError as exc:
++                raise ProgressLogError(f"{self.path}: line {number} is not JSON: {exc}") from exc
++            if not isinstance(record, dict) or record.get("n") != number:
++                raise ProgressLogError(
++                    f"{self.path}: line {number} is not entry {number} — an entry "
++                    "was dropped, reordered or rewritten"
++                )
++            if record.get("prev") != prev:
++                raise ProgressLogError(
++                    f"{self.path}: entry {number} does not chain to entry {number - 1} — "
++                    "an earlier entry was rewritten"
++                )
++            entries.append(record)
++            prev = _digest(line)
++        return entries, prev
++
++    def entries(self) -> list[dict]:
++        """All entries, oldest first, after verifying the chain.
++
++        Raises:
++            ProgressLogError: The file was rewritten, truncated or reordered.
++        """
++        return self._read()[0]
++
++    def append(self, entry: dict) -> dict:
++        """Append one entry (numbered and chained here).
++
++        Args:
++            entry: JSON-serialisable mapping; ``n`` and ``prev`` are set by
++                the log and may not be supplied.
++
++        Returns:
++            The stored entry.
++
++        Raises:
++            ProgressLogError: The existing log fails verification, or the
++                entry tries to set ``n``/``prev`` itself.
++        """
++        if {"n", "prev"} & set(entry):
++            raise ProgressLogError("entries may not set 'n' or 'prev': the log numbers them")
++        self.path.parent.mkdir(parents=True, exist_ok=True)
++        lock = self.path.with_name(self.path.name + ".lock")
++        with lock.open("w") as handle:
++            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
++            try:
++                entries, prev = self._read()
++                record = {"n": len(entries) + 1, "prev": prev, **entry}
++                line = json.dumps(record, sort_keys=True, ensure_ascii=False)
++                with self.path.open("a") as fh:
++                    fh.write(line + "\n")
++                    fh.flush()
++                    os.fsync(fh.fileno())
++                return record
++            finally:
++                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
++
++    def render(self) -> str:
++        """The entries as prompt text for a fresh session ('' when empty)."""
++        entries = self.entries()
++        if not entries:
++            return ""
++        blocks = []
++        for record in entries:
++            body = {k: v for k, v in record.items() if k not in ("n", "prev")}
++            blocks.append(
++                f"### entry {record['n']}\n\n```json\n"
++                + json.dumps(body, indent=2, sort_keys=True, ensure_ascii=False)
++                + "\n```"
++            )
++        return "\n\n".join(blocks)
+diff --git a/factory/publish.py b/factory/publish.py
+new file mode 100644
+index 0000000..83cadaf
+--- /dev/null
++++ b/factory/publish.py
+@@ -0,0 +1,204 @@
++"""Publishing a validated branch: the push and ``gh pr create`` (F-10 AC-13).
++
++These are the only two places the factory acts on the outside world with
++the orchestrator's credentials, so both are fenced in code:
++
++* :func:`push_branch` pushes exactly one ref — the run's own branch,
++  pointed at **the validated commit**, by an explicit
++  ``<sha>:refs/heads/X`` refspec, to the profile's remote URL (never a
++  configured remote name, so no ``remote.*.push``/``mirror`` config
++  applies), with no force and no tags. The source is the object name, not
++  the branch: the branch lives in the agent-owned work clone and a
++  surviving implementer process (F-06 documents setsid escapees) could
++  move it after L0/L1/L2 validated the head — pushing the sha publishes
++  the validated tree whatever the branch points at now. After the push,
++  ``ls-remote`` must read the ref back as exactly that sha, or the
++  publish fails before any PR opens. It refuses — **before any git
++  process starts** — the default branch, any branch outside the
++  ``factory/`` namespace, any branch the run did not create, and anything
++  that isn't a plain branch name (refspec syntax, ``+`` force, ``HEAD``).
++  The factory's own repo can't have branch protection on a free private
++  plan, so this check is the only guard on its ``main``.
++* :func:`gh_pr_create` opens the PR. The factory never merges: merging is
++  the owner's act (TASK-CONTRACT §3, v0 everything is ``merge: human``).
++
++Every git call uses :data:`factory.runs.GIT_HARDENING` (no hooks, no
++fsmonitor): the run's clone was written by an agent.
++"""
++
++from __future__ import annotations
++
++import re
++import shutil
++import subprocess
++import tempfile
++from dataclasses import dataclass
++from pathlib import Path
++
++from factory.runs import GIT_HARDENING
++
++BRANCH_PREFIX = "factory/"
++_BRANCH_RE = re.compile(r"^factory/[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$")
++_SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
++_GITHUB_REMOTE = re.compile(
++    r"^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
++    r"(?P<slug>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
++)
++
++
++class PushRefused(Exception):
++    """The orchestrator refused to push or open a PR for this ref."""
++
++
++class PublishError(Exception):
++    """git push or gh failed."""
++
++
++@dataclass(frozen=True)
++class PullRequest:
++    """What the orchestrator asks the PR seam to open."""
++
++    remote: str
++    base: str
++    head: str
++    title: str
++    body: str
++
++
++def check_branch(branch: str, *, created: set[str] | frozenset[str], default_branch: str) -> str:
++    """Validate a branch the orchestrator is about to publish.
++
++    Returns:
++        The full ref name ``refs/heads/<branch>``.
++
++    Raises:
++        PushRefused: The branch is the default branch, outside the
++            ``factory/`` namespace, not created by this run, or not a plain
++            branch name.
++    """
++    if not isinstance(branch, str) or not branch:
++        raise PushRefused(f"refusing to publish an empty branch name: {branch!r}")
++    if branch in (default_branch, f"refs/heads/{default_branch}") or branch.endswith(
++        f":refs/heads/{default_branch}"
++    ):
++        raise PushRefused(f"refusing to push the default branch {default_branch!r}")
++    if not _BRANCH_RE.match(branch) or ".." in branch or branch.endswith((".lock", ".")):
++        raise PushRefused(
++            f"refusing to push {branch!r}: the orchestrator only pushes plain branch "
++            f"names under {BRANCH_PREFIX!r} (no refspecs, no force, no HEAD)"
++        )
++    if branch not in created:
++        raise PushRefused(f"refusing to push {branch!r}: this run did not create it")
++    return f"refs/heads/{branch}"
++
++
++def push_branch(
++    repo: Path,
++    remote_url: str,
++    branch: str,
++    *,
++    sha: str,
++    created: set[str] | frozenset[str],
++    default_branch: str,
++) -> None:
++    """Push the validated commit, and nothing else, to the remote URL.
++
++    Args:
++        repo: The clone holding the validated ``sha``.
++        remote_url: The profile's ``repo.remote`` URL (or a path, in tests).
++        branch: The branch to publish (``factory/...``).
++        sha: The commit L0/L1/L2 validated — the object actually pushed;
++            the branch name is only the remote label it lands on.
++        created: Branch names this run created; anything else is refused.
++        default_branch: ``repo.default_branch`` — never pushed.
++
++    Raises:
++        PushRefused: See :func:`check_branch`, or ``sha`` isn't a full
++            object name; raised before git runs.
++        PublishError: The push failed, or the remote ref did not read
++            back as exactly ``sha`` (the publish is unconfirmed and no
++            PR may be opened about it).
++    """
++    ref = check_branch(branch, created=created, default_branch=default_branch)
++    if not _SHA_RE.match(sha or ""):
++        raise PushRefused(
++            f"refusing to push {branch!r}: the validated commit must be a full "
++            f"sha, got {sha!r}"
++        )
++    proc = subprocess.run(
++        [
++            "git", *GIT_HARDENING, "-C", str(repo), "push", "--no-follow-tags",
++            "--porcelain", remote_url, f"{sha}:{ref}",
++        ],
++        capture_output=True,
++        text=True,
++    )
++    if proc.returncode != 0:
++        raise PublishError(f"git push of {ref} failed: {proc.stderr.strip()[:1000]}")
++    probe = subprocess.run(
++        ["git", *GIT_HARDENING, "-C", str(repo), "ls-remote", remote_url, ref],
++        capture_output=True,
++        text=True,
++    )
++    if probe.returncode != 0:
++        raise PublishError(
++            f"could not confirm {ref} on the remote (ls-remote failed): "
++            f"{probe.stderr.strip()[:500]}"
++        )
++    fields = probe.stdout.split()
++    got = fields[0] if fields else ""
++    if got != sha:
++        raise PublishError(
++            f"remote {ref} reads {got or 'absent'}, not the validated commit "
++            f"{sha}: refusing to open a PR about an unconfirmed publish"
++        )
++
++
++def github_slug(remote_url: str) -> str:
++    """``owner/repo`` from a GitHub remote URL.
++
++    Raises:
++        PublishError: The remote isn't a GitHub URL.
++    """
++    match = _GITHUB_REMOTE.match(remote_url.strip())
++    if not match:
++        raise PublishError(f"cannot open a PR: {remote_url!r} is not a GitHub remote")
++    return match.group("slug")
++
++
++def gh_pr_create(pr: PullRequest, *, gh_bin: Path | str | None = None) -> str:
++    """Open the PR with ``gh pr create`` and return its URL.
++
++    The body travels through a temp file outside every clone (argv has a
++    size limit and shows up in ``ps``).
++
++    Raises:
++        PushRefused: ``pr.head`` is not a factory branch or is the base.
++        PublishError: gh is missing or fails.
++    """
++    if pr.head == pr.base or not _BRANCH_RE.match(pr.head):
++        raise PushRefused(f"refusing to open a PR from {pr.head!r} into {pr.base!r}")
++    gh = str(gh_bin) if gh_bin else shutil.which("gh")
++    if not gh:
++        raise PublishError("gh is not installed: the factory opens PRs with `gh pr create`")
++    slug = github_slug(pr.remote)
++    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as fh:
++        fh.write(pr.body)
++        body_path = Path(fh.name)
++    try:
++        proc = subprocess.run(
++            [
++                gh, "pr", "create", "--repo", slug, "--base", pr.base, "--head", pr.head,
++                "--title", pr.title, "--body-file", str(body_path),
++            ],
++            capture_output=True,
++            text=True,
++        )
++    finally:
++        body_path.unlink(missing_ok=True)
++    if proc.returncode != 0:
++        raise PublishError(f"gh pr create failed: {proc.stderr.strip()[:1000]}")
++    urls = re.findall(r"https://\S+/pull/\d+", proc.stdout)
++    if not urls:
++        raise PublishError(f"gh pr create printed no PR URL: {proc.stdout.strip()[:500]}")
++    return urls[-1]
+diff --git a/factory/state.py b/factory/state.py
+index 6f2701e..70bc79b 100644
+--- a/factory/state.py
++++ b/factory/state.py
+@@ -638,6 +638,20 @@ def reclaim_abandoned(self) -> list[str]:
+         finally:
+             lease.__exit__(None, None, None)
+ 
++    @contextlib.contextmanager
++    def idle_lease(self):
++        """Hold the run lease for orchestrator housekeeping between runs.
++
++        While held, no session can start (``begin_run`` refuses), so work
++        that must never race a live run — reclaiming orphaned run dirs
++        (F-10) — is safe inside the block.
++
++        Raises:
++            RunInProgressError: If a live run holds the lease.
++        """
++        with self._run_lease(holder="housekeeping"):
++            yield
++
+     @contextlib.contextmanager
+     def _run_lease(self, holder: str):
+         """Hold the non-blocking exclusive run lease on ``<queue>.run.lock``.
+diff --git a/schema/tasks.schema.json b/schema/tasks.schema.json
+index 7c30adf..d8b3125 100644
+--- a/schema/tasks.schema.json
++++ b/schema/tasks.schema.json
+@@ -20,7 +20,7 @@
+       "enum": ["auth", "payments", "rls", "migration", "safety", "privacy", "new_dependency", "deploy", "cross_repo", "external_service", "factory_control"]
+     },
+     "escalation": {
+-      "enum": ["attempts_exhausted", "budget_exhausted", "risk_path_touched", "new_dependency", "protected_path_touched", "contract_ambiguous", "quota_exhausted", "live_check_failed", "cross_repo"]
++      "enum": ["attempts_exhausted", "budget_exhausted", "risk_path_touched", "new_dependency", "protected_path_touched", "contract_ambiguous", "quota_exhausted", "live_check_failed", "cross_repo", "pr_create_failed", "orchestrator_error", "publish_refused"]
+     },
+     "check": {
+       "type": "object",
+diff --git a/tests/test_f10.py b/tests/test_f10.py
+new file mode 100644
+index 0000000..cfe4760
+--- /dev/null
++++ b/tests/test_f10.py
+@@ -0,0 +1,1396 @@
++"""F-10 acceptance tests — BUILD-ORDER.md, work order F-10.
++
++Contract rule (CLAUDE.md): an acceptance ref ``tests/test_f10.py::test_ac_N``
++means a test function with exactly that name.
++
++What is real and what is stubbed:
++
++* **Real:** the fixture project's git repo and a bare "GitHub" remote the
++  orchestrator pushes to, the F-05 clone manager, the F-03 queue and run
++  lease, F-07 L0 and F-08 L1 — and every project command they run goes
++  through the real pinned ``srt`` sandbox (AC-11).
++* **Stubbed:** the model. Each seat is a ``session_runner`` stub with
++  ``run_session_sandboxed``'s signature: the "implementer" writes files into
++  the run dir the way a session would, the "reviewer" returns verdict JSON.
++  No API spend. ``gh pr create`` is replaced by an ``open_pr`` recorder,
++  except in the tests of the real gh wrapper, which use a fake ``gh`` binary.
++"""
++
++import json
++import re
++import shlex
++import signal
++import subprocess
++import sys
++import textwrap
++from datetime import datetime, timezone
++from pathlib import Path
++from zoneinfo import ZoneInfo
++
++import pytest
++import yaml
++
++from factory import l0 as l0_module
++from factory import l1 as l1_module
++from factory.config import ConfigError, PeakWindow, in_peak_window, load_config
++from factory.contract import ContractError, acceptance_hash
++from factory.gates import CommandResult
++from factory.l1 import L1Report
++from factory.orchestrator import (
++    PullRequest,
++    reclaim_runs,
++    run_loop,
++    run_once,
++)
++from factory.prbody import (
++    REQUIRED_SECTIONS,
++    PRBodyError,
++    blast_radius,
++    build_evidence,
++    check_pr_body,
++    door,
++    how_to_revert,
++)
++from factory.progress import ProgressLog, ProgressLogError
++from factory.prompts import prompt_versions
++from factory.publish import PushRefused, gh_pr_create, push_branch
++from factory.runs import GIT_HARDENING, create_run
++from factory.session import SessionRecord
++from factory.state import TaskQueue
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++STOCKHOLM = ZoneInfo("Europe/Stockholm")
++# A Sunday afternoon: outside every default peak window, so runs may start.
++OFF_PEAK = datetime(2026, 10, 18, 15, 0, tzinfo=STOCKHOLM)
++REF = "tests/test_feature.py::test_ac_1"
++
++TEST_SOURCE = textwrap.dedent(
++    """
++    from impl import answer
++
++
++    def test_ac_1():
++        assert answer() == 42
++    """
++)
++REVIEW_PASS = json.dumps({"verdict": "pass", "findings": []})
++
++
++# ----------------------------------------------------------------- fixtures --
++
++
++def _git(repo: Path, *args: str) -> str:
++    return subprocess.run(
++        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
++    ).stdout.strip()
++
++
++def _task(task_id: str = "T-1", *, risk=(), ref: str = REF, **overrides) -> dict:
++    acceptance = [
++        {"id": "AC-1", "text": "answer() returns 42", "check": {"type": "test", "ref": ref}}
++    ]
++    task = {
++        "id": task_id,
++        "title": f"Make answer() return 42 ({task_id})",
++        "source": f"docs/{task_id}.md",
++        "kind": "build",
++        "priority": "P1",
++        "status": "ready",
++        "depends_on": [],
++        "risk": list(risk),
++        "gates": {"spec_approval": True, "merge": "human", "deploy": "human"},
++        "acceptance": acceptance,
++        "acceptance_hash": acceptance_hash(acceptance),
++        "approved_at": "2026-10-18T10:00:00Z",
++        "approved_by": "owner",
++        "budget": {"size": "S", "max_attempts": 3, "max_turns": 20, "wall_clock_min": 10},
++        "attempts": [],
++    }
++    task.update(overrides)
++    return task
++
++
++class Env:
++    """One fixture project: local repo + bare remote + factory root."""
++
++    def __init__(self, tmp_path: Path, tasks: list | None = None, profile_extra=None):
++        self.tmp = tmp_path
++        self.root = tmp_path / "factory-root"
++        (self.root / "holdouts" / "fixture").mkdir(parents=True)
++        self.holdout = self.root / "holdouts" / "fixture" / "scenario.md"
++        self.holdout.write_text("HOLDOUT-SECRET-CANARY\n")
++        self.repo = tmp_path / "proj"
++        self.remote = tmp_path / "remote.git"
++        self.repo.mkdir()
++        _git(self.repo, "init", "-b", "main")
++        _git(self.repo, "config", "user.email", "fixture@example.com")
++        _git(self.repo, "config", "user.name", "Fixture")
++        (self.repo / "impl.py").write_text("def answer():\n    return 0\n")
++        (self.repo / "tests").mkdir()
++        (self.repo / "tests" / "test_base.py").write_text("def test_base():\n    assert True\n")
++        profile = {
++            "name": "fixture",
++            "repo": {
++                "path": str(self.repo),
++                "default_branch": "main",
++                "remote": str(self.remote),
++                "merge_method": "squash",
++            },
++            "commands": {
++                "setup": "true",
++                "test": f"{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider",
++            },
++            "paths": {
++                "risk": {"payments": ["src/pay/**"]},
++                "protected": [".factory/**"],
++            },
++            "dependency_manifests": ["pyproject.toml"],
++            "deploy": {"mechanism": "none", "auto_on_merge": False},
++            "live_checks": {},
++            "docs_allowlist": [],
++        }
++        profile.update(profile_extra or {})
++        self.profile = profile
++        factory_dir = self.repo / ".factory"
++        factory_dir.mkdir()
++        self.profile_path = factory_dir / "project.yaml"
++        self.profile_path.write_text(yaml.safe_dump(profile))
++        self.queue_path = factory_dir / "tasks.json"
++        doc = {"version": 1, "project": "fixture", "tasks": tasks or [_task()]}
++        self.queue_path.write_text(json.dumps(doc, indent=2) + "\n")
++        (self.repo / ".gitignore").write_text(".factory/*.lock\n")
++        _git(self.repo, "add", "-A")
++        _git(self.repo, "commit", "-m", "base")
++        subprocess.run(
++            ["git", "clone", "--bare", "-q", str(self.repo), str(self.remote)], check=True
++        )
++        self.prs: list[PullRequest] = []
++
++    # The open_pr seam: record, never call gh.
++    def open_pr(self, pr: PullRequest) -> str:
++        self.prs.append(pr)
++        return f"https://github.com/fixture/fixture/pull/{len(self.prs)}"
++
++    def queue(self) -> TaskQueue:
++        return TaskQueue(self.queue_path)
++
++    def task(self, task_id: str = "T-1") -> dict:
++        return self.queue().get(task_id)
++
++    def remote_branches(self) -> set[str]:
++        out = _git(self.remote, "for-each-ref", "--format=%(refname)", "refs/heads")
++        return set(out.split())
++
++    def runs_left(self) -> list[Path]:
++        runs = self.root / "runs" / "fixture"
++        return sorted(runs.iterdir()) if runs.exists() else []
++
++    def sandbox_left(self) -> list[Path]:
++        sandbox = self.root / "sandbox"
++        return sorted(sandbox.iterdir()) if sandbox.exists() else []
++
++    def run(self, session_runner, **kwargs):
++        kwargs.setdefault("now", lambda: OFF_PEAK)
++        return run_once(
++            self.queue_path,
++            factory_root=self.root,
++            session_runner=session_runner,
++            open_pr=self.open_pr,
++            **kwargs,
++        )
++
++    def loop(self, session_runner, **kwargs):
++        kwargs.setdefault("now", lambda: OFF_PEAK)
++        return run_loop(
++            self.queue_path,
++            factory_root=self.root,
++            session_runner=session_runner,
++            open_pr=self.open_pr,
++            **kwargs,
++        )
++
++
++class Seats:
++    """Stub seats with ``run_session_sandboxed``'s signature.
++
++    The implementer writes ``impl.py`` (returning ``answer``) plus the
++    contract test into the run dir; the reviewer answers ``review``.
++    """
++
++    def __init__(self, answer=42, result="Implemented answer().", review=REVIEW_PASS,
++                 extra_files=None, implementer=None):
++        self.answer = answer
++        self.result = result
++        self.review = review
++        self.extra_files = extra_files or {}
++        self.implementer = implementer
++        self.calls: list[tuple[str, str, Path, dict]] = []
++
++    def prompts(self, seat: str) -> list[str]:
++        return [prompt for s, prompt, _, _ in self.calls if s == seat]
++
++    def __call__(self, seat, prompt, run_dir, profile, **kwargs):
++        run_dir = Path(run_dir)
++        self.calls.append((seat, prompt, run_dir, kwargs))
++        if seat == "implementer":
++            if self.implementer is not None:
++                return self.implementer(prompt, run_dir, kwargs)
++            (run_dir / "impl.py").write_text(f"def answer():\n    return {self.answer}\n")
++            (run_dir / "tests" / "test_feature.py").write_text(TEST_SOURCE)
++            for rel, text in self.extra_files.items():
++                target = run_dir / rel
++                target.parent.mkdir(parents=True, exist_ok=True)
++                target.write_text(text)
++            return SessionRecord(
++                seat=seat, status="completed", num_turns=3, model="stub-model",
++                tokens={"input_tokens": 120, "output_tokens": 40}, result=self.result,
++            )
++        return SessionRecord(
++            seat=seat, status="completed", num_turns=1, model="stub-model",
++            tokens={"input_tokens": 60, "output_tokens": 10}, result=self.review,
++        )
++
++
++def _section(body: str, name: str) -> str:
++    """The text of one top-level ``## name`` section of a PR body."""
++    match = re.search(rf"^## {re.escape(name)}\n(.*?)(?=^## |\Z)", body, re.M | re.S)
++    assert match, f"section {name!r} missing from body:\n{body}"
++    return match.group(1)
++
++
++# --- AC-1: end to end, stub model makes a correct change → PR, in_review ----
++
++
++def test_ac_1(tmp_path: Path):
++    env = Env(tmp_path)
++    seats = Seats()
++    result = env.run(seats)
++
++    assert result.outcome == "pr_opened", result
++    assert len(env.prs) == 1
++    pr = env.prs[0]
++    task = env.task()
++    assert task["status"] == "in_review"
++    assert len(task["attempts"]) == 1
++    attempt = task["attempts"][0]
++    assert attempt["outcome"] == "pass"
++    assert attempt["pr"] == result.pr == "https://github.com/fixture/fixture/pull/1"
++    assert task["links"]["pr"] == result.pr
++    assert task["links"]["branch"] == pr.head
++    # The branch really reached the remote, carrying the implementer's change.
++    assert f"refs/heads/{pr.head}" in env.remote_branches()
++    shown = _git(env.remote, "show", f"refs/heads/{pr.head}:impl.py")
++    assert "return 42" in shown
++    assert pr.base == "main"
++    # Each seat ran exactly once: implementer then reviewer.
++    assert [c[0] for c in seats.calls] == ["implementer", "reviewer"]
++    # The validator report is stored outside the run dirs, and every gate passed.
++    report = json.loads(Path(attempt["validator_report"]).read_text())
++    assert [report[k]["verdict"] for k in ("L0", "L1", "L2")] == ["pass", "pass", "pass"]
++
++
++# --- AC-2: three failures → needs_human, attempts_exhausted, no PR ---------
++
++
++def test_ac_2(tmp_path: Path):
++    env = Env(tmp_path)
++    seats = Seats(answer=41)  # wrong every time: the contract test stays red
++    result = env.run(seats)
++
++    assert result.outcome == "needs_human"
++    task = env.task()
++    assert task["status"] == "needs_human"
++    assert len(task["attempts"]) == 3
++    assert all(a["outcome"] != "pass" for a in task["attempts"])
++    assert task["attempts"][-1]["escalation"] == "attempts_exhausted"
++    assert env.prs == []
++    assert env.remote_branches() == {"refs/heads/main"}  # nothing was pushed
++    # Three implementer rounds, no reviewer (L0's test gate failed: the line stopped).
++    assert [c[0] for c in seats.calls] == ["implementer"] * 3
++    # Findings went back: round 2's prompt carries round 1's numbered L0 finding.
++    assert "1. [L0 " in seats.prompts("implementer")[1]
++    assert "tests/test_feature.py" in seats.prompts("implementer")[1]
++
++
++def test_session_failure_counts_as_a_failed_attempt(tmp_path: Path):
++    env = Env(tmp_path)
++
++    def broken(prompt, run_dir, kwargs):
++        return SessionRecord(seat="implementer", status="failed",
++                             reason="error_during_execution")
++
++    result = env.run(Seats(implementer=broken))
++    task = env.task()
++    assert result.outcome == "needs_human"
++    assert len(task["attempts"]) == 3
++    assert task["attempts"][-1]["escalation"] == "attempts_exhausted"
++    assert env.prs == []
++
++
++def test_budget_counts_earlier_attempts(tmp_path: Path):
++    """A re-queued task runs under the same attempt budget (TASK-CONTRACT §3)."""
++    earlier = {
++        "run_id": "old", "slice_id": "T-1", "started": "2026-10-17T10:00:00Z",
++        "outcome": "fail", "prompt_versions": {"implementer": "x"}, "skills": [],
++    }
++    env = Env(tmp_path, tasks=[_task(attempts=[dict(earlier), dict(earlier, run_id="old2")])])
++    seats = Seats(answer=41)
++    env.run(seats)
++    task = env.task()
++    assert len(task["attempts"]) == 3  # one more round, then exhausted
++    assert task["attempts"][-1]["escalation"] == "attempts_exhausted"
++    assert len(seats.prompts("implementer")) == 1
++
++
++def test_reviewer_fail_is_retried_then_exhausted(tmp_path: Path):
++    review = json.dumps({"verdict": "fail", "findings": [
++        {"id": "R1", "axis": "spec", "severity": "blocking", "text": "scope creep"}]})
++    env = Env(tmp_path)
++    seats = Seats(review=review)
++    result = env.run(seats)
++    assert result.outcome == "needs_human"
++    assert [c[0] for c in seats.calls] == ["implementer", "reviewer"] * 3
++    assert "scope creep" in seats.prompts("implementer")[1]
++    assert env.prs == []
++
++
++def test_l0_escalation_stops_immediately(tmp_path: Path):
++    """Protected path, new dependency, risk path: no retries (VALIDATOR-SPEC)."""
++    env = Env(tmp_path)
++    seats = Seats(extra_files={"src/pay/charge.py": "AMOUNT = 1\n"})
++    result = env.run(seats)
++    task = env.task()
++    assert result.outcome == "needs_human"
++    assert len(task["attempts"]) == 1
++    assert task["attempts"][0]["escalation"] == "risk_path_touched"
++    assert "payments" in task["risk"]  # the dynamic flag is written onto the task
++    assert task["gates"]["merge"] == "human"
++    assert env.prs == []
++
++
++# --- AC-3: quota/429 stops the loop, marks quota_exhausted, no retry -------
++
++
++def test_ac_3(tmp_path: Path):
++    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
++
++    def quota(prompt, run_dir, kwargs):
++        return SessionRecord(seat="implementer", status="failed", is_error=True,
++                             reason="api_error_429", subtype="success")
++
++    seats = Seats(implementer=quota)
++    result = env.loop(seats)
++
++    assert result.stop_reason == "quota_exhausted"
++    assert len(seats.calls) == 1  # no retry, and T-2 never started
++    t1, t2 = env.task("T-1"), env.task("T-2")
++    assert len(t1["attempts"]) == 1
++    assert t1["attempts"][0]["escalation"] == "quota_exhausted"
++    assert t1["attempts"][0]["outcome"] == "aborted"
++    assert t1["status"] == "ready"  # quota is not the task's fault: it re-queues
++    assert t2["status"] == "ready" and t2["attempts"] == []
++    assert env.prs == []
++
++
++@pytest.mark.parametrize(
++    "record",
++    [
++        SessionRecord(seat="reviewer", status="failed", reason="api_error_429"),
++        SessionRecord(seat="reviewer", status="failed",
++                      reason="ProcessError: API Error: 429 rate limit exceeded"),
++    ],
++)
++def test_reviewer_quota_also_stops(tmp_path: Path, record):
++    env = Env(tmp_path)
++    seats = Seats()
++    base = seats.__call__
++
++    def runner(seat, prompt, run_dir, profile, **kwargs):
++        if seat == "reviewer":
++            seats.calls.append((seat, prompt, Path(run_dir), kwargs))
++            return record
++        return base(seat, prompt, run_dir, profile, **kwargs)
++
++    result = env.loop(runner)
++    assert result.stop_reason == "quota_exhausted"
++    assert env.task()["attempts"][-1]["escalation"] == "quota_exhausted"
++    assert env.prs == []
++
++
++# --- AC-4: no session during the peak window; the window is config ---------
++
++
++def test_ac_4(tmp_path: Path):
++    monday_0930 = datetime(2026, 10, 19, 9, 30, tzinfo=STOCKHOLM)
++    env = Env(tmp_path)
++    seats = Seats()
++    result = env.loop(seats, now=lambda: monday_0930)
++    assert result.stop_reason == "peak_window"
++    assert seats.calls == []
++    assert env.task()["status"] == "ready"
++
++    # The window comes from config: move it, and the same instant is allowed.
++    config_path = tmp_path / "config.yaml"
++    config_path.write_text(yaml.safe_dump({"peak_window": {
++        "timezone": "Europe/Stockholm", "days": ["sat"], "start": "13:00", "end": "14:00"}}))
++    config = load_config(config_path)
++    result = env.loop(seats, now=lambda: monday_0930, config=config)
++    assert result.stop_reason == "queue_empty"
++    assert env.task()["status"] == "in_review"
++
++
++def test_peak_window_boundaries_and_dst():
++    window = load_config(None).peak_window  # the default: 08-12 Mon-Fri Stockholm
++    assert window == PeakWindow("Europe/Stockholm", ("mon", "tue", "wed", "thu", "fri"),
++                                "08:00", "12:00")
++    at = lambda *a: datetime(*a, tzinfo=STOCKHOLM)  # noqa: E731
++    assert in_peak_window(at(2026, 10, 19, 8, 0), window)
++    assert in_peak_window(at(2026, 10, 19, 11, 59), window)
++    assert not in_peak_window(at(2026, 10, 19, 7, 59), window)
++    assert not in_peak_window(at(2026, 10, 19, 12, 0), window)
++    assert not in_peak_window(at(2026, 10, 18, 9, 0), window)  # Sunday
++    # Swedish time, whatever the caller's zone: 07:30 UTC is 09:30 CEST
++    # in summer (in the window) but 08:30 CET after the switch (still in),
++    # and 06:30 UTC is 08:30 CEST but 07:30 CET (out) — DST is honoured.
++    utc = lambda *a: datetime(*a, tzinfo=timezone.utc)  # noqa: E731
++    assert in_peak_window(utc(2026, 10, 23, 6, 30), window)       # Fri, CEST
++    assert not in_peak_window(utc(2026, 10, 26, 6, 30), window)   # Mon, CET
++    with pytest.raises(ConfigError):
++        in_peak_window(datetime(2026, 10, 19, 9, 0), window)  # naive: refuse
++
++
++def test_bad_config_is_refused(tmp_path: Path):
++    for bad in (
++        {"peak_window": {"timezone": "Mars/Base", "days": ["mon"], "start": "08:00",
++                         "end": "12:00"}},
++        {"peak_window": {"timezone": "Europe/Stockholm", "days": ["funday"],
++                         "start": "08:00", "end": "12:00"}},
++        {"peak_window": {"timezone": "Europe/Stockholm", "days": ["mon"],
++                         "start": "8am", "end": "12:00"}},
++        {"peak_window": {"timezone": "Europe/Stockholm", "days": ["mon"],
++                         "start": "12:00", "end": "08:00"}},
++        {"unknown_key": 1},
++    ):
++        path = tmp_path / "bad.yaml"
++        path.write_text(yaml.safe_dump(bad))
++        with pytest.raises(ConfigError):
++            load_config(path)
++
++
++def test_peak_window_reached_mid_run_stops_before_next_session(tmp_path: Path):
++    env = Env(tmp_path)
++    clock = iter([OFF_PEAK, OFF_PEAK] + [datetime(2026, 10, 19, 9, 0, tzinfo=STOCKHOLM)] * 50)
++    seats = Seats(answer=41)
++    result = env.run(seats, now=lambda: next(clock))
++    assert result.outcome == "peak_window"
++    assert len(seats.prompts("implementer")) == 1
++    task = env.task()
++    assert task["status"] == "ready" and len(task["attempts"]) == 1
++    assert env.runs_left() == []
++
++
++# --- AC-5: no `gh pr merge` anywhere in the code (grep test) ----------------
++
++
++def test_ac_5():
++    patterns = [
++        re.compile(r"gh\s+pr\s+merge"),
++        re.compile(r"""["']pr["']\s*,\s*["']merge["']"""),
++        re.compile(r"pulls/[^\s\"']*/merge"),
++        re.compile(r"""["']merge["']\s*,\s*["']--"""),
++    ]
++    offenders = []
++    files = sorted((REPO_ROOT / "factory").rglob("*.py")) + sorted(
++        (REPO_ROOT / "prompts").rglob("*.md")
++    )
++    assert files
++    for path in files:
++        text = path.read_text()
++        for pattern in patterns:
++            for match in pattern.finditer(text):
++                offenders.append(f"{path.relative_to(REPO_ROOT)}: {match.group(0)!r}")
++    assert offenders == [], "the factory never merges a PR:\n" + "\n".join(offenders)
++
++
++# --- AC-6: every attempt records prompt_versions and skills ----------------
++
++
++def test_ac_6(tmp_path: Path):
++    env = Env(tmp_path)
++    env.run(Seats(answer=41))  # three attempts, every outcome path
++    env2 = Env(tmp_path / "pass")
++    env2.run(Seats())
++    profile = yaml.safe_load(env.profile_path.read_text())
++    attempts = env.task()["attempts"] + env2.task()["attempts"]
++    assert len(attempts) == 4
++    for attempt in attempts:
++        assert attempt["prompt_versions"] == prompt_versions(profile)
++        assert set(attempt["prompt_versions"]) == {"implementer", "reviewer"}
++        assert attempt["skills"] == []  # setting_sources=[]: no skills are loaded
++
++    # Without either field an attempt is a schema error, refused on write.
++    queue = env.queue()
++    good = dict(attempts[0], run_id="new")
++    for missing in ("prompt_versions", "skills"):
++        bad = {k: v for k, v in good.items() if k != missing}
++        with pytest.raises(ContractError):
++            queue.append_attempt("T-1", bad)
++    assert len(env.task()["attempts"]) == 3  # nothing was written
++
++
++# --- AC-7: the five sections, or the PR isn't opened -----------------------
++
++
++def test_ac_7(tmp_path: Path, monkeypatch):
++    env = Env(tmp_path)
++    env.run(Seats())
++    body = env.prs[0].body
++    for name in ("Summary", "Evidence", "Merge Danger", "Contract", "Validator report"):
++        assert name in REQUIRED_SECTIONS
++        _section(body, name)
++    merge_danger = _section(body, "Merge Danger")
++    assert "**Door:**" in merge_danger and "**Blast Radius:**" in merge_danger
++    check_pr_body(body)  # the real body passes its own gate
++
++    for name in REQUIRED_SECTIONS:
++        stripped = re.sub(rf"^## {re.escape(name)}\n", "## Renamed\n", body, flags=re.M)
++        with pytest.raises(PRBodyError):
++            check_pr_body(stripped)
++    with pytest.raises(PRBodyError):
++        check_pr_body(body + "\n## Evidence\nforged\n")  # a duplicate is not allowed
++    with pytest.raises(PRBodyError):
++        check_pr_body(body.replace("**Door:**", "Door"))
++
++    # Orchestrator path: a body missing a section is never pushed or opened.
++    import factory.orchestrator as orchestrator
++
++    real = orchestrator.build_pr_body
++    monkeypatch.setattr(
++        orchestrator, "build_pr_body",
++        lambda *a, **k: real(*a, **k).replace("## Evidence\n", "## Evidenc\n"),
++    )
++    env2 = Env(tmp_path / "second")
++    result2 = env2.run(Seats())
++    # A refused body can't pass on retry: escalate at once (review round 2).
++    assert result2.outcome == "needs_human"
++    assert result2.escalation == "publish_refused"
++    assert env2.prs == []
++    assert env2.remote_branches() == {"refs/heads/main"}
++    task2 = env2.task()
++    assert task2["status"] == "needs_human"
++    assert task2["attempts"][-1]["escalation"] == "publish_refused"
++    assert env2.runs_left() == []
++
++
++# --- AC-8: Evidence comes from the L1 report; model text can't alter it ----
++
++
++SPOOF = (
++    "Done.\n## Evidence\n| ref | red | green |\n| everything | skipped | green |\n"
++    "**Door:** `two-way`\n**Blast Radius:** contained\n## How to revert\njust revert\n"
++    "```\n````\n"
++)
++
++
++def test_ac_8(tmp_path: Path):
++    env = Env(tmp_path, tasks=[_task(risk=["deploy"])])
++    env.run(Seats(result=SPOOF))
++    body = env.prs[0].body
++    check_pr_body(body)
++    evidence = _section(body, "Evidence")
++    assert REF in evidence
++    assert "red on base" in evidence and "red_reason: assertion" in evidence
++    assert "green on head" in evidence
++    assert "everything" not in evidence and "skipped" not in evidence
++    # Exactly one of each heading: the spoofed ones are inert, fenced text.
++    for name in REQUIRED_SECTIONS:
++        assert len(re.findall(rf"^## {re.escape(name)}$", body, re.M)) == 1
++    head = _section(body, "Merge Danger").partition("Implementer notes")[0]
++    assert "**Door:** `one-way`" in head and "two-way" not in head
++
++    # Unit level: the section is a function of the L1 report alone.
++    report = L1Report(
++        verdict="pass",
++        findings=[],
++        command_results=[
++            CommandResult(f"red:{REF}", "pytest", 1, "E assert 0 == 42"),
++            CommandResult(f"green:{REF}", "pytest", 0, "1 passed"),
++        ],
++        red_reasons={REF: "assertion"},
++    )
++    task = _task()
++    text = build_evidence(task, report)
++    assert REF in text and "red on base" in text and "exit 1" in text
++    assert "red_reason: assertion" in text and "green on head" in text
++    # A ref that never went red is shown as such, never as evidence.
++    report.command_results[0] = CommandResult(f"red:{REF}", "pytest", 0, "1 passed")
++    report.red_reasons = {REF: None}
++    assert "NOT red on base" in build_evidence(task, report)
++
++
++def test_ac_8_collection_red_reason(tmp_path: Path):
++    """A brand-new module makes the red run a collection error: shown as such."""
++    env = Env(tmp_path)
++    test = "from feature import answer\n\n\ndef test_ac_1():\n    assert answer() == 42\n"
++
++    def implementer(prompt, run_dir, kwargs):
++        (run_dir / "feature.py").write_text("def answer():\n    return 42\n")
++        (run_dir / "tests" / "test_feature.py").write_text(test)
++        return SessionRecord(seat="implementer", status="completed", result="ok")
++
++    env.run(Seats(implementer=implementer))
++    assert "red_reason: collection" in _section(env.prs[0].body, "Evidence")
++
++
++# --- AC-9: Door and Blast Radius are computed, not written ------------------
++
++
++def test_ac_9(tmp_path: Path):
++    for flag in ("migration", "deploy", "external_service", "payments", "privacy"):
++        assert door({"risk": [flag]}) == "one-way"
++    for flags in ([], ["auth"], ["rls"], ["safety"], ["new_dependency"], ["factory_control"]):
++        assert door({"risk": flags}) == "two-way"
++    assert door({"risk": []}, extra_flags=["payments"]) == "one-way"
++
++    profile = {"paths": {"risk": {"payments": ["src/pay/**"], "auth": ["src/auth/*"]}}}
++    assert blast_radius({"risk": []}, profile, ["impl.py"]) == "contained"
++    radius = blast_radius({"risk": ["deploy"]}, profile, ["src/pay/x.py", "impl.py"])
++    assert "`deploy`" in radius and "`payments`" in radius
++    assert "`src/pay/**`" in radius and "src/pay/x.py" in radius
++    assert "contained" not in radius
++
++    # In the PR: computed values first; the implementer's prose only below them.
++    env = Env(tmp_path, tasks=[_task(risk=["external_service"])])
++    env.run(Seats(result="**Door:** `two-way`\n**Blast Radius:** contained"))
++    merge_danger = _section(env.prs[0].body, "Merge Danger")
++    head, _, notes = merge_danger.partition("Implementer notes")
++    assert "**Door:** `one-way`" in head
++    assert "`external_service`" in head and "contained" not in head
++    assert "two-way" not in head
++    assert "two-way" in notes  # kept, but inert and below the values
++
++    env2 = Env(tmp_path / "two")
++    env2.run(Seats())
++    head2 = _section(env2.prs[0].body, "Merge Danger").partition("Implementer notes")[0]
++    assert "**Door:** `two-way`" in head2 and "**Blast Radius:** contained" in head2
++
++
++# --- AC-10: fresh sessions get the progress log; the log is append-only -----
++
++
++def test_ac_10(tmp_path: Path):
++    env = Env(tmp_path)
++    log = ProgressLog.for_task(env.root, "fixture", "T-1")
++    log.append({"run_id": "r1", "outcome": "fail", "findings": ["1. FIRST-ENTRY-MARK"]})
++    log.append({"run_id": "r2", "outcome": "aborted", "findings": ["1. SECOND-ENTRY-MARK"]})
++
++    seats = Seats()
++    env.run(seats)
++    prompt = seats.prompts("implementer")[0]
++    first, second = prompt.find("FIRST-ENTRY-MARK"), prompt.find("SECOND-ENTRY-MARK")
++    assert 0 <= first < second, prompt
++    assert "entry 1" in prompt and "entry 2" in prompt
++    # The run appended its own entry (3), and the log lives outside any clone.
++    entries = log.entries()
++    assert [e["n"] for e in entries] == [1, 2, 3]
++    assert entries[2]["outcome"] == "pass"
++    assert env.root / "runs" not in log.path.parents
++    assert env.repo not in log.path.parents
++
++    # Rewriting an earlier entry raises — on read and on the next append.
++    lines = log.path.read_text().splitlines()
++    lines[0] = lines[0].replace("FIRST-ENTRY-MARK", "REWRITTEN")
++    log.path.write_text("\n".join(lines) + "\n")
++    with pytest.raises(ProgressLogError):
++        log.entries()
++    with pytest.raises(ProgressLogError):
++        log.append({"run_id": "r4", "outcome": "fail"})
++    # So does dropping one.
++    log.path.write_text("\n".join(log.path.read_text().splitlines()[1:]) + "\n")
++    with pytest.raises(ProgressLogError):
++        log.entries()
++
++
++def test_progress_log_reaches_every_round(tmp_path: Path):
++    env = Env(tmp_path)
++    seats = Seats(answer=41)
++    env.run(seats)
++    prompts = seats.prompts("implementer")
++    assert "entry 1" not in prompts[0]
++    assert "entry 1" in prompts[1] and "entry 2" not in prompts[1]
++    assert "entry 1" in prompts[2] and "entry 2" in prompts[2]
++
++
++# --- AC-11: L0 and L1 run project commands inside the sandbox ---------------
++
++
++def _probe_conftest(outside: Path, holdout: Path) -> str:
++    return textwrap.dedent(
++        f"""
++        import pathlib
++        RESULTS = []
++        try:
++            pathlib.Path({str(outside)!r}).write_text("pwned")
++            RESULTS.append("WRITE-ALLOWED")
++        except OSError:
++            RESULTS.append("WRITE-DENIED")
++        try:
++            RESULTS.append("READ-ALLOWED:" + pathlib.Path({str(holdout)!r}).read_text())
++        except OSError:
++            RESULTS.append("READ-DENIED")
++
++
++        def pytest_terminal_summary(terminalreporter):
++            terminalreporter.write_line("PROBE " + " ".join(RESULTS))
++        """
++    )
++
++
++def test_ac_11(tmp_path: Path, monkeypatch):
++    env = Env(tmp_path)
++    outside = tmp_path / "outside" / "pwned.txt"
++    outside.parent.mkdir()
++    conftest = _probe_conftest(outside, env.holdout)
++
++    # Control: the probe is real — run unsandboxed, it writes and reads.
++    control = tmp_path / "control"
++    (control / "tests").mkdir(parents=True)
++    (control / "tests" / "conftest.py").write_text(conftest)
++    (control / "tests" / "test_x.py").write_text("def test_x():\n    pass\n")
++    proc = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
++                          cwd=control, capture_output=True, text=True)
++    assert "PROBE WRITE-ALLOWED READ-ALLOWED:HOLDOUT-SECRET-CANARY" in proc.stdout
++    outside.unlink()
++
++    # Any unsandboxed project command during the run is a test failure.
++    def forbidden(*args, **kwargs):
++        raise AssertionError(f"project command ran outside the sandbox: {args}")
++
++    monkeypatch.setattr(l0_module, "_run_command", forbidden)
++    monkeypatch.setattr(l1_module, "run_command", forbidden)
++
++    seats = Seats(extra_files={"tests/conftest.py": conftest})
++    result = env.run(seats)
++    assert result.outcome == "pr_opened", result
++
++    commands = {c["name"]: c["output"] for c in result.reports["L0"]["commands"]}
++    commands.update({c["name"]: c["output"] for c in result.reports["L1"]["commands"]})
++    gated = ["test", f"red:{REF}", f"green:{REF}"]
++    for name in gated:
++        assert "PROBE WRITE-DENIED READ-DENIED" in commands[name], (name, commands[name])
++    assert all("HOLDOUT-SECRET-CANARY" not in out for out in commands.values())
++    assert not outside.exists()
++
++
++# --- AC-12: every run dir is cleaned up; loop reclaims orphans --------------
++
++
++def test_ac_12(tmp_path: Path):
++    # PR opened, needs_human, quota stop, exception: nothing is left behind.
++    def quota(prompt, run_dir, kwargs):
++        return SessionRecord(seat="implementer", status="failed", reason="api_error_429")
++
++    def crash(prompt, run_dir, kwargs):
++        # BaseException: an ordinary Exception is now caught, recorded as an
++        # orchestrator_error attempt and returned (review finding 2) — the
++        # exception-path cleanup proof uses the class that still escapes.
++        raise KeyboardInterrupt("orchestrator-side bug")
++
++    for name, seats, expected in (
++        ("pr", Seats(), "pr_opened"),
++        ("human", Seats(answer=41), "needs_human"),
++        ("quota", Seats(implementer=quota), "quota_exhausted"),
++    ):
++        env = Env(tmp_path / name)
++        assert env.run(seats).outcome == expected
++        assert env.runs_left() == [], name
++        assert env.sandbox_left() == [], name
++
++    env = Env(tmp_path / "crash")
++    with pytest.raises(KeyboardInterrupt, match="orchestrator-side bug"):
++        env.run(Seats(implementer=crash))
++    assert env.runs_left() == [] and env.sandbox_left() == []
++    assert env.task()["status"] == "ready"
++
++    # loop reclaims run dirs no live lease holds — and never a live run's.
++    env = Env(tmp_path / "orphans")
++    orphan = create_run("fixture", env.repo, factory_root=env.root)
++    orphan.settings_path.parent.mkdir(parents=True, exist_ok=True)
++    orphan.settings_path.write_text("{}")
++    runner_dir = orphan.settings_path.with_name(orphan.settings_path.name + "-runner")
++    runner_dir.mkdir()
++    queue = env.queue()
++    with queue.begin_run("T-1"):  # a live run holds the lease
++        assert reclaim_runs(env.queue(), "fixture", env.root) == []
++        assert orphan.root.exists()
++    # The holder above "died" in_progress; the lease is free now.
++    result = env.loop(Seats())
++    assert not orphan.root.exists()
++    assert not orphan.settings_path.exists() and not runner_dir.exists()
++    assert result.stop_reason == "queue_empty"
++    assert env.task()["status"] == "in_review"  # reclaimed to ready, then run
++    assert env.runs_left() == [] and env.sandbox_left() == []
++
++
++def test_ac_12_killed_run_is_cleaned_by_next_loop(tmp_path: Path):
++    env = Env(tmp_path)
++    marker = tmp_path / "session-started"
++    script = tmp_path / "killed_run.py"
++    script.write_text(textwrap.dedent(
++        f"""
++        import os, signal, sys
++        from pathlib import Path
++        sys.path.insert(0, {str(REPO_ROOT)!r})
++        from factory.orchestrator import run_once
++
++        def seat(seat, prompt, run_dir, profile, **kwargs):
++            Path({str(marker)!r}).write_text(str(run_dir))
++            os.kill(os.getpid(), signal.SIGKILL)  # killed mid-session
++
++        run_once(Path({str(env.queue_path)!r}), factory_root=Path({str(env.root)!r}),
++                 session_runner=seat, open_pr=lambda pr: "never")
++        """
++    ))
++    proc = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
++    assert proc.returncode == -signal.SIGKILL, proc.stderr
++    killed_dir = Path(marker.read_text())
++    assert killed_dir.exists() and killed_dir in env.runs_left()
++    assert env.task()["status"] == "in_progress"
++
++    result = env.loop(Seats())
++    assert not killed_dir.exists()
++    assert env.runs_left() == [] and env.sandbox_left() == []
++    assert result.stop_reason == "queue_empty"
++    assert env.task()["status"] == "in_review"
++
++
++# --- AC-13: never push the default branch; every git call is hardened ------
++
++
++def test_ac_13(tmp_path: Path, monkeypatch):
++    env = Env(tmp_path)
++    work = create_run("fixture", env.repo, factory_root=env.root, ref="main")
++    _git(work.root, "checkout", "-q", "-b", "factory/t-1-x")
++    _git(work.root, "-c", "user.name=t", "-c", "user.email=t@x", "commit",
++         "--allow-empty", "-q", "-m", "x")
++
++    # Every child process — subprocess.run included — is spawned through Popen.
++    spawned: list = []
++    real_popen = subprocess.Popen
++
++    class RecordPopen(real_popen):
++        def __init__(self, *args, **kwargs):
++            spawned.append(args[0] if args else kwargs.get("args"))
++            super().__init__(*args, **kwargs)
++
++    monkeypatch.setattr(subprocess, "Popen", RecordPopen)
++
++    refusals = [
++        ("main", {"main", "factory/t-1-x"}),               # the default branch
++        ("factory/other", {"factory/t-1-x"}),              # a ref the run didn't create
++        ("refs/heads/main", {"refs/heads/main"}),          # spelled as a full ref
++        ("factory/t-1-x:refs/heads/main", {"factory/t-1-x:refs/heads/main"}),  # refspec
++        ("+factory/t-1-x", {"+factory/t-1-x"}),            # force
++        ("HEAD", {"HEAD"}),
++        ("feature/x", {"feature/x"}),                      # outside the factory namespace
++    ]
++    for branch, created in refusals:
++        with pytest.raises(PushRefused):
++            push_branch(work.root, str(env.remote), branch, sha="0" * 40,
++                        created=created, default_branch="main")
++    assert spawned == [], "a refused push must not start any git process"
++
++    main_before = _git(env.remote, "rev-parse", "refs/heads/main")
++    head = _git(work.root, "rev-parse", "HEAD")
++    push_branch(work.root, str(env.remote), "factory/t-1-x", sha=head,
++                created={"factory/t-1-x"}, default_branch="main")
++    (push,) = [argv for argv in spawned if "push" in argv]
++    assert list(push[1:5]) == list(GIT_HARDENING)
++    assert push[-1] == f"{head}:refs/heads/factory/t-1-x"  # the object, not the branch
++    assert not any(a.startswith("+") or a in ("--force", "-f", "--mirror", "--all",
++                                               "--tags", "--follow-tags") for a in push)
++    assert env.remote_branches() == {"refs/heads/main", "refs/heads/factory/t-1-x"}
++    assert _git(env.remote, "rev-parse", "refs/heads/main") == main_before
++
++    # A whole run: every orchestrator-side git process carries GIT_HARDENING.
++    env2 = Env(tmp_path / "full")
++    spawned.clear()  # only the run's own processes from here on
++    assert env2.run(Seats()).outcome == "pr_opened"
++    gits = [list(argv) for argv in spawned
++            if isinstance(argv, (list, tuple)) and Path(str(argv[0])).name == "git"]
++    assert gits, "expected git calls during a run"
++    unhardened = [argv for argv in gits if argv[1:5] != list(GIT_HARDENING)]
++    assert unhardened == []
++    pushes = [argv for argv in gits if "push" in argv]
++    assert len(pushes) == 1
++    refspec = pushes[0][-1]
++    src, dst = refspec.split(":", 1)
++    assert dst == f"refs/heads/{env2.prs[0].head}"
++    assert re.fullmatch(r"[0-9a-f]{40}", src)  # the object, not the branch
++    assert _git(env2.remote, "rev-parse", dst) == src  # remote holds exactly it
++    assert env2.prs[0].head != "main"
++
++
++def test_agent_moving_the_default_branch_in_its_clone_is_never_pushed(tmp_path: Path):
++    """The agent owns its clone's refs; the orchestrator pushes only its branch."""
++    env = Env(tmp_path)
++    seats = Seats()
++    base = seats.__call__
++
++    def implementer(seat, prompt, run_dir, profile, **kwargs):
++        record = base(seat, prompt, run_dir, profile, **kwargs)
++        if seat == "implementer":
++            _git(run_dir, "-c", "user.name=a", "-c", "user.email=a@x", "commit",
++                 "-qam", "agent commit")
++            _git(run_dir, "branch", "-f", "main", "HEAD")
++        return record
++
++    main_before = _git(env.remote, "rev-parse", "refs/heads/main")
++    assert env.run(implementer).outcome == "pr_opened"
++    assert _git(env.remote, "rev-parse", "refs/heads/main") == main_before
++    assert len(env.remote_branches()) == 2
++
++
++def test_gh_pr_create_wrapper(tmp_path: Path):
++    """The real gh seam: `gh pr create` with the body from a file, nothing else."""
++    log = tmp_path / "gh-args"
++    fake = tmp_path / "gh"
++    fake.write_text(
++        "#!/bin/sh\n"
++        f"for a in \"$@\"; do printf '%s\\n' \"$a\" >> {shlex.quote(str(log))}; done\n"
++        "echo https://github.com/AgenticTony/x/pull/7\n"
++    )
++    fake.chmod(0o755)
++    pr = PullRequest(remote="https://github.com/AgenticTony/x.git", base="main",
++                     head="factory/t-1-x", title="T-1: thing", body="## Summary\nbody\n")
++    url = gh_pr_create(pr, gh_bin=fake)
++    assert url == "https://github.com/AgenticTony/x/pull/7"
++    args = log.read_text().splitlines()
++    assert args[:2] == ["pr", "create"]
++    assert args[args.index("--repo") + 1] == "AgenticTony/x"
++    assert args[args.index("--base") + 1] == "main"
++    assert args[args.index("--head") + 1] == "factory/t-1-x"
++    assert "--body-file" in args
++    with pytest.raises(PushRefused):
++        gh_pr_create(PullRequest(remote="https://github.com/a/b", base="main", head="main",
++                                 title="t", body="b"), gh_bin=fake)
++
++
++# --- AC-14: How to revert, built by the orchestrator ------------------------
++
++
++def test_ac_14(tmp_path: Path):
++    two = how_to_revert({"risk": []}, {"repo": {"merge_method": "squash"}})
++    assert "revert the squash-merge commit" in two.lower()
++    one = how_to_revert({"risk": ["deploy", "privacy"]}, {"repo": {"merge_method": "squash"}})
++    assert "does not undo" in one
++    assert "`deploy`" in one and "`privacy`" in one
++    one_extra = how_to_revert({"risk": []}, {}, extra_flags=["payments"])
++    assert "`payments`" in one_extra
++
++    env = Env(tmp_path, tasks=[_task(risk=["migration"])])
++    env.run(Seats(result="## How to revert\nnothing to undo, all two-way"))
++    section = _section(env.prs[0].body, "How to revert")
++    assert "does not undo" in section and "`migration`" in section
++    assert "nothing to undo" not in section
++
++    env2 = Env(tmp_path / "two")
++    env2.run(Seats())
++    assert "squash-merge commit" in _section(env2.prs[0].body, "How to revert")
++
++    body = env2.prs[0].body
++    with pytest.raises(PRBodyError):
++        check_pr_body(re.sub(r"^## How to revert\n", "", body, flags=re.M))
++
++
++def test_default_seat_runner_signature_matches(tmp_path: Path, monkeypatch):
++    """The default seat runner is the real run_session_sandboxed: every call
++    the orchestrator makes must bind to its signature."""
++    import inspect
++
++    import factory.orchestrator as orchestrator
++    from factory.session import run_session_sandboxed
++
++    signature = inspect.signature(run_session_sandboxed)
++    seats = Seats()
++
++    def checked(*args, **kwargs):
++        signature.bind(*args, **kwargs)  # TypeError on any drift
++        return seats(*args, **kwargs)
++
++    monkeypatch.setattr(orchestrator, "run_session_sandboxed", checked)
++    env = Env(tmp_path)
++    result = run_once(env.queue_path, factory_root=env.root, open_pr=env.open_pr,
++                      now=lambda: OFF_PEAK)
++    assert result.outcome == "pr_opened"
++    assert [c[0] for c in seats.calls] == ["implementer", "reviewer"]
++
++
++def test_huge_output_still_fits_a_pr_body(tmp_path: Path):
++    env = Env(tmp_path, profile_extra={"commands": {
++        "setup": "true",
++        "test": f"{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider",
++        "extra": {"noisy": f"{shlex.quote(sys.executable)} -c \"print('x' * 200000)\""},
++    }})
++    env.run(Seats(result="n" * 100_000))
++    body = env.prs[0].body
++    assert len(body) <= 65_536
++    check_pr_body(body)
++    with pytest.raises(PRBodyError):
++        check_pr_body(body + "x" * 70_000)
++
++
++# --------------------------------------------------------------- CLI wiring --
++
++
++def test_cli_run_and_loop_are_wired(tmp_path: Path, monkeypatch):
++    import factory.cli as cli
++
++    seen = {}
++
++    def fake_once(queue_path, **kwargs):
++        seen["once"] = (Path(queue_path), kwargs)
++        from factory.orchestrator import RunResult
++        return RunResult(outcome="idle")
++
++    def fake_loop(queue_path, **kwargs):
++        seen["loop"] = (Path(queue_path), kwargs)
++        from factory.orchestrator import LoopResult
++        return LoopResult(stop_reason="queue_empty", results=[])
++
++    monkeypatch.setattr(cli, "run_once", fake_once)
++    monkeypatch.setattr(cli, "run_loop", fake_loop)
++    queue = tmp_path / "tasks.json"
++    assert cli.main(["run", "--queue", str(queue)]) == 0
++    assert cli.main(["loop", "--queue", str(queue)]) == 0
++    assert seen["once"][0] == queue and seen["loop"][0] == queue
++    assert "run" not in cli.STUBS and "loop" not in cli.STUBS
++
++
++def test_nothing_to_run_is_idle(tmp_path: Path):
++    env = Env(tmp_path, tasks=[_task(status="draft")])
++    result = env.run(Seats())
++    assert result.outcome == "idle"
++    assert env.runs_left() == []
++
++
++# --- F-10 owner review round (PR #22; 5 findings; red before each fix) ------
++
++
++def test_review1_push_publishes_the_validated_sha_not_the_branch(tmp_path, monkeypatch):
++    """Finding 1: the branch can move between validation and push.
++
++    A surviving implementer process (F-06 documents setsid escapees)
++    commits to the work clone after L0/L1/L2 validated head_sha. What the
++    remote receives must be the validated commit, not whatever the branch
++    points at now.
++    """
++    from factory import orchestrator as orch
++
++    env = Env(tmp_path)
++    real_push = orch.push_branch
++
++    def sneaky_push(repo, remote_url, branch, **kwargs):
++        repo = Path(repo)
++        (repo / "impl.py").write_text("def answer():\n    return 'UNVALIDATED'\n")
++        _git(repo, "add", "-A")
++        _git(repo, "-c", "user.name=sneaky", "-c", "user.email=s@x",
++             "commit", "-q", "-m", "escapee moves the branch")
++        # committing on the current branch already moves it — no -f needed
++        return real_push(repo, remote_url, branch, **kwargs)
++
++    monkeypatch.setattr(orch, "push_branch", sneaky_push)
++    env.run(Seats())
++
++    branch = env.task()["links"]["branch"]
++    assert f"refs/heads/{branch}" in env.remote_branches()
++    published = _git(env.remote, "show", f"refs/heads/{branch}:impl.py")
++    assert "return 42" in published, "the remote holds the validated change"
++    assert "UNVALIDATED" not in published, "the remote holds the escapee's rewrite"
++
++
++def test_review1_push_confirms_the_remote_ref_or_refuses(tmp_path, monkeypatch):
++    """Finding 1 (transport half): after the push, ls-remote must agree.
++
++    If the remote ref does not read back as the validated sha, publishing
++    is a PublishError — never a PR about an unconfirmed commit.
++    """
++    from factory import publish as pub
++    from factory.publish import PublishError
++
++    env = Env(tmp_path)
++    work = create_run("fixture", env.repo, factory_root=env.root, ref="main")
++    try:
++        _git(work.root, "checkout", "-q", "-b", "factory/t-1-x")
++        _git(work.root, "-c", "user.name=t", "-c", "user.email=t@x",
++             "commit", "--allow-empty", "-q", "-m", "x")
++        sha = _git(work.root, "rev-parse", "HEAD")
++        real_run = subprocess.run
++
++        def lying_ls_remote(argv, **kwargs):
++            if "ls-remote" in argv:
++                return subprocess.CompletedProcess(
++                    argv, 0, stdout=f"{'0' * 40}\trefs/heads/factory/t-1-x\n", stderr=""
++                )
++            return real_run(argv, **kwargs)
++
++        monkeypatch.setattr(pub.subprocess, "run", lying_ls_remote)
++        with pytest.raises(PublishError):
++            push_branch(work.root, str(env.remote), "factory/t-1-x", sha=sha,
++                        created={"factory/t-1-x"}, default_branch="main")
++    finally:
++        from factory.runs import cleanup_run
++        cleanup_run(work)
++
++
++def test_review2_pr_failure_after_push_escalates_instead_of_requeueing(tmp_path):
++    """Finding 2 (pushed half): gh failing after the push must not loop.
++
++    The branch is already public; re-queueing to `ready` with no attempt
++    spends two more sessions per loop invocation forever and orphans
++    branches. It is `needs_human` with the attempt and branch recorded.
++    """
++    from factory.publish import PublishError
++
++    env = Env(tmp_path)
++
++    def failing_open_pr(pr):
++        raise PublishError("gh pr create failed: HTTP 422")
++
++    result = run_once(env.queue_path, factory_root=env.root, session_runner=Seats(),
++                      open_pr=failing_open_pr, now=lambda: OFF_PEAK)
++
++    assert result.outcome == "needs_human"
++    assert result.escalation == "pr_create_failed"
++    task = env.task()
++    assert task["status"] == "needs_human"
++    attempts = task["attempts"]
++    assert len(attempts) == 1
++    assert attempts[0]["outcome"] == "escalated"
++    assert attempts[0]["escalation"] == "pr_create_failed"
++    assert "HTTP 422" in attempts[0]["note"]
++    assert f"refs/heads/{task['links']['branch']}" in env.remote_branches()  # kept, named
++
++
++def test_review2_orchestrator_error_records_attempts_and_bounds_the_loop(
++    tmp_path, monkeypatch
++):
++    """Finding 2 (general half): a mid-round error must spend the budget.
++
++    A persistent L1 crash used to propagate with no attempt recorded, so
++    every loop invocation re-ran both seats forever. With the attempt
++    recorded, the loop is bounded by attempts_exhausted.
++    """
++    from factory import orchestrator as orch
++
++    env = Env(tmp_path)
++
++    def boom(*args, **kwargs):
++        raise RuntimeError("sandbox exploded")
++
++    monkeypatch.setattr(orch, "run_l1", boom)
++    # Review round 2: each loop stops at the first error, so a persistent
++    # crash is bounded across invocations by the attempt budget (3 here).
++    stops = [env.loop(Seats()).stop_reason for _ in range(4)]
++
++    assert stops == ["error", "error", "error", "escalation"]
++    task = env.task()
++    assert task["status"] == "needs_human"
++    attempts = task["attempts"]
++    assert attempts[-1]["escalation"] == "attempts_exhausted"
++    assert any(a.get("escalation") == "orchestrator_error" for a in attempts)
++    assert all(a.get("escalation") != "quota_exhausted" for a in attempts)
++    # nothing was ever pushed: the remote still holds only its cloned main
++    assert not any(b.startswith("refs/heads/factory/")
++                   for b in env.remote_branches())
++
++
++def test_review2_new_escalations_are_schema_valid(tmp_path):
++    """Finding 2: `pr_create_failed`/`orchestrator_error` join the enum.
++
++    Red against the pre-round schema, which rejects both values (the
++    F-09 schema-change pattern: the test is the proof the enum grew).
++    """
++    base = _task()
++    for escalation in ("pr_create_failed", "orchestrator_error"):
++        doc = {"version": 1, "project": "fixture",
++               "tasks": [dict(base, attempts=[{
++                   "run_id": "r1", "slice_id": "T-1", "started": "2026-10-18T10:00:00Z",
++                   "ended": "2026-10-18T10:01:00Z", "outcome": "escalated",
++                   "escalation": escalation,
++                   "prompt_versions": {"implementer": "0" * 64}, "skills": [],
++               }])]}
++        path = tmp_path / f"queue-{escalation}.json"
++        path.write_text(json.dumps(doc))
++        TaskQueue(path).get("T-1")  # loads and validates
++
++
++def test_review3_peak_window_before_review_records_the_aborted_round(tmp_path):
++    """Finding 3: a validated round stopped by the window is accounted.
++
++    The implementer's tokens and the attempt must be recorded (aborted —
++    the window is nobody's fault), and the next session must be told the
++    change existed, passed L0 and L1, and was discarded.
++    """
++    env = Env(tmp_path)
++    clock = iter([OFF_PEAK, OFF_PEAK] + [datetime(2026, 10, 19, 9, 0, tzinfo=STOCKHOLM)] * 50)
++    seats = Seats()  # a CORRECT change: validation passes, reviewer is next
++    result = env.run(seats, now=lambda: next(clock))
++
++    assert result.outcome == "peak_window"
++    assert len(seats.prompts("implementer")) == 1
++    assert seats.prompts("reviewer") == []
++    task = env.task()
++    assert task["status"] == "ready"
++    attempts = task["attempts"]
++    assert len(attempts) == 1
++    assert attempts[0]["outcome"] == "aborted"
++    assert attempts[0]["input_tokens"] == 120  # the implementer's spend, kept
++    assert "passed L0 and L1" in attempts[0]["note"]
++    log = ProgressLog.for_task(env.root, "fixture", "T-1")
++    rendered = log.render()
++    assert "passed L0 and L1" in rendered  # the next session learns it
++
++
++def test_review4_reviewer_not_started_when_the_budget_is_spent(tmp_path, monkeypatch):
++    """Finding 4: a spent wall clock escalates before the reviewer runs.
++
++    The old `max(remaining, 1.0)` floor let the reviewer start (and run a
++    minute past the budget) whenever the implementer had used it all.
++    """
++    from factory import orchestrator as orch
++
++    env = Env(tmp_path, tasks=[_task(budget={"size": "S", "max_attempts": 3,
++                                             "max_turns": 20, "wall_clock_min": 1})])
++    ticks = [0.0, 61.0]
++
++    def fake_monotonic():
++        return ticks.pop(0) if ticks else 62.0
++
++    monkeypatch.setattr(orch.time, "monotonic", fake_monotonic)
++    seats = Seats()
++    result = env.run(seats)
++
++    assert result.outcome == "needs_human"
++    assert result.escalation == "budget_exhausted"
++    assert seats.prompts("reviewer") == []  # no session past the budget
++    attempts = env.task()["attempts"]
++    assert attempts[-1]["escalation"] == "budget_exhausted"
++
++
++# --- review round 2 (PR #22) ------------------------------------------------
++
++
++def test_review5_bookkeeping_failure_after_pr_never_opens_a_second_pr(
++    tmp_path, monkeypatch
++):
++    """Once a PR is open, a failure recording it must not re-queue the task.
++
++    The pass attempt (with the PR URL) is saved before the in_review
++    transition; if that transition fails, the next run must finish the
++    bookkeeping instead of running both seats again and opening a second
++    PR for the same task.
++    """
++    from factory.state import StateError, TaskQueue
++
++    env = Env(tmp_path)
++    real_transition = TaskQueue.transition
++    fail_once = {"left": 1}
++
++    def flaky(self, task_id, new_status):
++        if new_status == "in_review" and fail_once["left"]:
++            fail_once["left"] -= 1
++            raise StateError("disk full")
++        return real_transition(self, task_id, new_status)
++
++    monkeypatch.setattr(TaskQueue, "transition", flaky)
++    seats = Seats()
++    with pytest.raises(StateError):
++        env.run(seats)
++    first_url = env.prs and "https://github.com/fixture/fixture/pull/1"
++    assert len(env.prs) == 1
++
++    result = env.run(seats)
++
++    assert len(env.prs) == 1, "a second PR was opened for the same task"
++    assert len(seats.calls) == 2, "the seats ran again after the PR was open"
++    assert result.outcome == "pr_opened"
++    assert result.pr == first_url
++    task = env.task()
++    assert task["status"] == "in_review"
++    assert task["links"]["pr"] == first_url
++
++
++def test_review6_push_fence_refusal_escalates_immediately(tmp_path, monkeypatch):
++    """A fence refusal is deterministic: retrying can't make it pass, so it
++    escalates on the first occurrence instead of spending the budget."""
++    from factory import orchestrator as orch
++    from factory.publish import PushRefused
++
++    env = Env(tmp_path)
++
++    def refuse(*args, **kwargs):
++        raise PushRefused("refusing to push: fence")
++
++    monkeypatch.setattr(orch, "push_branch", refuse)
++    seats = Seats()
++    result = env.run(seats)
++
++    assert result.outcome == "needs_human"
++    assert result.escalation == "publish_refused"
++    task = env.task()
++    assert task["status"] == "needs_human"
++    assert [a["escalation"] for a in task["attempts"]] == ["publish_refused"]
++    assert "fence" in task["attempts"][0]["note"]
++    assert len(seats.calls) == 2
++
++
++def test_review6_pr_body_refusal_escalates_immediately(tmp_path, monkeypatch):
++    from factory import orchestrator as orch
++    from factory.prbody import PRBodyError
++
++    env = Env(tmp_path)
++
++    def refuse(body):
++        raise PRBodyError("missing section: Evidence")
++
++    monkeypatch.setattr(orch, "check_pr_body", refuse)
++    result = env.run(Seats())
++
++    assert (result.outcome, result.escalation) == ("needs_human", "publish_refused")
++    assert env.task()["status"] == "needs_human"
++    assert not env.prs
++
++
++def test_review6_loop_stops_on_an_orchestrator_error(tmp_path, monkeypatch):
++    """A broken orchestrator must not drain the budget unattended: loop
++    stops on the first error, with the attempt recorded."""
++    from factory import orchestrator as orch
++
++    env = Env(tmp_path)
++
++    def boom(*args, **kwargs):
++        raise RuntimeError("sandbox exploded")
++
++    monkeypatch.setattr(orch, "run_l1", boom)
++    seats = Seats()
++    result = env.loop(seats)
++
++    assert result.stop_reason == "error"
++    assert len(result.results) == 1
++    assert len(seats.calls) == 1  # implementer only; L1 crashed before review
++    task = env.task()
++    assert task["status"] == "ready"
++    assert [a["escalation"] for a in task["attempts"]] == ["orchestrator_error"]
++
++
++def test_review7_task_contract_lists_every_escalation_reason():
++    """Mechanical sweep: every escalation the schema allows is documented
++    in TASK-CONTRACT.md's escalation-reasons line."""
++    repo = Path(__file__).resolve().parent.parent
++    schema = json.loads((repo / "schema" / "tasks.schema.json").read_text())
++    reasons = schema["$defs"]["escalation"]["enum"]
++    doc = (repo / "TASK-CONTRACT.md").read_text()
++    line = next(ln for ln in doc.splitlines() if ln.startswith("Escalation reasons"))
++    missing = [r for r in reasons if f"`{r}`" not in line]
++    assert not missing, f"TASK-CONTRACT.md doesn't list: {missing}"
