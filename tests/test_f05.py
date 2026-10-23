@@ -37,7 +37,6 @@ from factory.sandbox import (
     write_settings,
 )
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
 MODEL_ENDPOINT = "api.z.ai"
 
 
@@ -916,11 +915,18 @@ def test_timeout_stays_bounded_against_a_detached_process(tmp_path: Path):
 
 def test_srt_bin_ignores_env_overrides_entirely(monkeypatch):
     """No env var can redirect the sandbox binary in production: the override
-    mechanism is gone; tests inject via the srt_bin_path parameter."""
+    mechanism is gone; tests inject via the srt_bin_path parameter. The
+    expected path is anchored to the imported factory package itself, so the
+    test holds in whichever checkout actually supplies the code under test
+    (the conftest guard refuses a suite run against any other checkout)."""
+    import factory.sandbox
     from factory.sandbox import srt_bin as srt_bin_fn
 
     monkeypatch.setenv("FACTORY_SRT_BIN", "/tmp/definitely-not-srt")
-    assert srt_bin_fn() == REPO_ROOT / "node_modules" / ".bin" / "srt"
+    resolved = srt_bin_fn()
+    assert resolved != Path("/tmp/definitely-not-srt")
+    package_root = Path(factory.sandbox.__file__).resolve().parent.parent
+    assert resolved == package_root / "node_modules" / ".bin" / "srt"
 
 
 def test_run_sandboxed_takes_an_injected_srt_binary(tmp_path: Path):
