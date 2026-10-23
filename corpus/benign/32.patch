@@ -1,0 +1,335 @@
+diff --git a/projects/jobfinderos.baselines.json b/projects/jobfinderos.baselines.json
+new file mode 100644
+index 0000000..e0ca596
+--- /dev/null
++++ b/projects/jobfinderos.baselines.json
+@@ -0,0 +1,4 @@
++{
++  "known_errors": {},
++  "min_tests": 738
++}
+diff --git a/projects/jobfinderos.project.yaml b/projects/jobfinderos.project.yaml
+index 38765ff..42eb4fe 100644
+--- a/projects/jobfinderos.project.yaml
++++ b/projects/jobfinderos.project.yaml
+@@ -1,7 +1,9 @@
+-# DRAFT adapter for JobFinderOS — the pilot project.
+-# Destination: JobFinderOS/.factory/project.yaml. Validate against schema/project.schema.json.
+-# Commands are copied from CLAUDE.md "Stack & run commands" and .github/workflows/ci.yml (2026-10-15).
+-# Lines marked TODO(verify) are my inference, not read from the repo — confirm before onboarding.
++# Adapter for JobFinderOS, the pilot project. DRAFT for owner approval (2026-10-18).
++# Destination: JobFinderOS/.factory/project.yaml (lands by PR; main is branch-protected).
++# Validated against schema/project.schema.json.
++# Every value below was read from the repo at origin/main 9daedd1 (2026-10-18): CLAUDE.md,
++# .github/workflows/ci.yml, the scripts and services named. The earlier TODO(verify) lines are
++# resolved; the "Not used until" notes mark fields no built work order reads yet.
+ 
+ name: jobfinderos
+ 
+@@ -9,20 +11,31 @@ repo:
+   path: ~/Desktop/JobFinderOS
+   default_branch: main
+   remote: https://github.com/AgenticTony/JobFinderOS.git
+-  merge_method: squash            # TODO(verify)
++  merge_method: merge   # the repo's history merges PRs with merge commits ("Merge pull request #138 ...")
+ 
+ commands:
++  # CI pins Python 3.12 and Node 24; the venv and node_modules land inside the clean clone.
+   setup: >-
+-    cd backend && python3.12 -m venv .venv && .venv/bin/pip install -r requirements.dev.lock
++    cd backend && python3.12 -m venv .venv && .venv/bin/pip install -q -r requirements.dev.lock
+     && cd ../frontend && npm install --no-audit --no-fund
+-  lint: cd backend && .venv/bin/ruff check --select I,F app/ tests/ scripts/   # CI's ruleset; default ruleset has ~590 pre-existing hits
++  lint: cd backend && .venv/bin/ruff check --select I,F app/ tests/ scripts/   # CI's exact ruleset
+   typecheck: cd frontend && npx tsc --noEmit --noUnusedLocals --noUnusedParameters
+-  test: cd backend && PYTHONPATH=. .venv/bin/python -m pytest tests/ -q          # 437 tests must be green (CLAUDE.md)
+-  build: cd frontend && npm run build
++  # SQLite leg of CI. The Postgres leg (and the prod drift read) stay in JobFinderOS CI, which
++  # branch protection requires before any merge.
++  test: cd backend && PYTHONPATH=. .venv/bin/python -m pytest tests/ -q
++  # No `build` gate in the factory (readiness 2026-10-18): Turbopack's next/font fetch does not
++  # use srt's authenticated proxy, so the production build can't reach Google Fonts inside the
++  # sandbox. The build stays enforced before merge by JobFinderOS CI ("Frontend (type-check +
++  # build)", a required status check on main). `typecheck` above still gates every slice here.
++  # One contract test. Refs are repo-relative (backend/tests/...); pytest runs from backend/
++  # (no pytest config, so rootdir = backend). The shell strips the backend/ prefix.
++  test_ref: cd backend && r='{ref}' && PYTHONPATH=. .venv/bin/python -m pytest -q "${r#backend/}"
+   extra:
+     frontend_unit: cd frontend && node --test 'tests/**/*.test.ts'
+     flow: cd backend && PYTHONPATH=. .venv/bin/python tests/test_flow.py
+-    migration_single_head: cd backend && .venv/bin/python scripts/check_migration_drift.py --single-head-only   # TODO(verify) flag name; CI runs the full script with a prod reader role
++    # No URL and DRIFT_CHECK_OPTIONAL=true: the single-head check runs, the prod drift read is
++    # skipped (the sandbox has no prod credential, by design).
++    migration_single_head: cd backend && DRIFT_CHECK_OPTIONAL=true .venv/bin/python scripts/check_migration_drift.py
+     dev_lock: cd backend && .venv/bin/python scripts/check_dev_lock.py
+ 
+ # CLAUDE.md standard 8: the test database must NEVER be the live database.
+@@ -30,20 +43,31 @@ commands:
+ 
+ paths:
+   risk:
+-    migration: ["backend/alembic/**", "backend/app/core/database.py"]
+-    auth: ["backend/app/users.py", "backend/app/core/*auth*", "frontend/**/auth/**"]   # TODO(verify) frontend auth path
+-    payments: ["**/billing/**", "**/*paddle*"]                                          # WO-13/WO-16 will create these
++    migration: ["backend/alembic/**", "backend/app/core/database.py", "backend/app/core/dburl.py"]
++    auth:
++      - "backend/app/users.py"
++      - "backend/app/core/*auth*"
++      - "frontend/src/app/login/**"
++      - "frontend/src/app/sv/login/**"
++      - "frontend/src/components/LoginView.tsx"
++      - "frontend/src/lib/supabase.ts"
++    payments: ["**/billing/**", "**/*paddle*"]          # WO-13/WO-16 will create these
+     deploy: ["render.yaml", "ops/**", ".github/workflows/**", "backend/Dockerfile*"]
+-    external_service: ["backend/app/services/*composio*", "backend/app/services/*gmail*"]  # TODO(verify) send-from-Gmail path; fill-never-submit invariant
+-    privacy: ["backend/app/core/*sentry*", "backend/app/models/**"]                     # TODO(verify)
++    # Employer-facing email: _send_with_pdfs in draft_service.py dispatches through Resend.
++    external_service: ["backend/app/services/draft_service.py", "backend/app/services/pdf_service.py"]
++    privacy: ["backend/app/core/telemetry.py", "backend/app/models/**"]   # Sentry init + PII-bearing models
+   protected:
+     - ".factory/**"
+     - ".github/workflows/**"
+     - "backend/tests/test_calibration.py"        # pins prompt versions; silent edits must fail CI
+     - "backend/tests/**/conftest.py"
+     - "CLAUDE.md"
+-    # Per-task: the orchestrator adds the test files named in the task's acceptance checks
+-    # once the contract is approved, so workers cannot weaken the tests that define "done".
++    # Per task, the orchestrator also protects the test files named in the approved contract.
++  # What `setup` installs. L1 keeps these through its between-phase clean, so the red and green
++  # runs of each contract test still have the venv and node_modules.
++  setup_outputs:
++    - backend/.venv
++    - frontend/node_modules
+ 
+ dependency_manifests:
+   - backend/requirements.lock
+@@ -52,13 +76,16 @@ dependency_manifests:
+   - frontend/package.json
+   - frontend/package-lock.json
+ 
++baselines: .factory/baselines.json
++
+ deploy:
+   mechanism: render (backend api + hunt cron) + cloudflare-pages direct upload (frontend)
+   auto_on_merge: false           # render.yaml autoDeploy: false; Pages is NOT git-integrated
+-  command: bash ops/deploy_frontend.sh   # backend: Render deploy via API — TODO(verify) the exact command the owner uses
++  command: bash ops/deploy_frontend.sh   # frontend only. Not used until F-14 (L4); the factory never deploys in v0.
+   notes: >-
+     Merging does not ship. Deploy debt can accumulate silently (#120/#121 were merged but not deployed).
+     The orchestrator must record "merged" and "deployed" separately and never infer one from the other.
++    The backend deploys through Render; no factory step triggers it before F-14.
+ 
+ live_checks:
+   verify_deployment:
+@@ -70,20 +97,21 @@ live_checks:
+     when: risk:migration
+ 
+ holdouts:
+-  dir: ~/factory/holdouts/jobfinderos      # outside the repo; agents' sandbox denies reads here
+-  runner: "TODO — start with 3 scenarios: signup→first hunt; draft generated with zero fabrication flags; landing renders in /sv"
++  dir: ~/factory/holdouts/jobfinderos      # outside the repo; the sandbox denies reads here
++  runner: "Not used until F-15 (L3 is not built). Planned first scenarios: signup -> first hunt; draft with zero fabrication flags; landing renders in /sv."
+ 
+ docs_allowlist:
+   - fastapi.tiangolo.com
+   - docs.sqlalchemy.org
+   - alembic.sqlalchemy.org
+   - docs.pydantic.dev
++  - pypdf.readthedocs.io
+   - supabase.com
+   - nextjs.org
+   - react.dev
+   - tailwindcss.com
+   - docs.z.ai
+-  - docs.composio.dev
++  - resend.com
+   - developers.cloudflare.com
+   - render.com
+ 
+@@ -91,5 +119,7 @@ network_allowlist:
+   - pypi.org
+   - files.pythonhosted.org
+   - registry.npmjs.org
++  - fonts.googleapis.com   # next/font/google fetches at build time
++  - fonts.gstatic.com
+ 
+ cross_repo: []
+diff --git a/projects/jobfinderos.tasks.json b/projects/jobfinderos.tasks.json
+new file mode 100644
+index 0000000..1e824a0
+--- /dev/null
++++ b/projects/jobfinderos.tasks.json
+@@ -0,0 +1,173 @@
++{
++  "version": 1,
++  "project": "jobfinderos",
++  "updated_at": "2026-10-18T00:00:00Z",
++  "tasks": [
++    {
++      "id": "WO-21",
++      "title": "Outbound PDF text-layer verification",
++      "source": "docs/work-orders/WO-21-pdf-text-layer.md",
++      "kind": "build",
++      "priority": "P2",
++      "status": "draft",
++      "depends_on": [],
++      "risk": [
++        "external_service"
++      ],
++      "gates": {
++        "spec_approval": true,
++        "merge": "human",
++        "deploy": "human"
++      },
++      "acceptance": [
++        {
++          "id": "AC-1",
++          "text": "`pdf_service.verify_text_layer(pdf_bytes: bytes, expected: str) -> None` exists and raises `pdf_service.PdfTextLayerError` when the PDF's extracted text (pdfplumber, all pages) has fewer than `pdf_service.MIN_TEXT_CHARS` non-whitespace characters, or doesn't contain `expected` after whitespace normalisation. A deliberately broken fixture (a PDF whose page carries the content only as drawn shapes or an image, no text layer) fails with `PdfTextLayerError`. The test must be shown red before the function exists.",
++          "check": {
++            "type": "test",
++            "ref": "backend/tests/test_pdf_text_layer.py::test_ac_1"
++          }
++        },
++        {
++          "id": "AC-2",
++          "text": "Both renderers (`cover_letter_pdf`, `tailored_cv_pdf`) produce PDFs that pass `verify_text_layer` with a known phrase from the source text, for each of: plain ASCII content; a non-ASCII applicant name and body (å ä ö Å Ä Ö, curly quotes, em dash) on the unicode-font path; and the same non-ASCII content on the latin-1 core-font fallback path (`FONT_CANDIDATES` emptied, as `test_pdf_fonts.py` already does). Assert, don't warn.",
++          "check": {
++            "type": "test",
++            "ref": "backend/tests/test_pdf_text_layer.py::test_ac_2"
++          }
++        },
++        {
++          "id": "AC-3",
++          "text": "With `settings.PDF_TEXT_LAYER_ENFORCE` true, `draft_service._send_with_pdfs` verifies each generated PDF (cover letter and tailored CV) before any email is dispatched. When verification fails it does not call `resend.Emails.send`, sets `application.status = \"failed\"`, and sets `application.error` to a user-facing message that names the document that failed and says the send was blocked because an employer's system couldn't read the PDF. It then returns without raising.",
++          "check": {
++            "type": "test",
++            "ref": "backend/tests/test_pdf_text_layer.py::test_ac_3"
++          }
++        },
++        {
++          "id": "AC-4",
++          "text": "The send path can't skip the check: in `backend/app/services/draft_service.py` every call to `pdf_service.cover_letter_pdf` or `pdf_service.tailored_cv_pdf` goes through one helper that calls `verify_text_layer` on the bytes before returning them. A source-level test proves no direct render call remains outside that helper.",
++          "check": {
++            "type": "test",
++            "ref": "backend/tests/test_pdf_text_layer.py::test_ac_4"
++          }
++        },
++        {
++          "id": "AC-5",
++          "text": "No dependency manifest changes: extraction uses `pdfplumber`, already pinned in `backend/requirements.lock` (and used by `tests/test_pdf_fonts.py`). The existing suite stays green, including every test in `tests/test_pdf_fonts.py` unmodified.",
++          "check": {
++            "type": "command",
++            "ref": "cd backend && PYTHONPATH=. .venv/bin/python -m pytest tests/ -q",
++            "expect": "exit 0; L0 reports no new_dependency escalation"
++          }
++        },
++        {
++          "id": "AC-6",
++          "text": "Enforcement ships off: `Settings.PDF_TEXT_LAYER_ENFORCE: bool = False` is declared in `backend/app/core/config.py` (Settings forbids undeclared keys), following the `EMAIL_APPLY_ENABLED` pattern. With it false, verification still runs on every send; a failure logs one WARNING naming the application id and the failing document (no PDF content, no applicant PII in the message) and the send proceeds exactly as today. Turning it on needs only the env var, no deploy of new code.",
++          "check": {
++            "type": "test",
++            "ref": "backend/tests/test_pdf_text_layer.py::test_ac_6"
++          }
++        }
++      ],
++      "out_of_scope": [
++        "Adding pypdf or any other dependency (owner decision: pdfplumber is already pinned; WO-21 design step 1 is superseded).",
++        "Changing PDF layout, fonts, FONT_CANDIDATES order or the rendered content.",
++        "Changing the send flow beyond the verification gate: rate limits, Resend parameters, attachment names, the original-CV attachment.",
++        "Editing or weakening tests/test_pdf_fonts.py or any other existing test.",
++        "Frontend changes, migrations, and the browser-apply path.",
++        "Defaulting PDF_TEXT_LAYER_ENFORCE to true, or flipping it in any deployed environment (owner step)."
++      ],
++      "owner_steps": [
++        {
++          "text": "After merge: deploy the backend (Render) with PDF_TEXT_LAYER_ENFORCE unset (log-only).",
++          "done": false
++        },
++        {
++          "text": "Watch Render logs for PDF text-layer WARNINGs across real sends; if none are false positives, set PDF_TEXT_LAYER_ENFORCE=true on Render and confirm one real send still goes out with readable PDFs.",
++          "done": false
++        }
++      ],
++      "budget": {
++        "size": "S",
++        "max_attempts": 3,
++        "max_turns": 120,
++        "wall_clock_min": 90
++      },
++      "attempts": [],
++      "links": {}
++    },
++    {
++      "id": "WO-32",
++      "title": "Self-hosted fonts so the production build runs offline",
++      "source": "docs/work-orders/WO-32-self-hosted-fonts.md",
++      "kind": "build",
++      "priority": "P3",
++      "status": "draft",
++      "depends_on": [],
++      "risk": [],
++      "gates": {
++        "spec_approval": true,
++        "merge": "human",
++        "deploy": "human"
++      },
++      "acceptance": [
++        {
++          "id": "AC-1",
++          "text": "`frontend/src/app/layout.tsx` loads Geist, Geist Mono and Familjen Grotesk with `next/font/local` from woff2 files committed under `frontend/src/app/fonts/`, each family's OFL licence file committed beside them. No file under `frontend/src` imports `next/font/google`.",
++          "check": {
++            "type": "command",
++            "ref": "! git grep -n 'next/font/google' -- frontend/src && git grep -q 'next/font/local' -- frontend/src/app/layout.tsx && ls frontend/src/app/fonts/*.woff2 frontend/src/app/fonts/OFL*",
++            "expect": "exit 0"
++          }
++        },
++        {
++          "id": "AC-2",
++          "text": "The CSS variables `--font-geist-sans`, `--font-geist-mono` and `--font-familjen` keep their names and stay applied on `<html>`, so `globals.css` is unchanged.",
++          "check": {
++            "type": "command",
++            "ref": "for v in --font-geist-sans --font-geist-mono --font-familjen; do grep -q \"variable: '$v'\" frontend/src/app/layout.tsx || exit 1; done && git diff --exit-code origin/main -- frontend/src/app/globals.css",
++            "expect": "exit 0"
++          }
++        },
++        {
++          "id": "AC-3",
++          "text": "The production build succeeds with no network access to fonts.googleapis.com or fonts.gstatic.com.",
++          "check": {
++            "type": "command",
++            "ref": "cd frontend && NEXT_PUBLIC_API_URL=https://api.jobfinderos.example npm run build",
++            "expect": "exit 0 inside the factory sandbox with both font hosts removed from network_allowlist"
++          }
++        },
++        {
++          "id": "AC-4",
++          "text": "No dependency manifest changes (no `geist` package; the files are vendored).",
++          "check": {
++            "type": "command",
++            "ref": "git diff --exit-code origin/main -- frontend/package.json frontend/package-lock.json",
++            "expect": "exit 0"
++          }
++        }
++      ],
++      "out_of_scope": [
++        "Changing font families, weights, subsets or any visual styling.",
++        "Adding any npm dependency.",
++        "Editing globals.css."
++      ],
++      "owner_steps": [
++        {
++          "text": "After merge: in the factory profile, add the build command back to L0 and remove fonts.googleapis.com / fonts.gstatic.com from network_allowlist.",
++          "done": false
++        }
++      ],
++      "budget": {
++        "size": "S",
++        "max_attempts": 3,
++        "max_turns": 80,
++        "wall_clock_min": 60
++      },
++      "attempts": [],
++      "links": {}
++    }
++  ]
++}

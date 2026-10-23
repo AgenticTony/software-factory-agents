@@ -1,0 +1,176 @@
+diff --git a/.factory/tasks.json b/.factory/tasks.json
+index 32fab83..292693a 100644
+--- a/.factory/tasks.json
++++ b/.factory/tasks.json
+@@ -350,7 +350,7 @@
+     },
+     {
+       "id": "F-06",
+-      "title": "Session runner (headless Claude Code on Z.ai)",
++      "title": "Session runner (Claude Agent SDK on Z.ai)",
+       "source": "BUILD-ORDER.md#f-06--session-runner",
+       "kind": "build",
+       "priority": "P1",
+@@ -369,7 +369,7 @@
+       "acceptance": [
+         {
+           "id": "AC-1",
+-          "text": "With a stub `claude` binary, the runner kills the session at the wall-clock limit and returns `aborted`.",
++          "text": "With an injected fake `query` that never finishes, the runner stops at the wall-clock limit and returns `aborted`.",
+           "check": {
+             "type": "test",
+             "ref": "tests/test_f06.py::test_ac_1"
+@@ -377,7 +377,7 @@
+         },
+         {
+           "id": "AC-2",
+-          "text": "Malformed JSON output is reported as a failed attempt, not a crash.",
++          "text": "A `ResultMessage` with an error subtype (`error_max_turns`, `error_during_execution`, or `is_error` with `api_error_status`), and an SDK exception, are each recorded as a failed attempt with the reason. Neither crashes the runner.",
+           "check": {
+             "type": "test",
+             "ref": "tests/test_f06.py::test_ac_2"
+@@ -385,7 +385,7 @@
+         },
+         {
+           "id": "AC-3",
+-          "text": "The hook blocks an Edit to a protected path inside a real session.",
++          "text": "The protected-path hook returns `permissionDecision: \"deny\"` for an Edit/Write to a protected path (unit test on the callback), and blocks one inside a real session.",
+           "check": {
+             "type": "test",
+             "ref": "tests/test_f06.py::test_ac_3"
+@@ -393,11 +393,19 @@
+         },
+         {
+           "id": "AC-4",
+-          "text": "A real smoke session against Z.ai completes a trivial prompt, and the recorded model name is read from the result.",
++          "text": "A real smoke session against Z.ai completes a trivial prompt, and the recorded model name is read from `model_usage`.",
+           "check": {
+             "type": "test",
+             "ref": "tests/test_f06.py::test_ac_4"
+           }
++        },
++        {
++          "id": "AC-5",
++          "text": "The built options have `setting_sources == []`. The session env contains no GitHub token and no keychain secret other than the Z.ai token.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f06.py::test_ac_5"
++          }
+         }
+       ],
+       "budget": {
+diff --git a/BUILD-ORDER.md b/BUILD-ORDER.md
+index 2848068..41bd468 100644
+--- a/BUILD-ORDER.md
++++ b/BUILD-ORDER.md
+@@ -4,7 +4,7 @@ The factory's own build plan, written in the format the factory will consume: on
+ 
+ **Bootstrapping:** the factory can't build itself before it exists. F-01 to F-11 are built **interactively**, by you plus a Claude Code session (GLM or Claude), one WO per session. Once F-10 works end to end, the factory takes over its own remaining WOs (F-14 onward). That's the first real test, on a repo where a mistake only hurts the factory itself.
+ 
+-**Stack:** Python 3.12, `pytest`, `ruff`, JSON Schema validation, headless Claude Code for agent sessions, `gh` for PRs, `srt` / Claude Code sandbox for isolation. No web framework; it's a CLI.
++**Stack:** Python ≥ 3.11 (CI: 3.11 + 3.13), `pytest`, `ruff`, JSON Schema validation, Claude Agent SDK (`claude-agent-sdk`, pinned) for agent sessions, `gh` for PRs, `srt` / Claude Code sandbox for isolation. No web framework; it's a CLI.
+ 
+ ---
+ 
+@@ -18,7 +18,7 @@ The factory's own build plan, written in the format the factory will consume: on
+ | **F-03** | State machine and picker | 1 | F-02 | — | M |
+ | **F-04** | `factory approve` | 1 | F-03 | — | S |
+ | **F-05** | Clone manager and sandbox | 1 | F-01 | external_service | M |
+-| **F-06** | Session runner (headless Claude Code on Z.ai) | 1 | F-05 | external_service | M |
++| **F-06** | Session runner (Claude Agent SDK on Z.ai) | 1 | F-05 | external_service | M |
+ | **F-07** | L0 deterministic gates | 1 | F-02 | — | M |
+ | **F-08** | L1 red-first proof | 1 | F-07 | — | S |
+ | **F-09** | Agent prompts + L2 review | 1 | F-06 | — | M |
+@@ -46,7 +46,7 @@ Order to build in: **F-00 (in parallel) → F-01 → F-02 → F-03 → F-04 →
+ 
+ Owner steps:
+ 1. Email Z.ai support with two questions:
+-   - Are scheduled, unattended headless Claude Code runs allowed on the Coding Plan?
++   - Are scheduled, unattended Claude Code runs (via the Claude Agent SDK) allowed on the Coding Plan? (The owner has decided to proceed; this is for the record.)
+    - Does renewing a legacy Max plan keep the prompt-based quota?
+ 2. Check the legacy term's end date on Z.ai's "My plan" page.
+ 3. Check JobFinderOS's **production** env on Render for `GLM_BASE_URL`. If it's the Coding Plan endpoint (`api/coding/paas/v4`), move production to a metered key, or the Mistral-hosted path (MIG-WO5), **before F-13**.
+@@ -114,17 +114,26 @@ Acceptance (tests must *attempt* the forbidden action, not just inspect config):
+ - AC-4 No `GH_TOKEN`/`GITHUB_TOKEN` or keychain-derived variable is visible inside the sandbox.
+ 
+ ### F-06 — Session runner
+-`run_session(seat, prompt, cwd, max_turns, timeout_min)` wraps `claude -p --output-format json --max-turns N` inside the F-05 sandbox.
+-- **Env:** per-seat env: Z.ai base URL, auth token from the keychain, `API_TIMEOUT_MS`.
+-- **Clock:** wall-clock is enforced, and paused outside the session.
+-- **Hooks:** a per-run settings file with a PreToolUse hook that denies Edit/Write on `paths.protected`.
+-- **Record:** turns, tokens and the model reported back.
++`run_session(seat, prompt, cwd, max_turns, timeout_min)` calls `claude_agent_sdk.query()` with a `ClaudeAgentOptions` built per seat, inside the F-05 sandbox. The whole runner process runs under `srt`, so the Claude Code subprocess the SDK spawns inherits the sandbox.
++- **Options:**
++  - `cwd` = run dir
++  - `env` = Z.ai base URL, auth token from the keychain, `API_TIMEOUT_MS`
++  - `max_turns`; `system_prompt` = the seat prompt (F-09)
++  - `setting_sources=[]`: no user/project settings, so a session can't pick up your personal Claude config
++  - per-seat `allowed_tools` / `disallowed_tools`: the reviewer gets no Write/Edit
++- **Hooks:** in-process `PreToolUse` callbacks via `HookMatcher`:
++  - `Write|Edit|NotebookEdit` → deny if `tool_input.file_path` matches `paths.protected`
++  - `Bash` → deny `git push`, `gh `, and anything touching `~/.config/gh`
++- **Clock:** wall-clock is enforced with `asyncio.wait_for` around the message stream, and paused outside the session.
++- **Record:** from `ResultMessage`: `num_turns`, `subtype`, `is_error`, `terminal_reason`, tokens, and the model name from `model_usage`.
++- **Testability:** `query` is injected, so tests use a fake async generator instead of a real model.
+ 
+ Acceptance:
+-- AC-1 With a stub `claude` binary, the runner kills the session at the wall-clock limit and returns `aborted`.
+-- AC-2 Malformed JSON output is reported as a failed attempt, not a crash.
+-- AC-3 The hook blocks an Edit to a protected path inside a real session.
+-- AC-4 A real smoke session against Z.ai completes a trivial prompt, and the recorded model name is read from the result.
++- AC-1 With an injected fake `query` that never finishes, the runner stops at the wall-clock limit and returns `aborted`.
++- AC-2 A `ResultMessage` with an error subtype (`error_max_turns`, `error_during_execution`, or `is_error` with `api_error_status`), and an SDK exception, are each recorded as a failed attempt with the reason. Neither crashes the runner.
++- AC-3 The protected-path hook returns `permissionDecision: "deny"` for an Edit/Write to a protected path (unit test on the callback), and blocks one inside a real session.
++- AC-4 A real smoke session against Z.ai completes a trivial prompt, and the recorded model name is read from `model_usage`.
++- AC-5 The built options have `setting_sources == []`. The session env contains no GitHub token and no keychain secret other than the Z.ai token.
+ 
+ Owner steps: F-00 step 1 answered before AC-4 is run repeatedly or on a schedule.
+ 
+diff --git a/DESIGN-LOCAL-FACTORY.md b/DESIGN-LOCAL-FACTORY.md
+index 7aab827..7ceac43 100644
+--- a/DESIGN-LOCAL-FACTORY.md
++++ b/DESIGN-LOCAL-FACTORY.md
+@@ -126,7 +126,7 @@ The inline blueprint diagram from this session shows the same flow.
+ |---|---|---|
+ | `factory` CLI (orchestrator) | `import`, `approve <id>`, `run` (one slice), `loop` (until queue empty, quota hit or escalation), `status`, `verify-live <id>` | — |
+ | Contract validation | JSON Schema check of `tasks.json` + `project.yaml` on every load; refuse to run on invalid state | `schema/*.json` |
+-| Session runner | Starts one agent session in a sandboxed clone with seat-specific model, env, tools, hooks and turn cap | — |
++| Session runner | Starts one agent session in a sandboxed clone with seat-specific model, env, tools, hooks and turn cap | Claude Agent SDK (`claude-agent-sdk`): `query()` + `ClaudeAgentOptions` + `HookMatcher` |
+ | Implementer prompt | One slice, red-first test, conventional commit, structured report | SoloAdventurer `.claude/agents/implementer.md`, generalised |
+ | Reviewer prompt | Default FAIL, contract-vs-diff, project checklist | SoloAdventurer `.claude/agents/verifier.md`, generalised |
+ | Importer prompt | Proposes `tasks.json` from planning docs; you review the diff | — |
+@@ -138,7 +138,11 @@ The inline blueprint diagram from this session shows the same flow.
+ 
+ ### D1 — Substrate: Claude Code engine, driven by a thin Python orchestrator
+ - Each agent seat (implementer, reviewer, importer) is one **Claude Code session** started by the orchestrator. That reuses Claude Code's tools, hooks, sandbox and turn caps, plus your existing agent prompts, instead of writing an agent loop.
+-- **v0 runs headless Claude Code** (`claude -p … --output-format json --max-turns N`) behind a `run_session()` function. **The Claude Agent SDK (Python) is the drop-in upgrade** once D2's terms question is answered. It gives in-process hooks and typed results, and drives the same engine.
++- **v0 uses the Claude Agent SDK for Python** (`claude-agent-sdk`, version pinned) behind one `run_session()` function. **Owner decision, 2026-10-16.** The SDK runs the Claude Code engine as a subprocess, so the tools, sandbox and turn caps are Claude Code's. It adds what the CLI lacks:
++  - **In-process `PreToolUse` hooks:** Python callbacks that deny edits to protected paths, and `git push`/`gh` in Bash, with no settings file to tamper with.
++  - **Typed results:** `ResultMessage` with `num_turns`, `subtype`, `is_error`, `terminal_reason` and per-model `model_usage` tokens. No JSON parsing.
++  - **Per-session options:** `env`, `cwd`, `max_turns`, `system_prompt`, allowed/disallowed tools, and `setting_sources=[]`, so a session loads none of your personal Claude settings.
++- Headless `claude -p` remains the fallback behind the same function if the SDK ever becomes a problem.
+ - No agent framework, no state machine beyond the status set. Same stance as Machinecraft and Factory Missions: orchestration in prompts, bookkeeping in code.
+ 
+ ### D2 — Models: GLM via Z.ai's Anthropic-compatible endpoint
+@@ -150,9 +154,9 @@ The inline blueprint diagram from this session shows the same flow.
+   Because env is set **per session**, each seat can use a different provider. The single-provider limit applies within one session, not to the factory.
+ - **Model names.** Z.ai's own pages disagree: the Claude Code guide maps Opus/Sonnet to GLM-4.7, while the plan FAQ says plans cover GLM-5.3 and GLM-5.3-Flash. Don't hard-code a mapping. Run one session, check `/status`, and record the actual model in `attempts[].model`.
+ - **Terms caveat (open, must resolve before unattended runs).** The Coding Plan is "strictly limited to use within officially supported tools". Claude Code is listed; the Agent SDK isn't named; unattended or automated use isn't addressed either way. Actions:
+-  1. Ask Z.ai support in writing whether scheduled headless Claude Code runs are allowed under your plan.
+-  2. Until they answer, v0 uses headless Claude Code (the listed tool), not the SDK.
+-  3. If they say no, the fallback is Z.ai's pay-as-you-go API key on the same endpoint. Nothing else changes.
++  1. **Owner decision (2026-10-16): proceed with the Agent SDK.** Claude Code is a listed tool, and the SDK drives the Claude Code engine.
++  2. Still send the F-00 question to Z.ai and record their written answer, so the decision rests on more than our reading of the terms.
++  3. If they ever say no, the fallback is Z.ai's pay-as-you-go API key on the same endpoint. Nothing else changes.
+ - **Quota contention, checked in the repo.** JobFinderOS's *product* calls GLM through Z.ai's **Coding Plan endpoint**: `backend/.env.example` sets `GLM_BASE_URL=https://api.z.ai/api/coding/paas/v4`, and CLAUDE.md calls it a "flat-rate key". Matching and tailoring in production hunts run on it. Confirm the production env on Render matches. If it does:
+   - **the factory and production hunts would compete for one quota**, and a busy factory night could starve real users' hunts
+   - a production backend is almost certainly not an "officially supported tool" under the plan's terms
+@@ -204,7 +208,7 @@ Every contract is approved by you; every PR is merged by you; risk flags are per
+ ## 8. Phased build plan
+ 
+ **Phase 0 — Prerequisites (1–2 days)**
+-- Get Z.ai's written answer on automated headless use (D2).
++- Get Z.ai's written answer on automated Claude Code / Agent SDK use (D2). The owner has already decided to proceed; the answer is for the record.
+ - Move JobFinderOS's production AI off the Coding Plan endpoint (the example config uses it; confirm on Render) (D2).
+ - JobFinderOS readiness run: every `project.yaml` command passes unattended on a clean clone. Fix the `TODO(verify)` lines in [`projects/jobfinderos.project.yaml`](projects/jobfinderos.project.yaml).
+ - Branch protection on `main`; keychain items for the live-check secrets.

@@ -1,0 +1,1182 @@
+diff --git a/.factory/BOOTSTRAP.md b/.factory/BOOTSTRAP.md
+index 9741c08..1b643b7 100644
+--- a/.factory/BOOTSTRAP.md
++++ b/.factory/BOOTSTRAP.md
+@@ -386,3 +386,54 @@ A readiness run of the factory's own gates on a clean clone of JobFinderOS (`ori
+ - **AC-5** proven: `test_ac_5` — reconcile over copies of the real files leaves every owner_only task identical, and the F-04 real-files tests no longer pin F-00 to `draft`.
+ - **Owner follow-up after merge:** `factory tick F-00 1 2 3 4 5 6 --evidence "..."`, `factory tick F-06 1 --evidence "..."`, then `factory approve --reconcile-bootstrap` for F-09, F-10 and this entry.
+ - **Status to set at reconcile:** `done` once this PR's CI is green (ruff + pytest on 3.11 + 3.13) and you merge it. No deploy target, so L4 doesn't apply.
++
++---
++
++## F-24 — Realistic rehearsal fixture in CI
++
++- **Commits:** `feat/f24-rehearsal-fixture` — `feat: realistic rehearsal fixture in CI (F-24)` + `fix: ac_4 asserts the rehearsal lives in the tree CI runs (F-24)` (the dogfood proof caught AC-4 proving nothing on base; see Evidence).
++- **Built:** 2026-10-19. Interactive session, per BUILD-ORDER Phase 1b ("hardening WOs are built interactively, because they touch what judges agents").
++- **Design notes:** new `factory/rehearsal.py` — the fixture builder + `run_rehearsal`. The fixture is realistic on the three incident axes: `commands.setup` creates a real venv and installs a vendored npm package (lifecycle script included) into `node_modules` — offline, `--no-audit --no-fund`, no registry — with both declared as `paths.setup_outputs`; `test`/`test_ref` run through `.venv/bin/python`, `lint` through `node_modules/.bin`; the bare remote's `main` is one commit ahead of the local clone; `ambient_path_with_home_entries()` recreates the incident's interactive PATH (real home dirs first plus a literal `~` entry). The rehearsal itself is one `run_once` — real clone manager, remote-default fetch, srt-sandboxed L0 and L1, push, PR — with only the seats stubbed (`_RehearsalSeats`): exactly the readiness-run mechanics F-28 step 2 needs. The task budget is `max_attempts: 2` so a reverted fix burns to `needs_human` in one rehearsal, fast.
++- **The PATH sensitivity, honestly derived:** the original npm `spawn EPERM` was not deterministically reproducible offline (an empirical spike with home-first PATH — pyenv shims present, node lifecycle spawning — passed both with and without the fix: shell exec search skips denied candidates on macOS). The fix itself also drops literal `~` entries — a real leak class, and one no legitimate resolved PATH ever contains. The fixture's tracked `tools/env-guard.sh` (a plain toolchain precondition) refuses an unexpanded `~` entry: the sanitised child PATH never carries one, a leaked one always does — deterministic on macOS and Linux, inside the real sandbox, with no dependence on execvp error classes. Recorded here so nobody thinks the guard is decorative. **Correction (owner re-check, 2026-10-19):** the spike's conclusion does not hold on the owner's Mac. Run through the full rehearsal path with absolute home entries leaked (filter reduced to `startswith('~')`, old `~`-only guard), setup fails with the real npm EPERM ("operation was rejected by your operating system", exit 255). So the absolute-home leak does reproduce here. The guard stays as the canary that fires on every host, including ones where EPERM doesn't (not verified on the Linux runner).
++- **AC-1** proven: `tests/test_f24.py::test_ac_1` — remote ahead of local (ancestor-checked in the remote, which holds both objects), `setup_outputs == [.venv, node_modules]`, setup offline by construction (no URL, `--no-audit --no-fund`), ambient PATH carries home entries and a literal `~`; setup then runs end to end through the real sandbox under that PATH and both trees exist afterwards.
++- **AC-2** proven: `test_ac_2` — one `run_once` over the one-criterion contract through `run_rehearsal`: `pr_opened`, one PR, task `in_review`, attempt `pass`, L0/L1 `pass` with the red exit ≠ 0 and green exit = 0. The remote-only-commit property is no longer asserted by the test directly — `run_rehearsal` returns only when the outcome is `pr_opened` AND the PR head contains the remote's advanced main (it raises otherwise), so returning at all is the proof (review round 2, finding 1).
++- **AC-3** proven: `test_ac_3` — three monkeypatched reverts, each on a fresh fixture, each expecting a `RehearsalError` carrying the run result (review round 2, finding 1: any non-`pr_opened` outcome raises too): `_clean` without keeps → `needs_human` with L1 `test_not_green` (exit 127 both phases); `_path_outside_home` identity → `needs_human` with L0 `setup_failed`, the guard's own `env-guard:` message asserted in the setup output (review round 2, finding 3: attribution, not just failure); `_build_on_remote_default` no-op → `run_rehearsal` raises on the stale-base PR.
++- **AC-4** proven: `test_ac_4` — asserts the rehearsal harness lives in the tree CI clones (`factory/rehearsal.py`, checked as a file so an editable install can't mask its absence), ci.yml triggers on `pull_request`, the pytest step is exactly `pytest -q` with no marker/path filters and no `if`/`continue-on-error`, and `test_ac_1..3` carry no pytest markers or skip attributes.
++- **AC-5** proven: `test_ac_5` — `docs/incidents.md` (new, with `docs/`) holds one section per incident, each with **What broke** / **Which layer should have caught it** / test refs; every `tests/…::name` ref in the whole file is resolved by `ast.parse` (parsed, never executed — review round 1 finding 7) and verified to exist, so the register can't drift from the suite. The three PR #24 incidents are entries INC-001..003, each citing its original PR #24 test plus `test_ac_3`.
++- **Evidence (red-first):** the suite was red at collection on the missing `factory.rehearsal` (all five refs). Dogfood `run_l1` over the five contract refs, scratch clone, base `106f051` (main), head padded with `node_modules` as one commit (854 paths, verified to differ by `node_modules/` only): **first run verdict FAIL — `test_ac_4` was `test_proves_nothing` on base** (its assertions were retrospective over files already on main); fixed by asserting the harness file exists, re-run **verdict `pass`**: red `106f051`/green `88bee8a` (padded), exits 1/0 per ref — ac_1 exit 1 unknown, ac_2/ac_3/ac_4 exit 1 assertion, ac_5 exit 1 unknown (the reds ran under the orchestrator interpreter, whose editable install of the branch lets the file collect; on a clean base checkout the file is red at collection on the missing `factory.rehearsal`).
++- **Suite:** 5 F-24 tests / 382 total passing locally (macOS, real srt; ~21s for the F-24 file — three full rehearsals in AC-3 included), ruff clean. CI runs the same suite unchanged: the rehearsal is a plain test, no markers, no new CI step.
++- **Status to set at reconcile:** `done` once this PR's CI is green (ruff + pytest on 3.11 + 3.13) and you merge it. No deploy target, so L4 doesn't apply.
++
++### F-24 owner review round (PR #33; 9 findings — all fixed red-first where behaviour changed)
++
++- **(1) PATH revert proof only covered the literal-~ branch** (test coverage): the guard now bakes the host's home paths (both spellings — the same set `_path_outside_home` drops) into `tools/env-guard.sh` and refuses entries under them, so a filter simplified to `startswith('~')` still fails the rehearsal. `test_review1_path_leak_covers_absolute_home_entries` monkeypatches exactly that simplified filter and passes now. **Correction:** it was *not* red-first on the owner's Mac. Against the old `~`-only guard it passes too, because the leaked home entries trigger the real npm EPERM and setup fails anyway (see the F-24 PATH-sensitivity correction above). The test pins the behaviour on every host but does not prove the baked-home guard is needed on macOS.
++- **(2) `run_rehearsal` couldn't detect stale-base itself** (altitude): `run_rehearsal` now raises `RehearsalError` when a `pr_opened` PR head lacks the remote's default-branch commit (rc≠0 from merge-base, stderr surfaced in the message) or when no PR was recorded. `test_ac_3`'s third revert expects the `RehearsalError` raise (red before the fix: DID NOT RAISE); `test_ac_2` returns without raising, which is the positive proof; F-28's readiness flow treats a raise as not-ready. A separate `test_review2_run_rehearsal_detects_stale_base` was dropped in a follow-up: it was the same scenario as `test_ac_3`'s third revert and cost one extra full rehearsal.
++- **(3) Fixture .gitignore omitted .venv/node_modules** (correctness): a real project ignores what setup installs, and `_commit_work`'s `git add -A` would put both trees into any session's PR. `/.venv/` and `/node_modules/` added; `test_review3_fixture_ignores_install_trees` proves both via `git check-ignore` — red before, green after.
++- **(4) Empty ambient PATH yielded a trailing empty entry (= cwd)** (correctness): `ambient_path_with_home_entries` filters empty entries everywhere, including the inherited PATH's own interior empties. `test_review4_ambient_path_has_no_empty_entries` (PATH unset) was red before.
++- **(5) Local-clone ancestry assertion was vacuously true** (test correctness): the local-repo merge-base exited 128 (missing object) for any error, which read as "not an ancestor". AC-1 now judges aheadness in the remote under the new strict `_is_ancestor` (rc must be 0 or 1; anything else fails the test with stderr), and checks the local clone really lacks the commit via `cat-file -e` (rc≠0). Not red-first: the fixture behaviour was already correct; the assertion was the bug.
++- **(6) AC-4 missed module/conftest/trigger filters** (test coverage): `test_ac_4` additionally asserts no module-level `pytestmark`, no `pytest_collection_modifyitems` in a root/tests conftest (AST scan), no `addopts` under `[tool.pytest.ini_options]`, and no `paths`/`paths-ignore` on the PR trigger. Verified red by temporarily adding `pytestmark = [pytest.mark.slow]` (new assertion failed), then removing it.
++- **(7) AC-5 re-executed cited test modules** (correctness): ref resolution is now `_test_names_in` — an `ast.parse` scan for top-level `def`s, zero execution. `test_review7_incident_refs_resolve_without_executing` resolves a poisoned module (module-level raise + a def) that the old exec-based helper crashed on.
++- **(8) Every rehearsal rebuilt the fixture and reinstalled** (efficiency): the git fixture (repo + bare remote + advance push) is now built once per session (`fixture_template`) and copied per scenario with the profile's repo paths rewritten; per-scenario state (queue mutations, pushes) stays isolated. Fixture construction is now paid once. The saving is only the git work (init, bare clone, advance push); a per-rehearsal figure from 26s vs 21s wall-clock runs is within noise and is not claimed. The five sandboxed setup installs themselves remain by design: they are the realism F-24 exists to exercise, and test_ac_1's standalone setup is that AC's own direct proof.
++- **(9) Four divergent copies of the git helpers** (reuse): `rehearsal.py`'s private `_git` is gone (uses `factory.gates.git`, hardened, like the orchestrator); the test file has one `_git_out`-free shape — `hardened_git(...).strip()` where output is needed — and a single strict `_is_ancestor` (finding 5's semantics); `run_rehearsal`'s internal check is the harness-side strict form (raises with stderr). The vacuous-assertion bug of finding 5 came from exactly the old divergence; both remaining copies now fail loudly on git errors.
++- **Evidence (review round):** reds against the pre-fix head `e94faa7` (owner re-check: new tests run against the `e94faa7` `factory/rehearsal.py`): `test_ac_3` (DID NOT RAISE), `test_review3`, `test_review4`, and the since-dropped `test_review2` fail for the reported reasons. `test_review1` **passes** against the old module on macOS (real npm EPERM, see above), so it is not red-first evidence; findings 5–7 and 9 are test/structure fixes proven as described above. After the fixes: 10 F-24 tests / **387 total** passing locally (9 / 386 after `test_review2` was dropped), ruff clean. Dogfood `run_l1` re-run over the five contract refs (base `106f051`, node_modules-padded head): verdict `pass`, red exits 1 / green exits 0 per ref, unchanged.
++- **Status to set at reconcile:** unchanged — `done` once this PR's CI is green and you merge it.
++
++### F-24 owner review round 2 (PR #33, head `e2357a9`; 9 findings — all fixed)
++
++- **(1) A failed rehearsal still read as ready** (correctness): `run_rehearsal` raised only on stale-base/no-PR, so a `needs_human` outcome returned cleanly while the docs said F-28 readiness is "returns without raising". Now every non-`pr_opened` outcome raises `RehearsalError` (message carries the outcome, escalation and L0/L1/L2 finding ids), and the exception carries the run's `result` and `prs` for inspection. `test_ac_3` cases (1)/(2) and `test_review1` switched to `pytest.raises` — red before the fix (DID NOT RAISE).
++- **(2) The PR reply comment was out of date** (conventions): a correction comment is posted on PR #33 retracting the three withdrawn claims (review1 red-first, review2 red, ~25% speedup) and pointing at `e2357a9`'s ledger corrections and this round.
++- **(3) PATH-revert tests didn't attribute failure to the env guard** (test coverage): `test_ac_3` case (2) and `test_review1` now assert the guard's own `env-guard:` message in the setup command's output. On macOS the leaked PATH also triggers the real npm EPERM (the `e2357a9` correction), so without the message check a broken guard could pass unnoticed; with it the guard itself is the proven canary on every host.
++- **(4) Ledger AC evidence described pre-fix behaviour** (conventions): the AC-2, AC-3 and AC-5 bullets above are rewritten to match the code (raise-carrying reverts, guard attribution, AST-parsed refs).
++- **(5) AC-4 missed pytest.ini/setup.cfg/tox.ini and ignore hooks** (test coverage): `test_ac_4` now asserts none of `pytest.ini`/`tox.ini`/`setup.cfg` exists (the repo's pytest config lives in pyproject.toml only), and the conftest AST scan also rejects `pytest_ignore_collect` defs and `collect_ignore`/`collect_ignore_glob` assignments. Verified red by planting `pytest.ini` with `addopts = -m 'not slow'` and a `tests/conftest.py` with `collect_ignore = ['tests/test_f24.py']`: the new assertions failed; removed, green.
++- **(6) run_ref's missing-name exit contradicted its docstring** (correctness): a typo'd test name raised AttributeError outside the try and exited 1 (reads as `test_not_green`). Now `getattr(module, name, None)` → stderr "no test named …" and exit 2, matching the documented contract. `test_review8_run_ref_missing_name_exits_two` — red before (exit 1), green after; honest exits 0/1 re-verified.
++- **(7) Raw git subprocess calls bypassed the hardening** (reuse): both fixture clones and `run_rehearsal`'s merge-base now carry `GIT_HARDENING` (the merge-base keeps raw-subprocess rc semantics — rc 1 IS the answer there — with a comment saying why it isn't `gates.git`).
++- **(8) Home paths were interpolated into the guard unescaped** (correctness): `_env_guard_source` bakes the home paths one per line inside a quoted heredoc — literal to the shell whatever the characters — and rejects a home containing a newline at build time. `test_review9_env_guard_survives_odd_home_paths` (HOME set to `/tmp/fa'ke`): `sh -n` clean, the odd-home PATH leaks are refused with the guard message, clean PATHs pass — red against the old interpolation.
++- **(9) Redundant weak assertion in test_review1** (simplification): gone — the rework replaced `outcome != "pr_opened" or not prs` with the exact `needs_human` + `prs` + `setup_failed` + guard-attribution asserts, matching `test_ac_3` case (2).
++- **Evidence (round 2):** reds against `e2357a9` before the fixes: `test_ac_3` (DID NOT RAISE), `test_review1` (DID NOT RAISE), `test_review8` (exit 1), `test_review9` (guard never fired / bad substitution in the odd-home run); ac_4's additions proven red by the planted configs above. After the fixes: 11 F-24 tests / **388 total** passing locally, ruff clean. One intermediate round bug caught by the suite itself: the heredoc rework initially kept `.format`-style doubled braces in the shell template (`${{rest%%:*}}` → bad substitution), failing every setup-dependent test — fixed to verbatim braces with a comment warning `str.format` off.
++- **Status to set at reconcile:** unchanged — `done` once this PR's CI is green and you merge it.
++
++### F-24 owner review round 2, follow-up (PR #33; 2 findings — both fixed)
++
++- **The newline-rejection branch in `_env_guard_source` had no test, and raised the wrong exception:** the build-time rejection of a home path containing a newline raised `RehearsalError` — the "not ready" exception — for what is a fixture-build error that fires before anything has run. It now raises a plain `ValueError` (docstring states why: an invalid build input must not speak F-28's readiness vocabulary), and `test_review10_env_guard_rejects_newline_home_paths` covers the branch — red before the fix (the branch raised `RehearsalError` where the test demands `ValueError`), green after, with the message's diagnostic pinned (names the newline and the offending path).
++- **Evidence:** 12 F-24 tests / **389 total** passing locally, ruff clean.
++- **Status to set at reconcile:** unchanged — `done` once this PR's CI is green and you merge it.
+diff --git a/docs/incidents.md b/docs/incidents.md
+new file mode 100644
+index 0000000..27a209e
+--- /dev/null
++++ b/docs/incidents.md
+@@ -0,0 +1,59 @@
++# Factory incident register
++
++Every factory incident adds an entry here and a test in the same PR
++(BUILD-ORDER.md F-24 AC-5). Each entry names three things: what broke,
++which layer should have caught it, and the test that now does. A test in
++`tests/test_f24.py::test_ac_5` fails if any entry is missing a field or
++names a test that does not exist, so the register and the suite cannot
++drift apart.
++
++The first three entries are the bugs the JobFinderOS readiness rehearsal
++found on 2026-10-18 (PR #24) — the run that motivated F-24: none of them
++could fail CI, because every fixture the factory's own tests used was a
++toy repo.
++
++## INC-001 — L1 deleted what setup installed (2026-10-18, F-08)
++
++- **What broke:** L1's between-phase `git clean -fdx` removed
++  `backend/.venv` and `frontend/node_modules`, so every contract ref
++  failed with exit 127 in both phases and a healthy test read as
++  `test_not_green`. The gates had never run against a repo where setup
++  installs anything.
++- **Which layer should have caught it:** the factory's own test suite —
++  an L1 test with a fixture that declares `paths.setup_outputs` and
++  actually installs something would have gone red the moment `_clean`
++  wiped it. Toy fixtures with nothing installed hid the whole class.
++- **The tests that now do:**
++  - `tests/test_f08.py::test_rehearsal_clean_keeps_declared_setup_outputs`
++  - `tests/test_f24.py::test_ac_3` (reverts the fix; the rehearsal fails)
++
++## INC-002 — Sandboxed commands inherited home dirs on PATH (2026-10-18, F-05)
++
++- **What broke:** the ambient PATH starts with `~/.local/bin`,
++  `~/.pyenv/shims` and similar, which the sandbox denies reading. npm's
++  lifecycle spawn probed a denied dir first and died with `spawn EPERM`,
++  so `setup` failed inside a sandbox that had passed every F-05 test —
++  those tests ran with the CI runner's short, home-free PATH.
++- **Which layer should have caught it:** the sandbox tests: they asserted
++  the built environment's allow/deny lists but never ran a command under
++  the owner's real interactive PATH. Realism of the ambient environment,
++  not just of the settings file, is the sandbox's acceptance surface.
++- **The tests that now do:**
++  - `tests/test_f05.py::test_rehearsal_ambient_path_drops_home_entries`
++  - `tests/test_f05.py::test_rehearsal_sandboxed_child_sees_no_home_path_entries`
++  - `tests/test_f24.py::test_ac_3` (reverts the fix; the rehearsal fails)
++
++## INC-003 — The run built on the local checkout's stale main (2026-10-18, F-10)
++
++- **What broke:** the work clone came from the local repo at
++  `default_branch`, which was a week behind GitHub (`b0e2417` against
++  `9daedd1`). The agent built on stale code and the PR carried a wrong
++  base. Every orchestrator test used a remote that never moved, so the
++  gap between local clone and remote was invisible.
++- **Which layer should have caught it:** the orchestrator's tests — a
++  fixture whose remote advances after the clone is made would have shown
++  the run starting from the wrong commit.
++- **The tests that now do:**
++  - `tests/test_f10.py::test_rehearsal_run_builds_on_the_remote_default_branch`
++  - `tests/test_f10.py::test_rehearsal_run_refuses_when_the_remote_is_unreachable`
++  - `tests/test_f24.py::test_ac_3` (reverts the fix; the rehearsal fails)
+diff --git a/factory/rehearsal.py b/factory/rehearsal.py
+new file mode 100644
+index 0000000..e0ef36b
+--- /dev/null
++++ b/factory/rehearsal.py
+@@ -0,0 +1,511 @@
++"""The realistic rehearsal fixture (BUILD-ORDER F-24, AC-1/AC-2).
++
++Every fixture the factory's own tests used before F-24 was a toy repo:
++nothing installed, a short PATH, a remote that never moves. That is exactly
++how the three JobFinderOS readiness incidents of 2026-10-18 (PR #24)
++passed CI — each one only exists on a repo that looks like a real project.
++This module builds such a repo, offline, and drives one rehearsal run
++through the real ``factory run`` machinery with only the model seats
++stubbed.
++
++The fixture is realistic on the three axes that broke that day:
++
++* **Installed setup outputs.** ``commands.setup`` creates a Python venv
++  and a ``node_modules`` tree (a vendored package installed by npm, with
++  a lifecycle script, from the local tree — no registry, no network) and
++  the profile declares both as ``paths.setup_outputs`` so L1's between-
++  phase clean keeps them. The ``test``/``test_ref`` commands run through
++  ``.venv/bin/python`` and ``lint`` through ``node_modules/.bin``: wipe
++  either tree and every gate command dies with exit 127 — the shape of
++  incident (1).
++* **An ambient PATH with home-dir entries.** :func:`ambient_path_with_home_entries`
++  recreates the incident's environment: real home dirs (~/.pyenv/shims,
++  ~/.local/bin, …) first, plus a literal ``~`` entry. The sandbox drops
++  inherited home entries (either spelling) and literal ``~`` entries
++  (PR #24, incident 2); the fixture's ``tools/env-guard.sh`` — a plain
++  toolchain precondition with the host's home paths baked in — refuses a
++  PATH entry under the home (either spelling) or an unexpanded ``~``
++  entry, so a reverted *or simplified* filter fails setup inside the
++  sandbox, deterministically on every platform.
++* **A remote ahead of the local clone.** The bare remote's ``main``
++  carries a commit the local repo has never pulled, so a run that clones
++  the local checkout without fetching the remote builds on stale code —
++  incident (3).
++
++The rehearsal itself (:func:`run_rehearsal`) is one ``run_once`` over a
++one-criterion contract: real clone manager, real srt-sandboxed L0 and L1,
++real push and PR (via a recording ``open_pr``), stub seats. F-28's
++readiness-run mechanics are this same path, and its verdict is the
++function's control flow: ready only when it returns — every other
++outcome, and a stale-base PR, raises :class:`RehearsalError` carrying
++the run's result.
++"""
++
++import json
++import os
++import shutil
++import subprocess
++from dataclasses import dataclass
++from datetime import datetime, timezone
++from pathlib import Path
++
++import yaml
++
++from factory.contract import acceptance_hash
++from factory.gates import git as hardened_git
++from factory.orchestrator import run_once
++from factory.publish import PullRequest
++from factory.runs import GIT_HARDENING
++from factory.session import SessionRecord
++
++REHEARSAL_TEST_REF = "tests/test_feature.py::test_ac_1"
++
++TEST_SOURCE = "from impl import answer\n\n\ndef test_ac_1():\n    assert answer() == 42\n"
++
++REVIEW_PASS = json.dumps({"verdict": "pass", "findings": []})
++
++# The fixture's tracked file set. Committed to the base commit on main, so
++# every clone carries them; the contract test file is NOT here — the
++# implementer seat adds it on the branch, the red-first way.
++_RUN_REF = '''"""Run one named test ref (``path::name``) or a whole test file.
++
++The fixture project's own runner: pytest is not installed into the venv
++(the rehearsal is offline), so tests are plain functions the runner calls
++directly. Exit 0 = every test passed, 1 = a failure, 2 = nothing ran.
++"""
++import importlib.util
++import os
++import sys
++import traceback
++
++
++def _load(path):
++    sys.path.insert(0, os.getcwd())  # the project root, where impl.py lives
++    spec = importlib.util.spec_from_file_location("rehearsal_" + path.replace("/", "_"),
++                                                  path)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def main(argv):
++    if len(argv) != 2:
++        print("usage: run_ref.py <path>[::<name>]", file=sys.stderr)
++        return 2
++    path, _, name = argv[1].partition("::")
++    module = _load(path)
++    if name:
++        # A typo'd name is a not-found signal (exit 2), never an
++        # AttributeError traceback that reads as an ordinary failure.
++        func = getattr(module, name, None)
++        if not callable(func):
++            print("no test named %s in %s" % (name, path), file=sys.stderr)
++            return 2
++        functions = [(name, func)]
++    else:
++        functions = sorted((n, f) for n, f in vars(module).items()
++                           if n.startswith("test") and callable(f))
++    if not functions:
++        print("no tests found in %s" % path, file=sys.stderr)
++        return 2
++    failed = 0
++    for test_name, func in functions:
++        try:
++            func()
++            print("%s::%s passed" % (path, test_name), flush=True)
++        except Exception:
++            traceback.print_exc()
++            print("%s::%s FAILED" % (path, test_name), flush=True)
++            failed += 1
++    return 1 if failed else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv))
++'''
++
++# A plain toolchain precondition, the kind real setups carry: command
++# resolution through an unexpanded PATH entry is broken for every tool
++# downstream (the shell never expanded it), and so is resolution through
++# the owner's home, which the sandbox denies reading. Inside the sandbox
++# this is the deterministic canary for incident (2) on BOTH leak classes:
++# the sanitised child PATH never carries a literal `~` entry or anything
++# under the real home, and a leaked one of either kind always does — on
++# every platform, with no dependence on how a given execvp treats a
++# denied candidate. The home paths are baked in at fixture-build time
++# (both spellings of the home, the same set `_path_outside_home` drops).
++_ENV_GUARD_TEMPLATE = '''#!/bin/sh
++# Refuse a PATH that leaks the owner's home (either spelling) or carries
++# an unexpanded `~` entry. Home paths are baked in by factory.rehearsal,
++# one per line in the quoted heredoc below: with a quoted delimiter the
++# body is literal, so paths with quotes, spaces or shell metacharacters
++# stay data, never syntax. (No str.format anywhere near this template —
++# the shell braces must survive verbatim.)
++rest=$PATH:
++while [ -n "$rest" ]; do
++  entry=${rest%%:*}
++  rest=${rest#*:}
++  case $entry in
++    "~"|"~/"*)
++      echo "env-guard: PATH carries an unexpanded ~ entry: $entry" >&2
++      exit 1
++      ;;
++  esac
++  while IFS= read -r home; do
++    [ -n "$home" ] || continue
++    case $entry in
++      "$home"|"$home"/*)
++        echo "env-guard: PATH leaks a home-dir entry ($home): $entry" >&2
++        exit 1
++        ;;
++    esac
++  done <<'HOMES'
++__HOMES__
++HOMES
++done
++'''
++
++_LINT_JS = '''#!/usr/bin/env node
++// The fixture's lint tool: reads the tracked manifest it checks for.
++const fs = require("fs");
++fs.readFileSync("lint-manifest.txt", "utf8");
++console.log("lint-ok");
++'''
++
++_TINY_KIT = '''{
++  "name": "tiny-kit",
++  "version": "1.0.0",
++  "bin": { "rehearse-lint": "bin/lint.js" },
++  "scripts": { "install": "node -e \\"console.log('tiny-kit lifecycle ran')\\"" }
++}
++'''
++
++
++@dataclass
++class RehearsalFixture:
++    """The built fixture project: local repo (stale main), advanced remote,
++    and the orchestrator-side profile/queue paths."""
++
++    repo: Path
++    remote: Path
++    profile_path: Path
++    queue_path: Path
++    local_main: str
++    remote_main: str
++
++    def task(self) -> dict:
++        from factory.state import TaskQueue
++
++        return TaskQueue(self.queue_path).get("T-1")
++
++
++def ambient_path_with_home_entries() -> str:
++    """The ambient PATH of the owner's interactive shell, the incident's
++    environment: home dirs first (both spellings the fix drops), then the
++    real PATH. ``~/.local/bin`` and friends need not exist on the host —
++    the leaked literal ``~`` entry is the deterministic canary. Empty
++    entries are dropped everywhere: an empty PATH entry means the current
++    directory, a leak class of its own that AC-3 could not attribute."""
++    home = Path.home()
++    inherited = [entry for entry in os.environ.get("PATH", "").split(":") if entry]
++    return ":".join(
++        [
++            f"{home}/.pyenv/shims",
++            f"{home}/.local/bin",
++            f"{home}/.npm-global/bin",
++            "~/.local/bin",
++            *inherited,
++        ]
++    )
++
++
++def _env_guard_source() -> str:
++    """The guard script with this host's home paths baked in (both
++    spellings, the same set ``_path_outside_home`` drops).
++
++    The paths ride one per line inside a quoted heredoc, so any character
++    short of a newline is literal to the shell. A newline in a home path
++    cannot be represented that way and is rejected here, at build time —
++    a fixture that cannot be built correctly is better than one whose
++    guard silently matches nothing. The rejection is a plain ValueError:
++    it is an invalid fixture-build input, not a run that came back not
++    ready, so it must not speak F-28's RehearsalError vocabulary.
++    """
++    homes = {str(Path.home())}
++    homes.add(str(Path.home().resolve()))
++    for home in homes:
++        if "\n" in home:
++            raise ValueError(
++                f"cannot bake a home path containing a newline into env-guard.sh: {home!r}"
++            )
++    lines = "\n".join(sorted(homes))
++    return _ENV_GUARD_TEMPLATE.replace("__HOMES__", lines)
++
++
++def _write(path: Path, text: str, executable: bool = False) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(text)
++    if executable:
++        path.chmod(0o755)
++
++
++def _profile(repo: Path, remote: Path) -> dict:
++    return {
++        "name": "rehearsal-fixture",
++        "repo": {
++            "path": str(repo),
++            "default_branch": "main",
++            "remote": str(remote),
++            "merge_method": "squash",
++        },
++        "commands": {
++            "setup": (
++                "tools/env-guard.sh && python3 -m venv .venv"
++                " && npm install --no-audit --no-fund --no-save ./vendor/tiny-kit"
++            ),
++            "lint": "node_modules/.bin/rehearse-lint",
++            "test": ".venv/bin/python tools/run_ref.py tests/test_base.py",
++            "test_ref": ".venv/bin/python tools/run_ref.py {ref}",
++        },
++        "paths": {
++            "risk": {},
++            "protected": [".factory/**"],
++            "setup_outputs": [".venv", "node_modules"],
++        },
++        "dependency_manifests": ["package.json"],
++        "deploy": {"mechanism": "none", "auto_on_merge": False},
++        "live_checks": {},
++        "docs_allowlist": [],
++    }
++
++
++def _task() -> dict:
++    acceptance = [
++        {
++            "id": "AC-1",
++            "text": "answer() returns 42",
++            "check": {"type": "test", "ref": REHEARSAL_TEST_REF},
++        }
++    ]
++    return {
++        "id": "T-1",
++        "title": "Make answer() return 42 (rehearsal)",
++        "source": "docs/T-1.md",
++        "kind": "build",
++        "priority": "P1",
++        "status": "ready",
++        "depends_on": [],
++        "risk": [],
++        "gates": {"spec_approval": True, "merge": "human", "deploy": "human"},
++        "acceptance": acceptance,
++        "acceptance_hash": acceptance_hash(acceptance),
++        "approved_at": "2026-10-19T10:00:00Z",
++        "approved_by": "owner",
++        "budget": {"size": "S", "max_attempts": 2, "max_turns": 20, "wall_clock_min": 30},
++        "attempts": [],
++    }
++
++
++def build_rehearsal_fixture(dest: Path) -> RehearsalFixture:
++    """Build the fixture project at ``dest`` (offline, no network).
++
++    The local repo sits at the base commit; the bare remote's ``main`` is
++    one commit ahead (a file that landed "on GitHub" and was never pulled)
++    — the stale-checkout shape of incident (3).
++    """
++    dest = Path(dest)
++    dest.mkdir(parents=True)
++    hardened_git(dest, "init", "-q", "-b", "main")
++    hardened_git(dest, "config", "user.email", "rehearsal@example.com")
++    hardened_git(dest, "config", "user.name", "Rehearsal")
++
++    _write(dest / "impl.py", "def answer():\n    return 0\n")
++    _write(dest / "tools" / "run_ref.py", _RUN_REF)
++    _write(dest / "tools" / "env-guard.sh", _env_guard_source(), executable=True)
++    _write(dest / "tests" / "test_base.py", "def test_base():\n    assert True\n")
++    _write(dest / "package.json", '{"name": "rehearsal-fixture", "private": true}\n')
++    _write(dest / "lint-manifest.txt", "rehearsal fixture lint manifest\n")
++    _write(dest / "vendor" / "tiny-kit" / "package.json", _TINY_KIT)
++    _write(dest / "vendor" / "tiny-kit" / "bin" / "lint.js", _LINT_JS)
++
++    remote = dest.parent / f"{dest.name}-remote.git"
++    _write(dest / ".factory" / "project.yaml", yaml.safe_dump(_profile(dest, remote)))
++    _write(
++        dest / ".factory" / "tasks.json",
++        json.dumps(
++            {"version": 1, "project": "rehearsal-fixture", "tasks": [_task()]}, indent=2
++        )
++        + "\n",
++    )
++    # A real project ignores what setup installs: the orchestrator commits
++    # with `git add -A`, so a session that ran setup would otherwise put
++    # the whole .venv and node_modules tree into its PR.
++    _write(dest / ".gitignore", ".factory/*.lock\n/.venv/\n/node_modules/\n")
++
++    hardened_git(dest, "add", "-A")
++    hardened_git(dest, "commit", "-qm", "base")
++    local_main = hardened_git(dest, "rev-parse", "refs/heads/main").strip()
++
++    # Clones carry GIT_HARDENING like every other git call in the module
++    # (review round 2, finding 7): a host's global insteadOf/hooks config
++    # must not reach the fixture's remotes. check=True stays — a failed
++    # clone is a build failure, not a verdict.
++    subprocess.run(
++        ["git", *GIT_HARDENING, "clone", "--bare", "-q", str(dest), str(remote)],
++        check=True,
++    )
++    scratch = dest.parent / f"{dest.name}-scratch"
++    subprocess.run(
++        ["git", *GIT_HARDENING, "clone", "-q", str(remote), str(scratch)], check=True
++    )
++    identity = (
++        "-c", "user.email=rehearsal@example.com", "-c", "user.name=Rehearsal",
++    )
++    try:
++        _write(
++            scratch / "REMOTE-ONLY.md",
++            "Landed on the remote's default branch; the local clone never pulled it.\n",
++        )
++        hardened_git(scratch, *identity, "add", "-A")
++        hardened_git(
++            scratch, *identity, "commit", "-qm", "advance the default branch on the remote"
++        )
++        hardened_git(scratch, "push", "-q", "origin", "HEAD:main")
++    finally:
++        shutil.rmtree(scratch, ignore_errors=True)
++    remote_main = hardened_git(remote, "rev-parse", "refs/heads/main").strip()
++
++    return RehearsalFixture(
++        repo=dest,
++        remote=remote,
++        profile_path=dest / ".factory" / "project.yaml",
++        queue_path=dest / ".factory" / "tasks.json",
++        local_main=local_main,
++        remote_main=remote_main,
++    )
++
++
++class _RehearsalSeats:
++    """Stub seats with :func:`factory.session.run_session_sandboxed`'s
++    signature: the implementer writes the fix plus the contract test into
++    the run dir the way a session would; the reviewer returns a pass
++    verdict. No model, no API spend — everything downstream (commit, clean
++    clone, sandboxed L0/L1, push, PR) is the real machinery."""
++
++    def __init__(self) -> None:
++        self.calls: list[tuple[str, Path]] = []
++
++    def __call__(self, seat: str, prompt: str, run_dir, profile, **kwargs):
++        run_dir = Path(run_dir)
++        self.calls.append((seat, run_dir))
++        if seat == "implementer":
++            (run_dir / "impl.py").write_text("def answer():\n    return 42\n")
++            (run_dir / "tests" / "test_feature.py").write_text(TEST_SOURCE)
++            return SessionRecord(
++                seat=seat, status="completed", num_turns=2, model="stub-model",
++                tokens={"input_tokens": 120, "output_tokens": 40},
++                result="Implemented answer().",
++            )
++        return SessionRecord(
++            seat=seat, status="completed", num_turns=1, model="stub-model",
++            tokens={"input_tokens": 60, "output_tokens": 10},
++            result=REVIEW_PASS,
++        )
++
++
++class RehearsalError(RuntimeError):
++    """The rehearsal did not come back ready.
++
++    F-28's readiness flow treats a raised rehearsal exactly like a failed
++    one: the run is not ready. The exception carries the run's
++    :class:`~factory.orchestrator.RunResult` (``result``) and the recorded
++    PRs (``prs``) so callers can inspect what happened.
++    """
++
++    def __init__(self, message: str, result=None, prs=()) -> None:
++        super().__init__(message)
++        self.result = result
++        self.prs = list(prs)
++
++
++def _finding_ids(reports: dict) -> str:
++    """One line of L0/L1/L2 finding ids, for error messages."""
++    ids = []
++    for layer in ("L0", "L1", "L2"):
++        for finding in (reports.get(layer) or {}).get("findings") or []:
++            ids.append(f"{layer}:{finding.get('id')}")
++    return ", ".join(ids) or "no findings recorded"
++
++
++def run_rehearsal(
++    fixture: RehearsalFixture, factory_root: Path, *, now=None
++) -> tuple:
++    """One full ``factory run`` over the fixture's one-criterion contract.
++
++    A readiness run (F-28 step 2) is ready **only** when this returns:
++    every outcome other than ``pr_opened`` raises, and so does a
++    ``pr_opened`` whose PR head lacks the remote's default-branch commit
++    (incident INC-003, a stale-base build). "Returns without raising" is
++    the whole readiness verdict.
++
++    Returns:
++        ``(RunResult, prs)`` — the run's outcome and the PRs the recorder
++        captured (exactly one when all went well).
++
++    Raises:
++        RehearsalError: the outcome is anything but ``pr_opened``
++            (escalated, failed, quota/window/error), or a ``pr_opened``
++            run recorded no PR, or the PR head does not contain the
++            remote's default-branch commit. The exception carries the
++            run's ``result`` and ``prs``.
++    """
++    prs: list[PullRequest] = []
++
++    def open_pr(pr: PullRequest) -> str:
++        prs.append(pr)
++        return f"https://github.com/rehearsal/fixture/pull/{len(prs)}"
++
++    result = run_once(
++        fixture.queue_path,
++        fixture.profile_path,
++        factory_root=Path(factory_root),
++        session_runner=_RehearsalSeats(),
++        open_pr=open_pr,
++        now=now or (lambda: datetime.now(timezone.utc)),
++    )
++    if result.outcome != "pr_opened":
++        detail = f"escalation {result.escalation}" if result.escalation else "no escalation"
++        raise RehearsalError(
++            f"rehearsal outcome {result.outcome!r} ({detail}; "
++            f"{_finding_ids(result.reports)})",
++            result=result,
++            prs=prs,
++        )
++    if not prs:
++        raise RehearsalError(
++            "run_once reported pr_opened but no PR was recorded",
++            result=result,
++            prs=prs,
++        )
++    # rc 0 = the remote's advanced main is in the PR head; anything
++    # else (rc 1 = not an ancestor, or a git error, with stderr
++    # surfaced in the message) means the run built on a stale or
++    # unknown base: not ready, by construction. GIT_HARDENING matches
++    # factory.gates.git; raw subprocess only because the rc IS the answer
++    # here and gates.git raises on any non-zero exit.
++    proc = subprocess.run(
++        ["git", *GIT_HARDENING, "-C", str(fixture.remote), "merge-base", "--is-ancestor",
++         fixture.remote_main, f"refs/heads/{prs[-1].head}"],
++        capture_output=True,
++        text=True,
++    )
++    if proc.returncode != 0:
++        raise RehearsalError(
++            f"the PR head {prs[-1].head} does not contain the remote's "
++            f"default-branch commit {fixture.remote_main[:12]}: the run built "
++            f"on a stale local checkout (git rc={proc.returncode}, "
++            f"stderr: {proc.stderr.strip()[:200]})",
++            result=result,
++            prs=prs,
++        )
++    return result, prs
+diff --git a/tests/test_f24.py b/tests/test_f24.py
+new file mode 100644
+index 0000000..c0391e3
+--- /dev/null
++++ b/tests/test_f24.py
+@@ -0,0 +1,535 @@
++"""F-24 acceptance tests — BUILD-ORDER.md, work order F-24.
++
++Contract rule (CLAUDE.md): an acceptance ref ``tests/test_f24.py::test_ac_N``
++means a test function with exactly that name.
++
++The rehearsal is the point of this work order. Every earlier fixture was a
++toy repo — nothing installed, a short PATH, a remote that never moves —
++which is exactly how the three 2026-10-18 readiness incidents (PR #24)
++passed CI. ``factory.rehearsal`` builds a fixture that is realistic on the
++three axes that broke that day (an installed venv + ``node_modules`` the
++gates must keep, an ambient PATH carrying home-dir entries, a remote whose
++default branch is ahead of the local clone), and ``run_rehearsal`` drives
++it through the real ``factory run`` machinery — clone manager, sandboxed
++L0/L1, push, PR — with only the model seats stubbed.
++
++The git fixture is built once per session and copied per scenario
++(``fixture_template`` + ``rehearsal``): each rehearsal mutates its own
++queue and remote, so scenarios cannot share state, but the repo
++construction and the remote-advance push are paid once.
++"""
++
++import ast
++import re
++import shutil
++import subprocess
++import sys
++import tomllib
++from datetime import datetime
++from pathlib import Path
++from zoneinfo import ZoneInfo
++
++import pytest
++import yaml
++
++from factory import l1 as l1_module
++from factory import orchestrator as orchestrator_module
++from factory import sandbox as sandbox_module
++from factory.contract import load_profile
++from factory.gates import git as hardened_git
++from factory.rehearsal import (
++    RehearsalError,
++    RehearsalFixture,
++    _env_guard_source,
++    ambient_path_with_home_entries,
++    build_rehearsal_fixture,
++    run_rehearsal,
++)
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++STOCKHOLM = ZoneInfo("Europe/Stockholm")
++# A Sunday afternoon: outside every default peak window, so runs may start.
++OFF_PEAK = datetime(2026, 10, 18, 15, 0, tzinfo=STOCKHOLM)
++
++
++def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
++    """merge-base --is-ancestor with strict exit semantics.
++
++    0 means yes, 1 means no; any other exit (missing object, bad ref,
++    wrong repo) is an error and fails the test, never a quiet ``False`` —
++    a check that cannot fail for the right reason proves nothing. This is
++    the only ancestor helper in the file.
++    """
++    proc = subprocess.run(
++        ["git", "-C", str(repo), "merge-base", "--is-ancestor", ancestor, descendant],
++        capture_output=True,
++        text=True,
++    )
++    assert proc.returncode in (0, 1), (
++        f"merge-base --is-ancestor errored in {repo} (rc={proc.returncode}): "
++        f"{proc.stderr.strip()[:300]}"
++    )
++    return proc.returncode == 0
++
++
++def _test_names_in(file: Path) -> set:
++    """The top-level test function names in ``file``, parsed, never run.
++
++    Resolving the incident register's refs by importing each cited module
++    would re-execute module-level code (and break on any cited module
++    whose imports need the sandbox); the register cites plain module-level
++    test functions, and the AST says whether the name exists.
++    """
++    tree = ast.parse(file.read_text())
++    return {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
++
++
++@pytest.fixture(scope="session")
++def fixture_template(tmp_path_factory):
++    """The fixture pair, built once per session; spawns copy it."""
++    return build_rehearsal_fixture(tmp_path_factory.mktemp("f24-template") / "proj")
++
++
++@pytest.fixture
++def rehearsal(tmp_path, monkeypatch, fixture_template):
++    """A fresh-fixture spawner running under the poisoned ambient PATH.
++
++    Each scenario needs its own queue and remote: a rehearsal that fails
++    leaves the task ``needs_human`` with attempts spent, and a run pushes
++    into its own remote. Each spawn is a copy of the session template with
++    the profile's repo paths rewritten to the copy.
++    """
++    monkeypatch.setenv("PATH", ambient_path_with_home_entries())
++    state = {"n": 0}
++
++    def spawn():
++        state["n"] += 1
++        n = state["n"]
++        repo = tmp_path / f"proj-{n}"
++        remote = tmp_path / f"proj-{n}-remote.git"
++        shutil.copytree(fixture_template.repo, repo)
++        shutil.copytree(fixture_template.remote, remote)
++        profile_path = repo / ".factory" / "project.yaml"
++        profile = yaml.safe_load(profile_path.read_text())
++        profile["repo"]["path"] = str(repo)
++        profile["repo"]["remote"] = str(remote)
++        profile_path.write_text(yaml.safe_dump(profile))
++        root = tmp_path / f"factory-root-{n}"
++        root.mkdir()
++        fixture = RehearsalFixture(
++            repo=repo,
++            remote=remote,
++            profile_path=profile_path,
++            queue_path=repo / ".factory" / "tasks.json",
++            local_main=fixture_template.local_main,
++            remote_main=fixture_template.remote_main,
++        )
++        return fixture, root
++
++    yield spawn
++
++
++# --- AC-1: the fixture is realistic on the three incident axes --------------
++
++
++def test_ac_1(rehearsal, monkeypatch):
++    """A fixture project (built by the test, no network) has a setup that
++    installs a Python venv and a node_modules tree, declared as
++    setup_outputs; a remote whose default branch is ahead of the local
++    clone; and an ambient PATH that includes home-dir entries."""
++    fixture, root = rehearsal()
++
++    # The remote is ahead: its main has commits the local clone lacks.
++    remote_main = hardened_git(fixture.remote, "rev-parse", "refs/heads/main").strip()
++    local_main = hardened_git(fixture.repo, "rev-parse", "refs/heads/main").strip()
++    assert remote_main != local_main
++    assert fixture.remote_main == remote_main
++    # Judged in the remote, which holds both objects (strict semantics:
++    # an errored merge-base fails the test, never reads as "not ahead").
++    assert _is_ancestor(fixture.remote, local_main, remote_main)
++    # And the local clone really lacks the advanced commit — cat-file,
++    # not merge-base, so a missing object is checked as a missing object.
++    missing = subprocess.run(
++        ["git", "-C", str(fixture.repo), "cat-file", "-e", f"{remote_main}^{{commit}}"],
++        capture_output=True,
++        text=True,
++    )
++    assert missing.returncode != 0, (
++        "the fixture's local clone must NOT contain the remote's advanced main"
++    )
++
++    # The profile declares what setup installs, and setup touches no network.
++    profile = load_profile(fixture.profile_path)
++    outputs = profile["paths"]["setup_outputs"]
++    assert outputs == [".venv", "node_modules"]
++    setup = profile["commands"]["setup"]
++    assert "venv" in setup and "npm install" in setup
++    assert "--no-audit" in setup and "--no-fund" in setup, (
++        "npm must not reach the registry: the fixture is offline by design"
++    )
++    assert not re.search(r"https?://", setup), "setup must not fetch any URL"
++
++    # The ambient PATH carries home-dir entries (absolute and literal ~).
++    ambient = ambient_path_with_home_entries()
++    home = str(Path.home())
++    assert any(entry.startswith(home + "/") for entry in ambient.split(":"))
++    assert any(entry.startswith("~") for entry in ambient.split(":"))
++
++    # Setup really installs both trees, end to end through the real sandbox,
++    # under that ambient PATH (the sanitised child PATH passes the guard).
++    from factory.runs import cleanup_run, create_run
++    from factory.sandbox import build_settings, run_sandboxed, write_settings
++    from factory.session import DEFAULT_BASE_URL
++
++    monkeypatch.setenv("PATH", ambient)
++    run = create_run("rehearsal-fixture", fixture.repo, factory_root=root)
++    try:
++        settings = build_settings(
++            profile, run.root, model_endpoint=DEFAULT_BASE_URL, factory_root=root
++        )
++        write_settings(settings, run.settings_path)
++        proc = run_sandboxed(
++            ["/bin/sh", "-c", setup], run.root, run.settings_path, timeout=240
++        )
++        assert proc.returncode == 0, (proc.stdout + proc.stderr)[-800:]
++        assert (run.root / ".venv" / "bin" / "python").exists()
++        assert (run.root / "node_modules" / ".bin" / "rehearse-lint").exists()
++    finally:
++        cleanup_run(run)
++
++
++# --- AC-2: the rehearsal passes on main --------------------------------------
++
++
++def test_ac_2(rehearsal):
++    """A rehearsal test runs setup, L0 and L1 over a one-criterion contract
++    against that fixture, end to end through the real sandbox, and passes
++    on main. run_rehearsal itself raises on a stale-base PR (INC-003), so
++    returning without an error already proves the remote-default property."""
++    fixture, root = rehearsal()
++    result, prs = run_rehearsal(fixture, root, now=lambda: OFF_PEAK)
++
++    assert result.outcome == "pr_opened", result
++    assert len(prs) == 1
++    task = fixture.task()
++    assert task["status"] == "in_review"
++    attempts = task["attempts"]
++    assert attempts and attempts[-1]["outcome"] == "pass"
++
++    # Setup, L0 and L1 all ran inside the sandbox on the clean clone.
++    reports = result.reports
++    assert reports["L0"]["verdict"] == "pass"
++    commands = {c["name"] for c in reports["L0"]["commands"]}
++    assert "setup" in commands and "test" in commands and "lint" in commands
++    assert reports["L1"]["verdict"] == "pass", reports["L1"]["findings"]
++    red = next(c for c in reports["L1"]["commands"] if c["name"].startswith("red:"))
++    green = next(c for c in reports["L1"]["commands"] if c["name"].startswith("green:"))
++    assert red["exit_code"] != 0 and green["exit_code"] == 0
++
++
++# --- AC-3: reverting each PR #24 fix fails the rehearsal ---------------------
++
++
++def test_ac_3(rehearsal, monkeypatch):
++    """Reverting each PR #24 fix in turn (L1 `_clean` keeping setup outputs,
++    `_path_outside_home`, `_build_on_remote_default`) makes the rehearsal
++    fail. Proven by three tests that monkeypatch the old behaviour back
++    in."""
++
++    def old_clean(repo, keep=()):
++        hardened_git(repo, "clean", "-fdx")  # PR #24's pre-fix behaviour
++
++    # (1) _clean without the setup-output keeps: the venv is wiped between
++    # L1's phases, every ref exits 127, the round never passes. A failed
++    # rehearsal raises (review round 2, finding 1: F-28 readiness is
++    # "returns without raising", so needs_human must raise too), carrying
++    # the run's result for inspection.
++    with monkeypatch.context() as m:
++        m.setattr(l1_module, "_clean", old_clean)
++        fixture, root = rehearsal()
++        with pytest.raises(RehearsalError) as exc:
++            run_rehearsal(fixture, root, now=lambda: OFF_PEAK)
++    result = exc.value.result
++    assert result.outcome == "needs_human", result
++    assert not exc.value.prs
++    findings = [f["id"] for f in (result.reports.get("L1") or {}).get("findings") or []]
++    assert "test_not_green" in findings, result.reports["L1"]
++
++    # (2) _path_outside_home as identity: the sandboxed child inherits the
++    # home/literal-~ PATH entries, the fixture's env guard fails setup —
++    # and the guard's own message must be the recorded cause (review round
++    # 2, finding 3: on macOS a leaked PATH can fail setup via the real
++    # npm EPERM instead, so only the guard message attributes the failure
++    # to the canary rather than to whatever else the leak breaks).
++    with monkeypatch.context() as m:
++        m.setattr(sandbox_module, "_path_outside_home", lambda path: path)
++        fixture, root = rehearsal()
++        with pytest.raises(RehearsalError) as exc:
++            run_rehearsal(fixture, root, now=lambda: OFF_PEAK)
++    result = exc.value.result
++    assert result.outcome == "needs_human", result
++    assert not exc.value.prs
++    findings = [f["id"] for f in (result.reports.get("L0") or {}).get("findings") or []]
++    assert "setup_failed" in findings, result.reports["L0"]
++    setup = next(c for c in result.reports["L0"]["commands"] if c["name"] == "setup")
++    assert "env-guard:" in setup["output"], (
++        "the failure must be attributed to the env guard, not to whatever "
++        "else a leaked PATH happens to break on this host"
++    )
++
++    # (3) _build_on_remote_default as a no-op: the run builds on the stale
++    # local main, and run_rehearsal itself raises on the stale-base PR —
++    # the harness, not only this test, detects INC-003 (review finding 2).
++    with monkeypatch.context() as m:
++        m.setattr(orchestrator_module, "_build_on_remote_default", lambda *a, **k: None)
++        fixture, root = rehearsal()
++        with pytest.raises(RehearsalError, match="remote's default-branch"):
++            run_rehearsal(fixture, root, now=lambda: OFF_PEAK)
++
++
++# --- AC-4: CI runs the rehearsal on every PR ---------------------------------
++
++
++def test_ac_4():
++    """CI runs the rehearsal on every PR (it is not marked slow or
++    optional)."""
++    # The rehearsal this criterion is about must be part of the tree CI
++    # checks out: on a base without F-24 there is no rehearsal to run at
++    # all, whatever ci.yml says. (Checked as a file, not an import: an
++    # editable install of a newer checkout would satisfy the import.)
++    assert (REPO_ROOT / "factory" / "rehearsal.py").is_file(), (
++        "the rehearsal harness must live in the repo CI clones"
++    )
++
++    workflow = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text())
++    triggers = workflow.get(True) or workflow.get("on")
++    assert "pull_request" in triggers, "CI must run on every PR"
++    # A paths filter on the PR trigger would skip the rehearsal entirely.
++    pr_trigger = triggers.get("pull_request") if isinstance(triggers, dict) else None
++    if isinstance(pr_trigger, dict):
++        assert not ({"paths", "paths-ignore"} & set(pr_trigger)), (
++            "CI must not filter which PR files trigger the suite"
++        )
++
++    steps = workflow["jobs"]["test"]["steps"]
++    pytest_steps = [s for s in steps if "pytest" in (s.get("run") or "")]
++    assert pytest_steps, "CI must run pytest"
++    for step in pytest_steps:
++        run = step["run"]
++        assert run.strip() == "pytest -q", (
++            f"the suite must run whole (no marker/path filters): {run!r}"
++        )
++        assert "if" not in step and "continue-on-error" not in step, (
++            "the pytest step must not be conditional or non-blocking"
++        )
++
++    # Nothing may deselect the rehearsal from inside the suite either:
++    # per-test or module-level marks, a conftest collection hook, or
++    # pytest addopts would all remove it while ci.yml still says pytest -q.
++    module = sys.modules[__name__]
++    assert not vars(module).get("pytestmark"), (
++        "no module-level pytest marks may deselect this file"
++    )
++    for name in ("test_ac_1", "test_ac_2", "test_ac_3"):
++        test = getattr(module, name)
++        assert not test.__dict__.get("pytestmark"), f"{name} must not carry pytest markers"
++        assert not hasattr(test, "__unittest_skip__"), f"{name} must not be skipped"
++    # Alternative pytest config files take precedence over pyproject and
++    # could carry addopts; the repo's config lives in pyproject.toml only
++    # (review round 2, finding 5), so none of them may appear at all.
++    for rogue in ("pytest.ini", "tox.ini", "setup.cfg"):
++        assert not (REPO_ROOT / rogue).exists(), (
++            f"pytest config belongs in pyproject.toml; {rogue} would override it"
++        )
++    for conftest in (REPO_ROOT / "conftest.py", REPO_ROOT / "tests" / "conftest.py"):
++        if not conftest.exists():
++            continue
++        for node in ast.walk(ast.parse(conftest.read_text())):
++            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
++                assert node.name not in (
++                    "pytest_collection_modifyitems", "pytest_ignore_collect",
++                ), f"{conftest} must not deselect or ignore tests at collection time"
++            if isinstance(node, ast.Assign):
++                assigned = {t.id for t in node.targets if isinstance(t, ast.Name)}
++                assert not (assigned & {"collect_ignore", "collect_ignore_glob"}), (
++                    f"{conftest} must not drop test files from collection"
++                )
++    ini = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
++    ini_options = ini.get("tool", {}).get("pytest", {}).get("ini_options", {})
++    assert "addopts" not in ini_options, "pytest must run with no addopts filters"
++
++
++# --- AC-5: the incident register ---------------------------------------------
++
++
++def test_ac_5():
++    """`docs/incidents.md` records the three incidents, and for each: what
++    broke, which layer should have caught it, and the test that now does.
++    Every future factory incident adds an entry and a test in the same PR
++    (checked by a test that every entry names an existing test)."""
++    doc = (REPO_ROOT / "docs" / "incidents.md").read_text()
++
++    sections = re.split(r"(?m)^## ", doc)[1:]
++    assert len(sections) >= 3, "the three PR #24 incidents must each have an entry"
++    for section in sections:
++        assert "**What broke:**" in section, section.splitlines()[0]
++        assert "**Which layer should have caught it:**" in section, (
++            section.splitlines()[0]
++        )
++        refs = re.findall(r"`(tests/[\w/.]+\.py::[\w_]+)`", section)
++        assert refs, f"entry {section.splitlines()[0]!r} names no test"
++
++    # The standing rule: every test ref in the whole file names an existing
++    # top-level test function, resolved by parsing (never executing) the
++    # cited module. Future incidents citing a renamed or deleted test fail.
++    every_ref = set(re.findall(r"`(tests/[\w/.]+\.py::[\w_]+)`", doc))
++    assert every_ref, "the register cites no tests at all"
++    for ref in sorted(every_ref):
++        path, _, name = ref.partition("::")
++        file = REPO_ROOT / path
++        assert file.exists(), f"{ref}: file does not exist"
++        assert name in _test_names_in(file), f"{ref}: test does not exist"
++
++
++# --- owner review round (9 findings) ------------------------------------------
++
++
++def test_review1_path_leak_covers_absolute_home_entries(rehearsal, monkeypatch):
++    """Review round 1, finding 1: the PATH revert must catch the
++    absolute-$HOME leak class too, not only literal `~` entries — a
++    `_path_outside_home` simplified to startswith('~') would leak
++    `/<home>/.pyenv/shims` back into the sandboxed PATH. The fixture's
++    env guard bakes the host's home paths in and refuses entries under
++    them, so the rehearsal still fails. The guard's own message is
++    asserted (round 2, finding 3): on this Mac the leaked entries also
++    trigger the real npm EPERM (ledger correction, e2357a9), so without
++    the message check a broken guard would pass unnoticed wherever EPERM
++    happens to strike; with it, the guard itself is the proven canary on
++    every host, Linux CI included."""
++    def tilde_only_filter(path):
++        return ":".join(e for e in path.split(":") if e and not e.startswith("~"))
++
++    with monkeypatch.context() as m:
++        m.setattr(sandbox_module, "_path_outside_home", tilde_only_filter)
++        fixture, root = rehearsal()
++        with pytest.raises(RehearsalError) as exc:
++            run_rehearsal(fixture, root, now=lambda: OFF_PEAK)
++    result = exc.value.result
++    assert result.outcome == "needs_human", result
++    assert not exc.value.prs
++    findings = [f["id"] for f in (result.reports.get("L0") or {}).get("findings") or []]
++    assert "setup_failed" in findings, result.reports["L0"]
++    setup = next(c for c in result.reports["L0"]["commands"] if c["name"] == "setup")
++    assert "env-guard:" in setup["output"], (
++        "the guard, not incidental EPERM, must be the recorded cause"
++    )
++
++
++def test_review3_fixture_ignores_install_trees(rehearsal):
++    """Review finding 3: a real project gitignores what setup installs; the
++    orchestrator's `git add -A` would otherwise commit .venv and
++    node_modules into the PR of any session that ran setup."""
++    fixture, _ = rehearsal()
++    for ignored in (".venv/bin/python", "node_modules/tiny-kit/package.json"):
++        proc = subprocess.run(
++            ["git", "-C", str(fixture.repo), "check-ignore", "-q", ignored],
++            capture_output=True,
++        )
++        assert proc.returncode == 0, f"{ignored} must be gitignored by the fixture"
++
++
++def test_review4_ambient_path_has_no_empty_entries(monkeypatch):
++    """Review finding 4: with PATH unset the poisoned ambient PATH must not
++    grow an empty entry — an empty PATH entry means the current directory,
++    an unintended extra leak class AC-3 cannot attribute."""
++    monkeypatch.delenv("PATH", raising=False)
++    ambient = ambient_path_with_home_entries()
++    entries = ambient.split(":")
++    assert ambient, "the poisoned PATH must still carry the home entries"
++    assert "" not in entries, "an empty PATH entry resolves commands from cwd"
++    assert not ambient.endswith(":"), f"trailing separator: {ambient!r}"
++
++
++def test_review7_incident_refs_resolve_without_executing(tmp_path):
++    """Review finding 7: ref resolution must parse, not import — a cited
++    module with module-level side effects (or imports that need the
++    sandbox) must resolve without running any of it."""
++    poison = tmp_path / "test_poison.py"
++    poison.write_text(
++        'raise RuntimeError("import side effect must never run")\n\n\n'
++        "def test_ok():\n    pass\n"
++    )
++    assert "test_ok" in _test_names_in(poison)
++
++
++def test_review8_run_ref_missing_name_exits_two(fixture_template):
++    """Review round 2, finding 6: the fixture runner's documented contract
++    is exit 2 when nothing ran. A typo'd test name used to raise
++    AttributeError outside the try and exit 1 with a traceback — reading
++    as an ordinary test_not_green failure instead of a not-found signal."""
++    runner = fixture_template.repo / "tools" / "run_ref.py"
++    proc = subprocess.run(
++        [sys.executable, str(runner), "tests/test_base.py::no_such_test"],
++        cwd=fixture_template.repo,
++        capture_output=True,
++        text=True,
++    )
++    assert proc.returncode == 2, (proc.returncode, proc.stderr[-400:])
++    assert "no test named" in proc.stderr, proc.stderr[-400:]
++    # And the honest exit codes are unchanged: 0 pass, 1 failure.
++    ok = subprocess.run(
++        [sys.executable, str(runner), "tests/test_base.py::test_base"],
++        cwd=fixture_template.repo,
++        capture_output=True,
++        text=True,
++    )
++    assert ok.returncode == 0, ok.stderr[-300:]
++
++
++def test_review9_env_guard_survives_odd_home_paths(tmp_path, monkeypatch):
++    """Review round 2, finding 8: the home paths are pasted into a shell
++    script. A home containing a single quote used to make env-guard.sh a
++    syntax error — setup would fail on every rehearsal for a reason
++    unrelated to any incident. The baked paths now live one per line in a
++    quoted heredoc (literal, whatever the characters), and a newline in a
++    home path is rejected at build time."""
++    odd = "/tmp/fa'ke"
++    monkeypatch.setenv("HOME", odd)
++    script = _env_guard_source()
++    guard = tmp_path / "env-guard.sh"
++    guard.write_text(script)
++    guard.chmod(0o755)
++
++    syntax = subprocess.run(
++        ["/bin/sh", "-n", str(guard)], capture_output=True, text=True
++    )
++    assert syntax.returncode == 0, syntax.stderr
++
++    leak = subprocess.run(
++        ["/bin/sh", str(guard)],
++        env={"PATH": f"{odd}/bin:/usr/bin:/bin"},
++        capture_output=True,
++        text=True,
++    )
++    assert leak.returncode == 1, leak.stderr + leak.stdout
++    assert "env-guard:" in leak.stderr, leak.stderr
++
++    clean = subprocess.run(
++        ["/bin/sh", str(guard)],
++        env={"PATH": "/usr/bin:/bin"},
++        capture_output=True,
++        text=True,
++    )
++    assert clean.returncode == 0, clean.stderr
++
++
++def test_review10_env_guard_rejects_newline_home_paths(monkeypatch):
++    """Review round 2 follow-up: a home path containing a newline cannot be
++    represented in the heredoc, and the build-time rejection is a
++    fixture-build error — a ValueError — not a not-ready RehearsalError:
++    nothing has run yet when it fires, and F-28's readiness contract must
++    not be answerable by a bad build input. Pins the diagnostic too: the
++    message names the newline and the offending path."""
++    monkeypatch.setenv("HOME", "/tmp/bad\nhome")
++    with pytest.raises(ValueError, match=r"newline.*bad"):
++        _env_guard_source()

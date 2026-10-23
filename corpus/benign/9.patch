@@ -1,0 +1,655 @@
+diff --git a/.factory/BOOTSTRAP.md b/.factory/BOOTSTRAP.md
+index 7f8e37a..7443c19 100644
+--- a/.factory/BOOTSTRAP.md
++++ b/.factory/BOOTSTRAP.md
+@@ -97,3 +97,16 @@ Entries record evidence, not claims. Each criterion is marked proven, pending, o
+ - **AC-5** proven: `test_ac_5` — a failing lint whose output carries `lib/foo.py:10` (baselined) and `lib/foo.py:20` (new): verdict `fail` with exactly one `new_error` finding at `lib/foo.py:20`, line 10 noted pre-existing; the same command reporting only the baselined line 10 → verdict `pass` despite exit 1. Extra: tsc-style `src/x.ts(12,5): error TS…` parsed (`test_tsc_style_errors_are_parsed`); unparsable failing output → FAIL `command_failed`; `min_tests` floor enforced (`test_test_count_floor`).
+ - **Extra coverage:** setup failure skips remaining gates; command timeout (`command_timeout`); missing baseline file (`baseline_missing`); malformed baseline structure (`baseline_invalid`, no exemptions); clean diff + green commands → pass with no findings/escalations; pure-function units (`contract_test_files`, `parse_errors`, `parse_test_count`, `diff_file_changes` incl. rename line-tracking).
+ - **Status to set at reconcile:** `done` once this PR's CI is green (ruff + pytest on 3.11 + 3.13) and you merge it. No deploy target, so L4 doesn't apply.
++
++---
++
++## F-08 — L1 red-first proof
++
++- **Commits:** `feat/f08-l1-red-first` → PR (this one), **stacked on the open F-07 branch** `feat/f07-l0-gates` (F-08 depends on F-07; GitHub retargets this PR to `main` automatically when #8 merges). Red-first: the suite failed on the missing `factory.l1` module before implementation.
++- **Built:** 2026-10-16. Interactive session.
++- **Design notes:** new `factory/l1.py` — `run_l1(profile, repo, base, head, task)` proves every `check.type: test` ref in the approved contract red-first: force-checkout `head` → existence pre-check per ref (`path::name` shape, file present on head) → **red** (`git checkout --detach <base>`, apply ONLY the diff's test-file changes — A/C/M/T checked out from head, D removed, R = remove old + checkout new — then run each ref; exit 0 = `test_proves_nothing`; collection errors count as red, the question being "would it fail without the change") → **green** (`git checkout --force <head>`, run each ref; non-zero = `test_not_green`, or `contract_ambiguous` when the runner reports the test wasn't found/collected at all). The per-ref command comes from a new optional `commands.test_ref` shell template (`{ref}`/`{python}` placeholders; default `python -m pytest -q {ref}` — `python -m` puts the repo root on `sys.path` the way a project's own CI does); `schema/project.schema.json` gained the optional key, so jest-style projects override it. The repo is always left on `head_ref` (try/finally force checkout; a restore failure never masks the gate's error). A malformed template raises `GateError` before the checkout moves. L0 machinery (findings, `CommandResult`, git access, command runner, diff parsing) is imported from `factory.l0`, not duplicated. Deferred: mapping the non-test acceptance items to evidence (command exit codes, scheduled holdout/probe checks) — that report assembly belongs to F-10.
++- **AC-1** proven: `tests/test_f08.py::test_ac_1` — the named test passes on base with only the diff's test files applied → verdict `fail`, finding `test_proves_nothing`; the red run's exit 0 is asserted, so the reported FAIL *is* the proves-nothing case.
++- **AC-2** proven: `test_ac_2` — proper fixture (base fails the test; the diff adds the test and the fix) → verdict `pass`, red exit != 0, green exit == 0, and `to_dict()` carries the L1 report shape F-09/F-10 consume.
++- **AC-3** proven: `test_ac_3` — named file absent from the branch → `contract_ambiguous` before any run (no command results); file present but the named test absent → `contract_ambiguous` at green via the runner's not-found output, not `test_not_green`.
++- **Extra coverage:** a ref without `::` → ambiguous, nothing runs; honest red + a diff that doesn't fix the code → `test_not_green`; test committed before its impl (diff touches only code) → valid red-first PASS; command timeout → `command_timeout`; a custom `test_ref` template is used verbatim; a broken template → `GateError` with the checkout untouched; a contract with no test checks → pass (nothing to prove); deleted and renamed test files apply in the red phase without crashing; the repo is left on the slice branch, clean, after both PASS and FAIL runs; `contract_test_refs` order/dedup unit; `load_profile` accepts `commands.test_ref`.
++- **Status to set at reconcile:** `done` once this PR's CI is green (ruff + pytest on 3.11 + 3.13) and you merge it. No deploy target, so L4 doesn't apply.
+diff --git a/factory/l1.py b/factory/l1.py
+new file mode 100644
+index 0000000..2ce88d3
+--- /dev/null
++++ b/factory/l1.py
+@@ -0,0 +1,265 @@
++"""L1 contract proof — red-first, mechanised (VALIDATOR-SPEC.md, layer L1).
++
++Checks the claim behind every ``check.type: test`` item in a task's
++approved contract instead of trusting it: the named test must FAIL on the
++base commit with only the diff's test files applied (the red proof), and
++PASS with the full diff applied (the green proof). A test that already
++passes on base proves nothing about the change — that is exactly where
++false greens get through.
++
++Mechanics (the caller — F-10 — passes a clean clone of the slice's branch):
++
++1. The repo is forced onto ``head_ref`` and each named ref is checked for
++   existence. A ref that doesn't name a test (``path::name``), whose file
++   is absent from the branch, or whose named test the runner can't find,
++   is a FAIL with ``contract_ambiguous``: the item can't be checked as
++   written (VALIDATOR-SPEC L1 step 3).
++2. Red: ``git checkout --detach <base>``, apply ONLY the diff's test-file
++   changes (added/modified files checked out from head; deleted and
++   renamed-away files removed), run each ref. Exit 0 is a FAIL
++   (``test_proves_nothing``); collection errors and assertion failures
++   both count as red — the question is "would it fail without the change".
++3. Green: ``git checkout --force <head>``, run each ref. Any non-zero exit
++   is a FAIL: ``contract_ambiguous`` when the runner reports the test
++   wasn't found at all, ``test_not_green`` when it ran and failed.
++
++The per-ref command comes from ``commands.test_ref`` — a shell template
++with ``{ref}`` (the quoted node id) and ``{python}`` (the orchestrator's
++interpreter) placeholders — defaulting to pytest via ``python -m`` so the
++repo root lands on ``sys.path`` the way a project's own CI runs it. The
++repo is left on ``head_ref`` afterwards, whatever the verdict.
++
++Deferred beyond F-08: mapping the non-test acceptance items to evidence
++(command exit codes, scheduled holdout/probe checks) — that assembly
++belongs to the full validator report F-10 owns.
++"""
++
++import contextlib
++import re
++import shlex
++import subprocess
++import sys
++from dataclasses import dataclass, field
++from pathlib import Path
++
++# Shared L0 machinery: git access, command runner, findings, diff parsing.
++from factory.l0 import (
++    CommandResult,
++    Finding,
++    GateError,
++    _git,
++    _is_test_file,
++    _run_command,
++    contract_test_files,
++    diff_file_changes,
++)
++
++# Runner output meaning "the named test doesn't exist" rather than "it
++# failed": pytest's not-found error and its empty-collection summary.
++_NOT_FOUND = re.compile(r"not found|no tests ran|no tests collected", re.IGNORECASE)
++
++
++@dataclass
++class L1Report:
++    """The L1 verdict plus everything F-09/F-10 consume downstream."""
++
++    verdict: str
++    findings: list = field(default_factory=list)
++    command_results: list = field(default_factory=list)
++
++    def to_dict(self) -> dict:
++        return {
++            "layer": "L1",
++            "verdict": self.verdict,
++            "findings": [f.__dict__ | {} for f in self.findings],
++            "commands": [c.to_dict() for c in self.command_results],
++        }
++
++
++def contract_test_refs(task: dict) -> list:
++    """Collect the named-test refs from a task's acceptance checks.
++
++    Every ``check.type: test`` ref, in acceptance order, de-duplicated.
++    Unlike :func:`factory.l0.contract_test_files` this keeps malformed
++    refs too: they become ``contract_ambiguous`` findings instead of
++    being silently dropped.
++
++    Args:
++        task: A task record (may be empty).
++
++    Returns:
++        The ordered list of raw ref strings.
++    """
++    refs: list[str] = []
++    for item in task.get("acceptance") or []:
++        check = item.get("check") if isinstance(item, dict) else None
++        if isinstance(check, dict) and check.get("type") == "test":
++            ref = check.get("ref")
++            if isinstance(ref, str) and ref and ref not in refs:
++                refs.append(ref)
++    return refs
++
++
++def _ref_command(template: str, ref: str) -> str:
++    """Render the per-ref shell command from the template."""
++    try:
++        return template.format(ref=shlex.quote(ref), python=shlex.quote(sys.executable))
++    except (KeyError, IndexError, ValueError) as exc:
++        raise GateError(f"commands.test_ref template is invalid: {template!r}: {exc}") from exc
++
++
++def _file_on_ref(repo: Path, ref: str, path: str) -> bool:
++    """True when ``path`` exists in ``ref``'s tree."""
++    proc = subprocess.run(
++        ["git", "-C", str(repo), "cat-file", "-e", f"{ref}:{path}"],
++        capture_output=True,
++    )
++    return proc.returncode == 0
++
++
++def _apply_test_changes(repo: Path, head_ref: str, changes: list) -> None:
++    """Stage the diff's test-file side onto the current (base) checkout.
++
++    Added/modified files take head's content; deleted and renamed-away
++    files are removed. A rename stages both halves: remove the old path,
++    check out the new one.
++    """
++    for change in changes:
++        if change.status == "D":
++            _git(repo, "rm", "-q", "--", change.path)
++        elif change.status == "R":
++            _git(repo, "rm", "-q", "--", change.old_path)
++            _git(repo, "checkout", head_ref, "--", change.path)
++        else:  # A, C, M, T
++            _git(repo, "checkout", head_ref, "--", change.path)
++
++
++def run_l1(
++    profile: dict,
++    repo: Path | str,
++    base_ref: str,
++    head_ref: str,
++    task: dict | None = None,
++    timeout_sec: int = 600,
++) -> L1Report:
++    """Run the L1 red-first proof on a checkout of the slice's branch.
++
++    The caller (F-10) passes a clean clone; any repo holding both refs
++    works, so tests run fixtures directly. The gate moves the checkout
++    around (base for red, head for green) and leaves it on ``head_ref``.
++
++    Args:
++        profile: The loaded ``project.yaml`` mapping; only
++            ``commands.test_ref`` is read (optional template override).
++        repo: Repository holding ``base_ref`` and ``head_ref``.
++        base_ref: Base ref the slice is compared against.
++        head_ref: The slice's branch ref.
++        task: The task record whose ``check.type: test`` acceptance
++            items name the tests to prove red-first.
++        timeout_sec: Per-run wall-clock cap.
++
++    Returns:
++        The ``L1Report``; verdict is ``"fail"`` iff any finding exists.
++
++    Raises:
++        GateError: If git fails or the ``test_ref`` template is invalid
++            (before the checkout is touched).
++    """
++    repo = Path(repo)
++    task = task or {}
++    template = (profile.get("commands") or {}).get("test_ref") or "{python} -m pytest -q {ref}"
++
++    refs = contract_test_refs(task)
++    findings: list[Finding] = []
++    results: list[CommandResult] = []
++
++    # A broken template must fail before the gate moves the checkout.
++    _ref_command(template, "probe::probe")
++
++    _git(repo, "checkout", "--force", head_ref)
++    ref_files = contract_test_files(task)
++    test_changes = [
++        c
++        for c in diff_file_changes(repo, base_ref, head_ref)
++        if _is_test_file(c.path) or _is_test_file(c.old_path or "") or c.path in ref_files
++    ]
++
++    provable: list[str] = []
++    for ref in refs:
++        path = ref.split("::", 1)[0] if "::" in ref else None
++        if path is None:
++            findings.append(
++                Finding(
++                    "contract_ambiguous",
++                    f"test ref does not name a test (expected path::name): {ref}",
++                )
++            )
++        elif not _file_on_ref(repo, head_ref, path):
++            findings.append(
++                Finding(
++                    "contract_ambiguous",
++                    f"test file {path} named by the contract is not on {head_ref}",
++                    file=path,
++                )
++            )
++        else:
++            provable.append(ref)
++
++    try:
++        _git(repo, "checkout", "--detach", base_ref)
++        _apply_test_changes(repo, head_ref, test_changes)
++        for ref in provable:
++            result = _run_command(f"red:{ref}", _ref_command(template, ref), repo, timeout_sec)
++            results.append(result)
++            if result.timed_out:
++                findings.append(
++                    Finding("command_timeout", f"red run of {ref} exceeded {timeout_sec}s")
++                )
++            elif result.exit_code == 0:
++                findings.append(
++                    Finding(
++                        "test_proves_nothing",
++                        f"{ref} passes on {base_ref} with only the diff's test files; "
++                        "a test that already passes on base cannot prove the change",
++                        file=ref.split("::", 1)[0],
++                    )
++                )
++
++        _git(repo, "checkout", "--force", head_ref)
++        for ref in provable:
++            result = _run_command(f"green:{ref}", _ref_command(template, ref), repo, timeout_sec)
++            results.append(result)
++            if result.timed_out:
++                findings.append(
++                    Finding("command_timeout", f"green run of {ref} exceeded {timeout_sec}s")
++                )
++            elif result.exit_code != 0:
++                if _NOT_FOUND.search(result.output):
++                    findings.append(
++                        Finding(
++                            "contract_ambiguous",
++                            f"{ref} does not exist on {head_ref}: "
++                            f"{result.output.strip()[:200]}",
++                            file=ref.split("::", 1)[0],
++                        )
++                    )
++                else:
++                    findings.append(
++                        Finding(
++                            "test_not_green",
++                            f"{ref} fails with the full diff applied",
++                            file=ref.split("::", 1)[0],
++                        )
++                    )
++    finally:
++        # Leave the caller's repo on the slice branch, gate or no gate. A
++        # restore failure never masks the gate's own error.
++        with contextlib.suppress(GateError):
++            _git(repo, "checkout", "--force", head_ref)
++
++    findings.sort(key=lambda f: (f.id, f.file or "", f.text))
++    return L1Report(
++        verdict="fail" if findings else "pass",
++        findings=findings,
++        command_results=results,
++    )
+diff --git a/schema/project.schema.json b/schema/project.schema.json
+index c35ebe4..acb5c80 100644
+--- a/schema/project.schema.json
++++ b/schema/project.schema.json
+@@ -28,6 +28,7 @@
+         "lint": { "type": "string" },
+         "typecheck": { "type": "string" },
+         "test": { "type": "string" },
++        "test_ref": { "type": "string", "description": "Shell template that runs ONE named test for the L1 red-first proof. {ref} = the quoted test node id, {python} = the orchestrator's interpreter. Default: python -m pytest -q {ref}." },
+         "build": { "type": "string" },
+         "extra": { "type": "object", "additionalProperties": { "type": "string" } }
+       }
+diff --git a/tests/test_f08.py b/tests/test_f08.py
+new file mode 100644
+index 0000000..b26b62a
+--- /dev/null
++++ b/tests/test_f08.py
+@@ -0,0 +1,345 @@
++"""F-08 acceptance tests — BUILD-ORDER.md, work order F-08.
++
++Contract rule (CLAUDE.md): an acceptance ref ``tests/test_f08.py::test_ac_N``
++means a test function with exactly that name. The extra tests below cover
++paths the acceptance refs don't name: refs that don't name a test, a green
++phase that still fails, a test committed before its implementation, command
++timeouts, custom ``test_ref`` templates, repo restoration after the gate,
++the schema accepting ``commands.test_ref``, and deleted/renamed test files
++inside the red phase.
++"""
++
++import subprocess
++from pathlib import Path
++
++import pytest
++
++from factory.l0 import GateError
++from factory.l1 import contract_test_refs, run_l1
++
++PROFILE = {"name": "fixture", "commands": {}}
++
++TEST_SOURCE = "def test_answer():\n    from impl import answer\n\n    assert answer() == 42\n"
++
++
++def _git(repo: Path, *args: str) -> None:
++    subprocess.run(
++        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
++    )
++
++
++def _git_out(repo: Path, *args: str) -> str:
++    return subprocess.run(
++        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
++    ).stdout.strip()
++
++
++def _repo(tmp_path: Path, name: str, files: dict[str, str]) -> Path:
++    """Build a fixture git repo with one base commit on ``main``."""
++    repo = tmp_path / name
++    repo.mkdir()
++    _git(repo, "init", "-b", "main")
++    _git(repo, "config", "user.email", "fixture@example.com")
++    _git(repo, "config", "user.name", "Fixture")
++    for rel, text in files.items():
++        target = repo / rel
++        target.parent.mkdir(parents=True, exist_ok=True)
++        target.write_text(text)
++    _git(repo, "add", "-A")
++    _git(repo, "commit", "-m", "base")
++    return repo
++
++
++def _change(
++    repo: Path,
++    files: dict[str, str] | None = None,
++    delete: tuple[str, ...] = (),
++    rename: tuple[tuple[str, str], ...] = (),
++) -> None:
++    """Add a ``feature`` branch commit with the given changes."""
++    _git(repo, "checkout", "-b", "feature")
++    for rel, text in (files or {}).items():
++        target = repo / rel
++        target.parent.mkdir(parents=True, exist_ok=True)
++        target.write_text(text)
++    for old, new in rename:
++        (repo / new).parent.mkdir(parents=True, exist_ok=True)
++        _git(repo, "mv", old, new)
++    for rel in delete:
++        (repo / rel).unlink()
++    _git(repo, "add", "-A")
++    _git(repo, "commit", "-m", "change")
++
++
++def _task(*refs: str) -> dict:
++    """A task whose acceptance names each ref as a ``test`` check."""
++    return {
++        "id": "T-1",
++        "risk": [],
++        "acceptance": [
++            {"id": f"AC-{i}", "text": "it works", "check": {"type": "test", "ref": ref}}
++            for i, ref in enumerate(refs, start=1)
++        ],
++    }
++
++
++def _red_first_repo(tmp_path: Path, name: str) -> Path:
++    """A proper red-first fixture: base fails the test, the diff fixes it."""
++    repo = _repo(tmp_path, name, {"impl.py": "def answer():\n    return 0\n"})
++    _change(
++        repo,
++        files={
++            "impl.py": "def answer():\n    return 42\n",
++            "tests/test_feature.py": TEST_SOURCE,
++        },
++    )
++    return repo
++
++
++def _run(repo: Path, task: dict, profile=None, **kwargs):
++    return run_l1(
++        profile or dict(PROFILE), repo, "main", "feature", task=task, **kwargs
++    )
++
++
++def _result(report, name):
++    return next(r for r in report.command_results if r.name == name)
++
++
++# --- AC-1: named test already passes on base -> FAIL ("proves nothing") ----
++
++
++def test_ac_1(tmp_path):
++    repo = _repo(tmp_path, "ac1", {"impl.py": "def answer():\n    return 42\n"})
++    _change(
++        repo,
++        files={
++            "impl.py": "def answer():\n    return 42  # documented\n",
++            "tests/test_feature.py": TEST_SOURCE,
++        },
++    )
++    report = _run(repo, _task("tests/test_feature.py::test_answer"))
++    assert report.verdict == "fail"
++    assert any(f.id == "test_proves_nothing" for f in report.findings)
++    # The red phase really ran the test on base + the diff's test files,
++    # and it passed there — that is the failure being reported.
++    assert _result(report, "red:tests/test_feature.py::test_answer").exit_code == 0
++
++
++# --- AC-2: proper red-first fixture -> PASS --------------------------------
++
++
++def test_ac_2(tmp_path):
++    repo = _red_first_repo(tmp_path, "ac2")
++    report = _run(repo, _task("tests/test_feature.py::test_answer"))
++    assert report.verdict == "pass"
++    assert report.findings == []
++    assert _result(report, "red:tests/test_feature.py::test_answer").exit_code != 0
++    assert _result(report, "green:tests/test_feature.py::test_answer").exit_code == 0
++    as_dict = report.to_dict()
++    assert as_dict["layer"] == "L1"
++    assert as_dict["verdict"] == "pass"
++    assert [c["name"] for c in as_dict["commands"]] == [
++        "red:tests/test_feature.py::test_answer",
++        "green:tests/test_feature.py::test_answer",
++    ]
++
++
++# --- AC-3: named test doesn't exist -> FAIL with contract_ambiguous --------
++
++
++def test_ac_3(tmp_path):
++    # The named test file is absent from the branch entirely: caught before
++    # any run.
++    repo = _repo(tmp_path, "ac3a", {"impl.py": "def answer():\n    return 0\n"})
++    _change(repo, files={"impl.py": "def answer():\n    return 42\n"})
++    report = _run(repo, _task("tests/test_missing.py::test_nothing"))
++    assert report.verdict == "fail"
++    assert any(f.id == "contract_ambiguous" for f in report.findings)
++    assert report.command_results == []
++
++    # The file exists but the named test doesn't: caught at the green phase,
++    # where the runner reports the test wasn't found.
++    repo_b = _red_first_repo(tmp_path, "ac3b")
++    report_b = _run(repo_b, _task("tests/test_feature.py::test_absent"))
++    assert report_b.verdict == "fail"
++    assert any(f.id == "contract_ambiguous" for f in report_b.findings)
++    assert not any(f.id == "test_not_green" for f in report_b.findings)
++
++
++# --- Extra coverage: paths the acceptance refs don't name ------------------
++
++
++def test_ref_without_a_test_name_is_ambiguous(tmp_path):
++    repo = _red_first_repo(tmp_path, "nocolons")
++    report = _run(repo, _task("tests/test_feature.py"))
++    assert report.verdict == "fail"
++    assert any(
++        f.id == "contract_ambiguous" and "tests/test_feature.py" in f.text
++        for f in report.findings
++    )
++    assert report.command_results == []
++
++
++def test_green_failure_fails(tmp_path):
++    """Red is honest but the diff doesn't fix the code: not green."""
++    repo = _repo(tmp_path, "notgreen", {"impl.py": "def answer():\n    return 0\n"})
++    _change(
++        repo,
++        files={
++            "impl.py": "def answer():\n    return 0  # still broken\n",
++            "tests/test_feature.py": TEST_SOURCE,
++        },
++    )
++    report = _run(repo, _task("tests/test_feature.py::test_answer"))
++    assert report.verdict == "fail"
++    assert any(f.id == "test_not_green" for f in report.findings)
++    assert not any(f.id == "test_proves_nothing" for f in report.findings)
++
++
++def test_test_committed_before_impl_is_valid_red_first(tmp_path):
++    """The test landed in an earlier commit; the diff only fixes the code."""
++    repo = _repo(
++        tmp_path,
++        "tdd",
++        {"impl.py": "def answer():\n    return 0\n", "tests/test_feature.py": TEST_SOURCE},
++    )
++    _change(repo, files={"impl.py": "def answer():\n    return 42\n"})
++    report = _run(repo, _task("tests/test_feature.py::test_answer"))
++    assert report.verdict == "pass"
++    assert report.findings == []
++
++
++def test_command_timeout_is_a_failure(tmp_path):
++    repo = _red_first_repo(tmp_path, "slow")
++    profile = {"name": "fixture", "commands": {"test_ref": "sleep 5 # {ref}"}}
++    report = _run(
++        repo, _task("tests/test_feature.py::test_answer"), profile=profile, timeout_sec=1
++    )
++    assert report.verdict == "fail"
++    assert any(f.id == "command_timeout" for f in report.findings)
++
++
++def test_custom_test_ref_template(tmp_path):
++    repo = _red_first_repo(tmp_path, "custom")
++    profile = {
++        "name": "fixture",
++        "commands": {"test_ref": "{python} -m pytest -q {ref} -p no:cacheprovider"},
++    }
++    report = _run(repo, _task("tests/test_feature.py::test_answer"), profile=profile)
++    assert report.verdict == "pass"
++    assert "-p no:cacheprovider" in _result(
++        report, "red:tests/test_feature.py::test_answer"
++    ).command
++
++
++def test_broken_test_ref_template_refuses_to_run(tmp_path):
++    """A bad template fails before the gate touches the checkout."""
++    repo = _red_first_repo(tmp_path, "badtpl")
++    profile = {"name": "fixture", "commands": {"test_ref": "run {oops}"}}
++    with pytest.raises(GateError):
++        _run(repo, _task("tests/test_feature.py::test_answer"), profile=profile)
++    # The repo was never moved off the slice branch.
++    assert _git_out(repo, "rev-parse", "--abbrev-ref", "HEAD") == "feature"
++
++
++def test_no_test_checks_is_a_pass_with_nothing_to_prove(tmp_path):
++    repo = _repo(tmp_path, "nochecks", {"impl.py": "def answer():\n    return 42\n"})
++    _change(repo, files={"impl.py": "def answer():\n    return 42  # doc\n"})
++    task = {
++        "id": "T-2",
++        "risk": [],
++        "acceptance": [
++            {"id": "AC-1", "text": "builds", "check": {"type": "command", "ref": "make check"}}
++        ],
++    }
++    report = _run(repo, task)
++    assert report.verdict == "pass"
++    assert report.findings == []
++    assert report.command_results == []
++
++
++def test_deleted_and_renamed_test_files_apply_in_red_phase(tmp_path):
++    """The red phase stages the diff's test-file side: deletions really
++    delete, renames really move; neither crashes the gate."""
++    repo = _repo(
++        tmp_path,
++        "applytests",
++        {
++            "impl.py": "def answer():\n    return 0\n",
++            "tests/test_old.py": "def test_old():\n    assert True\n",
++            "tests/test_seed.py": "def test_seed():\n    assert True\n",
++        },
++    )
++    _change(
++        repo,
++        files={
++            "impl.py": "def answer():\n    return 42\n",
++            "tests/test_feature.py": TEST_SOURCE,
++        },
++        delete=("tests/test_old.py",),
++        rename=(("tests/test_seed.py", "tests/test_renamed.py"),),
++    )
++    report = _run(repo, _task("tests/test_feature.py::test_answer"))
++    assert report.verdict == "pass"
++    assert report.findings == []
++
++
++def test_repo_left_on_slice_branch_after_run(tmp_path):
++    repo = _red_first_repo(tmp_path, "restore")
++    passing = _run(repo, _task("tests/test_feature.py::test_answer"))
++    assert passing.verdict == "pass"
++    assert _git_out(repo, "rev-parse", "--abbrev-ref", "HEAD") == "feature"
++    assert _git_out(repo, "status", "--porcelain", "-uno") == ""
++
++    # Also after a FAIL verdict, the checkout comes back clean.
++    failing = _run(repo, _task("tests/test_feature.py::test_absent"))
++    assert failing.verdict == "fail"
++    assert _git_out(repo, "rev-parse", "--abbrev-ref", "HEAD") == "feature"
++    assert _git_out(repo, "status", "--porcelain", "-uno") == ""
++
++
++# --- Pure-function units and schema ----------------------------------------
++
++
++def test_contract_test_refs_ordered_and_deduped():
++    task = _task(
++        "tests/test_a.py::test_x",
++        "tests/test_a.py::test_x",
++        "tests/test_b.py::test_y",
++    )
++    task["acceptance"].append(
++        {"id": "AC-9", "text": "builds", "check": {"type": "command", "ref": "make check"}}
++    )
++    assert contract_test_refs(task) == [
++        "tests/test_a.py::test_x",
++        "tests/test_b.py::test_y",
++    ]
++    assert contract_test_refs({}) == []
++
++
++def test_schema_accepts_test_ref(tmp_path):
++    from factory.contract import load_profile
++
++    profile = tmp_path / "profile.yaml"
++    profile.write_text(
++        "name: fixture\n"
++        "repo:\n"
++        "  path: /tmp/fixture\n"
++        "  default_branch: main\n"
++        "  remote: https://example.com/fixture.git\n"
++        "commands:\n"
++        "  setup: 'true'\n"
++        "  test: pytest -q\n"
++        "  test_ref: '{python} -m pytest -q {ref}'\n"
++        "paths:\n"
++        "  risk: {}\n"
++        "  protected: []\n"
++        "deploy:\n"
++        "  mechanism: none\n"
++        "  auto_on_merge: false\n"
++        "live_checks: {}\n"
++        "docs_allowlist: []\n"
++    )
++    loaded = load_profile(profile)
++    assert loaded["commands"]["test_ref"] == "{python} -m pytest -q {ref}"

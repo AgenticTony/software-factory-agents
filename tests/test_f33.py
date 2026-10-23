@@ -231,8 +231,8 @@ def test_ac_4(tmp_path, capsys):
     assert code == 0, capsys.readouterr().err
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) == len(BUILTIN_SENTINELS)
-    lint = next(line for line in lines if "lint_suppression_added" in line)
-    assert lint.endswith(": fail"), lint
+    lint = next(line for line in lines if ": lint_suppression_added: " in line)
+    assert ": lint_suppression_added: fail" in lint, lint
 
     # no corpus at all: every sentinel over both corpora
     code = cli_main(["sentinels", "replay", "--queue", str(queue)])
@@ -240,7 +240,7 @@ def test_ac_4(tmp_path, capsys):
     out = capsys.readouterr().out.splitlines()
     assert len(out) == 2 * len(BUILTIN_SENTINELS)
     assert any(line.startswith("corpus/attack/lint_suppression_added-1.patch:")
-               and line.endswith(": fail") for line in out)
+               and ": lint_suppression_added: fail" in line for line in out)
 
     # reads only: nothing changed under the factory root or the corpus
     assert _snapshot(root) == root_before, "replay wrote under the factory root"
@@ -255,9 +255,24 @@ def test_replay_refuses_misuse(tmp_path, capsys):
                      str(attack), "--queue", str(queue)])
     assert code == 1
     assert "not both" in capsys.readouterr().err
-    # a corpus the project does not have
-    code = cli_main(["sentinels", "replay", "--corpus", "attack", "--queue",
-                     str(repo / ".factory" / "tasks.json").replace("proj", "nope")])
+    # a valid profile whose repo has no corpus at all
+    bare = tmp_path / "bare"
+    (bare / ".factory").mkdir(parents=True)
+    bare_profile = {
+        "name": "bare", "repo": {"path": str(tmp_path / "no-such-repo"),
+                                 "default_branch": "main",
+                                 "remote": "https://example.com/bare.git",
+                                 "merge_method": "squash"},
+        "commands": {"setup": "true", "test": "true"},
+        "paths": {"risk": {}, "protected": []},
+        "deploy": {"mechanism": "none", "auto_on_merge": False},
+        "live_checks": {}, "docs_allowlist": [],
+    }
+    (bare / ".factory" / "project.yaml").write_text(yaml.safe_dump(bare_profile))
+    bare_queue = bare / ".factory" / "tasks.json"
+    bare_queue.write_text("{}\n")
+    code = cli_main(["sentinels", "replay", "--corpus", "attack",
+                     "--queue", str(bare_queue)])
     assert code == 1
     assert "no corpus" in capsys.readouterr().err
     # a patch that is not there

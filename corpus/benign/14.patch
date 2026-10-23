@@ -1,0 +1,305 @@
+diff --git a/.factory/tasks.json b/.factory/tasks.json
+index 292693a..37c4ea7 100644
+--- a/.factory/tasks.json
++++ b/.factory/tasks.json
+@@ -581,6 +581,46 @@
+             "type": "test",
+             "ref": "tests/test_f09.py::test_ac_3"
+           }
++        },
++        {
++          "id": "AC-4",
++          "text": "Every reviewer finding carries `axis` (`spec` or `standards`). A finding without one is invalid verdict JSON (AC-1 applies). A `blocking` finding on either axis means FAIL, whatever the other axis says.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f09.py::test_ac_4"
++          }
++        },
++        {
++          "id": "AC-5",
++          "text": "The assembled reviewer prompt contains the smell baseline, the test-quality checks and the project's `standards` files. The assembled implementer prompt contains none of the `standards` files.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f09.py::test_ac_5"
++          }
++        },
++        {
++          "id": "AC-6",
++          "text": "`project.schema.json` accepts an optional `standards: [string]` and `tasks.schema.json` accepts an optional per-task `out_of_scope: [string]`. Unknown keys are still rejected. Both tests are red before the schema change.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f09.py::test_ac_6"
++          }
++        },
++        {
++          "id": "AC-7",
++          "text": "The L1 report (F-08's `L1Report`) records a `red_reason` per test ref: `assertion`, `collection` or `unknown`. A fixture whose test imports a not-yet-existing module gives `collection`, and a failing assert gives `assertion`. The verdict doesn't depend on it.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f09.py::test_ac_7"
++          }
++        },
++        {
++          "id": "AC-8",
++          "text": "Every vendored prompt file sits under `prompts/vendor/` next to its upstream `LICENSE` and the source commit SHA. A test fails if either is missing.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f09.py::test_ac_8"
++          }
+         }
+       ],
+       "budget": {
+@@ -663,6 +703,38 @@
+             "type": "test",
+             "ref": "tests/test_f10.py::test_ac_6"
+           }
++        },
++        {
++          "id": "AC-7",
++          "text": "The PR body has these sections: **Summary**, **Evidence**, **Merge Danger** (Door + Blast Radius), **Contract**, **Validator report**. The PR isn't opened if any is missing.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f10.py::test_ac_7"
++          }
++        },
++        {
++          "id": "AC-8",
++          "text": "**Evidence** is built by the orchestrator from the L1 report, not from model text. For each contract test ref it shows red on base (with `red_reason`) and green on head. Nothing the implementer writes can alter this section.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f10.py::test_ac_8"
++          }
++        },
++        {
++          "id": "AC-9",
++          "text": "**Door** is `one-way` when the task carries any of `migration`, `deploy`, `external_service`, `payments` or `privacy` (data that has leaked can't be recalled), and `two-way` otherwise. **Blast Radius** lists the risk flags and matched `paths.risk` globs, or `contained`. The implementer may add prose below them but can't change either value.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f10.py::test_ac_9"
++          }
++        },
++        {
++          "id": "AC-10",
++          "text": "An attempt that starts in a fresh session (re-queued run, rejected-PR fix round) receives the task's progress log, entries 1..N. The log is orchestrator-owned, lives outside the clone and is append-only: rewriting an earlier entry raises.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f10.py::test_ac_10"
++          }
+         }
+       ],
+       "budget": {
+@@ -758,6 +830,14 @@
+             "type": "test",
+             "ref": "tests/test_f12.py::test_ac_3"
+           }
++        },
++        {
++          "id": "AC-4",
++          "text": "The importer reads `.factory/out-of-scope/` (TASK-CONTRACT §5). A proposed task that resembles a record is listed in the import summary with the record's path. It's still proposed as `draft` and is never dropped or rejected on its own: you confirm the match.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f12.py::test_ac_4"
++          }
+         }
+       ],
+       "budget": {
+@@ -1027,6 +1107,22 @@
+             "type": "test",
+             "ref": "tests/test_f18.py::test_ac_2"
+           }
++        },
++        {
++          "id": "AC-3",
++          "text": "Triage checks `.factory/out-of-scope/` the same way the importer does (F-12 AC-4).",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f18.py::test_ac_3"
++          }
++        },
++        {
++          "id": "AC-4",
++          "text": "A bug draft carries at least one `test` acceptance item that reproduces the reported symptom. A signal that can't be turned into one is listed in the summary as needing info and doesn't become a draft.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f18.py::test_ac_4"
++          }
+         }
+       ],
+       "budget": {
+@@ -1079,6 +1175,22 @@
+             "type": "test",
+             "ref": "tests/test_f19.py::test_ac_3"
+           }
++        },
++        {
++          "id": "AC-4",
++          "text": "The review also reads the session transcripts of the attempts it samples, because agents push through friction that never shows up as a failure. Every proposal cites the run id and turn it comes from.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f19.py::test_ac_4"
++          }
++        },
++        {
++          "id": "AC-5",
++          "text": "A proposal that targets anything other than a prompt file (a new check, CI, `standards`, steering files) comes out as a `draft` task for you, never as a meta-loop PR. Agents can't edit what judges them (Principle 5).",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f19.py::test_ac_5"
++          }
+         }
+       ],
+       "budget": {
+diff --git a/BUILD-ORDER.md b/BUILD-ORDER.md
+index 41bd468..96120f1 100644
+--- a/BUILD-ORDER.md
++++ b/BUILD-ORDER.md
+@@ -168,6 +168,16 @@ Acceptance:
+ - AC-1 Reviewer output that isn't valid verdict JSON → treated as FAIL.
+ - AC-2 The prompt-hash test fails if a prompt file changes without the pin being updated.
+ - AC-3 The reviewer prompt includes the mandatory checklist from VALIDATOR-SPEC L2: real schema vs mock, scope, states, lifecycle.
++- AC-4 Every reviewer finding carries `axis` (`spec` or `standards`). A finding without one is invalid verdict JSON (AC-1 applies). A `blocking` finding on either axis means FAIL, whatever the other axis says.
++- AC-5 The assembled reviewer prompt contains the smell baseline, the test-quality checks and the project's `standards` files. The assembled implementer prompt contains none of the `standards` files.
++- AC-6 `project.schema.json` accepts an optional `standards: [string]` and `tasks.schema.json` accepts an optional per-task `out_of_scope: [string]`. Unknown keys are still rejected. Both tests are red before the schema change.
++- AC-7 The L1 report (F-08's `L1Report`) records a `red_reason` per test ref: `assertion`, `collection` or `unknown`. A fixture whose test imports a not-yet-existing module gives `collection`, and a failing assert gives `assertion`. The verdict doesn't depend on it.
++- AC-8 Every vendored prompt file sits under `prompts/vendor/` next to its upstream `LICENSE` and the source commit SHA. A test fails if either is missing.
++
++Prompt sources. The seat prompts adapt [mattpocock/skills](https://github.com/mattpocock/skills) @ `49dd158` (MIT), copied in and pinned by AC-2 rather than loaded as live skills:
++- **Implementer:** `tdd`: red before green, one test and its minimal code per cycle, vertical slices (not every test first and then all the code), test anti-patterns, mocks only at system boundaries. Refactoring belongs to review, not the loop. His "confirm the seams with the user" step becomes "the contract's `test` refs are the agreed seams": the session is AFK.
++- **Bug tasks** (from F-18): `diagnosing-bugs` Phase 1: a tight, red-capable reproduction command that has already been run once, before any hypothesis. If no correct seam exists for a regression test, that is reported as a finding and isn't papered over.
++- **Reviewer:** `code-review`: the two axes and the smell baseline (VALIDATOR-SPEC L2). The issue-tracker lookup is dropped, because the contract is passed in directly.
+ 
+ ### F-10 — `factory run` / `factory loop` + PR creation
+ - **`run`:** pick → clone → implementer session → L0 + L1 on a clean clone → L2 → (fail: findings back, up to `max_attempts`) → push the branch with the orchestrator's token → `gh pr create`, with the contract and validator report in the body → `in_review`.
+@@ -181,6 +191,12 @@ Acceptance:
+ - AC-4 `loop` won't start a session during 08:00–12:00 Mon–Fri Swedish time. The window comes from config.
+ - AC-5 The code contains no `gh pr merge` call (a grep test).
+ - AC-6 Every attempt records `prompt_versions` (seat → prompt content hash, from F-09) and `skills` (the skills loaded). An attempt without them is a schema error.
++- AC-7 The PR body has these sections: **Summary**, **Evidence**, **Merge Danger** (Door + Blast Radius), **Contract**, **Validator report**. The PR isn't opened if any is missing.
++- AC-8 **Evidence** is built by the orchestrator from the L1 report, not from model text. For each contract test ref it shows red on base (with `red_reason`) and green on head. Nothing the implementer writes can alter this section.
++- AC-9 **Door** is `one-way` when the task carries any of `migration`, `deploy`, `external_service`, `payments` or `privacy` (data that has leaked can't be recalled), and `two-way` otherwise. **Blast Radius** lists the risk flags and matched `paths.risk` globs, or `contained`. The implementer may add prose below them but can't change either value.
++- AC-10 An attempt that starts in a fresh session (re-queued run, rejected-PR fix round) receives the task's progress log, entries 1..N. The log is orchestrator-owned, lives outside the clone and is append-only: rewriting an earlier entry raises.
++
++PR body shape adapted from mattpocock/skills `pr` (its Summary visuals credit Dex Horthy's `show-me`). The difference: Evidence and Merge Danger come from validator facts, not the agent's own account.
+ 
+ ### F-11 — `factory status`: daily summary + metrics
+ Write a markdown summary per project:
+@@ -199,6 +215,7 @@ Acceptance:
+ - AC-1 The output validates against the schema, or the import is refused.
+ - AC-2 Every imported task is `draft`.
+ - AC-3 Running it twice with no doc changes proposes no diff for existing tasks. Status and attempts are preserved.
++- AC-4 The importer reads `.factory/out-of-scope/` (TASK-CONTRACT §5). A proposed task that resembles a record is listed in the import summary with the record's path. It's still proposed as `draft` and is never dropped or rejected on its own: you confirm the match.
+ 
+ ### F-13 — Onboard JobFinderOS (pilot)
+ **Kind:** owner_only. This is the onboarding steps in TASK-CONTRACT §6, run on the real repo.
+@@ -239,6 +256,8 @@ A monthly job: seed 5–10 known bugs on a branch, run the validator, record the
+ A Sentry-alert → triage-session pipeline. That session has no secrets, can't push, and outputs only `draft` tasks for your approval.
+ - AC-1 The triage session's sandbox has no repo write access and no GitHub token.
+ - AC-2 Its output is schema-valid draft tasks only. Free text never reaches an implementer.
++- AC-3 Triage checks `.factory/out-of-scope/` the same way the importer does (F-12 AC-4).
++- AC-4 A bug draft carries at least one `test` acceptance item that reproduces the reported symptom. A signal that can't be turned into one is listed in the summary as needing info and doesn't become a draft.
+ 
+ ## Phase 4 — Self-improvement and gate dial-down
+ 
+@@ -247,6 +266,10 @@ A weekly review of escalations and L2 findings → PRs with **itemised delta edi
+ - AC-1 A PR that touches validators, holdouts, contract tests or schemas is rejected by L0.
+ - AC-2 Edits are additions, removals or changes to individual items, never whole-file rewrites (a diff-size check).
+ - AC-3 The weekly review groups failed and escalated attempts by `prompt_versions` and `skills`, and reports each version's failure share. Each proposed edit names the version it targets and the evidence (attempt run ids) behind it.
++- AC-4 The review also reads the session transcripts of the attempts it samples, because agents push through friction that never shows up as a failure. Every proposal cites the run id and turn it comes from.
++- AC-5 A proposal that targets anything other than a prompt file (a new check, CI, `standards`, steering files) comes out as a `draft` task for you, never as a meta-loop PR. Agents can't edit what judges them (Principle 5).
++
++Review categories adapted from mattpocock/skills `retro`: navigation, automated checks, coding standards, steering-file bloat and no-ops, tool economy, information access. His warning applies too: a fully automated retro loop chases false positives, which is why every output is a proposal you review.
+ 
+ ### F-20 — Cross-provider reviewer
+ A per-seat provider config. Risk-flagged tasks get a second L2 review from a different provider.
+diff --git a/DESIGN-LOCAL-FACTORY.md b/DESIGN-LOCAL-FACTORY.md
+index 7ceac43..b9b9b10 100644
+--- a/DESIGN-LOCAL-FACTORY.md
++++ b/DESIGN-LOCAL-FACTORY.md
+@@ -127,8 +127,8 @@ The inline blueprint diagram from this session shows the same flow.
+ | `factory` CLI (orchestrator) | `import`, `approve <id>`, `run` (one slice), `loop` (until queue empty, quota hit or escalation), `status`, `verify-live <id>` | — |
+ | Contract validation | JSON Schema check of `tasks.json` + `project.yaml` on every load; refuse to run on invalid state | `schema/*.json` |
+ | Session runner | Starts one agent session in a sandboxed clone with seat-specific model, env, tools, hooks and turn cap | Claude Agent SDK (`claude-agent-sdk`): `query()` + `ClaudeAgentOptions` + `HookMatcher` |
+-| Implementer prompt | One slice, red-first test, conventional commit, structured report | SoloAdventurer `.claude/agents/implementer.md`, generalised |
+-| Reviewer prompt | Default FAIL, contract-vs-diff, project checklist | SoloAdventurer `.claude/agents/verifier.md`, generalised |
++| Implementer prompt | One slice, red-first test, conventional commit, structured report | SoloAdventurer `.claude/agents/implementer.md`, generalised; mattpocock/skills `tdd` (vendored, F-09) |
++| Reviewer prompt | Default FAIL, two axes (spec + standards), project checklist, test quality | SoloAdventurer `.claude/agents/verifier.md`, generalised; mattpocock/skills `code-review` (vendored, F-09) |
+ | Importer prompt | Proposes `tasks.json` from planning docs; you review the diff | — |
+ | L0/L1 engine | Deterministic: commands, baseline, diff policy, red-first proof | Rules from `verifier.md` |
+ | L3/L4 runner | Holdout runner, `live_checks` from the profile | `ops/verify_deployment.sh`, `preflight.py`, `check-schema-refs.py`, migration-drift workflow |
+@@ -251,4 +251,5 @@ Every contract is approved by you; every PR is merged by you; risk flags are per
+ - [Z.ai — Claude Code setup](https://docs.z.ai/scenario-example/develop-tools/claude.md) · [Coding Plan FAQ](https://docs.z.ai/devpack/faq) · [Coding Plan overview / quotas](https://docs.z.ai/devpack/overview)
+ - [Anthropic sandbox-runtime (srt)](https://github.com/anthropic-experimental/sandbox-runtime) · [Claude Code sandboxing](https://code.claude.com/docs/en/sandboxing)
+ - Requesty, Agent SDK with a custom base URL: the SDK reads `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` — [docs](https://docs.requesty.ai/integrations/anthropic-agent-sdks.md)
++- [mattpocock/skills](https://github.com/mattpocock/skills) @ `49dd158` (MIT): `tdd`, `code-review`, `pr`, `diagnosing-bugs`, `triage`, `retro`. A solo practitioner's operating details under the lab architecture above; where it differs (agent-run merges, parallel writers) this design wins.
+ - Rest: see [REVIEW-IMPROVEMENTS.md](REVIEW-IMPROVEMENTS.md) sources
+diff --git a/TASK-CONTRACT.md b/TASK-CONTRACT.md
+index 167395c..add76b5 100644
+--- a/TASK-CONTRACT.md
++++ b/TASK-CONTRACT.md
+@@ -27,6 +27,7 @@ One record per work item (WO, story, or step). Big items are split into **slices
+ | `risk` | Static flags declared from the doc: `auth`, `payments`, `rls`, `migration`, `safety`, `privacy`, `new_dependency`, `deploy`, `cross_repo`, `external_service`, `factory_control` (changes to how work is chosen or judged: schemas, contracts, validator config). The validator adds dynamic flags from the diff (§ VALIDATOR-SPEC L0). |
+ | `gates` | `spec_approval` (bool), `merge` (`human`/`auto`), `deploy` (`human`/`auto`). Any risk flag forces `human` on merge. In v0 everything is `human`. |
+ | `acceptance` | The **validation contract**: list of `{id, text, check}`. `check.type` is `test` (named test that must fail before / pass after), `command`, `holdout` (scenario id), `prod_probe` (post-deploy check), or `manual` (becomes an owner step). Frozen when the spec is approved: `acceptance_hash` = SHA-256 of the canonical JSON. A changed hash after approval sends the task back to `draft` — except a `done` task, which is **flagged for your review** instead: reopening verified work is a human decision, never automatic. |
++| `out_of_scope` | Optional list of things this task must **not** change or add, e.g. adjacent features that look related. It gives the L2 Spec axis something concrete to check scope creep against (VALIDATOR-SPEC L2). You write it at approval, alongside `acceptance`. It isn't part of `acceptance_hash` (F-04 hashes `acceptance` only), so editing it after approval doesn't send the task back to `draft`. |
+ | `owner_steps` | `[{text, done}]` — things only you can do (JobFinderOS "Owner steps (not buildable by a session)"; SoloAdventurer 👤 items). |
+ | `slices` | `[{id, text, status, acceptance_ids}]` — ordered build units. One session builds one slice. |
+ | `budget` | `{size: S|M, max_attempts, max_turns, wall_clock_min}`. L-sized work must be sliced; the factory refuses an unsliced L. |
+@@ -104,8 +105,11 @@ The adapter. Everything the factory must know about a repo that isn't in a task.
+ | `live_checks` | Post-deploy commands the orchestrator runs **outside** the sandbox with secrets from the macOS keychain. |
+ | `holdouts` | Directory outside the repo (`~/factory/holdouts/<project>/`) and how to run it. |
+ | `docs_allowlist` | Domains the agent may fetch for docs grounding (both projects mandate official-docs lookups). |
++| `standards` | Optional repo-relative paths of the project's coding-standards docs (e.g. `CODING_STANDARDS.md`, `CONTRIBUTING.md`). **Read by the L2 reviewer only**, never pushed to the implementer. Mechanical rules belong in L0 tooling, not here. |
+ | `cross_repo` | Sibling repos whose changes can break this one. v0: any task touching them → `needs_human`. |
+ 
++**Out-of-scope register (`.factory/out-of-scope/`).** One markdown file per rejected *concept* (not per request): what was rejected, the durable reason, and the requests that asked for it. Only you write it. It's a protected path, and it records rejected enhancements, never features that turned out to exist already. The importer (F-12) and triage (F-18) read it, and a draft that resembles a record is shown to you with the record cited. Matching is by concept, not keyword, and **you confirm the match**: nothing is rejected automatically. Adapted from mattpocock/skills `triage`.
++
+ ## 6. Onboarding an existing project
+ 
+ 1. **Readiness check.** Factory runs `commands.*` on a clean clone. Every command must run unattended and pass (or match the baseline). Fix the repo first if not — a factory on a red repo can't tell its own breakage from existing breakage.
+diff --git a/VALIDATOR-SPEC.md b/VALIDATOR-SPEC.md
+index f042c5e..56606f9 100644
+--- a/VALIDATOR-SPEC.md
++++ b/VALIDATOR-SPEC.md
+@@ -45,17 +45,31 @@ Both projects already require "a test that would fail without the change". The v
+ 
+ A test that passes on the base commit proves nothing, and this is where false greens get through.
+ 
++**What L1 can't prove.** Red-then-green shows that the test depends on the change. It doesn't show that the test checks behaviour. Two cases pass L1 and still prove nothing:
++
++- **Red for the wrong reason.** The test is red on base only because the symbol it imports doesn't exist yet (collection or import error), so the run never reached an assertion. This is how red-first legitimately looks for a brand-new function, so L1 can't reject it. It does mean the red phase proved only that the name was missing.
++- **Tautological or implementation-coupled assertions.** The expected value recomputes what the code computes (`assert add(a, b) == a + b`), or the test asserts on mocked internal collaborators or call counts instead of the result at a public interface. It goes red on base (the code is missing), green on head, and would stay green under a wrong implementation that mirrors the same logic.
++
++L1 therefore records **how** each ref went red (`assertion` vs `collection`) in its report. Judging assertion quality is L2's job (the test-quality checks below), and holdouts (L3) back it up with checks the agent never sees.
++
+ ### L2 — Adversarial review (the only model-judged layer)
+ 
+ - **Fresh session**, read-only tools (Read, Grep, Glob, Bash for running checks only). Reuse SoloAdventurer's `verifier.md` as the base prompt: *default verdict FAIL; evidence flips it, claims do not.*
+-- **Input:** the approved contract, the diff, L0/L1 output. **Not** the implementer's narrative. The reviewer judges what was built against what was asked.
++- **Input:** the approved contract, the diff, L0/L1 output (including each ref's red reason). **Not** the implementer's narrative. The reviewer judges what was built against what was asked.
++- **Two axes, reviewed separately** (adapted from mattpocock/skills `code-review`). A change can pass one and fail the other, so neither is allowed to mask the other:
++  - **Spec:** does the diff implement the contract? It reports acceptance items that are missing or partial, behaviour nobody asked for (scope creep, checked against the contract's `out_of_scope`), and items that look implemented but wrongly. Each finding quotes the acceptance item it concerns.
++  - **Standards:** does the diff follow the project's documented standards (`project.yaml` `standards`)? A fixed baseline of named code smells (Fowler, *Refactoring* ch. 3: Mysterious Name, Duplicated Code, Feature Envy, Data Clumps, Primitive Obsession, Repeated Switches, Shotgun Surgery, Divergent Change, Speculative Generality, Message Chains, Middle Man, Refused Bequest) always applies. A documented project standard overrides a smell. A smell is always a judgement call, never a hard violation, so it never blocks on its own. Anything L0 tooling already enforces is skipped. A project with no `standards` runs the baseline only, and the report says so.
++  - Standards live with the reviewer, not the implementer: the implementer has the most context pressure, and the reviewer receives a diff and has the least.
+ - **Mandatory checklist** (from your own incident history):
+   - Does any new backend call (table, RPC, edge function, column) exist in the **real schema**, or only in a mock? A test that mocks the client is not evidence the backend exists.
+   - Does the change touch only the slice's scope?
+   - Loading, error, empty and offline states — and does offline UI report *unknown*, not a false "disabled"?
+   - New provider/subscription/cache: what invalidates it, who cancels it, what happens on logout?
++  - **Test quality** (the part L1 can't prove). Every contract test, and especially any ref L1 reports as red only by `collection`:
++    - Does its expected value come from an independent source (a literal, a worked example, the acceptance text), or does it recompute what the code does?
++    - Does it assert through the public interface, or on mocked internal collaborators, private methods or call counts? Mocks belong only at system boundaries (external APIs, time, randomness).
+ - **Model:** a different model from the implementer where possible. With GLM-only, the self-preference bias is real, so L0, L1 and L3 — none judged by the model — carry most of the weight. Add a cross-provider reviewer when budget allows (see design doc §7).
+-- Output: JSON `{verdict, findings: [{id, severity, file, line, text}]}`, stored as the `validator_report`.
++- Output: JSON `{verdict, findings: [{id, axis, severity, file, line, text}]}`, with `axis` being `spec` or `standards`, stored as the `validator_report`. A finding with severity `blocking` on either axis means FAIL. Findings are not re-ranked across axes.
+ 
+ ### L3 — Holdout scenarios (agents never see them)
+ 
+@@ -87,6 +101,8 @@ attempt 3: fix → L0 → L1 → L2
+ PASS → L3 → PR opened → you merge → deploy → L4
+ ```
+ 
++Not every round shares a session: an aborted run re-enters the queue, and a PR you reject comes back as a fix round, maybe days later. A **fresh** session carries no context, so the orchestrator keeps a per-task **progress log**, an append-only record of each attempt's report and findings (from Anthropic's long-running-harness `progress.txt` pattern). The log lives outside the clone, and every new session gets a read-only copy. The agent never edits earlier entries.
++
+ `max_attempts` defaults to 3, matching your existing `loop.md`. Risk, protected-path, new-dependency and cross-repo hits escalate **immediately**: no retries, since retrying won't make them safe.
+ 
+ ## Validating the validator

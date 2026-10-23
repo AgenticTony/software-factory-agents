@@ -1,0 +1,80 @@
+diff --git a/.factory/tasks.json b/.factory/tasks.json
+index 9d34f91..32fab83 100644
+--- a/.factory/tasks.json
++++ b/.factory/tasks.json
+@@ -647,6 +647,14 @@
+             "type": "test",
+             "ref": "tests/test_f10.py::test_ac_5"
+           }
++        },
++        {
++          "id": "AC-6",
++          "text": "Every attempt records `prompt_versions` (seat → prompt content hash, from F-09) and `skills` (the skills loaded). An attempt without them is a schema error.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f10.py::test_ac_6"
++          }
+         }
+       ],
+       "budget": {
+@@ -1055,6 +1063,14 @@
+             "type": "test",
+             "ref": "tests/test_f19.py::test_ac_2"
+           }
++        },
++        {
++          "id": "AC-3",
++          "text": "The weekly review groups failed and escalated attempts by `prompt_versions` and `skills`, and reports each version's failure share. Each proposed edit names the version it targets and the evidence (attempt run ids) behind it.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f19.py::test_ac_3"
++          }
+         }
+       ],
+       "budget": {
+diff --git a/BUILD-ORDER.md b/BUILD-ORDER.md
+index ae4504b..2848068 100644
+--- a/BUILD-ORDER.md
++++ b/BUILD-ORDER.md
+@@ -171,6 +171,7 @@ Acceptance:
+ - AC-3 A quota/429 error stops `loop` and marks `quota_exhausted`, with no retry.
+ - AC-4 `loop` won't start a session during 08:00–12:00 Mon–Fri Swedish time. The window comes from config.
+ - AC-5 The code contains no `gh pr merge` call (a grep test).
++- AC-6 Every attempt records `prompt_versions` (seat → prompt content hash, from F-09) and `skills` (the skills loaded). An attempt without them is a schema error.
+ 
+ ### F-11 — `factory status`: daily summary + metrics
+ Write a markdown summary per project:
+@@ -233,9 +234,10 @@ A Sentry-alert → triage-session pipeline. That session has no secrets, can't p
+ ## Phase 4 — Self-improvement and gate dial-down
+ 
+ ### F-19 — Meta loop
+-A weekly review of escalations and L2 findings → PRs with **itemised delta edits** to prompt files.
++A weekly review of escalations and L2 findings → PRs with **itemised delta edits** to prompt files. Edits target what actually caused failures. Every attempt records which prompt versions and skills it used (F-10 AC-6), and the review traces failures back to them. This is a non-trained version of the credit-assignment idea in market-based post-training ([arXiv 2610.22322](https://arxiv.org/abs/2610.22322)).
+ - AC-1 A PR that touches validators, holdouts, contract tests or schemas is rejected by L0.
+ - AC-2 Edits are additions, removals or changes to individual items, never whole-file rewrites (a diff-size check).
++- AC-3 The weekly review groups failed and escalated attempts by `prompt_versions` and `skills`, and reports each version's failure share. Each proposed edit names the version it targets and the evidence (attempt run ids) behind it.
+ 
+ ### F-20 — Cross-provider reviewer
+ A per-seat provider config. Risk-flagged tasks get a second L2 review from a different provider.
+diff --git a/schema/tasks.schema.json b/schema/tasks.schema.json
+index dd9f930..a1cffc1 100644
+--- a/schema/tasks.schema.json
++++ b/schema/tasks.schema.json
+@@ -58,7 +58,7 @@
+     },
+     "attempt": {
+       "type": "object",
+-      "required": ["run_id", "slice_id", "started", "outcome"],
++      "required": ["run_id", "slice_id", "started", "outcome", "prompt_versions", "skills"],
+       "additionalProperties": false,
+       "properties": {
+         "run_id": { "type": "string" },
+@@ -74,6 +74,8 @@
+         "pr": { "type": "string" },
+         "validator_report": { "type": "string", "description": "Path to the stored validator report" },
+         "escalation": { "$ref": "#/$defs/escalation" },
++        "prompt_versions": { "type": "object", "description": "seat -> prompt content hash (F-09); used for credit assignment in F-19", "additionalProperties": { "type": "string" } },
++        "skills": { "type": "array", "items": { "type": "string" }, "description": "Skills loaded in the session, name@version" },
+         "note": { "type": "string" }
+       }
+     },

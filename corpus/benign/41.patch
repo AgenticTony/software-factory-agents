@@ -1,0 +1,51 @@
+diff --git a/.factory/BOOTSTRAP.md b/.factory/BOOTSTRAP.md
+index 94d60c4..fe42703 100644
+--- a/.factory/BOOTSTRAP.md
++++ b/.factory/BOOTSTRAP.md
+@@ -553,9 +553,9 @@ All three reproducible findings were red against `caf2786` in a scratch worktree
+ - **Commits:** `feat/f26-merges-in-order` → PR (this one). Red-first: the suite was red at collection on the missing `factory.mergeorder` module; the escalation enum additionally proven red against the pre-change schema (`ContractError … 'stale_base' is not one of […]`) and the `in_review -> needs_human` edge proven illegal in the pre-change table (`illegal transition in_review -> needs_human; allowed from in_review: deploying, draft, in_progress`).
+ - **Built:** 2026-10-21. Interactive session, after a full re-read (ledger, CLAUDE.md, the F-26 WO with its #29 branch-protection amendment, orchestrator/state/publish/contract/runs/rehearsal, both schemas, TASK-CONTRACT §3/§5, VALIDATOR-SPEC, the f10/f23/f25 harnesses, open PRs and worktrees) per the owner's understand-first directive; branched from `origin/main` (`b5742f3`, F-25 reconciled) after the owner's mid-turn correction that this checkout's F-25 `draft` was a stale-branch artifact.
+ - **Design notes:** new `factory/mergeorder.py` — `Protection(checked, strict, plan_limit, detail)` classifies one `gh api repos/<slug>/branches/<default>/protection` answer (`classify_protection`, pure, unit-tested on canned gh output; `gh_branch_protection` is the real seam, gh resolved like `gh_pr_create`); `admission(profile, protection=…)` admits a strictly-protected repo, admits GitHub's plan-limit 403 **only** with `repo.branch_protection: unavailable` declared, and refuses every other answer naming the missing setting — raised as `MergeOrderError(ContractError)`, so the CLI's existing exit-2 handling needed no new wiring. `run_once` calls it after config load, **before the queue is read**: a refusal starts no session, clones nothing, spends nothing. The stale-base sweep (`_sweep_stale_prs`) runs on every `factory run` for each task `in_review` with PR and branch links: **full** (not blob-filtered — the scratch clone's lazy blob fetches go to the local source, which holds neither the moved default head nor the pushed PR branch) fetches of the remote default head and the PR branch; up to date (`merge-base --is-ancestor`) → nothing to do; stale → a local `git merge` onto the new base, then L0 and L1 on a clean clone of the merged tree under the same sandboxed gate runner a round uses — a local proof of the merge a strict setting (or the unavailable self-enforcement) would force before it happens. Failure (merge conflict, L0/L1 fail or escalate) appends an attempt (`outcome: escalated`, `escalation: stale_base`, rounds/turns/tokens 0 — no session ran, and no implementer budget spent) and moves the task `in_review -> needs_human` (new legal edge, reason "stale base failed re-validation on the new default head (F-26)"); a pass records the evidence in the progress log and the `<run-id>-revalidate.json` report and leaves the task `in_review` — readiness now proven against the current default head, with **no attempt appended** so a later fix round keeps its full budget. AC-2: after pick and the peak check, open factory PRs (queue truth: `in_review` + `links.pr`) at or above `repo.concurrency` (schema-validated, default 1) return `RunResult("concurrency_wait")` — the ready task untouched, no session, no attempt; `loop` stops on the same-named reason (CLI exit 0). The sweep runs before pick so an escalated stale PR stops the run even with an empty ready queue, and the concurrency count is taken after the sweep (a just-escalated PR frees its slot).
+-- **AC-1 proven:** `tests/test_f26.py::test_ac_1` — admission matrix: strict passes (declaration irrelevant); protected-without-strict, protected-without-checks and not-protected each refuse naming the setting, **with and without** the declaration (it never excuses a repo that could have protection); the plan-limit 403 admits only with `repo.branch_protection: unavailable`, and without it the refusal names the declaration; any other gh answer refuses. Schema halves: `repo.branch_protection` (enum `["unavailable"]`) and `repo.concurrency` (integer ≥ 1) validate, and garbage values (`"enabled"`, `1`, `None`, `0`, `-1`, `"2"`, `1.5`) refuse at load. End to end: a not-strict repo raises before the queue is read — task still `ready`, no PR, no session ran.
+-- **AC-2 proven:** `test_ac_2` — after a PR opens (T-1 `in_review`), the default profile leaves T-2 waiting: outcome `concurrency_wait`, no seat calls, T-2 still `ready` with no attempts, still one PR; the loop stops `concurrency_wait`; with `concurrency: 2` in the profile the second PR opens and both tasks sit `in_review`.
+-- **AC-3 proven:** `test_ac_3` — end to end on the real fixture remote through the real sandbox: up to date → the sweep is a no-op (no attempt, no log entry); a clean remote advance (unrelated file) → re-validation runs the real L0+L1 on the merged tree, passes, and the task stays `in_review` with the pass recorded (attempts unchanged); a conflicting advance → `needs_human`/`stale_base` with the attempt's note naming the conflict and `links.branch` intact. The schema enum carries `stale_base` (red-first) and the new edge is legal while `in_review -> awaiting_owner` stays illegal.
++- **AC-1** proven: `tests/test_f26.py::test_ac_1` — admission matrix: strict passes (declaration irrelevant); protected-without-strict, protected-without-checks and not-protected each refuse naming the setting, **with and without** the declaration (it never excuses a repo that could have protection); the plan-limit 403 admits only with `repo.branch_protection: unavailable`, and without it the refusal names the declaration; any other gh answer refuses. Schema halves: `repo.branch_protection` (enum `["unavailable"]`) and `repo.concurrency` (integer ≥ 1) validate, and garbage values (`"enabled"`, `1`, `None`, `0`, `-1`, `"2"`, `1.5`) refuse at load. End to end: a not-strict repo raises before the queue is read — task still `ready`, no PR, no session ran.
++- **AC-2** proven: `test_ac_2` — after a PR opens (T-1 `in_review`), the default profile leaves T-2 waiting: outcome `concurrency_wait`, no seat calls, T-2 still `ready` with no attempts, still one PR; the loop stops `concurrency_wait`; with `concurrency: 2` in the profile the second PR opens and both tasks sit `in_review`.
++- **AC-3** proven: `test_ac_3` — end to end on the real fixture remote through the real sandbox: up to date → the sweep is a no-op (no attempt, no log entry); a clean remote advance (unrelated file) → re-validation runs the real L0+L1 on the merged tree, passes, and the task stays `in_review` with the pass recorded (attempts unchanged); a conflicting advance → `needs_human`/`stale_base` with the attempt's note naming the conflict and `links.branch` intact. The schema enum carries `stale_base` (red-first) and the new edge is legal while `in_review -> awaiting_owner` stays illegal.
+ - **Extra coverage:** a conflict-free merge whose merged tree fails the gates (the remote adds a test demanding a different answer) also escalates `stale_base` — the re-validation runs the gates, not just git-merge; the classifier matrix on canned gh output (strict / lax / null checks / 404 / plan-limit 403 / other 403); `gh_branch_protection` builds `api repos/<slug>/branches/<b>/protection` and refuses a non-GitHub remote.
+ - **Changed existing tests (behaviour changed on purpose):** (1) test_f03's ILLEGAL_EDGE_CLASSES loses `("in_review", "needs_human")` with a comment — the F-26 edge makes it legal; the "lateral" class keeps its other representatives. (2) test_f10 AC-5's grep drops its fourth pattern (`["']merge["']\s*,\s*["']--`) with a comment — it over-matched the sweep's LOCAL `git merge --no-edit` on a scratch clone (the simulation this AC exists to allow); the three remaining patterns still catch every real PR-merge mechanism (shell form, argv form, REST endpoint), and the factory still never merges. (3) Fixture honesty: f10's `Env.run`/`Env.loop`, its two direct `run_once` calls, the killed-run subprocess script, the f23 harness, the f25 `Env.run`, and `rehearsal.run_rehearsal` all inject a strict-protected `Protection` — the fixture remotes are local paths the real gh seam cannot answer for.
+ - **Also changed:** TASK-CONTRACT (the escalation line, a `stale_base` owner paragraph — update the branch or reject the PR; the report names the failed step — the §3 edge row, and §5's `repo` row documenting `branch_protection`/`concurrency`) and VALIDATOR-SPEC ("Rounds and escalation" gains the merge-order paragraph) — the review7 sweep held the doc side, as designed. `RunResult`/`LoopResult` docstrings and the CLI `_EXIT` map carry `concurrency_wait` (exit 0).
+diff --git a/.factory/tasks.json b/.factory/tasks.json
+index 92f1a2b..e1365b2 100644
+--- a/.factory/tasks.json
++++ b/.factory/tasks.json
+@@ -1,7 +1,7 @@
+ {
+   "version": 1,
+   "project": "software-factory",
+-  "updated_at": "2026-10-21T13:52:45Z",
++  "updated_at": "2026-10-22T12:09:59Z",
+   "tasks": [
+     {
+       "id": "F-00",
+@@ -1702,7 +1702,7 @@
+       "source": "BUILD-ORDER.md#f-26--merges-in-order",
+       "kind": "build",
+       "priority": "P1",
+-      "status": "draft",
++      "status": "done",
+       "depends_on": [
+         "F-10"
+       ],
+@@ -1747,7 +1747,10 @@
+         "wall_clock_min": 90
+       },
+       "attempts": [],
+-      "links": {}
++      "links": {},
++      "acceptance_hash": "1672d067e4830931ea1985e45b2b1d47b8c8dc043140dc075a4e75cd261bea39",
++      "approved_at": "2026-10-22T12:09:59Z",
++      "approved_by": "Anthony"
+     },
+     {
+       "id": "F-27",

@@ -1,0 +1,2225 @@
+diff --git a/.factory/BOOTSTRAP.md b/.factory/BOOTSTRAP.md
+index f8e5785..e0a8367 100644
+--- a/.factory/BOOTSTRAP.md
++++ b/.factory/BOOTSTRAP.md
+@@ -123,3 +123,65 @@ Entries record evidence, not claims. Each criterion is marked proven, pending, o
+ - **AC-3** proven: `test_ac_3` — named file absent from the branch → `contract_ambiguous` before any run (no command results); file present but the named test absent → `contract_ambiguous` at green via the runner's not-found output, not `test_not_green`.
+ - **Extra coverage:** a ref without `::` → ambiguous, nothing runs; honest red + a diff that doesn't fix the code → `test_not_green`; test committed before its impl (diff touches only code) → valid red-first PASS; command timeout → `command_timeout`; custom `test_ref` template used verbatim; path/name placeholders; shell braces pass through; a contract with no test checks → pass (nothing to prove); deleted and test-to-test-renamed files apply in the red phase without crashing; the repo is left on the slice branch, clean, after both PASS and FAIL runs; `contract_test_refs` order/dedup and `ref_path` strip units; `load_profile` accepts `commands.test_ref`.
+ - **Status to set at reconcile:** `done` once this PR's CI is green (ruff + pytest on 3.11 + 3.13) and you merge it. No deploy target, so L4 doesn't apply.
++
++---
++
++## F-05 — Clone manager and sandbox
++
++- **Commits:** `feat/f05-clone-sandbox` → PR (this one). Red-first: the suite failed on the missing `factory.runs` module before implementation.
++- **Built:** 2026-10-16. Interactive session, then this ledger entry.
++- **Design notes:** new `factory/runs.py` (clone manager) + `factory/sandbox.py` (srt integration), built to the owner's mid-session direction: **srt itself, not a hand-rolled Seatbelt wrapper**.
++  - **srt pinned three ways:** `package.json` pins `@anthropic-ai/sandbox-runtime` at exactly `"0.0.79"` (no `^`/`~`), the committed `package-lock.json` freezes the install (CI and the Mac both run `npm ci` from it), and `ensure_srt()` runs `srt --version` before anything is sandboxed — any value other than `0.0.79` refuses with the fix in the message. `run_sandboxed()` calls it on every spawn; F-06/F-10 will also call it at session/loop start. `FACTORY_SRT_BIN` overrides the binary path for tests (fakes must still report the pin or they're refused).
++  - **Settings from the profile** (`build_settings`, written by `write_settings` next to the runs root under `<factory_root>/sandbox/`): `filesystem.allowWrite = [run_dir]` only; `denyRead` = holdouts root, `~/.ssh`, `~/.config/gh` and the **whole runs root** (stricter than "other projects": sibling runs of the same project are denied too), with `allowRead = [run_dir]` re-allowing the run's own tree (allowRead beats denyRead per srt semantics); `network.allowedDomains` = model endpoint hostname (URL or bare host accepted) + `docs_allowlist` + `network_allowlist`, `deniedDomains: []` (srt requires the key and refuses invalid files rather than falling back to defaults — verified empirically).
++  - **Env, two layers** (AC-4): `sandbox_env()` builds a minimal allowlist env (PATH/HOME/LANG/TZ + run-dir TMPDIR + scrubbed extras) so an interactive orchestrator shell can't leak into a session; `scrub_env()` drops the structural GitHub token names, every `GH_*`/`GITHUB_*` variable, and caller-named keychain-derived names (the Z.ai model token is deliberately not on any list — it is the one secret the sandbox holds). Backstop: the settings file denies the same names via `credentials.envVars` (`{"mode": "deny", "name": ...}`), enforced by srt even when an unscrubbed env is handed straight to it — proven by invoking srt directly with a leaky env in `test_ac_4`.
++  - **TMPDIR points inside the run dir** (`<run_dir>/.tmp`): writes are allowed nowhere else, and tools that need scratch (pip builds, the macOS python xcrun shim) would otherwise break.
++  - **Command transport:** `srt -c <shlex.join(cmd)>`. The variadic form joins argv naively and mangles quoting (reproduced); `-c` takes one command string verbatim, so argv survives the shell round trip exactly.
++  - **Clone manager:** `create_run()` runs the WO's exact command (`git clone --filter=blob:none` from the local repo via `file://` URI), optionally detach-checkouts a ref — resolved to a commit via `ref` → `origin/<ref>` first, because a branch that exists only as a remote ref sends `checkout --detach` down git's DWIM branch-creation path, which rejects `--detach` (reproduced on git 2.50) — seeds a warm dependency cache (`shutil.copytree` into the run dir), and returns the `RunDir`. `cleanup_run()` removes clone + settings file and is idempotent. Run ids: `<UTC stamp>-<6 hex>`, created under `runs/<project>/`.
++  - **Known local-git behaviour, recorded:** on this Mac's git 2.50 (Homebrew), the local `file://` server ignores the blob filter ("filtering not recognized by server, ignoring") while git still records `remote.origin.promisor=true` + `partialclonefilter=blob:none`. The command is exactly the WO's; a fully-materialised clone is still correct, just not lazy.
++  - **CI (owner decision, up front):** sandbox tests RUN on Ubuntu, never skipped. The workflow installs `bubblewrap socat ripgrep`, lifts Ubuntu 24.04's AppArmor unprivileged-userns block (`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`) before pytest, and installs srt from the committed lockfile (`npm ci` + setup-node 22). There is no skip mechanism anywhere: locally a missing srt fails `ensure_srt` (and the tests) with the fix in the message; on CI a broken stack is a red run. `test_ac_3` makes a live, unauthenticated HTTPS request to `api.z.ai` from inside the sandbox (connection success only, no credentials); a Z.ai outage is a labelled CI failure, not a sandbox bug — the assertion message says so and the example.com control in the same test distinguishes the two.
++- **AC-1** proven: `tests/test_f05.py::test_ac_1` — inside a real srt sandbox: write inside the run dir succeeds (and reads back); writes to the factory root outside the run dir and to `/tmp` raise EPERM; the target files don't exist afterwards.
++- **AC-2** proven: `test_ac_2` — a real read attempt on `<factory_root>/holdouts/scenario.md` raises EPERM, while a control read inside the run dir succeeds (the denial is targeted, not a blanket read-block).
++- **AC-3** proven: `test_ac_3` — from inside the sandbox, curl to `https://api.z.ai` returns a real HTTP status (any 1xx–5xx proves the unauthenticated connection; "000" would mean no response) while curl to non-allowlisted `https://example.com` fails at the srt proxy (CONNECT 403 → http_code 000). srt's network model is proxy-based: the child gets authenticated proxy env vars and allowlist enforcement happens at the proxy; direct socket DNS inside the sandbox is denied by design.
++- **AC-4** proven: `test_ac_4` — a child env carrying `GH_TOKEN`, `GITHUB_TOKEN`, `GH_HOST` and a keychain-derived name shows all of them absent inside the sandbox while a permitted extra (`API_TIMEOUT_MS`) survives; plus the settings-file backstop proven by feeding srt an unscrubbed env directly.
++- **Extra coverage:** `ensure_srt` accept/refuse/missing (fake binaries); `run_sandboxed` refuses before spawning when srt is missing (no side effects); missing srt is a failure not a skip (executable statement of the no-skip policy); settings-builder units (allowlist composition incl. URL endpoint, deny-read targets incl. the runs root, credential deny set); clone manager (blob:none config recorded, `origin` URL, named-ref checkout, warm-cache copy, unique run ids, missing-source refusal, idempotent cleanup); `scrub_env` prefix/exact/forbidden semantics.
++- **CI round (first push failed on Linux; fixed and green):** srt's Linux network bridges create their unix sockets at `join(tmpdir(), ...)` — with the run-dir TMPDIR in srt's env, the socket path overflowed the kernel's ~108-byte `sun_path` limit and the bridges silently never came up ("Failed to create bridge sockets after 5 attempts" → all four sandbox AC tests red on CI only; macOS passed because its Seatbelt path has no bridges). Fix: `run_sandboxed` runs srt itself with no TMPDIR (node falls back to the short system temp) and gives the child its run-dir TMPDIR as a shell assignment prefix on the `-c` command string. Second push: **both matrix jobs green with the sandbox tests running for real** (run 38922627259 on head `a1c6fb5`).
++- **Owner review round (4 findings, all fixed on this PR):**
++  - **CI was already green:** the reviewer's bridge-socket guess was exactly the bug found and fixed after the first red push (see the CI-round note above); both matrix jobs pass with the sandbox tests running for real.
++  - **Raw-socket test:** `test_direct_socket_to_non_allowlisted_ip_is_blocked` — a child that ignores the proxy env vars and dials `1.1.1.1:443` by raw IP is blocked (EPERM under Seatbelt; no egress at all under bwrap's network namespace). Proxy filtering is no longer the only proven boundary. (Probing also showed `example.com` resolves to 127.0.0.1 on this Mac — a hosts override — hence the fixed IP.)
++  - **.git hooks/config escape:** srt already denies writes to `.git/hooks`/`.git/config` of the repo under the child's cwd (found by bisection: the same write succeeds or fails depending only on cwd) — but that protection is cwd-relative, so it's now ours explicitly: `denyWrite` carries the run's `.git/hooks` and `.git/config` as absolute paths, and every orchestrator-side git call (`create_run`'s clone/checkout/rev-parse) runs with `GIT_HARDENING` (`-c core.hooksPath=/dev/null -c core.fsmonitor=false`). Proven three ways: `test_git_hook_and_config_planting_is_denied_in_sandbox` (sandboxed planting denied; normal `.git` writes like COMMIT_EDITMSG still work), `test_planted_hook_never_fires_for_orchestrator_git` (a hook planted directly on disk fires for a plain `git commit` — the control — and never for a hardened one), and a settings unit test.
++  - **Env allowlist on every path:** `run_sandboxed(env=...)` no longer merges the caller's dict as a whole env — an explicit env is now an overlay of deliberately chosen names on the same minimal base (`sandbox_env(extra=env)`), so ambient `os.environ` variables cannot cross just because a caller supplied a dict. Proven by `test_provided_env_never_inherits_ambient_variables` (an ambient monkeypatched secret is absent while the chosen extra passes).
++  - **CI round 2 (home deny vs srt's own helpers):** the home-wide denyRead broke Linux CI — runners check the repo out under `/home/runner`, so srt's `apply-seccomp` vendor helper (executed from inside the bwrap namespace) became unreadable and every sandboxed command died at startup ("apply-seccomp: No such file or directory"). Fix: `allowRead` now carries the srt package dir (`node_modules/@anthropic-ai/sandbox-runtime`) as well as the run dir — the runtime's own helpers must be visible to the sandbox it creates, while the factory's source and everything else under the repo/home stays denied.
++  - **CI round 3 (test-only):** the planted-hook test's control `git commit` failed on the runner — clones carry no git identity and the runner has no global one (masked locally by the developer's `~/.gitconfig`). The test now sets an explicit identity in the run clone, which is exactly what the orchestrator must do per the F-06 note below. Final state: **both matrix jobs green with all 25 F-05 tests running for real on Linux** (run 38928407968, head `6711b4b`).
++  - **Home-wide read denial:** `denyRead` now leads with `~` (the run dir is re-allowed via `allowRead`), subsuming `~/.ssh`, `~/.config/gh` and `~/factory` in the production layout and closing everything else in the home folder (`~/.aws`, shell rc files, other checkouts); the explicit entries stay for the test layout where the factory root is outside home. Proven by `test_home_reads_are_denied` (a probe file in the real HOME is EPERM inside the sandbox; `/etc/hosts` reads fine). Session-flow consequence recorded for F-06: git identity can't come from `~/.gitconfig` inside the sandbox — pass it via env (`GIT_AUTHOR_*`) or `git -c`, which is the controlled form anyway.
++- **Owner review round 2 (10 findings: 4 already fixed by round 1 — the review scored a pre-fix head — and 6 new, all fixed on this PR):**
++  - Already-fixed (evidence in round 1 above, re-verified on the current head): `.git/hooks`+`.git/config` denyWrite; home-wide denyRead; `env=` allowlist overlay; raw-socket test.
++  - **Timeout orphans (reproduced by construction):** `run_sandboxed` now spawns srt with `start_new_session=True` and, on wall-clock expiry, SIGKILLs the whole process group (`os.killpg`) before raising `TimeoutExpired` — an aborted session can no longer leave its shell/agent processes running unsupervised while the next run starts. Proven by `test_timeout_kills_the_whole_process_group`: a grandchild heartbeat loop stops growing after the timeout.
++  - **factory_root guessed from layout:** `build_settings` now takes an explicit `factory_root`; when omitted, the canonical `runs/<project>/<run-id>` nesting is *asserted* — a differently-nested run dir raises instead of silently pointing the holdouts deny at a nonexistent path. Proven by `test_build_settings_rejects_an_unrecognised_run_layout`.
++  - **`FACTORY_SRT_BIN` in production:** the override is now honoured **only under pytest** (`PYTEST_CURRENT_TEST` set); in production a stale export is inert and the repo-pinned `node_modules` binary is used. A fake that echoes the pin and execs unsandboxed can no longer impersonate srt outside tests. Proven by `test_srt_bin_override_is_inert_outside_tests` (the fake's side effect never fires).
++  - **Version check cost:** `ensure_srt` caches the result per binary state (`lru_cache` keyed on path + mtime + size; failures uncached) — one Node boot per process instead of one per sandboxed command. Proven by `test_ensure_srt_caches_the_version_check` (counting fake invoked once across three checks).
++  - **`--filter=blob:none` ignored for local clones (reproduced):** plain file:// clones warn "filtering not recognized by server" and materialise fully. `create_run` now passes `--upload-pack "git -c uploadpack.allowFilter=true upload-pack"`, verified empirically: with the override, a two-branch fixture clone contains only the checked-out branch's blobs (1 vs 2). `test_clone_is_actually_partial` asserts the other branch's blob is *absent* via `cat-file --batch-all-objects` — the config assertions alone were never proof. (The first version of this test committed the other-branch file on main, so its blob was legitimately present — fixture bug, not mechanism.)
++  - **Warm cache hygiene:** `_relocate_venv` rewrites a copied venv's absolute cache paths (bin shebangs, `activate`, `pyvenv.cfg`) to the run dir, so `.venv/bin/pip` no longer executes the *cache's* interpreter against sandbox-denied paths; `_seed_cache_excludes` appends the cache's top-level entries to `.git/info/exclude` so a session's `git add -A` can't commit `node_modules`/`.venv` even where the target's .gitignore misses them; `.git/info` joins the sandbox's denyWrite so the agent can't undo the excludes. Proven by `test_warm_cache_is_relocated_and_excluded_from_commits`.
++  - **"Other projects" read denial, now attempt-proven:** `test_sibling_run_reads_are_denied` reads a real sibling project's run file from inside another run's sandbox → denied (the runs-root deny from round 1, exercised end to end this time).
++- **Owner review round 3 (10 findings: the env leak from round 1 correctly re-flagged as unfixed — my round-1 "fix" stopped ambient inheritance but a caller's `env=dict(os.environ)` still crossed — plus 9 new, all fixed on this PR):**
++  - **Env allowlist, for real this time (reproduced by the reviewer):** `sandbox_env` now merges ambient + caller env and keeps only `SESSION_ENV_ALLOWLIST` names (PATH/LANG/TZ/TMPDIR, the Anthropic seat vars, git identity, `LC_*`/`GIT_CONFIG_*` prefixes) before the GitHub scrub — so `env={**os.environ, token}` (the natural F-06 call) cannot smuggle AWS/Supabase/OpenAI keys across. Adding a passthrough name is now a deliberate, reviewable edit to one frozenset. Proven by `test_env_dict_of_os_environ_is_allowlisted` (planted ambient secret absent, deliberate session names present). The false "impossible by construction" comment is gone.
++  - **Toolchain under $HOME executable (reproduced: rc=126):** the home-wide deny made `~/.local/bin/claude`, pyenv/uv/nvm interpreters — anything F-06 must exec from home — unexecutable. `build_settings(toolchain=...)` (default: this Python + `TOOLCHAIN_BINS` on PATH) resolves each binary and re-allows its directory chain below home (which for a `bin/` dir includes the version prefix where `lib/`/site-packages live). Proven by `test_toolchain_under_home_is_executable` (a real binary under real $HOME runs `--version` inside the sandbox) and `test_toolchain_allowread_covers_version_prefix_and_ancestors`.
++  - **Bounded teardown, both directions (both reproduced):** (a) a session leaving `npm run dev &` behind stalled `run_sandboxed` until the background child exited — the group is now SIGKilled after the *normal* leader exit too, so stragglers never outlive the run (`test_background_child_does_not_stall_the_return`); (b) a setsid'd process survives killpg and holds the pipes, and the post-kill drain waited for it (12.4s against a 3s timeout) — the drain is bounded (`_DRAIN_GRACE_SEC`), after which the pipes are force-closed and `TimeoutExpired` propagates (`test_timeout_stays_bounded_against_a_detached_process`). Known residual, documented in the docstring: the escapee process itself may survive (pid-namespace kills are srt/bwrap's side via `--die-with-parent`); the orchestrator never waits for it and its credentials die with the run dir.
++  - **HOME is a writable scratch (`<run>/.home`):** the child no longer gets the real, now-unreadable home — pip/npm/Claude Code get a HOME they can read and write inside the run. Git identity can't come from `~/.gitconfig`; it arrives via the allowlisted `GIT_AUTHOR_*`/`GIT_COMMITTER_*` names. Proven by `test_home_is_a_writable_scratch_inside_the_run`.
++  - **`FACTORY_SRT_BIN` gone entirely:** an env var the orchestrator carries (even `PYTEST_CURRENT_TEST` — itself just an env var) can no longer redirect the sandbox binary. `srt_bin()` is a constant; tests inject fakes via the new `srt_bin_path` parameter on `run_sandboxed` (still pin-checked). Proven by `test_srt_bin_ignores_env_overrides_entirely` and `test_run_sandboxed_takes_an_injected_srt_binary`.
++  - **Cache excludes anchored:** entries are now `/name/` — a cache's `lib/` no longer ignores `src/lib/**` everywhere (silent incomplete PRs). Proven by `test_cache_excludes_are_anchored_to_the_run_root` via `git check-ignore` both ways.
++  - **Venv relocation handles symlinked cache paths:** both the given and the resolved path are rewritten (`/tmp` vs `/private/tmp`), and `site-packages/*.pth` files join the rewrite set. Proven by `test_venv_relocation_handles_symlinked_cache_paths` (shebang written through a symlinked cache path is relocated). `direct_url.json` and editable-install metadata remain unwritten — recorded as a known limitation for F-06 to revisit if a warm cache ever ships editable installs.
++  - **Warm cache refuses tracked collisions:** `git ls-files` top-level components are checked against the cache's top-level entries; a collision (a stray `package-lock.json`) refuses the run instead of silently mutating the checkout. Proven by `test_warm_cache_refuses_tracked_file_collisions`.
++- **Owner review round 4 (7 findings — 4 confirmed bugs introduced by round 3, plus scope/docstring issues; all fixed on this PR):**
++  - **Pipe deadlock (reproduced: 300KB write ate a 20s timeout):** round 3's `proc.wait()` stopped draining the PIPEs while the leader ran — the classic >64KB pipe-buffer deadlock; real sessions (pytest -v, npm logs, Claude Code streams) would wedge until `timeout_min`. Fixed with a single-threaded select loop: both pipes are non-blocking, every read goes through `select` with a bounded wait, nothing in this process ever blocks on a pipe. Phase 1 polls the leader (≤0.5s latency — a leader that exits while a background child holds the pipes is still noticed and the stragglers killed); phase 2 drains bounded by `_DRAIN_GRACE_SEC`. An earlier reader-thread attempt was abandoned: instrumented, `TextIOWrapper.close()` blocked ~12s on a reader mid-syscall — threads + text wrappers can't be made deterministic here. Proven by `test_large_output_does_not_deadlock` (300KB completes fast, all bytes delivered).
++  - **Ambient seat names crossed (reproduced):** round 3's single allowlist let the orchestrator's own `ANTHROPIC_*` and any `GIT_CONFIG_*` ride in by inheritance. Split: `AMBIENT_ENV_ALLOWLIST` (PATH/LANG/TZ + `LC_*` only) vs `SESSION_ENV_ALLOWLIST` (seat + git-identity names, taken **only** from the explicit `env=`). `GIT_CONFIG_*` is on **no** list — env-injected git config is exec-capable (`core.sshCommand`, `credential.helper`); `git -c` on the command line is the controlled route. Proven by `test_ambient_seat_and_git_config_names_do_not_cross`: ambient API key/base URL/GIT_CONFIG_* absent; the explicitly-passed `ANTHROPIC_AUTH_TOKEN` wins over its ambient shadow.
++  - **Toolchain reads re-opened ~/.local (confirmed):** the ancestor-chain allowRead re-enabled whole subtrees (uv's credential store, cursor-agent, Copilot shims). Narrowed to **install dir only**, plus the parent when the binary sits in a `bin/` (the pyenv/nvm version prefix where `lib/`+site-packages live). Proven by `test_toolchain_allowread_is_install_dir_only` and — crucially — `test_toolchain_bin_dir_under_home_still_executes`: a real binary under the real `$HOME` still execs, so the round-3 F-06 fix survives its own scope reduction.
++  - **`.home`/`.tmp` not git-excluded (reproduced):** scratch (pip/npm caches, Claude Code session transcripts) showed up untracked and would ride into PRs via `git add -A`. `create_run` now seeds `/.home/` and `/.tmp/` into `.git/info/exclude` on **every** run, warm cache or not (`_seed_run_excludes`). Proven by `test_home_and_tmp_scratch_are_git_excluded` (`git status --porcelain` empty after the sandbox writes both).
++  - **`_force_close` discarded output:** the select redesign keeps everything read before the grace expiry — `test_timeout_preserves_partial_output` asserts the leader's pre-detach marker survives in `TimeoutExpired.output`.
++  - **False "credentials die with the run dir" claim:** the docstring now states the truth — an escaped (setsid) process keeps the model token in its memory and environment for as long as it lives; what it loses is *network* (srt's filtering proxy died), and deleting the run dir revokes nothing. Suspected abuse → rotate the seat token.
++  - **fd hygiene (found while fixing, source of the unraisable-exception warnings):** EOF-marked streams leaked their read-end fds, and raw `os.close` raced the buffered file objects at GC. The owning file objects are now closed exactly once each — safe here precisely because the design is single-threaded.
++- **Owner review round 5 (3 findings, all fixed on this PR; 1 a regression from round 4's narrowing):**
++  - **Claude Code via its `~/.local/bin` symlink was rc=126 again (reproduced on 095ec8b):** narrowing toolchain reads to the resolved install dir dropped the *link* the native installer puts on PATH (`~/.local/bin/claude -> ~/.local/share/claude/versions/X`); exec by that path was denied (rc=126) and by name not found (rc=127) — only the resolved path ran. `_toolchain_allowread` now walks each toolchain path's symlink chain and re-allows every link below home as the literal *file*, never its directory. Proven by `test_toolchain_symlink_under_home_executes` (relative symlink under the real `$HOME`; exec via the link **and** via PATH lookup; asserts the link file is allowed but its dir isn't) — red at rc=126 before the fix. Verified on the owner's Mac against the real CLI: `~/.local/bin/claude --version` and `claude --version` both rc=0 inside the sandbox; default allowRead under home is exactly `~/.local/bin/claude` + `~/.local/share/claude/versions`; `ls ~/.local`, `~/.local/share`, `~/.local/share/uv` all `Operation not permitted`.
++  - **`bin/` parent rule could re-open `~/.local`:** a toolchain binary resolving to a real file in `~/.local/bin` re-allowed all of `~/.local`. The rule now adds only the `bin/`'s sibling `lib/` (stdlib + site-packages), never the whole parent. Proven by `test_bin_dir_parent_never_reopens_a_shared_prefix` (`~/.local/bin/x` → exactly `{~/.local/bin, ~/.local/lib}`); `test_toolchain_allowread_is_install_dir_only` updated to the sibling-`lib/` shape. Verified with the real pyenv 3.11.9 interpreter: with only `bin/`, the binary and `lib/` allowed, `import ssl, json, sqlite3, venv` runs inside the sandbox.
++  - **Stale docstrings:** `run_sandboxed` still described the abandoned reader-thread teardown; `build_settings(toolchain=)` and `test_toolchain_under_home_is_executable` still described the round-3 ancestor chain. All three now describe the code as it is; `test_run_sandboxed_docstring_matches_the_select_pump` guards the first.
++  - Evidence: 50 F-05 tests / 217 total passing locally, ruff clean.
++- **Status to set at reconcile:** `done` once this PR's CI is green (ruff + pytest on 3.11 + 3.13, with the sandbox tests running for real on Linux) and you merge it. No deploy target, so L4 doesn't apply.
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 3a9e350..06145da 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -18,6 +18,19 @@ jobs:
+         with:
+           python-version: ${{ matrix.python-version }}
+           cache: pip
++      - uses: actions/setup-node@v4
++        with:
++          node-version: 22
++          cache: npm
++      # Sandbox stack (F-05): srt comes from the committed lockfile — the
++      # same build as the orchestrator's Mac — and on Linux needs bubblewrap,
++      # socat and ripgrep. Ubuntu 24.04 blocks unprivileged user namespaces
++      # through AppArmor, which breaks bubblewrap out of the box; lift it so
++      # the sandbox acceptance tests run for real here (they are never
++      # skipped — a broken sandbox stack must fail CI, not hide from it).
++      - run: sudo apt-get update && sudo apt-get install -y bubblewrap socat ripgrep
++      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
++      - run: npm ci
+       - run: python -m pip install --upgrade pip
+       - run: pip install -e ".[dev]"
+       - run: ruff check .
+diff --git a/.gitignore b/.gitignore
+index 72dd463..c9db7d0 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -25,3 +25,6 @@ out/
+ 
+ # Writer lock for tasks.json (F-03) — runtime artifact, never committed
+ .factory/*.lock
++
++# srt (sandbox runtime) — pinned in package.json; only the lockfile is committed
++node_modules/
+diff --git a/factory/runs.py b/factory/runs.py
+new file mode 100644
+index 0000000..b2c12be
+--- /dev/null
++++ b/factory/runs.py
+@@ -0,0 +1,245 @@
++"""Clone manager: one disposable run dir per session (DESIGN-LOCAL-FACTORY D3).
++
++Each session works in ``<factory_root>/runs/<project>/<run-id>/``, a
++``git clone --filter=blob:none`` of the local repo (blobs stream on demand,
++so clones are cheap). A warm dependency cache can be seeded into the run
++dir so sessions don't pay a fresh install every time. Everything a run
++produces is disposable: ``cleanup_run`` deletes the clone and its sandbox
++settings without a trace.
++"""
++
++import shutil
++import subprocess
++import uuid
++from dataclasses import dataclass
++from datetime import datetime, timezone
++from pathlib import Path
++
++FACTORY_ROOT_DEFAULT = Path.home() / "factory"
++
++# Every git command the orchestrator runs outside the sandbox disables hooks
++# and fsmonitor: a hook planted inside a run (or a stale one from a bypassed
++# deny) must never execute with the orchestrator's credentials. Sessions
++# inside the sandbox can't rewrite .git/hooks or .git/config either (the
++# sandbox settings deny both), so this is the outer layer of the same rule.
++GIT_HARDENING = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
++
++
++class RunError(Exception):
++    """A run dir cannot be created or cleaned up as requested."""
++
++
++@dataclass(frozen=True)
++class RunDir:
++    """A single session's clone plus its sibling srt settings file."""
++
++    project: str
++    run_id: str
++    root: Path
++    settings_path: Path
++
++
++def create_run(
++    project: str,
++    source: Path,
++    *,
++    factory_root: Path | None = None,
++    ref: str | None = None,
++    warm_cache: Path | None = None,
++) -> RunDir:
++    """Clone ``source`` into a fresh run dir and return its :class:`RunDir`.
++
++    Args:
++        project: Project slug (``project.yaml`` ``name``); the run lives under
++            ``<factory_root>/runs/<project>/``.
++        source: Path to the local git repo to clone from.
++        factory_root: Factory root (default ``~/factory``). Tests point this
++            at a temp dir; production never overrides it.
++        ref: Optional branch/tag/commit to detach-checkout after cloning.
++        warm_cache: Optional directory copied into the run dir verbatim
++            (prebuilt venv, ``node_modules``) so sessions start warm.
++
++    Returns:
++        The created run: its ``root`` is the clone, ``settings_path`` is where
++        the sandbox settings for this run belong (written by the caller).
++
++    Raises:
++        RunError: The source repo doesn't exist, or git/copy failed. The
++            message names the offending step; no partial dir is kept.
++    """
++    root = Path(factory_root) if factory_root else FACTORY_ROOT_DEFAULT
++    source = Path(source).resolve()
++    if not (source / ".git").exists():
++        raise RunError(
++            f"cannot clone run for {project!r}: {source} is not a git repository"
++        )
++
++    runs_root = root / "runs"
++    dest = runs_root / project / _new_run_id()
++    while dest.exists():  # uuid suffix makes this near-impossible; stay safe
++        dest = runs_root / project / _new_run_id()
++
++    # uploadpack.allowFilter: a local file:// server refuses blob filters by
++    # default, git then WARNS ("filtering not recognized by server, ignoring")
++    # and silently does a full clone — every run would copy all blobs of all
++    # history, defeating D3's "clones are cheap". Overriding the upload-pack
++    # command turns the filter on for the local source too.
++    result = subprocess.run(
++        [
++            "git", *GIT_HARDENING, "clone", "--filter=blob:none",
++            "--upload-pack", "git -c uploadpack.allowFilter=true upload-pack",
++            source.as_uri(), str(dest),
++        ],
++        capture_output=True,
++        text=True,
++    )
++    if result.returncode != 0:
++        shutil.rmtree(dest, ignore_errors=True)
++        raise RunError(
++            f"git clone --filter=blob:none failed for {project!r} "
++            f"from {source}: {result.stderr.strip()}"
++        )
++
++    if ref is not None:
++        # A branch name usually exists in the clone only as origin/<name>;
++        # `git checkout --detach <name>` would then take the DWIM branch-
++        # creation path, which rejects --detach. Resolve to a commit first.
++        commit = _resolve_commit(dest, ref)
++        if commit is None:
++            shutil.rmtree(dest, ignore_errors=True)
++            raise RunError(f"ref {ref!r} not found in clone of {source} (run {dest})")
++        result = subprocess.run(
++            ["git", *GIT_HARDENING, "-C", str(dest), "checkout", "--detach", commit],
++            capture_output=True,
++            text=True,
++        )
++        if result.returncode != 0:
++            shutil.rmtree(dest, ignore_errors=True)
++            raise RunError(
++                f"checkout of ref {ref!r} ({commit}) failed in run {dest}: "
++                f"{result.stderr.strip()}"
++            )
++
++    if warm_cache is not None:
++        _refuse_tracked_collisions(dest, warm_cache)
++        try:
++            shutil.copytree(warm_cache, dest, dirs_exist_ok=True)
++            _relocate_venv(Path(warm_cache), dest)
++            _seed_run_excludes(dest, warm_cache)
++        except OSError as exc:
++            shutil.rmtree(dest, ignore_errors=True)
++            raise RunError(f"warm cache copy from {warm_cache} into {dest} failed: {exc}")
++    else:
++        _seed_run_excludes(dest, None)
++
++    settings_path = root / "sandbox" / f"{project}-{dest.name}.json"
++    return RunDir(project=project, run_id=dest.name, root=dest, settings_path=settings_path)
++
++
++def cleanup_run(run: RunDir) -> None:
++    """Delete the run's clone and settings file. Idempotent: a missing run
++    (already cleaned, or never finished creating) is not an error."""
++    shutil.rmtree(run.root, ignore_errors=True)
++    run.settings_path.unlink(missing_ok=True)
++
++
++def _new_run_id() -> str:
++    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
++    return f"{stamp}-{uuid.uuid4().hex[:6]}"
++
++
++def _refuse_tracked_collisions(dest: Path, warm_cache: Path) -> None:
++    """Refuse a cache that would overwrite tracked files: a stray
++    package-lock.json in the cache would silently mutate the checkout the
++    agent is supposed to diff against (phantom lockfile changes, L0
++    new_dependency escalations, cache content in the PR)."""
++    tracked = subprocess.run(
++        ["git", *GIT_HARDENING, "-C", str(dest), "ls-files"],
++        check=True, capture_output=True, text=True,
++    ).stdout
++    top_tracked = {
++        line.split("/", 1)[0] for line in tracked.splitlines() if line.strip()
++    }
++    collisions = sorted(
++        {entry.name for entry in Path(warm_cache).iterdir()} & top_tracked
++    )
++    if collisions:
++        shutil.rmtree(dest, ignore_errors=True)
++        raise RunError(
++            f"warm cache would overwrite tracked files in the run: "
++            f"{', '.join(collisions)}"
++        )
++
++
++def _relocate_venv(cache: Path, dest: Path) -> None:
++    """Rewrite a copied venv's absolute cache paths to the run dir.
++
++    A venv is not relocatable as-is: ``bin/*`` shebangs and ``activate``
++    embed the venv's absolute path, ``pyvenv.cfg`` points at its home, and
++    ``.pth`` files reference install locations. Left as the cache path,
++    ``.venv/bin/pip`` executes the *cache's* interpreter and installs target
++    the cache — writes the sandbox denies. The venv embeds the path it was
++    *created through*, so both the given path and its resolved form (a
++    symlinked cache: ``/tmp`` vs ``/private/tmp`` on macOS) are rewritten.
++    Best-effort by prefix substitution; only venv-looking trees are touched.
++    """
++    for venv_name in (".venv", "venv"):
++        venv = dest / venv_name
++        if not (venv / "pyvenv.cfg").exists():
++            continue
++        olds = {str(cache / venv_name), str(cache.resolve() / venv_name)}
++        new = str(venv)
++        targets = [venv / "pyvenv.cfg"]
++        bin_dir = venv / "bin"
++        if bin_dir.is_dir():
++            targets.extend(p for p in bin_dir.iterdir() if p.is_file())
++        targets.extend(venv.glob("lib*/python*/site-packages/*.pth"))
++        for path in targets:
++            try:
++                text = path.read_text()
++            except (OSError, UnicodeDecodeError):
++                continue  # binaries (symlinked interpreters) have no text to fix
++            if any(old in text for old in olds):
++                for old in olds:
++                    text = text.replace(old, new)
++                path.write_text(text)
++
++
++def _seed_run_excludes(dest: Path, warm_cache: Path | None) -> None:
++    """Anchor the run's scratch dirs — and the warm cache's top-level
++    entries, if any — in ``.git/info/exclude``.
++
++    Keeps a session's ``git add -A`` from committing ``node_modules`` /
++    ``.venv`` when the target repo's .gitignore doesn't cover them, and —
++    always — from committing the sandbox's own scratch: ``.home`` (pip/npm
++    caches, Claude Code session state and transcripts) and ``.tmp``.
++    Entries are anchored with a leading ``/`` so they match only at the run
++    root. ``.git/info`` is sandbox-denyWritten, so the agent can't undo it.
++    """
++    exclude = dest / ".git" / "info" / "exclude"
++    exclude.parent.mkdir(parents=True, exist_ok=True)
++    entries = ["/.home/", "/.tmp/"]
++    if warm_cache is not None:
++        entries += [
++            f"/{entry.name}" + ("/" if entry.is_dir() else "")
++            for entry in sorted(Path(warm_cache).iterdir())
++        ]
++    with exclude.open("a") as fh:
++        fh.write("\n# factory: run scratch (seeded by create_run)\n")
++        fh.write("\n".join(entries) + "\n")
++
++
++def _resolve_commit(repo: Path, ref: str) -> str | None:
++    """First of ``ref`` / ``origin/<ref>`` that resolves to a commit, else None."""
++    for candidate in (ref, f"origin/{ref}"):
++        result = subprocess.run(
++            [
++                "git", *GIT_HARDENING, "-C", str(repo),
++                "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}",
++            ],
++            capture_output=True,
++            text=True,
++        )
++        if result.returncode == 0:
++            return result.stdout.strip()
++    return None
+diff --git a/factory/sandbox.py b/factory/sandbox.py
+new file mode 100644
+index 0000000..8e755a4
+--- /dev/null
++++ b/factory/sandbox.py
+@@ -0,0 +1,555 @@
++"""The session sandbox: srt, pinned, with settings built from the profile.
++
++Isolation is Anthropic's ``srt`` (``@anthropic-ai/sandbox-runtime``) —
++Seatbelt on macOS, bubblewrap on Linux — installed at an exact version in
++this repo's ``package.json`` (see BUILD-ORDER F-05: pin the srt version).
++The factory refuses to sandbox anything unless ``srt --version`` matches
++: data:`SRT_PIN`, so a drifted or broken install stops the factory instead
++of quietly weakening the sandbox.
++
++The settings file (DESIGN-LOCAL-FACTORY D3) allows writes only inside the
++run dir (minus its ``.git/hooks`` and ``.git/config`` — see GIT_HARDENING
++in :mod:`factory.runs`), denies reads of the entire home directory (the run
++dir is re-allowed), the holdouts, and every other run, and allows network
++only to the model endpoint plus the project profile's ``docs_allowlist``
++and ``network_allowlist``. Credentials are defence-in-depth: the
++environment is scrubbed before the child is spawned *and* the settings file
++denies the same names inside srt, so a caller mistake can't leak a GitHub
++token or a keychain-derived variable.
++"""
++
++import json
++import os
++import select
++import shlex
++import shutil
++import signal
++import subprocess
++import sys
++import time
++from contextlib import suppress
++from functools import lru_cache
++from pathlib import Path
++from typing import Sequence
++from urllib.parse import urlsplit
++
++SRT_PIN = "0.0.79"
++_REPO_ROOT = Path(__file__).resolve().parent.parent
++
++# Structurally blocked env names: nothing a build session does needs GitHub
++# credentials, so they never cross the sandbox boundary in either layer.
++_FORBIDDEN_ENV_EXACT = frozenset(
++    {"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"}
++)
++_FORBIDDEN_ENV_PREFIXES = ("GH_", "GITHUB_")
++
++# Names a session may ever see, split by where they may come from:
++#
++# * AMBIENT_* — inherited from the orchestrator's environment. Deliberately
++#   excludes every seat/secret/git name: the orchestrator's own
++#   ANTHROPIC_* keys, or GIT_CONFIG_* set by CI, must never ride into a
++#   session by inheritance (a real Anthropic key reaching a Z.ai seat,
++#   exec-capable git config arriving unasked).
++# * SESSION_* — allowed ONLY from the caller's explicit ``env=``: the model
++#   seat (base URL, the one secret the sandbox holds, API timeout) and the
++#   git identity (the sandbox can't read ~/.gitconfig). GIT_CONFIG_* is not
++#   on any list — env-injected git config is exec-capable; `git -c` on the
++#   command line is the controlled route.
++#
++# Adding a name to either list is a deliberate, reviewable act.
++AMBIENT_ENV_ALLOWLIST = frozenset({"PATH", "LANG", "TZ"})
++AMBIENT_ENV_PREFIXES = ("LC_",)
++SESSION_ENV_ALLOWLIST = frozenset(
++    {
++        "PATH",
++        "LANG",
++        "TZ",
++        "TMPDIR",
++        "ANTHROPIC_BASE_URL",
++        "ANTHROPIC_AUTH_TOKEN",
++        "ANTHROPIC_API_KEY",
++        "ANTHROPIC_MODEL",
++        "API_TIMEOUT_MS",
++        "GIT_AUTHOR_NAME",
++        "GIT_AUTHOR_EMAIL",
++        "GIT_COMMITTER_NAME",
++        "GIT_COMMITTER_EMAIL",
++    }
++)
++SESSION_ENV_PREFIXES = ("LC_",)
++
++# Seconds to wait for output after the process group is killed: pipe buffer
++# drains fast when every writer is dead; a process that escaped the group
++# (setsid) and holds the pipes is force-closed after this grace instead of
++# hanging the orchestrator.
++_DRAIN_GRACE_SEC = 10.0
++
++# Binaries a session may need to exec that can live under $HOME: resolved
++# and re-allowed for reading by build_settings (the home-wide denyRead would
++# otherwise make the session's own toolchain unexecutable — rc=126).
++TOOLCHAIN_BINS = ("node", "npm", "npx", "claude", "git", "curl")
++
++
++class SandboxError(Exception):
++    """The sandbox cannot be used: srt missing, wrong version, or unusable."""
++
++
++def srt_bin() -> Path:
++    """Path to the pinned srt binary: always ``node_modules/.bin/srt`` in
++    this repo. There is deliberately **no environment override** — an env
++    var the orchestrator happens to carry must never be able to hand the
++    sandbox to a wrapper. Tests inject fakes through the ``srt_bin_path``
++    parameters of :func:`ensure_srt` / :func:`run_sandboxed` instead.
++    """
++    return _REPO_ROOT / "node_modules" / ".bin" / "srt"
++
++
++def ensure_srt(srt_bin_path: Path | None = None) -> str:
++    """Check ``srt --version`` against the pin and return the version string.
++
++    The check is cached per binary state (path + mtime + size): it costs a
++    Node boot, and the binary cannot change mid-process without the
++    fingerprint changing. Failures are never cached.
++
++    Args:
++        srt_bin_path: Binary to check (default: the repo-pinned install, or
++            ``FACTORY_SRT_BIN`` under pytest).
++
++    Returns:
++        The reported version, which equals :data:`SRT_PIN`.
++
++    Raises:
++        SandboxError: srt is missing, won't run, or reports any version other
++            than the pin. The message says how to fix the install.
++    """
++    binary = Path(srt_bin_path) if srt_bin_path else srt_bin()
++    if not binary.exists():
++        raise SandboxError(
++            f"srt not found at {binary}. Install the pinned sandbox runtime "
++            f"with `npm ci` (package.json pins @anthropic-ai/sandbox-runtime "
++            f"at {SRT_PIN}), or point FACTORY_SRT_BIN at the right binary."
++        )
++    stat = binary.stat()
++    return _verified_srt(str(binary), (stat.st_mtime_ns, stat.st_size))
++
++
++@lru_cache(maxsize=None)
++def _verified_srt(binary: str, fingerprint: tuple[int, int]) -> str:
++    """Run the actual version check once per binary state. ``fingerprint``
++    (mtime, size) busts the cache if the binary is replaced on disk."""
++    try:
++        proc = subprocess.run(
++            [binary, "--version"],
++            capture_output=True,
++            text=True,
++            timeout=60,
++        )
++    except (OSError, subprocess.TimeoutExpired) as exc:
++        raise SandboxError(f"srt at {binary} could not be executed: {exc}") from exc
++    if proc.returncode != 0:
++        raise SandboxError(
++            f"srt --version exited {proc.returncode} at {binary}: {proc.stderr.strip()}"
++        )
++    lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
++    version = lines[-1].split()[-1] if lines else ""
++    if version != SRT_PIN:
++        raise SandboxError(
++            f"srt version mismatch: expected {SRT_PIN} (pinned in package.json), "
++            f"got {version!r} from {binary}. Run `npm ci` and retry; the factory "
++            "refuses to run sessions against an unpinned sandbox."
++        )
++    return version
++
++
++def scrub_env(env: dict[str, str], forbidden: tuple[str, ...] = ()) -> dict[str, str]:
++    """Drop GitHub credentials and caller-named secrets from ``env``.
++
++    Removes the structural GitHub token names, every ``GH_*``/``GITHUB_*``
++    variable, and the names in ``forbidden`` (keychain-derived variables —
++    the orchestrator knows which those are; the sandbox doesn't). The Z.ai
++    model token is not on any of those lists: it is the one secret the
++    sandbox is allowed to hold (DESIGN D3, rule of two).
++    """
++    forbidden_upper = {name.upper() for name in forbidden}
++    scrubbed: dict[str, str] = {}
++    for key, value in env.items():
++        upper = key.upper()
++        if upper in _FORBIDDEN_ENV_EXACT or upper in forbidden_upper:
++            continue
++        if any(upper.startswith(prefix) for prefix in _FORBIDDEN_ENV_PREFIXES):
++            continue
++        scrubbed[key] = value
++    return scrubbed
++
++
++def sandbox_env(
++    run_dir: Path,
++    *,
++    extra: dict[str, str] | None = None,
++    forbidden: tuple[str, ...] = (),
++) -> dict[str, str]:
++    """Build the child env: ambient base + allowlisted extras, HOME inside
++    the run.
++
++    Three rules, applied on every path:
++
++    * ambient inheritance is limited to :data:`AMBIENT_ENV_ALLOWLIST`
++      (PATH/LANG/TZ and ``LC_*``) — the orchestrator's own seat keys and
++      git config never enter a session unasked;
++    * the caller's ``extra`` is limited to :data:`SESSION_ENV_ALLOWLIST`
++      (and ``LC_*``) — ``extra=dict(os.environ)`` cannot smuggle an
++      unlisted secret across, because os.environ's secret names are not on
++      the session list;
++    * the GitHub/forbidden scrub runs on top of both.
++
++    HOME points at ``<run_dir>/.home`` and TMPDIR at ``<run_dir>/.tmp`` —
++    writable scratch (the real home is denyRead; writes are allowed nowhere
++    outside the run). Both are git-excluded by ``create_run``.
++    """
++    run_dir = Path(run_dir)
++    home = run_dir / ".home"
++    home.mkdir(parents=True, exist_ok=True)
++    tmp = run_dir / ".tmp"
++    tmp.mkdir(parents=True, exist_ok=True)
++    env = {
++        key: value
++        for key, value in os.environ.items()
++        if key in AMBIENT_ENV_ALLOWLIST or key.startswith(AMBIENT_ENV_PREFIXES)
++    }
++    if extra:
++        for key, value in extra.items():
++            if key in SESSION_ENV_ALLOWLIST or key.startswith(SESSION_ENV_PREFIXES):
++                env[key] = value
++    env["HOME"] = str(home)
++    env["TMPDIR"] = str(tmp)
++    return scrub_env(env, forbidden)
++
++
++def build_settings(
++    profile: dict,
++    run_dir: Path,
++    *,
++    model_endpoint: str,
++    forbidden_env: tuple[str, ...] = (),
++    factory_root: Path | None = None,
++    toolchain: "Sequence[Path] | None" = None,
++) -> dict:
++    """Build the srt settings dict for one run from the project profile.
++
++    Args:
++        profile: The loaded ``project.yaml`` (``docs_allowlist`` /
++            ``network_allowlist`` keys are read; both optional here).
++        run_dir: The session's run dir — the only writable, self-readable
++            path inside the sandbox.
++        model_endpoint: The seat's model endpoint (Z.ai base URL or bare
++            host). Its hostname joins the network allowlist.
++        forbidden_env: Keychain-derived env names denied in addition to the
++            structural GitHub set (same list the orchestrator scrubs).
++        factory_root: Explicit factory root. When omitted it is derived from
++            the canonical ``<factory_root>/runs/<project>/<run-id>`` layout —
++            and that derivation is *asserted*, never guessed silently: a run
++            dir with a different nesting raises instead of quietly pointing
++            the holdouts deny at a wrong path (which would leave the real
++            holdouts readable).
++        toolchain: Binaries the session must be able to exec even though
++            they live under the (denied) home dir — Claude Code, pyenv/uv
++            pythons, nvm node. Each gets its resolved install dir, the
++            sibling ``lib/`` of a ``bin/`` install dir, and the symlink
++            files on the way re-allowed for reading — never ancestor
++            directories (see :func:`_toolchain_allowread`). Default: this
++            Python plus :data:`TOOLCHAIN_BINS` found on PATH.
++
++    Returns:
++        A settings dict accepted by ``srt --settings``.
++
++    Raises:
++        SandboxError: ``run_dir`` doesn't follow the canonical layout and no
++            explicit ``factory_root`` was given.
++    """
++    run_dir = Path(run_dir).resolve()
++    runs_root = run_dir.parent.parent
++    if factory_root is None:
++        if runs_root.name != "runs":
++            raise SandboxError(
++                f"cannot derive the factory root from {run_dir}: its layout is not "
++                "runs/<project>/<run-id>. Pass factory_root explicitly, or the "
++                "holdouts deny would name a path that doesn't exist."
++            )
++        factory_root = runs_root.parent
++    else:
++        factory_root = Path(factory_root).resolve()
++    if toolchain is None:
++        toolchain = [sys.executable]
++        toolchain += [Path(found) for name in TOOLCHAIN_BINS
++                      if (found := shutil.which(name))]
++    allowed_domains = [
++        _endpoint_host(model_endpoint),
++        *profile.get("docs_allowlist", []),
++        *profile.get("network_allowlist", []),
++    ]
++    denied_names = sorted(
++        set(_FORBIDDEN_ENV_EXACT) | {name for name in forbidden_env if name}
++    )
++    # srt's Linux sandbox runs its vendor helpers (apply-seccomp, the java
++    # agent jar) from INSIDE the bwrap namespace. On hosts where this repo
++    # sits under $HOME — CI runners check out under /home/runner — the
++    # home-wide denyRead below would hide them and every sandboxed command
++    # would die at startup. Re-allow exactly the runtime's own package dir;
++    # the factory's source (and everything else in the repo) stays denied.
++    srt_package = _REPO_ROOT / "node_modules" / "@anthropic-ai" / "sandbox-runtime"
++    home = Path("~").expanduser()
++    toolchain_reads = sorted(
++        _toolchain_allowread(home, toolchain), key=str
++    )
++    return {
++        "network": {"allowedDomains": allowed_domains, "deniedDomains": []},
++        "filesystem": {
++            "denyRead": [
++                str(home),
++                str(factory_root / "holdouts"),
++                str(Path("~/.ssh").expanduser()),
++                str(Path("~/.config/gh").expanduser()),
++                str(runs_root),
++            ],
++            "allowRead": [str(run_dir), str(srt_package)]
++            + [str(entry) for entry in toolchain_reads],
++            "allowWrite": [str(run_dir)],
++            # The run's git control files are not the agent's to edit: a hook
++            # or core.hooksPath/fsmonitor redirect planted here executes later,
++            # OUTSIDE the sandbox, when the orchestrator commits and pushes
++            # with its own credentials. srt already protects the repo under
++            # the child's cwd; these absolute denies make that guarantee ours,
++            # independent of cwd. `.git/info` holds the exclude file the
++            # orchestrator seeds with warm-cache entries (create_run) — the
++            # agent must not undo those excludes either.
++            "denyWrite": [
++                str(run_dir / ".git" / "hooks"),
++                str(run_dir / ".git" / "config"),
++                str(run_dir / ".git" / "info"),
++            ],
++        },
++        "credentials": {
++            "envVars": [{"mode": "deny", "name": name} for name in denied_names]
++        },
++    }
++
++
++def write_settings(settings: dict, path: Path) -> Path:
++    """Write a settings dict to ``path`` (parent dirs created) as JSON."""
++    path = Path(path)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps(settings, indent=2) + "\n")
++    return path
++
++
++def run_sandboxed(
++    cmd: list[str],
++    run_dir: Path,
++    settings_path: Path,
++    *,
++    env: dict[str, str] | None = None,
++    timeout: float | None = None,
++    cwd: Path | None = None,
++    srt_bin_path: Path | None = None,
++) -> subprocess.CompletedProcess:
++    """Run ``cmd`` under srt confined to ``run_dir``.
++
++    Args:
++        cmd: The command (argv list) to run inside the sandbox.
++        run_dir: The run dir: the child's cwd, HOME (``.home``) and TMPDIR
++            (``.tmp``), and the only path it may write.
++        settings_path: srt settings file (from :func:`build_settings` +
++            :func:`write_settings`).
++        env: Names to add to the child env on top of the base. The session
++            allowlist (:data:`SESSION_ENV_ALLOWLIST`) applies to the whole
++            result regardless of what is passed — ``env={**os.environ,
++            token}`` cannot smuggle an unlisted secret across. Scrub
++            keychain-derived names yourself (via :func:`sandbox_env`) — the
++            settings file denies them as the backstop layer.
++        timeout: Wall-clock seconds for the leader. While it runs, the
++            pipes are pumped by a single-threaded ``select`` loop over
++            non-blocking fds (``proc.wait`` on PIPEd output would deadlock
++            past the ~64KB pipe buffer); nothing in this process ever blocks
++            on a pipe. On expiry — and also on a normal leader exit, so
++            stragglers never outlive the run — the whole process group is
++            SIGKILLed, then the pipes drain for at most
++            :data:`_DRAIN_GRACE_SEC`; after that, pipes still held by a
++            process that escaped the group (setsid) are closed, with the
++            output read so far preserved. Such an escapee may itself
++            survive (killing by pid namespace is srt's side, via bwrap's
++            ``--die-with-parent``): the orchestrator stops waiting for it,
++            and it loses *network* because srt's filtering proxy died — but
++            it keeps the model token in its memory and environment for as
++            long as it lives; deleting the run dir revokes nothing. Treat
++            escaped processes as a prompt for the owner to rotate the seat
++            token if abuse is suspected.
++        cwd: Working dir (default: the run dir).
++        srt_bin_path: Test injection for the srt binary (still pin-checked).
++            There is no production override path.
++
++    Returns:
++        The completed process (text mode, output captured).
++
++    Raises:
++        SandboxError: srt is missing or not at the pinned version — checked
++            before the child is spawned.
++        subprocess.TimeoutExpired: the wall clock ran out; the process group
++            is dead (or force-detached) by the time it propagates.
++    """
++    binary = Path(srt_bin_path) if srt_bin_path else srt_bin()
++    ensure_srt(srt_bin_path=binary)
++    run_dir = Path(run_dir)
++    tmp = run_dir / ".tmp"
++    tmp.mkdir(parents=True, exist_ok=True)
++    child_env = sandbox_env(run_dir, extra=env)
++    # srt's Linux network bridges create unix sockets in node's tmpdir().
++    # A TMPDIR deep inside the run dir overflows the kernel's ~108-byte
++    # sun_path limit and the bridges silently never come up ("Failed to
++    # create bridge sockets"). So srt itself runs with no TMPDIR (node falls
++    # back to the system temp, which is short), and the *child* gets its
++    # run-dir TMPDIR as a shell assignment prefix instead — same environment
++    # for the command, short socket paths for srt.
++    child_env.pop("TMPDIR", None)
++    command = f"TMPDIR={shlex.quote(str(tmp))} {shlex.join(cmd)}"
++    # srt runs the command through a shell itself; `-c` takes one command
++    # string verbatim ("no escaping applied"), so shlex.join carries our
++    # argv across that boundary without quoting accidents. srt becomes a
++    # session leader (start_new_session), so one killpg reaches the whole
++    # tree — shell, session processes, socat bridges.
++    proc = subprocess.Popen(
++        [str(binary), "--settings", str(settings_path), "-c", command],
++        env=child_env,
++        cwd=str(cwd if cwd else run_dir),
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        start_new_session=True,
++    )
++    # Pump the pipes with non-blocking reads while the leader runs: waiting
++    # on the process with PIPEd output deadlocks the moment a command writes
++    # past the pipe buffer (~64KB) — pytest -v, npm install logs, Claude
++    # Code streams all blow past it. Nothing in this process ever blocks on
++    # a pipe: every read goes through select with a bounded timeout.
++    streams = {"out": proc.stdout.fileno(), "err": proc.stderr.fileno()}
++    buffers = {"out": bytearray(), "err": bytearray()}
++    for fd in streams.values():
++        os.set_blocking(fd, False)
++    timed_out = False
++    deadline = None if timeout is None else time.monotonic() + timeout
++
++    # Phase 1: pump while the leader runs. Polling (not wait()) so a leader
++    # that exits while a background child still holds the pipes is noticed
++    # within 0.5s and the stragglers are killed instead of stalling us.
++    while proc.poll() is None:
++        if deadline is not None and time.monotonic() >= deadline:
++            timed_out = True
++            break
++        if deadline is None:
++            wait = 0.5
++        else:
++            wait = max(0.0, min(0.5, deadline - time.monotonic()))
++        _pump(streams, buffers, wait)
++
++    # Kill every remaining group member: on timeout the leader is one of
++    # them; on a normal exit this reaps background children the session
++    # left behind (`npm run dev &`, test servers) so nothing outlives the
++    # run holding its pipes or its credentials.
++    with suppress(ProcessLookupError, PermissionError):
++        os.killpg(proc.pid, signal.SIGKILL)  # pid == pgid (session leader)
++    proc.wait()  # reap the leader
++
++    # Phase 2: bounded drain — whatever the killed tree left in the pipes,
++    # plus EOF now that its writers are dead. A process that escaped the
++    # group (setsid) keeps its write-end open; the grace expiry is what
++    # stops us waiting for it. The raw fds are then simply closed (nothing
++    # of ours is blocked on them) and the output read so far is kept.
++    drain_deadline = time.monotonic() + _DRAIN_GRACE_SEC
++    while any(fd >= 0 for fd in streams.values()):
++        if time.monotonic() >= drain_deadline:
++            break
++        _pump(streams, buffers, max(0.0, drain_deadline - time.monotonic()))
++    # Close the owning file objects exactly once each (single-threaded here,
++    # so nothing can be mid-read on them): raw os.close would race the
++    # buffered objects' own close at GC time and leak unraisable warnings.
++    for stream in (proc.stdout, proc.stderr):
++        with suppress(OSError, ValueError):
++            stream.close()
++    out = buffers["out"].decode(errors="replace")
++    err = buffers["err"].decode(errors="replace")
++    if timed_out:
++        raise subprocess.TimeoutExpired(proc.args, timeout, output=out, stderr=err)
++    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
++
++
++def _pump(streams: dict, buffers: dict, wait: float) -> None:
++    """One bounded select+read round over the open pipes. EOF marks the
++    stream closed by setting its fd entry to -1."""
++    open_fds = [fd for fd in streams.values() if fd >= 0]
++    if not open_fds:
++        return
++    ready, _, _ = select.select(open_fds, [], [], wait)
++    for name, fd in streams.items():
++        if fd < 0 or fd not in ready:
++            continue
++        try:
++            chunk = os.read(fd, 1 << 16)
++        except BlockingIOError:
++            continue
++        if chunk:
++            buffers[name] += chunk
++        else:  # EOF: every writer on this pipe is gone
++            streams[name] = -1
++
++
++def _toolchain_allowread(home: Path, toolchain: "Sequence[Path]") -> set[Path]:
++    """Paths below ``home`` that must stay readable so the session's
++    toolchain can exec:
++
++    * the resolved binary's own directory;
++    * when that directory is a ``bin/``, its sibling ``lib/`` — where an
++      interpreter's stdlib and site-packages live (pyenv's
++      ``versions/3.12/lib``, nvm's ``versions/node/v22/lib``). Never the
++      whole parent: for ``~/.local/bin`` that would re-open all of
++      ``~/.local`` (``~/.local/share`` holds uv's credential store,
++      cursor-agent, Copilot shims);
++    * every symlink on the way to the binary, as the literal link *file*
++      (never its directory). The native Claude Code install is
++      ``~/.local/bin/claude -> ~/.local/share/claude/versions/X``; without
++      the link itself, exec by that path or by PATH lookup is denied
++      (rc=126 / rc=127) even though the target is readable.
++
++    Ancestors are deliberately NOT re-allowed: allowing the chain up to
++    ``$HOME`` would re-open whole subtrees like ``~/.local``.
++    """
++    entries: set[Path] = set()
++
++    def below_home(path: Path) -> bool:
++        return path != home and home in path.parents
++
++    for raw in toolchain:
++        link = Path(raw).expanduser()
++        if not link.is_absolute():
++            continue
++        for _ in range(40):  # same hop limit as the kernel's ELOOP
++            if not link.is_symlink():
++                break
++            if below_home(link):
++                entries.add(link)
++            link = link.parent / os.readlink(link)
++        try:
++            binary = Path(raw).expanduser().resolve()
++        except OSError:
++            continue
++        directory = binary.parent
++        if not below_home(directory):
++            continue
++        entries.add(directory)
++        if directory.name == "bin" and directory.parent != home:
++            entries.add(directory.parent / "lib")
++    return entries
++
++
++def _endpoint_host(endpoint: str) -> str:
++    """Hostname of a URL or bare-host endpoint (``https://api.z.ai/api`` → ``api.z.ai``)."""
++    if "://" in endpoint:
++        return urlsplit(endpoint).hostname or endpoint
++    return endpoint
+diff --git a/package-lock.json b/package-lock.json
+new file mode 100644
+index 0000000..7dc4200
+--- /dev/null
++++ b/package-lock.json
+@@ -0,0 +1,64 @@
++{
++  "name": "software-factory-sandbox",
++  "lockfileVersion": 3,
++  "requires": true,
++  "packages": {
++    "": {
++      "name": "software-factory-sandbox",
++      "devDependencies": {
++        "@anthropic-ai/sandbox-runtime": "0.0.79"
++      }
++    },
++    "node_modules/@anthropic-ai/sandbox-runtime": {
++      "version": "0.0.79",
++      "resolved": "https://registry.npmjs.org/@anthropic-ai/sandbox-runtime/-/sandbox-runtime-0.0.79.tgz",
++      "integrity": "sha512-WjBmS9fbTpnQwQkM9SU+JjhM2CcXo9eWEELktY1100RMvTy/jPhP44yZ3NXhh+GHB350OgPbM3+FubE5WVRtSA==",
++      "dev": true,
++      "dependencies": {
++        "@pondwader/socks5-server": "^1.0.10",
++        "commander": "^12.1.0",
++        "node-forge": "^1.4.0",
++        "zod": "^3.25.0"
++      },
++      "bin": {
++        "srt": "dist/cli.js"
++      },
++      "engines": {
++        "node": ">=22.12.0"
++      }
++    },
++    "node_modules/@pondwader/socks5-server": {
++      "version": "1.0.10",
++      "resolved": "https://registry.npmjs.org/@pondwader/socks5-server/-/socks5-server-1.0.10.tgz",
++      "integrity": "sha512-bQY06wzzR8D2+vVCUoBsr5QS2U6UgPUQRmErNwtsuI6vLcyRKkafjkr3KxbtGFf9aBBIV2mcvlsKD1UYaIV+sg==",
++      "dev": true
++    },
++    "node_modules/commander": {
++      "version": "12.1.0",
++      "resolved": "https://registry.npmjs.org/commander/-/commander-12.1.0.tgz",
++      "integrity": "sha512-Vw8qHK3bZM9y/P10u3Vib8o/DdkvA2OtPtZvD871QKjy74Wj1WSKFILMPRPSdUSx5RFK1arlJzEtA4PkFgnbuA==",
++      "dev": true,
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/node-forge": {
++      "version": "1.4.0",
++      "resolved": "https://registry.npmjs.org/node-forge/-/node-forge-1.4.0.tgz",
++      "integrity": "sha512-LarFH0+6VfriEhqMMcLX2F7SwSXeWwnEAJEsYm5QKWchiVYVvJyV9v7UDvUv+w5HO23ZpQTXDv/GxdDdMyOuoQ==",
++      "dev": true,
++      "engines": {
++        "node": ">= 6.13.0"
++      }
++    },
++    "node_modules/zod": {
++      "version": "3.25.76",
++      "resolved": "https://registry.npmjs.org/zod/-/zod-3.25.76.tgz",
++      "integrity": "sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ==",
++      "dev": true,
++      "funding": {
++        "url": "https://github.com/sponsors/colinhacks"
++      }
++    }
++  }
++}
+diff --git a/package.json b/package.json
+new file mode 100644
+index 0000000..52d49aa
+--- /dev/null
++++ b/package.json
+@@ -0,0 +1,8 @@
++{
++  "name": "software-factory-sandbox",
++  "private": true,
++  "description": "Pins the sandbox runtime (srt) used by factory/sandbox.py. The factory verifies the version at runtime (SRT_PIN) and refuses to run on a mismatch. Install with: npm ci",
++  "devDependencies": {
++    "@anthropic-ai/sandbox-runtime": "0.0.79"
++  }
++}
+diff --git a/tests/test_f05.py b/tests/test_f05.py
+new file mode 100644
+index 0000000..3e59cf1
+--- /dev/null
++++ b/tests/test_f05.py
+@@ -0,0 +1,1218 @@
++"""F-05 acceptance tests — BUILD-ORDER.md, work order F-05.
++
++Contract rule (CLAUDE.md): an acceptance ref ``tests/test_f05.py::test_ac_N``
++means a test function with exactly that name. Every acceptance test *attempts*
++the forbidden action inside a real ``srt`` sandbox — none of them merely
++inspect the generated settings.
++
++No-skip policy (owner decision, 2026-10-16): a broken sandbox stack is a
++failure, never a silent skip. Locally (macOS) ``srt`` comes from this repo's
++pinned ``node_modules``; on CI (Ubuntu) the workflow installs bubblewrap,
++socat and ripgrep, and lifts the AppArmor unprivileged-userns restriction
++before pytest. If any of that breaks, these tests fail loudly.
++"""
++
++import os
++import shlex
++import shutil
++import subprocess
++import sys
++import textwrap
++import time
++from pathlib import Path
++
++import pytest
++
++from factory.runs import RunError, cleanup_run, create_run
++from factory.sandbox import (
++    SRT_PIN,
++    SandboxError,
++    _toolchain_allowread,
++    build_settings,
++    ensure_srt,
++    run_sandboxed,
++    sandbox_env,
++    srt_bin,
++    write_settings,
++)
++
++REPO_ROOT = Path(__file__).resolve().parent.parent
++MODEL_ENDPOINT = "api.z.ai"
++
++
++def _git(repo: Path, *args: str) -> None:
++    subprocess.run(
++        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
++    )
++
++
++def _fixture_repo(tmp_path: Path) -> Path:
++    """A tiny local repo to clone from (the real clone source for runs)."""
++    repo = tmp_path / "source-repo"
++    repo.mkdir()
++    (repo / "README.md").write_text("# fixture\n")
++    _git(repo, "init", "-b", "main")
++    _git(repo, "config", "user.email", "test@factory.local")
++    _git(repo, "config", "user.name", "factory test")
++    _git(repo, "add", "-A")
++    _git(repo, "commit", "-m", "base")
++    return repo
++
++
++def _factory_root(tmp_path: Path) -> Path:
++    root = tmp_path / "factory-root"
++    (root / "holdouts").mkdir(parents=True)
++    (root / "holdouts" / "scenario.md").write_text("holdout scenario — secret")
++    return root
++
++
++def _make_run(tmp_path: Path, **kwargs):
++    """Create a real run (clone + settings) and hand back (run, factory_root, settings)."""
++    root = _factory_root(tmp_path)
++    run = create_run("fixture", _fixture_repo(tmp_path), factory_root=root, **kwargs)
++    settings = build_settings(
++        {"docs_allowlist": ["docs.python.org"], "network_allowlist": ["pypi.org"]},
++        run.root,
++        model_endpoint=MODEL_ENDPOINT,
++        forbidden_env=("JFO_PROBE_PASS",),
++    )
++    write_settings(settings, run.settings_path)
++    return run, root, settings
++
++
++def _child(script: str, args: list[str]) -> list[str]:
++    return [sys.executable, "-c", script, *args]
++
++
++# --- F-05 AC-1: a sandboxed process can't write outside the run dir -------
++
++
++def test_ac_1(tmp_path: Path):
++    run, root, settings = _make_run(tmp_path)
++    outside_run = root / "probe-outside.txt"
++    outside_tmp = Path("/tmp") / f"f05-probe-{os.getpid()}.txt"
++    script = textwrap.dedent(
++        """
++        import sys
++        def attempt(label, fn):
++            try:
++                fn()
++                print(f"{label}:ok", flush=True)
++            except Exception as exc:
++                print(f"{label}:denied {type(exc).__name__}", flush=True)
++        inside, outside_run, outside_tmp = sys.argv[1], sys.argv[2], sys.argv[3]
++        attempt("inside", lambda: open(inside, "w").write("x"))
++        attempt("outside_run", lambda: open(outside_run, "w").write("x"))
++        attempt("outside_tmp", lambda: open(outside_tmp, "w").write("x"))
++        """
++    )
++    proc = run_sandboxed(
++        _child(script, [str(run.root / "inside.txt"), str(outside_run), str(outside_tmp)]),
++        run.root,
++        run.settings_path,
++        timeout=60,
++    )
++    outcomes = dict(line.split(":", 1) for line in proc.stdout.splitlines())
++    assert outcomes["inside"] == "ok", proc.stdout + proc.stderr
++    assert outcomes["outside_run"].startswith("denied"), (
++        "write outside the run dir but inside the factory root succeeded\n"
++        f"{proc.stdout}{proc.stderr}"
++    )
++    assert outcomes["outside_tmp"].startswith("denied"), (
++        f"write to /tmp succeeded\n{proc.stdout}{proc.stderr}"
++    )
++    assert not outside_run.exists() and not outside_tmp.exists()
++
++
++# --- F-05 AC-2: a sandboxed process can't read ~/factory/holdouts ---------
++
++
++def test_ac_2(tmp_path: Path):
++    run, root, settings = _make_run(tmp_path)
++    script = textwrap.dedent(
++        """
++        import sys
++        def attempt(label, fn):
++            try:
++                fn()
++                print(f"{label}:ok", flush=True)
++            except Exception as exc:
++                print(f"{label}:denied {type(exc).__name__}", flush=True)
++        holdout, control = sys.argv[1], sys.argv[2]
++        attempt("holdout", lambda: open(holdout).read())
++        attempt("control", lambda: open(control).read())
++        """
++    )
++    control = run.root / "README.md"
++    proc = run_sandboxed(
++        _child(script, [str(root / "holdouts" / "scenario.md"), str(control)]),
++        run.root,
++        run.settings_path,
++        timeout=60,
++    )
++    outcomes = dict(line.split(":", 1) for line in proc.stdout.splitlines())
++    assert "holdout" in outcomes and "control" in outcomes, (
++        f"child did not report its attempts\n{proc.stdout}{proc.stderr}"
++    )
++    assert outcomes["holdout"].startswith("denied"), (
++        f"holdouts file was readable inside the sandbox\n{proc.stdout}{proc.stderr}"
++    )
++    assert outcomes["control"] == "ok", (
++        "reads inside the run dir are broken too — the denial is too broad\n"
++        f"{proc.stdout}{proc.stderr}"
++    )
++
++
++# --- F-05 AC-3: network allowlist ------------------------------------------
++
++
++def test_ac_3(tmp_path: Path):
++    run, _, settings = _make_run(tmp_path)
++    script = textwrap.dedent(
++        """
++        import subprocess, sys
++
++        def fetch(url):
++            proc = subprocess.run(
++                ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
++                 "--max-time", "20", url],
++                capture_output=True, text=True,
++            )
++            return proc.returncode, (proc.stdout or "").strip(), proc.stderr.strip()
++
++        allowed_code, blocked_code, blocked_err = None, None, None
++        rc, code, err = fetch(sys.argv[1])
++        print(f"allowed rc={rc} code={code} err={err!r}", flush=True)
++        if rc == 0 and code != "000":
++            allowed_code = code
++        rc, code, err = fetch(sys.argv[2])
++        print(f"blocked rc={rc} code={code} err={err!r}", flush=True)
++        blocked_code, blocked_err = code, err
++        print(f"RESULT allowed={allowed_code} blocked_code={blocked_code}", flush=True)
++        """
++    )
++    proc = run_sandboxed(
++        _child(script, [f"https://{MODEL_ENDPOINT}", "https://example.com"]),
++        run.root,
++        run.settings_path,
++        timeout=120,
++    )
++    result = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT")]
++    assert result, f"child produced no verdict\n{proc.stdout}{proc.stderr}"
++    allowed = result[0].split("allowed=")[1].split()[0]
++    blocked = result[0].split("blocked_code=")[1].strip()
++    assert allowed != "None", (
++        "api.z.ai was NOT reachable from inside the sandbox. The allowlist names it, "
++        "so this is either a Z.ai outage (external — retry before debugging) or a "
++        "sandbox/proxy misconfiguration; the blocked-domain control below tells them "
++        f"apart.\n{proc.stdout}{proc.stderr}"
++    )
++    assert blocked == "000", (
++        f"non-allowlisted example.com was reachable (http_code={blocked})\n"
++        f"{proc.stdout}{proc.stderr}"
++    )
++
++
++# --- F-05 AC-4: no GitHub/keychain credentials inside the sandbox ----------
++
++
++def test_ac_4(tmp_path: Path):
++    run, _, settings = _make_run(tmp_path)
++    keychain_derived = "JFO_PROBE_PASS"
++    names = ["GH_TOKEN", "GITHUB_TOKEN", "GH_HOST", keychain_derived]
++    script = textwrap.dedent(
++        """
++        import os, sys
++        for name in sys.argv[1:]:
++            value = os.environ.get(name)
++            print(f"{name}={'<set:' + value + '>' if value is not None else 'absent'}", flush=True)
++        print(f"API_TIMEOUT_MS={os.environ.get('API_TIMEOUT_MS')}", flush=True)
++        """
++    )
++    env = sandbox_env(
++        run.root,
++        extra={
++            "GH_TOKEN": "gh-leak",
++            "GITHUB_TOKEN": "github-leak",
++            "GH_HOST": "github.com",
++            keychain_derived: "keychain-leak",
++            "API_TIMEOUT_MS": "3000000",
++        },
++        forbidden=[keychain_derived],
++    )
++    proc = run_sandboxed(
++        _child(script, names), run.root, run.settings_path, env=env, timeout=60
++    )
++    seen = dict(line.split("=", 1) for line in proc.stdout.splitlines())
++    for name in names:
++        assert seen[name] == "absent", (
++            f"{name} is visible inside the sandbox\n{proc.stdout}{proc.stderr}"
++        )
++    assert seen["API_TIMEOUT_MS"] == "3000000", proc.stdout
++
++    # Defence in depth: even env vars that slip past our scrubbing are denied
++    # by the settings file itself (credentials.envVars), enforced by srt.
++    # This layer is probed by invoking srt directly, because run_sandboxed
++    # always scrubs the env it is handed — the backstop must hold without it.
++    leaky = dict(os.environ)
++    leaky.update({"GH_TOKEN": "gh-leak", keychain_derived: "keychain-leak"})
++    proc = subprocess.run(
++        [
++            str(srt_bin()),
++            "--settings",
++            str(run.settings_path),
++            "-c",
++            shlex.join(_child(script, ["GH_TOKEN", keychain_derived])),
++        ],
++        env=leaky,
++        cwd=str(run.root),  # outside the denied home dir, like run_sandboxed
++        capture_output=True,
++        text=True,
++        timeout=60,
++    )
++    seen = dict(line.split("=", 1) for line in proc.stdout.splitlines())
++    assert seen["GH_TOKEN"] == "absent" and seen[keychain_derived] == "absent", (
++        f"settings-file credential deny did not strip the variables\n{proc.stdout}{proc.stderr}"
++    )
++
++
++# --- srt pinning: check srt --version, refuse on mismatch -------------------
++
++
++def test_ensure_srt_accepts_the_pinned_version():
++    assert ensure_srt() == SRT_PIN
++
++
++def _fake_srt(tmp_path: Path, version: str) -> Path:
++    fake = tmp_path / "fake-srt"
++    fake.write_text(f"#!/bin/sh\necho '{version}'\n")
++    fake.chmod(0o755)
++    return fake
++
++
++def test_ensure_srt_refuses_a_version_mismatch(tmp_path: Path):
++    fake = _fake_srt(tmp_path, "0.0.78")
++    with pytest.raises(SandboxError, match="0.0.78"):
++        ensure_srt(srt_bin_path=fake)
++
++
++def test_ensure_srt_fails_when_srt_is_missing(tmp_path: Path):
++    with pytest.raises(SandboxError, match="srt"):
++        ensure_srt(srt_bin_path=tmp_path / "does-not-exist")
++
++
++def test_missing_srt_is_a_failure_not_a_skip(tmp_path: Path):
++    """A broken install fails loudly; there is no skip path (owner rule).
++    Injection is by parameter — there is no env override to set."""
++    run, _, settings = _make_run(tmp_path)
++    with pytest.raises(SandboxError, match="srt"):
++        run_sandboxed(
++            ["true"],
++            run.root,
++            run.settings_path,
++            srt_bin_path=tmp_path / "missing-srt",
++        )
++    assert not (run.root / "inside.txt").exists()
++
++
++# --- settings generation from the profile -----------------------------------
++
++
++def test_settings_allowlist_is_model_endpoint_plus_profile_lists(tmp_path: Path):
++    run, _, settings = _make_run(tmp_path)
++    net = settings["network"]
++    assert net["allowedDomains"] == [MODEL_ENDPOINT, "docs.python.org", "pypi.org"]
++    assert net["deniedDomains"] == []
++    fs = settings["filesystem"]
++    assert fs["allowWrite"] == [str(run.root)]
++    assert str(run.root / ".git" / "hooks") in fs["denyWrite"]
++    assert str(run.root / ".git" / "config") in fs["denyWrite"]
++    assert str(run.root) in fs["allowRead"]
++
++
++def test_settings_deny_reads_for_holdouts_ssh_gh_and_other_runs(tmp_path: Path):
++    run, root, settings = _make_run(tmp_path)
++    deny = [str(Path(p).expanduser()) for p in settings["filesystem"]["denyRead"]]
++    assert str(root / "holdouts") in deny
++    assert str(Path("~/.ssh").expanduser()) in deny
++    assert str(Path("~/.config/gh").expanduser()) in deny
++    assert str(root / "runs") in deny  # other projects' (and siblings') runs
++
++
++def test_settings_model_endpoint_accepts_a_url(tmp_path: Path):
++    run = create_run("fixture", _fixture_repo(tmp_path), factory_root=_factory_root(tmp_path))
++    settings = build_settings({}, run.root, model_endpoint="https://api.z.ai/api/anthropic")
++    assert settings["network"]["allowedDomains"][0] == "api.z.ai"
++
++
++def test_settings_credential_deny_covers_github_and_keychain_names(tmp_path: Path):
++    run, _, settings = _make_run(tmp_path)
++    denied = {e["name"] for e in settings["credentials"]["envVars"]}
++    assert {"GH_TOKEN", "GITHUB_TOKEN", "JFO_PROBE_PASS"} <= denied
++
++
++# --- clone manager -----------------------------------------------------------
++
++
++def test_create_run_clones_with_blob_none_filter(tmp_path: Path):
++    run, root, _ = _make_run(tmp_path)
++    assert run.root == root / "runs" / "fixture" / run.run_id
++    config = subprocess.run(
++        [
++            "git", "-C", str(run.root), "config", "--get-regexp",
++            r"remote\.origin\.(promisor|partialclonefilter|url)",
++        ],
++        check=True, capture_output=True, text=True,
++    ).stdout
++    assert "remote.origin.promisor true" in config, config
++    assert "remote.origin.partialclonefilter blob:none" in config, config
++    assert (run.root / "README.md").exists()
++
++
++def test_create_run_checkouts_named_ref(tmp_path: Path):
++    source = _fixture_repo(tmp_path)
++    (source / "feature.txt").write_text("feature\n")
++    _git(source, "add", "-A")
++    _git(source, "commit", "-m", "feature")
++    _git(source, "branch", "feature-branch")
++    run = create_run("fixture", source, factory_root=_factory_root(tmp_path), ref="feature-branch")
++    assert (run.root / "feature.txt").exists()
++
++
++def test_create_run_copies_the_warm_cache(tmp_path: Path):
++    cache = tmp_path / "warm-cache"
++    cache.mkdir()
++    (cache / ".venv-marker").write_text("warm")
++    run = create_run(
++        "fixture",
++        _fixture_repo(tmp_path),
++        factory_root=_factory_root(tmp_path),
++        warm_cache=cache,
++    )
++    assert (run.root / ".venv-marker").read_text() == "warm"
++
++
++def test_run_ids_are_unique(tmp_path: Path):
++    root = _factory_root(tmp_path)
++    source = _fixture_repo(tmp_path)
++    first = create_run("fixture", source, factory_root=root)
++    second = create_run("fixture", source, factory_root=root)
++    assert first.run_id != second.run_id
++    assert first.root != second.root
++
++
++def test_create_run_refuses_a_missing_source(tmp_path: Path):
++    with pytest.raises(RunError, match="no-such-repo"):
++        create_run("fixture", tmp_path / "no-such-repo", factory_root=_factory_root(tmp_path))
++
++
++def test_cleanup_run_removes_everything_and_is_idempotent(tmp_path: Path):
++    run, _, _ = _make_run(tmp_path)
++    run.settings_path.parent.mkdir(parents=True, exist_ok=True)
++    run.settings_path.write_text("{}")
++    cleanup_run(run)
++    assert not run.root.exists()
++    assert not run.settings_path.exists()
++    cleanup_run(run)  # second call must not raise
++
++
++def test_scrub_env_strips_github_prefixes_and_forbidden_names():
++    env = sandbox_env(
++        Path("/tmp"),
++        extra={
++            "GH_TOKEN": "x", "GITHUB_TOKEN": "y", "GH_HOST": "z",
++            "GITHUB_REPOSITORY": "r", "ANTHROPIC_AUTH_TOKEN": "keep-me",
++        },
++        forbidden=["SECRET_X"],
++    )
++    assert "GH_TOKEN" not in env and "GITHUB_TOKEN" not in env
++    assert "GH_HOST" not in env and "GITHUB_REPOSITORY" not in env
++    assert env["ANTHROPIC_AUTH_TOKEN"] == "keep-me"
++    assert "PATH" in env and "HOME" in env
++
++
++# --- review round: raw sockets, git-hook escapes, env allowlist, home reads ---
++
++
++def test_direct_socket_to_non_allowlisted_ip_is_blocked(tmp_path: Path):
++    """A process that ignores the proxy env vars and dials a raw IP must be
++    blocked too — proxy filtering alone is not the boundary. 1.1.1.1:443 is
++    a real, stable, non-allowlisted endpoint; the socket API cannot use the
++    proxy, so this exercises the kernel-level network denial."""
++    run, _, settings = _make_run(tmp_path)
++    script = textwrap.dedent(
++        """
++        import socket, sys
++        try:
++            conn = socket.create_connection((sys.argv[1], 443), timeout=10)
++            conn.close()
++            print("direct:CONNECTED", flush=True)
++        except Exception as exc:
++            print(f"direct:BLOCKED {type(exc).__name__}: {exc}", flush=True)
++        """
++    )
++    proc = run_sandboxed(
++        _child(script, ["1.1.1.1"]), run.root, run.settings_path, timeout=60
++    )
++    assert "direct:BLOCKED" in proc.stdout, (
++        f"raw socket to non-allowlisted 1.1.1.1:443 connected — proxy filtering "
++        f"is the only network boundary\n{proc.stdout}{proc.stderr}"
++    )
++
++
++def test_git_hook_and_config_planting_is_denied_in_sandbox(tmp_path: Path):
++    """A sandboxed process must not write .git/hooks or .git/config: hooks
++    planted there execute later, OUTSIDE the sandbox, when the orchestrator
++    commits and pushes with its own credentials."""
++    run, _, settings = _make_run(tmp_path)
++    script = textwrap.dedent(
++        """
++        import sys
++        def attempt(label, fn):
++            try:
++                fn()
++                print(f"{label}:ok", flush=True)
++            except Exception as exc:
++                print(f"{label}:denied {type(exc).__name__}", flush=True)
++        hook, config = sys.argv[1], sys.argv[2]
++        attempt("hook", lambda: open(hook, "w").write("#!/bin/sh\\ntouch /tmp/pwned\\n"))
++        attempt("config", lambda: open(config, "a").write("[core] hooksPath = /tmp\\n"))
++        attempt("commitmsg", lambda: open(sys.argv[3], "w").write("normal write"))
++        """
++    )
++    commitmsg = run.root / ".git" / "COMMIT_EDITMSG"
++    proc = run_sandboxed(
++        _child(script, [str(run.root / ".git/hooks/pre-commit"),
++                        str(run.root / ".git/config"),
++                        str(commitmsg)]),
++        run.root,
++        run.settings_path,
++        timeout=60,
++    )
++    outcomes = dict(line.split(":", 1) for line in proc.stdout.splitlines())
++    assert outcomes["hook"].startswith("denied"), (
++        f".git/hooks write allowed — a planted hook could fire outside the sandbox\n"
++        f"{proc.stdout}{proc.stderr}"
++    )
++    assert outcomes["config"].startswith("denied"), (
++        f".git/config write allowed — core.hooksPath could be redirected\n"
++        f"{proc.stdout}{proc.stderr}"
++    )
++    assert outcomes["commitmsg"] == "ok", (
++        f"normal .git writes are broken too — the denial is too broad\n{proc.stdout}{proc.stderr}"
++    )
++
++
++def test_planted_hook_never_fires_for_orchestrator_git(tmp_path: Path):
++    """Even if a hook somehow gets planted (deny bypass, stale run), the
++    orchestrator's own git commands must never execute it: every git call
++    runs with hooks and fsmonitor disabled. The control proves the detector
++    works by firing the hook with a plain git commit first."""
++    from factory.runs import GIT_HARDENING
++
++    run = create_run("fixture", _fixture_repo(tmp_path), factory_root=_factory_root(tmp_path))
++    # Clones carry no git identity (local config doesn't propagate, and the
++    # runner has no global one) — the orchestrator side sets it explicitly.
++    _git(run.root, "config", "user.email", "orchestrator@factory.local")
++    _git(run.root, "config", "user.name", "factory orchestrator")
++    marker = tmp_path / "hook-ran"
++    hook = run.root / ".git" / "hooks" / "pre-commit"
++    hook.write_text(f"#!/bin/sh\ntouch '{marker}'\n")
++    hook.chmod(0o755)
++
++    (run.root / "one.txt").write_text("1\n")
++    _git(run.root, "add", "-A")
++    _git(run.root, "commit", "-m", "plain git — control")  # plain git DOES fire it
++    assert marker.exists(), "control failed: the planted hook did not fire for plain git"
++    marker.unlink()
++
++    (run.root / "two.txt").write_text("2\n")
++    _git(run.root, "add", "-A")
++    subprocess.run(
++        ["git", "-C", str(run.root), *GIT_HARDENING, "commit", "-m", "hardened"],
++        check=True, capture_output=True, text=True,
++    )
++    assert not marker.exists(), (
++        "the planted hook fired during an orchestrator git command — GIT_HARDENING "
++        "must disable core.hooksPath and core.fsmonitor on every orchestrator-side git call"
++    )
++
++
++def test_provided_env_never_inherits_ambient_variables(tmp_path: Path, monkeypatch):
++    """The allowlist applies on every path: an explicit env= overlay can pass
++    deliberately chosen names, but nothing ambient leaks in from os.environ
++    just because a caller supplied a dict."""
++    run, _, settings = _make_run(tmp_path)
++    monkeypatch.setenv("FACTORY_TEST_AMBIENT_SECRET", "ambient-leak")
++    script = textwrap.dedent(
++        """
++        import os, sys
++        for name in sys.argv[1:]:
++            value = os.environ.get(name)
++            print(f"{name}={value if value is not None else 'absent'}", flush=True)
++        """
++    )
++    proc = run_sandboxed(
++        _child(script, ["FACTORY_TEST_AMBIENT_SECRET", "API_TIMEOUT_MS"]),
++        run.root,
++        run.settings_path,
++        env={"API_TIMEOUT_MS": "3000000"},
++        timeout=60,
++    )
++    seen = dict(line.split("=", 1) for line in proc.stdout.splitlines())
++    assert seen["FACTORY_TEST_AMBIENT_SECRET"] == "absent", (
++        f"ambient os.environ variable crossed the sandbox via the env= path\n"
++        f"{proc.stdout}{proc.stderr}"
++    )
++    assert seen["API_TIMEOUT_MS"] == "3000000", proc.stdout
++
++
++def test_home_reads_are_denied(tmp_path: Path):
++    """~ is denied for reads (the run dir is re-allowed): the WO's "other
++    projects" plus everything else in the owner's home — ~/.aws, shell rc
++    files, other checkouts — is none of a session's business."""
++    probe = Path("~/.factory-sandbox-probe").expanduser()
++    probe.write_text("home secret\n")
++    try:
++        run, _, settings = _make_run(tmp_path)
++        script = textwrap.dedent(
++            """
++            import sys
++            def attempt(label, fn):
++                try:
++                    fn()
++                    print(f"{label}:ok", flush=True)
++                except Exception as exc:
++                    print(f"{label}:denied {type(exc).__name__}", flush=True)
++            attempt("home", lambda: open(sys.argv[1]).read())
++            attempt("control", lambda: open(sys.argv[2]).read())
++            """
++        )
++        proc = run_sandboxed(
++            _child(script, [str(probe), "/etc/hosts"]),
++            run.root,
++            run.settings_path,
++            timeout=60,
++        )
++        outcomes = dict(line.split(":", 1) for line in proc.stdout.splitlines())
++        assert outcomes["home"].startswith("denied"), (
++            f"a file in the owner's home was readable inside the sandbox\n"
++            f"{proc.stdout}{proc.stderr}"
++        )
++        assert outcomes["control"] == "ok", (
++            f"system reads are broken too — the denial is too broad\n{proc.stdout}{proc.stderr}"
++        )
++    finally:
++        probe.unlink(missing_ok=True)
++
++
++def test_settings_deny_git_control_paths_and_home(tmp_path: Path):
++    run, _, settings = _make_run(tmp_path)
++    deny_write = [str(Path(p)) for p in settings["filesystem"]["denyWrite"]]
++    assert str(run.root / ".git" / "hooks") in deny_write
++    assert str(run.root / ".git" / "config") in deny_write
++    deny_read = [str(Path(p).expanduser()) for p in settings["filesystem"]["denyRead"]]
++    assert str(Path("~").expanduser()) in deny_read
++
++
++# --- review round 2: process groups, layout pinning, override gating, ---------- 
++# --- lazy clones, warm-cache hygiene -------------------------------------------
++
++
++def test_timeout_kills_the_whole_process_group(tmp_path: Path):
++    """A wall-clock timeout must kill srt AND the shell/agent processes it
++    spawned, or an aborted session keeps writing and calling the model while
++    the next run starts. srt runs as a session leader, so killpg reaches the
++    grandchildren; the heartbeat proves they died."""
++    run, _, _ = _make_run(tmp_path)
++    heartbeat = run.root / "heartbeat"
++    script = textwrap.dedent(
++        f"""
++        import subprocess, time
++        subprocess.Popen(
++            ["/bin/sh", "-c", "while true; do echo x >> '{heartbeat}'; sleep 0.2; done"]
++        )
++        time.sleep(60)
++        """
++    )
++    with pytest.raises(subprocess.TimeoutExpired):
++        run_sandboxed(_child(script, []), run.root, run.settings_path, timeout=4)
++    time.sleep(1.0)
++    first = heartbeat.stat().st_size
++    time.sleep(1.2)
++    assert heartbeat.stat().st_size == first, (
++        "the heartbeat kept growing after the timeout — sandboxed descendants "
++        "survived the kill and are still running unsupervised"
++    )
++
++
++def test_build_settings_rejects_an_unrecognised_run_layout(tmp_path: Path):
++    """The factory root must not be guessed silently: a run dir outside the
++    canonical runs/<project>/<id> layout has to fail loudly (or get an
++    explicit factory_root), or the holdouts deny would name a wrong path and
++    the real one would stay readable."""
++    odd = tmp_path / "not-runs" / "fixture" / "abc123"
++    odd.mkdir(parents=True)
++    with pytest.raises(SandboxError, match="factory_root"):
++        build_settings({}, odd, model_endpoint=MODEL_ENDPOINT)
++    settings = build_settings(
++        {}, odd, model_endpoint=MODEL_ENDPOINT, factory_root=tmp_path
++    )
++    deny = [str(Path(p).expanduser()) for p in settings["filesystem"]["denyRead"]]
++    assert str(tmp_path / "holdouts") in deny
++
++
++def test_ensure_srt_caches_the_version_check(tmp_path: Path):
++    """The pin check costs a Node boot; it must run once per binary state,
++    not once per sandboxed command. The counting fake proves invocations."""
++    calls = tmp_path / "calls"
++    fake = tmp_path / "counting-srt"
++    fake.write_text(f"#!/bin/sh\necho x >> '{calls}'\necho '{SRT_PIN}'\n")
++    fake.chmod(0o755)
++    ensure_srt(srt_bin_path=fake)
++    ensure_srt(srt_bin_path=fake)
++    ensure_srt(srt_bin_path=fake)
++    assert calls.read_text().count("x") == 1
++
++
++def test_clone_is_actually_partial(tmp_path: Path):
++    """--filter=blob:none must be honoured by the local file:// server (it
++    needs uploadpack.allowFilter), not just recorded in the config: the
++    other branch's file blob must be MISSING from the clone."""
++    source = _fixture_repo(tmp_path)
++    _git(source, "checkout", "-b", "other-branch")
++    (source / "other.txt").write_text("other branch\n")
++    _git(source, "add", "-A")
++    _git(source, "commit", "-m", "other branch")
++    _git(source, "checkout", "main")
++
++    run = create_run("fixture", source, factory_root=_factory_root(tmp_path))
++    listing = subprocess.run(
++        ["git", "-C", str(run.root), "cat-file", "--batch-all-objects", "--batch-check"],
++        check=True, capture_output=True, text=True,
++    ).stdout
++    present = {line.split()[0] for line in listing.splitlines() if line.split()[1] == "blob"}
++
++    def blob_sha(rev: str, path: str) -> str:
++        return subprocess.run(
++            ["git", "-C", str(run.root), "rev-parse", f"{rev}:{path}"],
++            check=True, capture_output=True, text=True,
++        ).stdout.strip()
++
++    assert blob_sha("HEAD", "README.md") in present, "checked-out blob missing?!"
++    assert blob_sha("origin/other-branch", "other.txt") not in present, (
++        "the clone is fully materialised — the blob filter was ignored by the "
++        "local server and every run pays a full clone"
++    )
++
++
++def test_warm_cache_is_relocated_and_excluded_from_commits(tmp_path: Path):
++    """A copied venv carries absolute paths from the cache (shebangs,
++    pyvenv.cfg); they are rewritten to the run dir. Cache entries also go
++    into .git/info/exclude so a session's `git add -A` can't commit them,
++    and .git/info joins the sandbox's denied writes so the agent can't undo
++    the excludes."""
++    cache = tmp_path / "warm-cache"
++    (cache / "node_modules").mkdir(parents=True)
++    (cache / "node_modules" / "lib.js").write_text("module.exports = 1\n")
++    venv_bin = cache / ".venv" / "bin"
++    venv_bin.mkdir(parents=True)
++    (venv_bin / "pip").write_text(f"#!{cache}/.venv/bin/python\n# -*- coding: utf-8 -*-\n")
++    (venv_bin / "activate").write_text(f"VIRTUAL_ENV='{cache}/.venv'\n")
++    (cache / ".venv" / "pyvenv.cfg").write_text(f"home = {cache}/base\n")
++
++    run = create_run(
++        "fixture", _fixture_repo(tmp_path), factory_root=_factory_root(tmp_path),
++        warm_cache=cache,
++    )
++    assert (run.root / ".venv" / "bin" / "pip").read_text().startswith(
++        f"#!{run.root}/.venv/bin/python"
++    ), "shebang still points into the warm cache"
++    activate = (run.root / ".venv" / "bin" / "activate").read_text()
++    assert f"VIRTUAL_ENV='{run.root}/.venv'" in activate
++    exclude = (run.root / ".git" / "info" / "exclude").read_text()
++    assert ".venv/" in exclude and "node_modules/" in exclude, (
++        f"warm-cache entries not excluded: {exclude!r}"
++    )
++
++    settings = build_settings({}, run.root, model_endpoint=MODEL_ENDPOINT)
++    deny_write = [str(Path(p)) for p in settings["filesystem"]["denyWrite"]]
++    assert str(run.root / ".git" / "info") in deny_write
++
++
++def test_sibling_run_reads_are_denied(tmp_path: Path):
++    """Other projects' (and sibling) runs are unreadable — the WO's "other
++    projects" clause, proven by an attempt on a real sibling run."""
++    source = _fixture_repo(tmp_path)
++    root = _factory_root(tmp_path)
++    first = create_run("project-a", source, factory_root=root)
++    second = create_run("project-b", source, factory_root=root)
++    (first.root / "sibling-secret.txt").write_text("other project's data\n")
++    for run in (first, second):
++        write_settings(
++            build_settings({}, run.root, model_endpoint=MODEL_ENDPOINT),
++            run.settings_path,
++        )
++    script = textwrap.dedent(
++        """
++        import sys
++        try:
++            open(sys.argv[1]).read()
++            print("sibling:ok", flush=True)
++        except Exception as exc:
++            print(f"sibling:denied {type(exc).__name__}", flush=True)
++        """
++    )
++    proc = run_sandboxed(
++        _child(script, [str(first.root / "sibling-secret.txt")]),
++        second.root,
++        second.settings_path,
++        timeout=60,
++    )
++    assert proc.stdout.startswith("sibling:denied"), (
++        f"a sibling project's run was readable inside the sandbox\n"
++        f"{proc.stdout}{proc.stderr}"
++    )
++
++
++# --- review round 3: env allowlist for real, toolchain access, HOME scratch, ---
++# --- bounded teardown, anchored excludes, venv edge cases --------------------
++
++
++def test_env_dict_of_os_environ_is_allowlisted(tmp_path: Path, monkeypatch):
++    """The scenario the finding describes: F-06 passes {**os.environ, token}.
++    A planted ambient secret must NOT cross; the deliberate session names
++    must. Nothing about this is satisfied by 'the caller chose the dict' —
++    os.environ IS a dict the caller can pass."""
++    run, _, _ = _make_run(tmp_path)
++    monkeypatch.setenv("FAKE_AWS_SECRET", "leak123")
++    script = textwrap.dedent(
++        """
++        import os, sys
++        for name in sys.argv[1:]:
++            value = os.environ.get(name)
++            print(f"{name}={value if value is not None else 'absent'}", flush=True)
++        """
++    )
++    names = ["FAKE_AWS_SECRET", "AWS_SECRET_ACCESS_KEY", "ANTHROPIC_AUTH_TOKEN",
++             "API_TIMEOUT_MS"]
++    proc = run_sandboxed(
++        _child(script, names),
++        run.root,
++        run.settings_path,
++        env={**os.environ, "ANTHROPIC_AUTH_TOKEN": "zai-token",
++             "API_TIMEOUT_MS": "3000000"},
++        timeout=60,
++    )
++    seen = dict(line.split("=", 1) for line in proc.stdout.splitlines())
++    assert seen["FAKE_AWS_SECRET"] == "absent", (
++        f"ambient secret crossed via env=dict(os.environ)\n{proc.stdout}{proc.stderr}"
++    )
++    assert seen["AWS_SECRET_ACCESS_KEY"] == "absent", proc.stdout
++    assert seen["ANTHROPIC_AUTH_TOKEN"] == "zai-token", proc.stdout
++    assert seen["API_TIMEOUT_MS"] == "3000000", proc.stdout
++
++
++def test_toolchain_under_home_is_executable(tmp_path: Path):
++    """F-06 runs the Claude Code CLI, which may live under $HOME
++    (~/.local/bin/claude, pyenv, uv, nvm). The home-wide denyRead must not
++    make the session's own toolchain unexecutable: build_settings re-allows
++    the resolved toolchain paths (binary dir, its sibling lib/ when the
++    dir is a bin/, and the literal symlinks on the way — never ancestors)."""
++    home = Path.home()
++    tool_root = home / ".factory-sandbox-toolchain-test"
++    tool_bin = tool_root / "bin"
++    tool_bin.mkdir(parents=True, exist_ok=True)
++    try:
++        claude = tool_bin / "claude"
++        claude.write_text("#!/bin/sh\necho 'claude 2.0.0 (toolchain ok)'\n")
++        claude.chmod(0o755)
++        run, _, _ = _make_run(tmp_path)
++        settings = build_settings(
++            {}, run.root, model_endpoint=MODEL_ENDPOINT, toolchain=[claude]
++        )
++        write_settings(settings, run.settings_path)
++        proc = run_sandboxed(
++            [str(claude), "--version"], run.root, run.settings_path, timeout=60
++        )
++        assert "toolchain ok" in proc.stdout, (
++            f"toolchain binary under $HOME could not run: rc={proc.returncode}\n"
++            f"{proc.stdout}{proc.stderr}"
++        )
++    finally:
++        shutil.rmtree(tool_root, ignore_errors=True)
++
++
++def test_home_is_a_writable_scratch_inside_the_run(tmp_path: Path):
++    """HOME points at <run>/.home, not the (now unreadable) real home: pip,
++    npm, git and Claude Code all want a HOME they can read and write."""
++    run, _, _ = _make_run(tmp_path)
++    script = textwrap.dedent(
++        """
++        import os, pathlib
++        home = pathlib.Path(os.environ["HOME"])
++        print(f"HOME={home}", flush=True)
++        (home / ".cache").mkdir(parents=True, exist_ok=True)
++        (home / ".cache" / "probe").write_text("ok")
++        print(f"cache=ok", flush=True)
++        """
++    )
++    proc = run_sandboxed(
++        _child(script, []), run.root, run.settings_path, timeout=60
++    )
++    assert proc.stdout.splitlines()[0] == f"HOME={run.root / '.home'}", (
++        f"HOME is not the run scratch dir\n{proc.stdout}{proc.stderr}"
++    )
++    assert "cache=ok" in proc.stdout, proc.stdout
++
++
++def test_background_child_does_not_stall_the_return(tmp_path: Path):
++    """A session that leaves `npm run dev &` behind must not hold the
++    orchestrator: once the leader exits, the group is killed and the return
++    is bounded even though the background child inherited the pipes."""
++    run, _, _ = _make_run(tmp_path)
++    script = textwrap.dedent(
++        """
++        import subprocess, sys
++        subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
++        print("leader done", flush=True)
++        """
++    )
++    started = time.monotonic()
++    proc = run_sandboxed(_child(script, []), run.root, run.settings_path, timeout=60)
++    elapsed = time.monotonic() - started
++    assert "leader done" in proc.stdout
++    assert elapsed < 25, (
++        f"run_sandboxed took {elapsed:.1f}s to return after the leader exited — "
++        "a background child is holding the pipes"
++    )
++
++
++def test_timeout_stays_bounded_against_a_detached_process(tmp_path: Path):
++    """A process that escapes the process group (setsid) survives killpg and
++    holds the pipes. The timeout must still return in bounded time (drain
++    grace + forced pipe close), not wait for the escapee."""
++    run, _, _ = _make_run(tmp_path)
++    script = textwrap.dedent(
++        """
++        import subprocess, sys, time
++        subprocess.Popen(
++            [sys.executable, "-c", "import time; time.sleep(60)"],
++            start_new_session=True,
++        )
++        time.sleep(60)
++        """
++    )
++    started = time.monotonic()
++    with pytest.raises(subprocess.TimeoutExpired):
++        run_sandboxed(_child(script, []), run.root, run.settings_path, timeout=3)
++    elapsed = time.monotonic() - started
++    assert elapsed < 25, (
++        f"TimeoutExpired took {elapsed:.1f}s to propagate — a detached child "
++        "held the pipes past the drain grace"
++    )
++
++
++def test_srt_bin_ignores_env_overrides_entirely(monkeypatch):
++    """No env var can redirect the sandbox binary in production: the override
++    mechanism is gone; tests inject via the srt_bin_path parameter."""
++    from factory.sandbox import srt_bin as srt_bin_fn
++
++    monkeypatch.setenv("FACTORY_SRT_BIN", "/tmp/definitely-not-srt")
++    assert srt_bin_fn() == REPO_ROOT / "node_modules" / ".bin" / "srt"
++
++
++def test_run_sandboxed_takes_an_injected_srt_binary(tmp_path: Path):
++    """The parameter is the only injection path (and still pin-checked)."""
++    run, _, _ = _make_run(tmp_path)
++    fake = _fake_srt(tmp_path, "0.0.78")
++    with pytest.raises(SandboxError, match="0.0.78"):
++        run_sandboxed(
++            ["true"], run.root, run.settings_path, srt_bin_path=fake
++        )
++    assert not (run.root / "true-ran").exists()
++
++
++def test_cache_excludes_are_anchored_to_the_run_root(tmp_path: Path):
++    """A cache entry named `lib` must not ignore src/lib anywhere in the
++    repo — unanchored excludes would hide agent-written files from
++    `git add -A` and ship an incomplete PR."""
++    cache = tmp_path / "warm-cache"
++    (cache / "lib").mkdir(parents=True)
++    (cache / "lib" / "cached.so").write_text("cache")
++    run = create_run(
++        "fixture", _fixture_repo(tmp_path), factory_root=_factory_root(tmp_path),
++        warm_cache=cache,
++    )
++    nested = run.root / "src" / "lib" / "new_module.py"
++    nested.parent.mkdir(parents=True)
++    nested.write_text("agent code\n")
++    ignored = subprocess.run(
++        ["git", "-C", str(run.root), "check-ignore", "-q", "src/lib/new_module.py"],
++        capture_output=True,
++    )
++    assert ignored.returncode == 1, (
++        "src/lib/new_module.py is ignored by an unanchored cache exclude"
++    )
++    root_ignored = subprocess.run(
++        ["git", "-C", str(run.root), "check-ignore", "-q", "lib/cached.so"],
++        capture_output=True,
++    )
++    assert root_ignored.returncode == 0, "the cache's own lib/ is not excluded"
++
++
++def test_venv_relocation_handles_symlinked_cache_paths(tmp_path: Path):
++    """A cache reached via a symlink embeds the *given* path in shebangs
++    (/tmp vs /private/tmp on macOS); rewriting only the resolved path is a
++    silent no-op. Both forms must be rewritten."""
++    real = tmp_path / "real-cache"
++    venv_bin = real / ".venv" / "bin"
++    venv_bin.mkdir(parents=True)
++    (venv_bin / "pip").write_text("")  # filled below with the linked path
++    (real / ".venv" / "pyvenv.cfg").write_text("")
++
++    link = tmp_path / "linked-cache"
++    os.symlink(real, link)
++    (venv_bin / "pip").write_text(f"#!{link}/.venv/bin/python\n")
++
++    run = create_run(
++        "fixture", _fixture_repo(tmp_path), factory_root=_factory_root(tmp_path),
++        warm_cache=link,
++    )
++    assert (run.root / ".venv" / "bin" / "pip").read_text().startswith(
++        f"#!{run.root}/.venv/bin/python"
++    ), "shebang written through the symlinked path was not relocated"
++
++
++def test_warm_cache_refuses_tracked_file_collisions(tmp_path: Path):
++    """A cache entry that would overwrite a tracked file (package-lock.json,
++    requirements.txt) must refuse, not silently mutate the checkout the
++    agent is supposed to diff against."""
++    cache = tmp_path / "warm-cache"
++    cache.mkdir()
++    (cache / "README.md").write_text("cache content, not the repo's\n")
++    with pytest.raises(RunError, match="README.md"):
++        create_run(
++            "fixture", _fixture_repo(tmp_path), factory_root=_factory_root(tmp_path),
++            warm_cache=cache,
++        )
++
++
++# --- review round 4: pipe pumping, ambient seats, toolchain scope, excludes ---
++
++
++def test_large_output_does_not_deadlock(tmp_path: Path):
++    """proc.wait() with PIPEd stdout deadlocks once the child writes past the
++    pipe buffer (~64KB): nothing drains the pipes while the leader runs. A
++    300KB write must finish fast, not eat the whole wall clock."""
++    run, _, _ = _make_run(tmp_path)
++    script = "import sys\nsys.stdout.write('x' * 300000)\nprint()"
++    started = time.monotonic()
++    proc = run_sandboxed(
++        [sys.executable, "-c", script], run.root, run.settings_path, timeout=20
++    )
++    elapsed = time.monotonic() - started
++    assert len(proc.stdout.strip()) == 300000, (
++        f"output truncated or lost: {len(proc.stdout)} bytes\n{proc.stderr[-300:]}"
++    )
++    assert elapsed < 10, (
++        f"took {elapsed:.1f}s for a sub-second command — pipe deadlock"
++    )
++
++
++def test_ambient_seat_and_git_config_names_do_not_cross(tmp_path: Path, monkeypatch):
++    """The orchestrator's own ANTHROPIC_* keys and any GIT_CONFIG_* must not
++    enter a session by ambient inheritance (a real Anthropic key reaching a
++    Z.ai seat; exec-capable git config riding in). Seat names are taken ONLY
++    from the explicit env=; GIT_CONFIG_* is not taken at all."""
++    run, _, _ = _make_run(tmp_path)
++    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-real-key")
++    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "ambient-override-token")
++    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://evil.example")
++    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
++    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.sshCommand")
++    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "sh -c 'curl https://evil'")
++    # ANTHROPIC_AUTH_TOKEN itself is asserted positively below: the explicit
++    # env= is its only source and must win over the ambient monkeypatched one.
++    names = [
++        "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL",
++        "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0",
++    ]
++    script = textwrap.dedent(
++        """
++        import os, sys
++        for name in sys.argv[1:]:
++            value = os.environ.get(name)
++            print(f"{name}={value if value is not None else 'absent'}", flush=True)
++        """
++    )
++    proc = run_sandboxed(
++        _child(script, names + ["PATH", "ANTHROPIC_AUTH_TOKEN"]),
++        run.root,
++        run.settings_path,
++        env={"ANTHROPIC_AUTH_TOKEN": "deliberate"},
++        timeout=60,
++    )
++    seen = dict(line.split("=", 1) for line in proc.stdout.splitlines())
++    for name in names:
++        assert seen[name] == "absent", (
++            f"ambient {name} crossed into the session\n{proc.stdout}{proc.stderr}"
++        )
++    assert seen["PATH"], "PATH must still be inherited"
++    assert seen["ANTHROPIC_AUTH_TOKEN"] == "deliberate", (
++        "the explicit env= is the only source for seat names, and it must "
++        "win over the ambient value"
++    )
++
++
++def test_toolchain_allowread_is_install_dir_only():
++    """Only the resolved install dir is re-allowed (plus the sibling lib/
++    when the binary sits in a bin/), never the ancestors: re-allowing the
++    chain re-opens ~/.local and ~/.local/share — uv's credential store,
++    cursor-agent, Copilot shims and friends live there."""
++    home = Path.home()
++    base = home / ".factory-sandbox-tc-r4"
++    claude = base / "share" / "claude" / "versions" / "X" / "claude"
++    assert _toolchain_allowread(home, [claude]) == {
++        base / "share" / "claude" / "versions" / "X"
++    }
++    python = base / "pyenv" / "versions" / "3.12" / "bin" / "python"
++    assert _toolchain_allowread(home, [python]) == {
++        base / "pyenv" / "versions" / "3.12" / "bin",
++        base / "pyenv" / "versions" / "3.12" / "lib",  # stdlib + site-packages
++    }
++
++
++def test_toolchain_bin_dir_under_home_still_executes(tmp_path: Path):
++    """The narrowed toolchain reads must still let a binary under $HOME run:
++    the round-3 exec fix has to survive its own scope reduction."""
++    home = Path.home()
++    tool_root = home / ".factory-sandbox-toolchain-r4"
++    tool_bin = tool_root / "bin"
++    tool_bin.mkdir(parents=True, exist_ok=True)
++    try:
++        probe = tool_bin / "probe"
++        probe.write_text("#!/bin/sh\necho 'r4 toolchain ok'\n")
++        probe.chmod(0o755)
++        run, _, _ = _make_run(tmp_path)
++        settings = build_settings({}, run.root, model_endpoint=MODEL_ENDPOINT,
++                                  toolchain=[probe])
++        write_settings(settings, run.settings_path)
++        proc = run_sandboxed([str(probe)], run.root, run.settings_path, timeout=60)
++        assert "r4 toolchain ok" in proc.stdout, (
++            f"rc={proc.returncode}\n{proc.stdout}{proc.stderr}"
++        )
++    finally:
++        shutil.rmtree(tool_root, ignore_errors=True)
++
++
++def test_home_and_tmp_scratch_are_git_excluded(tmp_path: Path):
++    """<run>/.home and <run>/.tmp are scratch: pip/npm caches and Claude Code
++    session state land there, and none of it may show up as untracked (an
++    agent's `git add -A` would commit caches and transcripts into the PR)."""
++    run, _, _ = _make_run(tmp_path)
++    script = textwrap.dedent(
++        """
++        import os, pathlib
++        home = pathlib.Path(os.environ["HOME"])
++        (home / ".cache" / "pip").mkdir(parents=True, exist_ok=True)
++        (home / ".cache" / "pip" / "x").write_text("cache")
++        pathlib.Path(os.environ["TMPDIR"], "scratch").write_text("tmp")
++        print("written", flush=True)
++        """
++    )
++    proc = run_sandboxed(
++        _child(script, []), run.root, run.settings_path, timeout=60
++    )
++    assert "written" in proc.stdout, proc.stdout + proc.stderr
++    status = subprocess.run(
++        ["git", "-C", str(run.root), "status", "--porcelain"],
++        check=True, capture_output=True, text=True,
++    ).stdout
++    assert status == "", f"scratch files appear as untracked:\n{status}"
++
++
++def test_timeout_preserves_partial_output(tmp_path: Path):
++    """When a detached pipe-holder forces the pipes closed, whatever the
++    leader already wrote must survive — not be discarded."""
++    run, _, _ = _make_run(tmp_path)
++    script = textwrap.dedent(
++        """
++        import subprocess, sys, time
++        print("BEFORE-DETACH-MARKER", flush=True)
++        subprocess.Popen(
++            [sys.executable, "-c", "import time; time.sleep(60)"],
++            start_new_session=True,
++        )
++        time.sleep(60)
++        """
++    )
++    with pytest.raises(subprocess.TimeoutExpired) as excinfo:
++        run_sandboxed(_child(script, []), run.root, run.settings_path, timeout=3)
++    output = excinfo.value.output or ""
++    assert "BEFORE-DETACH-MARKER" in output, (
++        f"partial output discarded on force-close: {output!r}"
++    )
++
++
++# --- review round 5 ----------------------------------------------------------
++
++
++def test_toolchain_symlink_under_home_executes(tmp_path: Path):
++    """The native Claude Code install is a symlink under $HOME
++    (~/.local/bin/claude -> ~/.local/share/claude/versions/X). Exec through
++    the link — directly and via a PATH lookup — must work, not just through
++    the resolved path: F-06 finds the CLI by name."""
++    home = Path.home()
++    base = home / ".factory-sandbox-tc-r5"
++    link_dir = base / "bin"
++    real_dir = base / "share" / "tool" / "versions" / "1.0"
++    real_dir.mkdir(parents=True, exist_ok=True)
++    link_dir.mkdir(parents=True, exist_ok=True)
++    try:
++        real = real_dir / "r5tool"
++        real.write_text("#!/bin/sh\necho 'r5 symlink ok'\n")
++        real.chmod(0o755)
++        link = link_dir / "r5tool"
++        link.symlink_to(Path("..") / "share" / "tool" / "versions" / "1.0" / "r5tool")
++        run, _, _ = _make_run(tmp_path)
++        settings = build_settings({}, run.root, model_endpoint=MODEL_ENDPOINT,
++                                  toolchain=[link])
++        write_settings(settings, run.settings_path)
++        via_link = run_sandboxed([str(link)], run.root, run.settings_path, timeout=60)
++        assert "r5 symlink ok" in via_link.stdout, (
++            f"exec via the symlink failed: rc={via_link.returncode}\n"
++            f"{via_link.stdout}{via_link.stderr}"
++        )
++        via_path = run_sandboxed(
++            ["r5tool"], run.root, run.settings_path, timeout=60,
++            env={"PATH": f"{link_dir}{os.pathsep}{os.environ['PATH']}"},
++        )
++        assert "r5 symlink ok" in via_path.stdout, (
++            f"PATH lookup of the symlinked tool failed: rc={via_path.returncode}\n"
++            f"{via_path.stdout}{via_path.stderr}"
++        )
++        # Only the link file itself is re-allowed, never its directory.
++        allow = settings["filesystem"]["allowRead"]
++        assert str(link) in allow and str(link_dir) not in allow
++    finally:
++        shutil.rmtree(base, ignore_errors=True)
++
++
++def test_bin_dir_parent_never_reopens_a_shared_prefix():
++    """A binary living in ~/.local/bin must not re-allow all of ~/.local
++    (uv credentials, cursor-agent, ... under ~/.local/share). For a bin/ dir
++    only its sibling lib/ (where an interpreter's stdlib and site-packages
++    live) joins the reads, never the whole parent."""
++    home = Path.home()
++    reads = _toolchain_allowread(home, [home / ".local" / "bin" / "sometool"])
++    assert home / ".local" not in reads, reads
++    assert reads == {home / ".local" / "bin", home / ".local" / "lib"}
++
++
++def test_run_sandboxed_docstring_matches_the_select_pump():
++    """The teardown is a single-threaded select loop; the docstring must not
++    describe the abandoned reader-thread design."""
++    doc = run_sandboxed.__doc__ or ""
++    assert "reader thread" not in doc.lower(), "docstring still describes reader threads"
++    assert "select" in doc

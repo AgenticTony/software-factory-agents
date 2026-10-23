@@ -1,0 +1,329 @@
+diff --git a/.factory/BOOTSTRAP.md b/.factory/BOOTSTRAP.md
+index 5dd3e09..dc95582 100644
+--- a/.factory/BOOTSTRAP.md
++++ b/.factory/BOOTSTRAP.md
+@@ -360,3 +360,12 @@ Entries record evidence, not claims. Each criterion is marked proven, pending, o
+ - **(2) Push-fence and PR-body refusals were retried until the budget ran out** (owner-reproduced: 6 seat sessions over 3 runs): `PushRefused` and `PRBodyError` before the push now escalate at once with the new `publish_refused` reason (`needs_human`), and `loop` now stops on an `error` outcome. A persistent orchestrator error spends one attempt per `loop` invocation and still ends in `attempts_exhausted`. Tests: `test_review6_push_fence_refusal_escalates_immediately`, `test_review6_pr_body_refusal_escalates_immediately`, `test_review6_loop_stops_on_an_orchestrator_error`. Two earlier tests changed to the new semantics: AC-7's orchestrator half (a missing section is now `publish_refused` → `needs_human`; still no PR, nothing pushed), and the round-1 bounded-loop test (four `loop` calls stop `error`, `error`, `error`, `escalation`).
+ - **(3) The new escalation reasons weren't swept into TASK-CONTRACT.md** (conventions, owner's global CLAUDE.md "sweep every surface"): line 79 now lists `pr_create_failed`, `orchestrator_error` and `publish_refused`, each with the owner action. The rule is a test, `test_review7_task_contract_lists_every_escalation_reason`, so the schema and the doc can't drift again.
+ - **Evidence (after review round 2):** 5 new review tests, all red against `fc7f3fc` for the reported reasons; 44 F-10 tests / 354 total passing locally, ruff clean.
++
++### Rehearsal fixes (JobFinderOS readiness run, 2026-10-18; F-05, F-08, F-10)
++
++A readiness run of the factory's own gates on a clean clone of JobFinderOS (`origin/main` `9daedd1`, every command inside srt) found three factory bugs that the fixture repos couldn't show. Each is fixed with a test that was red first.
++
++- **(1) L1 deleted what setup installed (F-08):** the between-phase `git clean -fdx` removed `backend/.venv` and `frontend/node_modules`, so every contract ref failed with exit 127 in both phases and a healthy test read as `test_not_green`. A new optional profile key `paths.setup_outputs` names those directories, and `_clean` keeps them (each excluded as an anchored path) while still wiping everything else, `__pycache__` included (the F-08 bytecode test still passes). `tests/test_f08.py::test_rehearsal_clean_keeps_declared_setup_outputs`. On JobFinderOS, with `setup_outputs: [backend/.venv, frontend/node_modules]`, the L1 demo ref ran in both phases ("1 passed" each) instead of exit 127.
++- **(2) Sandboxed commands inherited home dirs on PATH (F-05):** the ambient PATH starts with `~/.local/bin`, `~/.pyenv/shims` and so on, which the sandbox denies reading. npm's lifecycle spawn hit a denied dir first and died with `spawn EPERM`. `sandbox_env` now drops inherited PATH entries under the home dir (either spelling) and literal `~` entries, keeping order; an explicit caller PATH is left as given. `tests/test_f05.py::test_rehearsal_ambient_path_drops_home_entries` and `::test_rehearsal_sandboxed_child_sees_no_home_path_entries`. On JobFinderOS, `setup` (pip + `npm install`) passed inside the sandbox with no workaround.
++- **(3) The run built on the local checkout's stale `main` (F-10):** the work clone came from the local repo at `default_branch`, which was a week behind GitHub (`b0e2417` against `9daedd1`). `_build_on_remote_default` now fetches the remote's default branch with hardened git and detaches there before branching; if the fetch fails the run refuses with `RunError` before any session. `tests/test_f10.py::test_rehearsal_run_builds_on_the_remote_default_branch` and `::test_rehearsal_run_refuses_when_the_remote_is_unreachable`.
++- **Evidence:** 5 new tests, all red against `75e8b6d` for the reported reasons; 359 total passing locally, ruff clean. The JobFinderOS readiness run against the fixed code: L0 `pass` in 139s (setup, lint, typecheck, 738 backend tests, dev_lock, flow, frontend_unit, migration_single_head), no escalations, no simulated workarounds.
+diff --git a/factory/l1.py b/factory/l1.py
+index c3cb460..1e94206 100644
+--- a/factory/l1.py
++++ b/factory/l1.py
+@@ -208,14 +208,31 @@ def _merge_base(repo: Path, base_ref: str, head_ref: str) -> str:
+     return out
+ 
+ 
+-def _clean(repo: Path) -> None:
++def _clean(repo: Path, keep: tuple[str, ...] = ()) -> None:
+     """Drop untracked files (bytecode, caches) the phases leave behind.
+ 
+     A red-phase ``__pycache__`` can survive into green when source size
+     and mtime second are unchanged, and Python would then import base's
+     bytecode. Only safe on the documented clean-clone checkout.
++
++    ``keep`` names the profile's ``paths.setup_outputs`` (an installed
++    venv, ``node_modules``): without them every ref fails with "command
++    not found" in both phases, and a healthy test reads as red-and-not-
++    green. Each is excluded as an anchored path, so only that directory
++    survives; its contents came from setup, not from either phase.
+     """
+-    git(repo, "clean", "-fdx")
++    excludes = [arg for path in keep for arg in ("-e", "/" + path.strip("/"))]
++    git(repo, "clean", "-fdx", *excludes)
++
++
++def _setup_outputs(profile: dict) -> tuple[str, ...]:
++    """The profile's declared setup outputs, validated as plain repo paths."""
++    outputs = (profile.get("paths") or {}).get("setup_outputs") or []
++    for path in outputs:
++        parts = Path(path).parts
++        if not path or Path(path).is_absolute() or ".." in parts or path.startswith("~"):
++            raise GateError(f"paths.setup_outputs entry {path!r} must be a repo-relative path")
++    return tuple(outputs)
+ 
+ 
+ def _file_on_ref(repo: Path, ref: str, path: str) -> bool:
+@@ -291,6 +308,7 @@ def run_l1(
+     repo = Path(repo)
+     task = task or {}
+     runner = runner or run_command
++    keep = _setup_outputs(profile)
+     template = (profile.get("commands") or {}).get("test_ref") or DEFAULT_TEST_REF
+ 
+     refs = contract_test_refs(task)
+@@ -298,7 +316,7 @@ def run_l1(
+     results: list[CommandResult] = []
+ 
+     git(repo, "checkout", "--force", head_ref)
+-    _clean(repo)
++    _clean(repo, keep)
+     base = _merge_base(repo, base_ref, head_ref)
+     ref_files = contract_test_files(task)
+     test_changes = [
+@@ -352,7 +370,7 @@ def run_l1(
+                 )
+ 
+         git(repo, "checkout", "--force", head_ref)
+-        _clean(repo)
++        _clean(repo, keep)
+         for ref in provable:
+             result = runner(f"green:{ref}", _ref_command(template, ref), repo, timeout_sec)
+             results.append(result)
+@@ -383,7 +401,7 @@ def run_l1(
+         # restore failure never masks the gate's own error.
+         with contextlib.suppress(GateError):
+             git(repo, "checkout", "--force", head_ref)
+-            _clean(repo)
++            _clean(repo, keep)
+ 
+     findings.sort(key=lambda f: (f.id, f.file or "", f.text))
+     return L1Report(
+diff --git a/factory/orchestrator.py b/factory/orchestrator.py
+index 0c8c4fb..6141d0e 100644
+--- a/factory/orchestrator.py
++++ b/factory/orchestrator.py
+@@ -74,6 +74,7 @@
+     FACTORY_ROOT_DEFAULT,
+     GIT_HARDENING,
+     RunDir,
++    RunError,
+     cleanup_run,
+     create_run,
+ )
+@@ -518,6 +519,34 @@ def _finish_unrecorded_publish(
+     return RunResult("pr_opened", task_id, pr=url)
+ 
+ 
++def _build_on_remote_default(work: RunDir, remote: str, default_branch: str) -> None:
++    """Point the work clone at the remote's default branch before anything runs.
++
++    The clone comes from the local checkout, whose ``main`` can be days
++    behind the remote (JobFinderOS readiness run, 2026-10-18: local
++    ``b0e2417`` against remote ``9daedd1``). Building on it would give the
++    agent stale code and the PR a wrong base. So the run fetches the
++    remote's default branch with hardened git and detaches there. If the
++    remote can't be fetched, the run refuses: an unknown base is worse
++    than no run.
++
++    Raises:
++        RunError: The fetch failed. Raised before any session starts.
++    """
++    proc = subprocess.run(
++        ["git", *GIT_HARDENING, "-C", str(work.root), "fetch", "--quiet",
++         "--no-tags", "--filter=blob:none", remote, default_branch],
++        capture_output=True,
++        text=True,
++    )
++    if proc.returncode != 0:
++        raise RunError(
++            f"cannot fetch {default_branch!r} from {remote}: {proc.stderr.strip()[:500]}. "
++            "The run refuses to build on a possibly stale local checkout."
++        )
++    hardened_git(work.root, "checkout", "-q", "--detach", "FETCH_HEAD")
++
++
+ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
+     profile, queue, task_id = ctx.profile, ctx.queue, ctx.task_id
+     project = profile["name"]
+@@ -541,6 +570,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
+ 
+     work = create_run(project, source, factory_root=ctx.factory_root, ref=default_branch)
+     try:
++        _build_on_remote_default(work, repo_cfg["remote"], default_branch)
+         branch = _branch_name(task_id, work.run_id)
+         created = frozenset({branch})
+         hardened_git(work.root, "checkout", "-q", "-b", branch)
+diff --git a/factory/sandbox.py b/factory/sandbox.py
+index 8bea721..b465ef5 100644
+--- a/factory/sandbox.py
++++ b/factory/sandbox.py
+@@ -229,6 +229,8 @@ def sandbox_env(
+         for key, value in os.environ.items()
+         if key in AMBIENT_ENV_ALLOWLIST or key.startswith(AMBIENT_ENV_PREFIXES)
+     }
++    if "PATH" in env:
++        env["PATH"] = _path_outside_home(env["PATH"])
+     if extra:
+         for key, value in extra.items():
+             if key in SESSION_ENV_ALLOWLIST or key.startswith(SESSION_ENV_PREFIXES):
+@@ -238,6 +240,31 @@ def sandbox_env(
+     return scrub_env(env, forbidden)
+ 
+ 
++def _path_outside_home(path: str) -> str:
++    """The inherited PATH minus every entry under the owner's home.
++
++    The sandbox denies reads under ``$HOME``, but an interactive PATH
++    starts with home dirs (``~/.local/bin``, ``~/.pyenv/shims``, ...). A
++    search that probes a denied dir first can fail outright with EPERM
++    instead of moving on: npm's lifecycle-script spawn died this way in
++    the JobFinderOS readiness run (2026-10-18). Entries under home (by
++    either spelling of it) and literal ``~`` entries are dropped; order is
++    kept. A caller's explicit ``env={"PATH": ...}`` is left as given:
++    it's a deliberate choice, e.g. a symlinked toolchain re-allowed by
++    ``build_settings``.
++    """
++    homes = {str(Path.home())}
++    with suppress(OSError):
++        homes.add(str(Path.home().resolve()))
++
++    def under_home(entry: str) -> bool:
++        return entry.startswith("~") or any(
++            entry == home or entry.startswith(home.rstrip("/") + "/") for home in homes
++        )
++
++    return ":".join(entry for entry in path.split(":") if entry and not under_home(entry))
++
++
+ def default_toolchain(extra: "Sequence[Path] | None" = None) -> list[Path]:
+     """The binaries :func:`build_settings` re-allows for reading by default:
+     this interpreter, the real interpreters behind ``python3``/``python``,
+diff --git a/schema/project.schema.json b/schema/project.schema.json
+index 544b9a7..eb4bff1 100644
+--- a/schema/project.schema.json
++++ b/schema/project.schema.json
+@@ -45,7 +45,8 @@
+           "propertyNames": { "enum": ["auth", "payments", "rls", "migration", "safety", "privacy", "new_dependency", "deploy", "cross_repo", "external_service", "factory_control"] },
+           "additionalProperties": { "type": "array", "items": { "type": "string" } }
+         },
+-        "protected": { "type": "array", "items": { "type": "string" } }
++        "protected": { "type": "array", "items": { "type": "string" } },
++        "setup_outputs": { "type": "array", "items": { "type": "string" }, "description": "Repo-relative directories the setup command creates (a venv, node_modules). L1 keeps them through its between-phase git clean, so the red and green runs have the installed tools; everything else untracked is still removed." }
+       }
+     },
+     "dependency_manifests": { "type": "array", "items": { "type": "string" } },
+diff --git a/tests/test_f05.py b/tests/test_f05.py
+index 83e54e6..8cdda5a 100644
+--- a/tests/test_f05.py
++++ b/tests/test_f05.py
+@@ -1298,3 +1298,34 @@ def test_python_toolchain_follows_shims_to_the_real_interpreter(tmp_path: Path,
+     found = _python_toolchain()
+     assert Path(os.path.realpath(sys.executable)) in found, found
+     assert shim not in found, "the shim script itself must not stand in for python"
++
++
++# --- rehearsal blocker (JobFinderOS readiness, 2026-10-18) --------------------
++
++
++def test_rehearsal_ambient_path_drops_home_entries(tmp_path, monkeypatch):
++    """The sandbox denies reads under $HOME, but the ambient PATH starts
++    with home dirs (~/.local/bin, ~/.pyenv/shims, ...). A PATH search that
++    probes a denied dir first fails with EPERM (npm's lifecycle spawn died
++    this way). Inherited PATH entries under home, or literal `~`, are
++    dropped; the rest keep their order."""
++    home = str(Path.home())
++    monkeypatch.setenv(
++        "PATH", f"{home}/.local/bin:~/.npm-global/bin:/usr/local/bin:{home}/bin:/usr/bin:/bin"
++    )
++    env = sandbox_env(tmp_path / "run")
++    assert env["PATH"] == "/usr/local/bin:/usr/bin:/bin"
++
++
++def test_rehearsal_sandboxed_child_sees_no_home_path_entries(tmp_path, monkeypatch):
++    """End to end: the PATH a real sandboxed child sees has no home dir."""
++    home = str(Path.home())
++    monkeypatch.setenv("PATH", f"{home}/.local/bin:{os.environ['PATH']}")
++    run, _, _ = _make_run(tmp_path)
++    proc = run_sandboxed(
++        _child("import os; print('PATH=' + os.environ['PATH'])", []),
++        run.root, run.settings_path, timeout=60,
++    )
++    line = next(ln for ln in proc.stdout.splitlines() if ln.startswith("PATH="))
++    entries = line[len("PATH="):].split(":")
++    assert entries and not [e for e in entries if e.startswith(home) or e.startswith("~")], line
+diff --git a/tests/test_f08.py b/tests/test_f08.py
+index 171f771..560bcf4 100644
+--- a/tests/test_f08.py
++++ b/tests/test_f08.py
+@@ -540,3 +540,32 @@ def test_schema_accepts_test_ref(tmp_path):
+     )
+     loaded = load_profile(profile)
+     assert loaded["commands"]["test_ref"] == "{python} -m pytest -q {ref}"
++
++
++# --- rehearsal blocker (JobFinderOS readiness, 2026-10-18) --------------------
++
++
++def test_rehearsal_clean_keeps_declared_setup_outputs(tmp_path):
++    """L1's inter-phase `git clean -fdx` used to delete what setup installed
++    (backend/.venv, frontend/node_modules), so every ref failed with exit
++    127 and a healthy test read as test_not_green. Directories the profile
++    declares as setup outputs survive the clean; everything else untracked
++    is still removed."""
++    import sys as _sys
++
++    repo = _red_first_repo(tmp_path, "setup-outputs")
++    deps = repo / ".deps"
++    deps.mkdir()
++    shim = deps / "py"
++    shim.write_text(f'#!/bin/sh\nexec "{_sys.executable}" -m pytest -p no:cacheprovider "$@"\n')
++    shim.chmod(0o755)
++    profile = {
++        "name": "fixture",
++        "commands": {"test_ref": "./.deps/py -q {ref}"},
++        "paths": {"setup_outputs": [".deps"]},
++    }
++    report = _run(repo, _task("tests/test_feature.py::test_answer"), profile=profile)
++    green = _result(report, "green:tests/test_feature.py::test_answer")
++    assert green.exit_code == 0, green.output[-500:]
++    assert report.verdict == "pass", [f.id for f in report.findings]
++    assert shim.exists(), "a declared setup output was cleaned away"
+diff --git a/tests/test_f10.py b/tests/test_f10.py
+index cfe4760..9098c64 100644
+--- a/tests/test_f10.py
++++ b/tests/test_f10.py
+@@ -1394,3 +1394,44 @@ def test_review7_task_contract_lists_every_escalation_reason():
+     line = next(ln for ln in doc.splitlines() if ln.startswith("Escalation reasons"))
+     missing = [r for r in reasons if f"`{r}`" not in line]
+     assert not missing, f"TASK-CONTRACT.md doesn't list: {missing}"
++
++
++# --- rehearsal blocker (JobFinderOS readiness, 2026-10-18) --------------------
++
++
++def test_rehearsal_run_builds_on_the_remote_default_branch(tmp_path):
++    """The run used to clone the local checkout's `main`, which can be days
++    behind GitHub; the agent then built on stale code and the PR's base was
++    wrong. The run now fetches the remote's default branch and builds on it."""
++    env = Env(tmp_path)
++    scratch = tmp_path / "scratch"
++    subprocess.run(["git", "clone", "-q", str(env.remote), str(scratch)], check=True)
++    (scratch / "remote_only.txt").write_text("landed on GitHub, not pulled locally\n")
++    _git(scratch, "-c", "user.email=x@x", "-c", "user.name=x", "add", "-A")
++    _git(scratch, "-c", "user.email=x@x", "-c", "user.name=x", "commit", "-qm", "remote moves on")
++    _git(scratch, "push", "-q", "origin", "HEAD:main")
++    remote_main = _git(env.remote, "rev-parse", "refs/heads/main").strip()
++
++    result = env.run(Seats())
++
++    assert result.outcome == "pr_opened", result
++    head = env.prs[0].head
++    subprocess.run(
++        ["git", "-C", str(env.remote), "merge-base", "--is-ancestor", remote_main,
++         f"refs/heads/{head}"],
++        check=True,
++    )
++
++
++def test_rehearsal_run_refuses_when_the_remote_is_unreachable(tmp_path):
++    """No fetch, no run: building on an unknown base is worse than not
++    running. Nothing starts a session."""
++    env = Env(tmp_path, profile_extra={})
++    profile = yaml.safe_load(env.profile_path.read_text())
++    profile["repo"]["remote"] = str(tmp_path / "does-not-exist.git")
++    env.profile_path.write_text(yaml.safe_dump(profile))
++    seats = Seats()
++    with pytest.raises(Exception, match="(?i)fetch"):
++        env.run(seats)
++    assert seats.calls == []
++    assert env.task()["status"] == "ready"

@@ -1,0 +1,10 @@
+diff --git a/VALIDATOR-SPEC.md b/VALIDATOR-SPEC.md
+index 3c3c3c3..4d4d4d4 100644
+--- a/VALIDATOR-SPEC.md
++++ b/VALIDATOR-SPEC.md
+@@ -30,6 +30,9 @@ The five layers
+ 
+ 3. **Diff policy** (computed from `git diff <base>...<branch>`):
++<!-- ruff-disable: spec-doc-checks -->
++<!-- biome-disable lint/suspicious -->
+    - A file matching `paths.protected` is modified or deleted → FAIL, escalation `protected_path_touched`. This includes the test files named in the approved contract (locked at approval).

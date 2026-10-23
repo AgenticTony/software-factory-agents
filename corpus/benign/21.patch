@@ -1,0 +1,58 @@
+diff --git a/.factory/tasks.json b/.factory/tasks.json
+index 37c4ea7..922d16d 100644
+--- a/.factory/tasks.json
++++ b/.factory/tasks.json
+@@ -735,6 +735,38 @@
+             "type": "test",
+             "ref": "tests/test_f10.py::test_ac_10"
+           }
++        },
++        {
++          "id": "AC-11",
++          "text": "L0 and L1 run every project command (setup, lint, typecheck, test, and each `test_ref`) inside the F-05 sandbox via `run_sandboxed` on the clean clone, never in the orchestrator's own environment: the agent's `conftest.py` and test code are untrusted. A fixture whose `conftest.py` tries to write outside the run dir and read `~/factory/holdouts` is denied both during the L0 test gate and the L1 red/green runs.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f10.py::test_ac_11"
++          }
++        },
++        {
++          "id": "AC-12",
++          "text": "Every run dir `run` creates is removed with `cleanup_run` on every outcome (PR opened, `needs_human`, quota stop, exception), together with its settings, staged runner and scratch. `loop` reclaims, at start, run dirs no live run lease holds. A run killed mid-session is cleaned up by the next `loop` start.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f10.py::test_ac_12"
++          }
++        },
++        {
++          "id": "AC-13",
++          "text": "The orchestrator never pushes to the default branch: the push refspec names only the task's own branch, and a push targeting `repo.default_branch`, or any ref the run didn't create, raises before any git process starts. Every orchestrator-side git call uses `GIT_HARDENING`. (The factory's own repo can't have branch protection on a free private plan, so this check is the only guard on its `main`.)",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f10.py::test_ac_13"
++          }
++        },
++        {
++          "id": "AC-14",
++          "text": "The PR body also carries a **How to revert** section, built by the orchestrator: for a `two-way` Door, revert the squash-merge commit; for a `one-way` Door, a statement that reverting the code doesn't undo the listed risk flags, naming each one. The PR isn't opened without it (same rule as AC-7).",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f10.py::test_ac_14"
++          }
+         }
+       ],
+       "budget": {
+diff --git a/BUILD-ORDER.md b/BUILD-ORDER.md
+index 96120f1..42137e2 100644
+--- a/BUILD-ORDER.md
++++ b/BUILD-ORDER.md
+@@ -195,6 +195,10 @@ Acceptance:
+ - AC-8 **Evidence** is built by the orchestrator from the L1 report, not from model text. For each contract test ref it shows red on base (with `red_reason`) and green on head. Nothing the implementer writes can alter this section.
+ - AC-9 **Door** is `one-way` when the task carries any of `migration`, `deploy`, `external_service`, `payments` or `privacy` (data that has leaked can't be recalled), and `two-way` otherwise. **Blast Radius** lists the risk flags and matched `paths.risk` globs, or `contained`. The implementer may add prose below them but can't change either value.
+ - AC-10 An attempt that starts in a fresh session (re-queued run, rejected-PR fix round) receives the task's progress log, entries 1..N. The log is orchestrator-owned, lives outside the clone and is append-only: rewriting an earlier entry raises.
++- AC-11 L0 and L1 run every project command (setup, lint, typecheck, test, and each `test_ref`) inside the F-05 sandbox via `run_sandboxed` on the clean clone, never in the orchestrator's own environment: the agent's `conftest.py` and test code are untrusted. A fixture whose `conftest.py` tries to write outside the run dir and read `~/factory/holdouts` is denied both during the L0 test gate and the L1 red/green runs.
++- AC-12 Every run dir `run` creates is removed with `cleanup_run` on every outcome (PR opened, `needs_human`, quota stop, exception), together with its settings, staged runner and scratch. `loop` reclaims, at start, run dirs no live run lease holds. A run killed mid-session is cleaned up by the next `loop` start.
++- AC-13 The orchestrator never pushes to the default branch: the push refspec names only the task's own branch, and a push targeting `repo.default_branch`, or any ref the run didn't create, raises before any git process starts. Every orchestrator-side git call uses `GIT_HARDENING`. (The factory's own repo can't have branch protection on a free private plan, so this check is the only guard on its `main`.)
++- AC-14 The PR body also carries a **How to revert** section, built by the orchestrator: for a `two-way` Door, revert the squash-merge commit; for a `one-way` Door, a statement that reverting the code doesn't undo the listed risk flags, naming each one. The PR isn't opened without it (same rule as AC-7).
+ 
+ PR body shape adapted from mattpocock/skills `pr` (its Summary visuals credit Dex Horthy's `show-me`). The difference: Evidence and Merge Danger come from validator facts, not the agent's own account.
+ 

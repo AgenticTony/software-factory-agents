@@ -1,0 +1,273 @@
+diff --git a/.factory/BOOTSTRAP.md b/.factory/BOOTSTRAP.md
+index e0a8367..44e92c7 100644
+--- a/.factory/BOOTSTRAP.md
++++ b/.factory/BOOTSTRAP.md
+@@ -184,4 +184,10 @@ Entries record evidence, not claims. Each criterion is marked proven, pending, o
+   - **`bin/` parent rule could re-open `~/.local`:** a toolchain binary resolving to a real file in `~/.local/bin` re-allowed all of `~/.local`. The rule now adds only the `bin/`'s sibling `lib/` (stdlib + site-packages), never the whole parent. Proven by `test_bin_dir_parent_never_reopens_a_shared_prefix` (`~/.local/bin/x` → exactly `{~/.local/bin, ~/.local/lib}`); `test_toolchain_allowread_is_install_dir_only` updated to the sibling-`lib/` shape. Verified with the real pyenv 3.11.9 interpreter: with only `bin/`, the binary and `lib/` allowed, `import ssl, json, sqlite3, venv` runs inside the sandbox.
+   - **Stale docstrings:** `run_sandboxed` still described the abandoned reader-thread teardown; `build_settings(toolchain=)` and `test_toolchain_under_home_is_executable` still described the round-3 ancestor chain. All three now describe the code as it is; `test_run_sandboxed_docstring_matches_the_select_pump` guards the first.
+   - Evidence: 50 F-05 tests / 217 total passing locally, ruff clean.
++- **Fresh-context review of `d898f10` (follow-up PR; 2 reproduced defects + 1 footgun, all fixed):** an independent session reviewed the merged code against real srt; boundary sound under the production `~/factory` layout, no security hole. Fixed red-first:
++  - **F1 — settings credential backstop was exact-name only:** `scrub_env` drops the whole `GH_*`/`GITHUB_*` prefix, but srt's `credentials.envVars` deny takes exact names, so a scrub-bypassing caller leaked e.g. `GH_APP_TOKEN` (reproduced: settings without the name → child sees `prefix-leak`). `build_settings` now denies the well-known names plus every `GH_*`/`GITHUB_*` present in the environment at build time; the module docstring states that limit. `test_settings_backstop_denies_every_github_name_in_the_environment` (red on the missing names; its srt half proven able to fail).
++  - **F2 — warm-cache copy followed symlinks:** a dangling or circular (pnpm-style `self -> ..`) link aborted the run, and a venv's `bin/python` was copied as a 6 MB file. `copytree(symlinks=True)`; absolute links into the cache are retargeted into the run; `_relocate_venv` never rewrites through a symlink. `test_warm_cache_symlinks_are_preserved_not_followed`; checked with a real `python -m venv` cache (link kept, `sys.prefix` is the run's copy).
++  - **P3 — `python` missing from the default toolchain:** `which python3` returns a pyenv *shim script*, so adding the name alone would allow the shim, not the interpreter. `_python_toolchain()` asks each `python3`/`python` on PATH for its `sys.executable`. `test_python_toolchain_follows_shims_to_the_real_interpreter`.
++  - Not fixed, recorded: P1 (`sandbox_env` used with srt directly on Linux reintroduces the deep-TMPDIR bridge-socket failure; `run_sandboxed` is the supported path), P2 (`.git/info` denyWrite blocks in-sandbox git maintenance like `update-server-info`; commits unaffected).
++  - Evidence: 53 F-05 tests / 220 total passing locally, ruff clean; real `claude --version` by name still rc=0 in the sandbox.
+ - **Status to set at reconcile:** `done` once this PR's CI is green (ruff + pytest on 3.11 + 3.13, with the sandbox tests running for real on Linux) and you merge it. No deploy target, so L4 doesn't apply.
+diff --git a/factory/runs.py b/factory/runs.py
+index b2c12be..611b190 100644
+--- a/factory/runs.py
++++ b/factory/runs.py
+@@ -8,6 +8,7 @@
+ settings without a trace.
+ """
+ 
++import os
+ import shutil
+ import subprocess
+ import uuid
+@@ -123,7 +124,13 @@ def create_run(
+     if warm_cache is not None:
+         _refuse_tracked_collisions(dest, warm_cache)
+         try:
+-            shutil.copytree(warm_cache, dest, dirs_exist_ok=True)
++            # symlinks=True: prebuilt venvs/node_modules are full of links.
++            # Following them aborts the run on any dangling or circular link
++            # (pnpm-style `self -> ..`) and copies a venv's bin/python as a
++            # full interpreter file. Links are kept as links; absolute links
++            # into the cache are then retargeted into the run.
++            shutil.copytree(warm_cache, dest, symlinks=True, dirs_exist_ok=True)
++            _retarget_cache_links(Path(warm_cache), dest)
+             _relocate_venv(Path(warm_cache), dest)
+             _seed_run_excludes(dest, warm_cache)
+         except OSError as exc:
+@@ -171,6 +178,29 @@ def _refuse_tracked_collisions(dest: Path, warm_cache: Path) -> None:
+         )
+ 
+ 
++def _retarget_cache_links(cache: Path, dest: Path) -> None:
++    """Point absolute symlinks that lead into the cache at the run's copy.
++
++    A link copied verbatim with an absolute cache target would still reach
++    into the cache — which the sandbox may not even let the session read.
++    Relative links and links to anything outside the cache are untouched.
++    """
++    prefixes = sorted({str(cache), str(cache.resolve())}, key=len, reverse=True)
++    for dirpath, dirnames, filenames in os.walk(dest, followlinks=False):
++        for name in (*dirnames, *filenames):
++            link = Path(dirpath) / name
++            if not link.is_symlink():
++                continue
++            target = os.readlink(link)
++            if not os.path.isabs(target):
++                continue
++            for prefix in prefixes:
++                if target == prefix or target.startswith(prefix + os.sep):
++                    link.unlink()
++                    os.symlink(str(dest) + target[len(prefix):], link)
++                    break
++
++
+ def _relocate_venv(cache: Path, dest: Path) -> None:
+     """Rewrite a copied venv's absolute cache paths to the run dir.
+ 
+@@ -192,7 +222,10 @@ def _relocate_venv(cache: Path, dest: Path) -> None:
+         targets = [venv / "pyvenv.cfg"]
+         bin_dir = venv / "bin"
+         if bin_dir.is_dir():
+-            targets.extend(p for p in bin_dir.iterdir() if p.is_file())
++            # Never rewrite through a symlink: it may point outside the run.
++            targets.extend(
++                p for p in bin_dir.iterdir() if p.is_file() and not p.is_symlink()
++            )
+         targets.extend(venv.glob("lib*/python*/site-packages/*.pth"))
+         for path in targets:
+             try:
+diff --git a/factory/sandbox.py b/factory/sandbox.py
+index 8e755a4..7e9614d 100644
+--- a/factory/sandbox.py
++++ b/factory/sandbox.py
+@@ -13,9 +13,13 @@
+ dir is re-allowed), the holdouts, and every other run, and allows network
+ only to the model endpoint plus the project profile's ``docs_allowlist``
+ and ``network_allowlist``. Credentials are defence-in-depth: the
+-environment is scrubbed before the child is spawned *and* the settings file
+-denies the same names inside srt, so a caller mistake can't leak a GitHub
+-token or a keychain-derived variable.
++environment is scrubbed before the child is spawned (allowlist, then the
++whole ``GH_*``/``GITHUB_*`` prefix), *and* the settings file denies GitHub
++names inside srt as a backstop. srt's deny takes exact names only, so the
++backstop lists the well-known token names plus every ``GH_*``/``GITHUB_*``
++variable present when the settings are built, plus the caller's
++keychain-derived names — a prefixed secret that appears only *after* the
++settings were built is caught by the scrub alone.
+ """
+ 
+ import json
+@@ -89,6 +93,12 @@
+ # otherwise make the session's own toolchain unexecutable — rc=126).
+ TOOLCHAIN_BINS = ("node", "npm", "npx", "claude", "git", "curl")
+ 
++# Well-known GitHub credential names, always on the settings backstop even
++# when absent from the environment at build time.
++_GITHUB_TOKEN_NAMES = frozenset(
++    {"GH_APP_TOKEN", "GH_PAT", "GITHUB_PAT", "GITHUB_APP_PRIVATE_KEY"}
++)
++
+ 
+ class SandboxError(Exception):
+     """The sandbox cannot be used: srt missing, wrong version, or unusable."""
+@@ -279,7 +289,7 @@ def build_settings(
+     else:
+         factory_root = Path(factory_root).resolve()
+     if toolchain is None:
+-        toolchain = [sys.executable]
++        toolchain = [sys.executable, *_python_toolchain()]
+         toolchain += [Path(found) for name in TOOLCHAIN_BINS
+                       if (found := shutil.which(name))]
+     allowed_domains = [
+@@ -288,7 +298,10 @@ def build_settings(
+         *profile.get("network_allowlist", []),
+     ]
+     denied_names = sorted(
+-        set(_FORBIDDEN_ENV_EXACT) | {name for name in forbidden_env if name}
++        set(_FORBIDDEN_ENV_EXACT)
++        | _GITHUB_TOKEN_NAMES
++        | {k for k in os.environ if k.upper().startswith(_FORBIDDEN_ENV_PREFIXES)}
++        | {name for name in forbidden_env if name}
+     )
+     # srt's Linux sandbox runs its vendor helpers (apply-seccomp, the java
+     # agent jar) from INSIDE the bwrap namespace. On hosts where this repo
+@@ -500,6 +513,36 @@ def _pump(streams: dict, buffers: dict, wait: float) -> None:
+             streams[name] = -1
+ 
+ 
++@lru_cache(maxsize=None)
++def _python_toolchain() -> tuple[Path, ...]:
++    """The real interpreters behind ``python3``/``python`` on PATH.
++
++    pyenv (and friends) put a *script* named ``python3`` on PATH, not a
++    symlink, so ``shutil.which`` alone names the shim — re-allowing the shim
++    dir leaves the interpreter it runs unreadable. Each found command is
++    asked for its own ``sys.executable`` instead (outside the sandbox, once
++    per process). A command that fails or hangs is skipped, not fatal.
++    """
++    found: list[Path] = []
++    for name in ("python3", "python"):
++        command = shutil.which(name)
++        if not command:
++            continue
++        try:
++            proc = subprocess.run(
++                [command, "-c", "import sys; print(sys.executable)"],
++                capture_output=True, text=True, timeout=10,
++            )
++        except (OSError, subprocess.TimeoutExpired):
++            continue
++        executable = proc.stdout.strip()
++        if proc.returncode == 0 and executable:
++            real = Path(os.path.realpath(executable))
++            if real not in found:
++                found.append(real)
++    return tuple(found)
++
++
+ def _toolchain_allowread(home: Path, toolchain: "Sequence[Path]") -> set[Path]:
+     """Paths below ``home`` that must stay readable so the session's
+     toolchain can exec:
+diff --git a/tests/test_f05.py b/tests/test_f05.py
+index 3e59cf1..83e54e6 100644
+--- a/tests/test_f05.py
++++ b/tests/test_f05.py
+@@ -12,6 +12,7 @@
+ before pytest. If any of that breaks, these tests fail loudly.
+ """
+ 
++import json
+ import os
+ import shlex
+ import shutil
+@@ -1216,3 +1217,84 @@ def test_run_sandboxed_docstring_matches_the_select_pump():
+     doc = run_sandboxed.__doc__ or ""
+     assert "reader thread" not in doc.lower(), "docstring still describes reader threads"
+     assert "select" in doc
++
++
++# --- review follow-ups (fresh-context review of d898f10) ------------------
++
++
++def test_settings_backstop_denies_every_github_name_in_the_environment(
++    tmp_path: Path, monkeypatch
++):
++    """F1: scrub_env drops the whole GH_/GITHUB_ prefix, but srt's
++    credentials.envVars deny takes exact names only. The backstop must name
++    every GitHub-prefixed variable actually present when settings are built
++    (plus well-known token names), or a scrub-bypassing caller leaks e.g. a
++    GH_APP_TOKEN while GH_TOKEN is stripped."""
++    monkeypatch.setenv("GH_APP_TOKEN", "prefix-leak")
++    monkeypatch.setenv("GITHUB_PAT_EXTRA", "prefix-leak-2")
++    run, _, _ = _make_run(tmp_path)
++    settings = json.loads(run.settings_path.read_text())
++    denied = {e["name"] for e in settings["credentials"]["envVars"]}
++    assert {"GH_APP_TOKEN", "GITHUB_PAT_EXTRA", "GH_TOKEN", "GITHUB_TOKEN"} <= denied
++
++    script = "import os; print('GH_APP_TOKEN=' + repr(os.environ.get('GH_APP_TOKEN')))"
++    proc = subprocess.run(
++        [str(srt_bin()), "--settings", str(run.settings_path), "-c",
++         shlex.join(_child(script, []))],
++        env=dict(os.environ), cwd=run.root, capture_output=True, text=True,
++        timeout=60,
++    )
++    assert "GH_APP_TOKEN=None" in proc.stdout, (
++        f"settings backstop let a GH_-prefixed secret through\n{proc.stdout}{proc.stderr}"
++    )
++
++
++def test_warm_cache_symlinks_are_preserved_not_followed(tmp_path: Path):
++    """F2: prebuilt venvs and node_modules are full of symlinks. A dangling
++    or circular link must not abort the run, links stay links (a venv's
++    bin/python is not copied as a 6MB file), and an absolute link pointing
++    into the cache is retargeted into the run (the cache may be unreadable
++    inside the sandbox)."""
++    cache = tmp_path / "warm-cache"
++    (cache / "node_modules" / "a").mkdir(parents=True)
++    (cache / "node_modules" / "a" / "index.js").write_text("module.exports = 1\n")
++    os.symlink("/nonexistent/target", cache / "node_modules" / "dangling")
++    os.symlink("..", cache / "node_modules" / "a" / "self")  # pnpm-style cycle
++    os.symlink(cache / "node_modules" / "a" / "index.js", cache / "node_modules" / "abs")
++    (cache / ".venv" / "bin").mkdir(parents=True)
++    (cache / ".venv" / "pyvenv.cfg").write_text("home = /usr/bin\n")
++    real_python = Path(os.path.realpath(sys.executable))
++    os.symlink(real_python, cache / ".venv" / "bin" / "python")
++
++    run = create_run(
++        "fixture", _fixture_repo(tmp_path), factory_root=_factory_root(tmp_path),
++        warm_cache=cache,
++    )
++    nm = run.root / "node_modules"
++    assert (nm / "dangling").is_symlink()
++    assert (nm / "a" / "self").is_symlink()
++    py = run.root / ".venv" / "bin" / "python"
++    assert py.is_symlink() and Path(os.readlink(py)) == real_python, (
++        "venv interpreter symlink was dereferenced into a copy"
++    )
++    assert Path(os.readlink(nm / "abs")) == nm / "a" / "index.js", (
++        "absolute link into the cache still points at the cache"
++    )
++
++
++def test_python_toolchain_follows_shims_to_the_real_interpreter(tmp_path: Path, monkeypatch):
++    """P3: pyenv puts a bash *script* named python3 on PATH, not a symlink,
++    so shutil.which() alone names the shim. The toolchain must allow the real
++    interpreter the shim runs (asked via sys.executable), so a $HOME-based
++    pyenv/uv python stays executable inside the sandbox."""
++    from factory.sandbox import _python_toolchain
++    shim_dir = tmp_path / "shims"
++    shim_dir.mkdir()
++    shim = shim_dir / "python3"
++    shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
++    shim.chmod(0o755)
++    monkeypatch.setenv("PATH", f"{shim_dir}{os.pathsep}{os.environ['PATH']}")
++    _python_toolchain.cache_clear()
++    found = _python_toolchain()
++    assert Path(os.path.realpath(sys.executable)) in found, found
++    assert shim not in found, "the shim script itself must not stand in for python"

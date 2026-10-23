@@ -1,0 +1,295 @@
+diff --git a/.factory/BOOTSTRAP.md b/.factory/BOOTSTRAP.md
+new file mode 100644
+index 0000000..68ad9e8
+--- /dev/null
++++ b/.factory/BOOTSTRAP.md
+@@ -0,0 +1,20 @@
++# Bootstrap ledger
++
++Until `factory approve` exists (F-04), nothing can legally write `.factory/tasks.json`, so its statuses stay `draft`. Progress during the bootstrap is recorded **here** instead, one entry per work order, with evidence.
++
++F-04 AC-4 reconciles this ledger into `tasks.json`: each entry is approved and set to its final status through the normal state machine. After that, this file is frozen.
++
++Entries record evidence, not claims. Each criterion is marked proven, pending, or not met.
++
++---
++
++## F-01 — Repo scaffold
++
++- **Commits:**
++  - `c997c7b` on `main`. This went straight to `main` before the branch rule existed, and was pushed.
++  - Review fixes on `fix/f01-review`.
++- **Built:** 2026-10-16. Interactive session, then a code review (10 findings) the same day.
++- **AC-1** proven: `tests/test_f01.py::test_ac_1` passes locally.
++- **AC-2** proven: the CI `test` job passed on [PR #1](https://github.com/AgenticTony/software-factory-agents/pull/1) (ruff + pytest, Python 3.12). The review changed CI to a 3.11 + 3.13 matrix, so the fix PR's CI run must also pass before reconcile.
++- **AC-3** proven: `tests/test_f01.py::test_ac_3` passes locally.
++- **Status to set at reconcile:** `done` once the fix PR's CI is green and you merge it. There's no deploy target, so L4 doesn't apply.
+diff --git a/.factory/project.yaml b/.factory/project.yaml
+index 544bfd9..9ce6e62 100644
+--- a/.factory/project.yaml
++++ b/.factory/project.yaml
+@@ -5,7 +5,7 @@ name: software-factory
+ repo:
+   path: ~/Desktop/Software_Factory_Agents
+   default_branch: main
+-  remote: https://github.com/AgenticTony/software-factory-agents.git   # TODO(verify): created in F-00 step 6
++  remote: https://github.com/AgenticTony/software-factory-agents.git
+   merge_method: squash
+ 
+ commands:
+@@ -16,7 +16,7 @@ commands:
+ paths:
+   risk:
+     # Control files: touching these changes how work is chosen or judged.
+-    safety: ["schema/**", "TASK-CONTRACT.md", "VALIDATOR-SPEC.md", ".factory/tasks.json"]
++    factory_control: ["schema/**", "TASK-CONTRACT.md", "VALIDATOR-SPEC.md", ".factory/**"]
+     deploy: [".github/workflows/**"]
+   protected:
+     - ".factory/**"
+diff --git a/.factory/tasks.json b/.factory/tasks.json
+index 195aec5..9d34f91 100644
+--- a/.factory/tasks.json
++++ b/.factory/tasks.json
+@@ -268,6 +268,14 @@
+             "type": "test",
+             "ref": "tests/test_f04.py::test_ac_3"
+           }
++        },
++        {
++          "id": "AC-4",
++          "text": "`factory approve --reconcile-bootstrap` reads `.factory/BOOTSTRAP.md`. For each entry, after interactive confirmation, it approves the task and moves it through legal transitions to its recorded status. A criterion marked \"pending\" can never produce `done`.",
++          "check": {
++            "type": "test",
++            "ref": "tests/test_f04.py::test_ac_4"
++          }
+         }
+       ],
+       "budget": {
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 3f089b6..3a9e350 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -8,11 +8,16 @@ on:
+ jobs:
+   test:
+     runs-on: ubuntu-latest
++    strategy:
++      matrix:
++        # 3.11 = declared floor (requires-python); 3.13 = local dev version
++        python-version: ["3.11", "3.13"]
+     steps:
+       - uses: actions/checkout@v4
+       - uses: actions/setup-python@v5
+         with:
+-          python-version: "3.12"
++          python-version: ${{ matrix.python-version }}
++          cache: pip
+       - run: python -m pip install --upgrade pip
+       - run: pip install -e ".[dev]"
+       - run: ruff check .
+diff --git a/.gitignore b/.gitignore
+index a324db9..b0dad17 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -16,8 +16,8 @@ dist/
+ .video_agent/
+ out/
+ 
+-# Factory run state (sandbox clones, execution records); tasks.json IS committed
+-.factory/runs/
++# Run dirs live OUTSIDE the repo (~/factory/runs/, DESIGN D3) — nothing to ignore here.
++# .factory/tasks.json and .factory/project.yaml ARE committed.
+ 
+ # OS
+ .DS_Store
+diff --git a/BUILD-ORDER.md b/BUILD-ORDER.md
+index 618b4f5..ae4504b 100644
+--- a/BUILD-ORDER.md
++++ b/BUILD-ORDER.md
+@@ -98,6 +98,7 @@ Acceptance:
+ - AC-1 Approving a task with no acceptance items is refused.
+ - AC-2 After approval, the status is `ready` or `blocked` according to its dependencies.
+ - AC-3 `--yes` is not accepted when the task has risk flags. Risk-flagged approval is always interactive.
++- AC-4 `factory approve --reconcile-bootstrap` reads `.factory/BOOTSTRAP.md`. For each entry, after interactive confirmation, it approves the task and moves it through legal transitions to its recorded status. A criterion marked "pending" can never produce `done`.
+ 
+ ### F-05 — Clone manager and sandbox
+ - Create `~/factory/runs/<project>/<run-id>/` as a `git clone --filter=blob:none` from the local repo.
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 87f071d..aa9f590 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -16,6 +16,11 @@ agents do the volume. Architecture and reasoning: `DESIGN-LOCAL-FACTORY.md`.
+ 
+ - **Never hand-edit `.factory/tasks.json`.** The orchestrator (F-03+) is its only
+   writer. Changes go through a PR a human reviews.
++- **Bootstrap (until F-04 lands):** record each finished work order in
++  `.factory/BOOTSTRAP.md`, with evidence per acceptance criterion. F-04 reconciles
++  it into `tasks.json`.
++- **Contract test names are exact:** an acceptance ref `tests/test_fNN.py::test_ac_N`
++  means a test function with exactly that name.
+ - **Schema-validate on load.** Code touching `tasks.json` or `project.yaml`
+   validates against `schema/` first (F-02). Invalid state refuses to run.
+ - **Acceptance criteria become failing tests before code** (red-first,
+@@ -23,9 +28,13 @@ agents do the volume. Architecture and reasoning: `DESIGN-LOCAL-FACTORY.md`.
+ - **Mechanical rules are linters/tests, not prose.** If a rule can be checked,
+   check it in CI instead of writing it here.
+ - `ruff check .` and `pytest -q` must pass before any commit.
++- **Git:** never commit to `main`. One branch + PR per work order
++  (`feat/fNN-<slug>`). Conventional commits (`feat:` / `fix:` / `chore:` / `docs:`),
++  with the WO id in the subject, e.g. `feat: contract loading (F-02)`. **Never add
++  `Co-Authored-By` or any AI attribution trailer.**
+ 
+ ## Working here
+ 
+-- Python >= 3.11. Setup: `pip install -e ".[dev]"`. CLI: `factory --help`.
++- Python >= 3.11; CI tests 3.11 and 3.13. Setup: `pip install -e ".[dev]"`. CLI: `factory --help`.
+ - Bootstrap phase: one work order per session (F-01 to F-11, BUILD-ORDER.md).
+ - CI (`.github/workflows/ci.yml`) runs ruff + pytest on every PR.
+diff --git a/TASK-CONTRACT.md b/TASK-CONTRACT.md
+index d091c36..1342396 100644
+--- a/TASK-CONTRACT.md
++++ b/TASK-CONTRACT.md
+@@ -24,7 +24,7 @@ One record per work item (WO, story, or step). Big items are split into **slices
+ | `priority` | `P1`–`P3`. Ties broken by queue order. |
+ | `depends_on` | Task ids. Cross-repo deps are written `repo:id` (e.g. `soloadventurer-mobile:9b`) and are always treated as unmet until a human marks them met. |
+ | `status` | See §3. |
+-| `risk` | Static flags declared from the doc: `auth`, `payments`, `rls`, `migration`, `safety`, `privacy`, `new_dependency`, `deploy`, `cross_repo`, `external_service`. The validator adds dynamic flags from the diff (§ VALIDATOR-SPEC L0). |
++| `risk` | Static flags declared from the doc: `auth`, `payments`, `rls`, `migration`, `safety`, `privacy`, `new_dependency`, `deploy`, `cross_repo`, `external_service`, `factory_control` (changes to how work is chosen or judged: schemas, contracts, validator config). The validator adds dynamic flags from the diff (§ VALIDATOR-SPEC L0). |
+ | `gates` | `spec_approval` (bool), `merge` (`human`/`auto`), `deploy` (`human`/`auto`). Any risk flag forces `human` on merge. In v0 everything is `human`. |
+ | `acceptance` | The **validation contract**: list of `{id, text, check}`. `check.type` is `test` (named test that must fail before / pass after), `command`, `holdout` (scenario id), `prod_probe` (post-deploy check), or `manual` (becomes an owner step). Frozen when the spec is approved: `acceptance_hash` = SHA-256 of the canonical JSON. A changed hash after approval sends the task back to `draft`. |
+ | `owner_steps` | `[{text, done}]` — things only you can do (JobFinderOS "Owner steps (not buildable by a session)"; SoloAdventurer 👤 items). |
+diff --git a/factory/cli.py b/factory/cli.py
+index 24b4e55..a51fc1b 100644
+--- a/factory/cli.py
++++ b/factory/cli.py
+@@ -23,18 +23,22 @@ def build_parser() -> argparse.ArgumentParser:
+         prog="factory",
+         description="Local agent software factory control plane.",
+     )
+-    sub = parser.add_subparsers(dest="command", required=False)
++    sub = parser.add_subparsers(dest="command", required=True)
+     for name, wo in STUBS.items():
+         sub.add_parser(name, help=f"stub — implemented in {wo}")
+     return parser
+ 
+ 
+ def main(argv: list[str] | None = None) -> int:
+-    parser = build_parser()
+-    args = parser.parse_args(argv)
+-    if args.command is None:
+-        parser.print_help()
+-        return 2
++    """Parses arguments and dispatches a subcommand.
++
++    Args:
++        argv: Arguments without the program name; defaults to sys.argv[1:].
++
++    Returns:
++        Process exit code. Stubs return 2 (not implemented).
++    """
++    args = build_parser().parse_args(argv)
+     print(
+         f"factory {args.command}: not implemented yet (scheduled in {STUBS[args.command]})",
+         file=sys.stderr,
+diff --git a/schema/project.schema.json b/schema/project.schema.json
+index 70f222f..c35ebe4 100644
+--- a/schema/project.schema.json
++++ b/schema/project.schema.json
+@@ -40,7 +40,8 @@
+       "properties": {
+         "risk": {
+           "type": "object",
+-          "description": "risk flag -> list of globs",
++          "description": "risk flag -> list of globs. Keys must be risk flags from tasks.schema.json.",
++          "propertyNames": { "enum": ["auth", "payments", "rls", "migration", "safety", "privacy", "new_dependency", "deploy", "cross_repo", "external_service", "factory_control"] },
+           "additionalProperties": { "type": "array", "items": { "type": "string" } }
+         },
+         "protected": { "type": "array", "items": { "type": "string" } }
+diff --git a/schema/tasks.schema.json b/schema/tasks.schema.json
+index 8a6fc5f..dd9f930 100644
+--- a/schema/tasks.schema.json
++++ b/schema/tasks.schema.json
+@@ -17,7 +17,7 @@
+       "enum": ["draft", "blocked", "ready", "in_progress", "in_review", "deploying", "awaiting_owner", "needs_human", "done", "not_buildable"]
+     },
+     "risk_flag": {
+-      "enum": ["auth", "payments", "rls", "migration", "safety", "privacy", "new_dependency", "deploy", "cross_repo", "external_service"]
++      "enum": ["auth", "payments", "rls", "migration", "safety", "privacy", "new_dependency", "deploy", "cross_repo", "external_service", "factory_control"]
+     },
+     "escalation": {
+       "enum": ["attempts_exhausted", "budget_exhausted", "risk_path_touched", "new_dependency", "protected_path_touched", "contract_ambiguous", "quota_exhausted", "live_check_failed", "cross_repo"]
+diff --git a/tests/test_f01.py b/tests/test_f01.py
+index 62225cb..f5369cd 100644
+--- a/tests/test_f01.py
++++ b/tests/test_f01.py
+@@ -1,4 +1,8 @@
+-"""F-01 acceptance tests — BUILD-ORDER.md, work order F-01."""
++"""F-01 acceptance tests — BUILD-ORDER.md, work order F-01.
++
++Test names must equal the contract refs in .factory/tasks.json
++(`tests/test_f01.py::test_ac_<n>`); L1 (F-08) resolves them by node id.
++"""
+ 
+ import json
+ import subprocess
+@@ -12,7 +16,8 @@
+ SUBCOMMANDS = ["approve", "run", "loop", "status", "import", "verify-live"]
+ 
+ 
+-def test_ac_1_help_lists_all_subcommands():
++def test_ac_1():
++    """AC-1: `factory --help` lists every subcommand."""
+     result = subprocess.run(
+         [sys.executable, "-m", "factory", "--help"],
+         capture_output=True,
+@@ -24,24 +29,37 @@ def test_ac_1_help_lists_all_subcommands():
+         assert cmd in result.stdout, f"`{cmd}` missing from factory --help"
+ 
+ 
+-def test_ac_2_ci_runs_ruff_and_pytest_and_both_pass():
++def test_ac_2():
++    """AC-2 (wiring only): CI runs the exact gates on every PR.
++
++    This proves the workflow is wired, not that it passes. The pass itself is
++    evidenced by the CI run on the F-01 PR (see .factory/BOOTSTRAP.md).
++    """
+     ci = yaml.safe_load((REPO / ".github" / "workflows" / "ci.yml").read_text())
++    triggers = ci.get("on", ci.get(True))  # PyYAML parses bare `on:` as True
++    assert "pull_request" in triggers, "CI must run on pull requests"
+     runs = [
+-        step["run"] for job in ci["jobs"].values() for step in job["steps"] if "run" in step
++        step["run"].strip()
++        for job in ci["jobs"].values()
++        for step in job["steps"]
++        if "run" in step
+     ]
+-    assert any("pytest" in r for r in runs), "CI must run pytest"
+-    assert any("ruff check" in r for r in runs), "CI must run ruff check"
+-
+-    ruff = subprocess.run(
+-        [sys.executable, "-m", "ruff", "check", "."],
+-        capture_output=True,
+-        text=True,
+-        cwd=REPO,
+-    )
+-    assert ruff.returncode == 0, ruff.stdout
++    assert "ruff check ." in runs, "CI must run `ruff check .` as its own step"
++    assert "pytest -q" in runs, "CI must run `pytest -q` as its own step"
+ 
+ 
+-def test_ac_3_project_profile_validates():
++def test_ac_3():
++    """AC-3: this repo's own project profile validates against the schema."""
+     profile = yaml.safe_load((REPO / ".factory" / "project.yaml").read_text())
+     schema = json.loads((REPO / "schema" / "project.schema.json").read_text())
+     jsonschema.validate(profile, schema)
++
++
++def test_contract_refs_resolve():
++    """Every F-01 acceptance ref in tasks.json names a test in this module."""
++    tasks = json.loads((REPO / ".factory" / "tasks.json").read_text())["tasks"]
++    f01 = next(t for t in tasks if t["id"] == "F-01")
++    for ac in f01["acceptance"]:
++        path, _, name = ac["check"]["ref"].partition("::")
++        assert path == "tests/test_f01.py", ac["check"]["ref"]
++        assert callable(globals().get(name)), f"{ac['check']['ref']} does not resolve"

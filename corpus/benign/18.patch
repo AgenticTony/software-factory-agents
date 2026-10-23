@@ -1,0 +1,2409 @@
+diff --git a/.factory/BOOTSTRAP.md b/.factory/BOOTSTRAP.md
+index 44e92c7..00eb1e7 100644
+--- a/.factory/BOOTSTRAP.md
++++ b/.factory/BOOTSTRAP.md
+@@ -191,3 +191,50 @@ Entries record evidence, not claims. Each criterion is marked proven, pending, o
+   - Not fixed, recorded: P1 (`sandbox_env` used with srt directly on Linux reintroduces the deep-TMPDIR bridge-socket failure; `run_sandboxed` is the supported path), P2 (`.git/info` denyWrite blocks in-sandbox git maintenance like `update-server-info`; commits unaffected).
+   - Evidence: 53 F-05 tests / 220 total passing locally, ruff clean; real `claude --version` by name still rc=0 in the sandbox.
+ - **Status to set at reconcile:** `done` once this PR's CI is green (ruff + pytest on 3.11 + 3.13, with the sandbox tests running for real on Linux) and you merge it. No deploy target, so L4 doesn't apply.
++
++---
++
++## F-06 — Session runner (Claude Agent SDK on Z.ai)
++
++- **Commits:** `feat/f06-session-runner` → PR (this one). Red-first: the suite failed on the missing `factory.session` module before implementation.
++- **Built:** 2026-10-16. Interactive session; real-session evidence gathered the same day (smoke + blocked-write runs below).
++- **Design notes:** new `factory/session.py`; small extensions to `factory/sandbox.py` and `factory/runs.py`.
++  - **SDK pinned exactly:** `claude-agent-sdk==0.2.168` in `pyproject.toml`. The runner is written against the 0.2.x `ResultMessage` — `model_usage`, `terminal_reason`, `api_error_status` — which 0.1.x (previously installed globally) drops entirely. CI installs the pin via `pip install -e ".[dev]"`, so a drift is a red run.
++  - **Seats:** `implementer` runs `permission_mode="bypassPermissions"` — the srt sandbox *is* the permission system (DESIGN D3), prompts are meaningless unattended, and PreToolUse deny hooks still block under bypass (verified live in AC-3). `reviewer` disallows `Write`/`Edit`/`NotebookEdit` outright (WO: "the reviewer gets no Write/Edit"; NotebookEdit is the same class). Seat system prompts are a `SeatConfig` field left empty until F-09.
++  - **Env:** `session_env()` returns *literally* the three seat names (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `API_TIMEOUT_MS`) — it reads nothing ambient, so no GitHub token, keychain secret or inherited `ANTHROPIC_*` can appear in options by construction. `setting_sources=[]` on every seat.
++  - **Hooks (in-process, via `HookMatcher`):** `Write|Edit|NotebookEdit` denied when `file_path` matches a `paths.protected` glob — matched in three forms (as-given, cwd-joined absolute, cwd-relative), fnmatch semantics (``*`` spans `/`, erring protective). The callback also re-checks `tool_name` (defence in depth for direct use). `Bash` denied on `\bgit\s+push\b`, the standalone word `gh` as a command (`(?:^|[\s;&|/])gh(?:\s|$)` — plain `\bgh\b` false-positives on "gh-gh-gh", verified), and the `.config/gh` substring.
++  - **Clock:** each message receive runs under `asyncio.wait_for(…, timeout=remaining)` with a single deadline — a stream that keeps yielding is still cut off at the limit. Option building and record extraction sit outside the clock (the WO's "paused outside the session").
++  - **Record:** `SessionRecord` from the `ResultMessage`: `num_turns`, `subtype`, `is_error`, `terminal_reason`, `usage` tokens, `total_cost_usd`, `result`; model name from `model_usage` (the entry with the most input+output tokens when several ran; all names in `models`). `to_dict`/`from_dict` for the JSON boundary.
++  - **Sandboxed execution (`run_session_sandboxed`):** execs the entry under `run_sandboxed` with the profile-built settings; outer wall clock = `timeout_min` + teardown grace so the in-session clock fires first. Two F-05 extensions: `build_settings(allow_read=…)` for deliberate read carve-outs, and `default_toolchain(extra=…)` extracted from the old inline default (behaviour unchanged; F-05 suite untouched-green).
++  - **The staged runner copy (found by a real failure):** the first probe ran the entry as `python -m factory.session` from the repo — and imported the *clone's* `factory/sandbox.py`. Root cause, isolated by instrumenting a real sandbox: python's import must **list** the directory that holds a package, the sandbox denies listing the repo, so `import factory` silently fell through sys.path to the `factory/` package in the target clone (untrusted shadowing; a self-hosting clone of the factory repo hits the same way). Fix: the orchestrator stages a copy of the factory package at `<settings>-runner/` — outside the run dir (the agent can write nothing there), re-allowed for reading via `allow_read`, importable because its *parent* is exactly what's allowed — and the entry is a `-c` bootstrap inserting that dir ahead of cwd. The repo itself stays list-denied, so prompts/schemas/validator docs remain unreadable to sessions. `cleanup_run` removes the `-runner` sibling with the settings file. `PYTHONPATH` is on no allowlist (the bootstrap needs none); a test pins that it never crosses, either ambient or explicit.
++  - **Token:** `seat_token()` = keychain item `factory-zai` (production path per DESIGN D2) → ambient `ANTHROPIC_AUTH_TOKEN` (the owner's current bootstrap env). No token → `SessionConfigError` with the one-liner fix, before anything spawns.
++  - **Token-gated real tests (recorded for review):** AC-3's real half and AC-4 need a credential that by design exists only on the orchestrator's Mac (Rule of Two; CI is Linux). Where `seat_token()` is None — the CI runner — those tests assert the runner's *refusal* path instead: a deliberate distinction from the F-05 no-skip rule (a credential that must never leave the Mac is not a broken stack), and the refusal itself is real, executed behaviour — the entry-refusal test runs the actual `python -c <bootstrap>` process, SDK import and all. Both shapes run the full suite green locally (below).
++  - **`permission_denials` is empty for hook denials** (verified live): the CLI populates that field for `can_use_tool` denials, not PreToolUse hook denies. AC-3's real half therefore evidences the attempt by turn count (a denied Write costs a turn) plus the absent file — and uses an ordinary new file (`protected.md`) as the target rather than a sandbox-also-denied path like `.git/config`, where the srt backstop would mask a hook failure (a positive control: hook broken ⇒ file appears ⇒ test fails).
++- **AC-1** proven: `tests/test_f06.py::test_ac_1` — an injected query that never finishes (it keeps yielding, so the clock must bound the *stream*, not just silence) returns `aborted`/`wall_clock` in 2–15 s against a 3 s budget.
++- **AC-2** proven: `test_ac_2` — `error_max_turns`, `error_during_execution`, `is_error` + `api_error_status` 429, and a mid-stream `CLINotFoundError` are each returned as a failed record with the reason in it; the runner never raises.
++- **AC-3** proven: `test_ac_3` — unit half: deny matrix across Write/Edit/NotebookEdit × relative/absolute/`.git` forms, allow cases (`src/app.py`, a Read on a protected path), bash-guard deny/allow matrix (incl. `/usr/bin/gh`, `git  push` double-space, the `gh-gh-gh` false-positive guard); real half (owner's Mac): a real sandboxed session ordered to Write `protected.md` completes with the file absent and ≥2 turns — the hook denied a genuinely attempted write.
++- **AC-4** proven (owner's Mac, 2026-10-16): `test_ac_4` — a real session inside the real srt sandbox against `https://api.z.ai/api/anthropic` completed "Reply with exactly the word ok" in 1 turn, `result == "ok"`, and the recorded model — `claude-opus-5-5`, from `model_usage` — is the Z.ai Coding Plan's Opus→GLM mapping showing up exactly as DESIGN D2 predicted ("don't hard-code a mapping… record the actual model"). CI shape: the refusal path, per the token-gating note above. Owner step ("F-00 step 1 answered before AC-4 is run repeatedly or on a schedule"): F-00 step 1 was owner-confirmed 2026-10-16, before this one-off run — compliant; the step stays for reconcile to tick, and repeated/scheduled runs remain gated on it.
++- **AC-5** proven: `test_ac_5` — `setting_sources == []` on every seat; `options.env` is exactly the three seat names while the ambient environment carries `GH_TOKEN`, `GITHUB_TOKEN`, `JFO_SUPABASE_ANON_KEY` and a foreign `ANTHROPIC_BASE_URL`; the reviewer seat disallows the edit tools, the implementer seat doesn't.
++- **Extra coverage:** record distillation (multi-model `model_usage` → primary by token weight), a stream that ends with no `ResultMessage` → `failed`/`no_result_message`, unknown seat → `SessionConfigError`, the entry's no-token refusal (real subprocess, exit 2, fix message, no traceback), the bootstrap's clone-shadowing immunity (poison `factory/` in cwd loses to the staged copy), `_stage_runner` (no `__pycache__`/pyc, restages clean, idempotent), `cleanup_run` removes the `-runner` sibling, `SessionRecord` JSON round-trip, PYTHONPATH never crosses into the sandbox, hook output shape pinned to the SDK's `SyncHookJSONOutput` contract.
++- **Evidence:** 16 F-06 tests / 236 total passing locally in **both** shapes — without a token (the CI shape: refusal halves) and with the owner's Z.ai token (real sandboxed sessions against Z.ai, ~$0.24 of API across the runs) — ruff clean.
++- **Owner review round on PR #18 (9 findings — 7 owner-reproduced, 2 code-reading; all fixed on this PR, each with a red-first test in `tests/test_f06.py` under `test_review*`):**
++  - **(1) Direct `run_session` calls leaked the whole orchestrator environment** (owner-reproduced; verified in the SDK transport: it merges ALL of `os.environ` into the Claude Code subprocess — `options.env` is an overlay, never a replacement). Fix: `run_session` **windows the process env** for the stream's life — `_window_environ` keeps only process mechanics (PATH/LANG/TZ/HOME/TMPDIR, `LC_*`) plus the proxy names (inside the sandbox those carry srt's authenticated proxy, the session's only network route) and the seat names, and the finally restores the orchestrator's env exactly. Proven by `test_review1_direct_call_does_not_leak_ambient_environment`: GH_TOKEN, an AWS key, a foreign `ANTHROPIC_API_KEY` and a planted secret are absent for the whole stream (checked again after the first message), PATH survives, and everything is restored afterwards.
++  - **(2) Default settings path one level too shallow** (owner-reproduced): `run_dir.parent.parent` is the *runs root*, so settings landed at `<factory>/runs/sandbox/…`, which `cleanup_run` never looks at — every session leaked a settings file plus a staged factory copy. Fix: derive `runs/<project>/<run-id>` → `<factory>/sandbox/<project>-<run-id>.json` with the layout **asserted** (same refusal style as `build_settings`), so the derived path always equals `RunDir.settings_path`. Proven by `test_review2_default_settings_path_uses_the_factory_root` (no `runs/sandbox` dir is ever created) and `test_review2_settings_and_runner_are_cleaned_up` (real `create_run`/`cleanup_run`: settings, `-runner` copy and spec all gone).
++  - **(3) Protected-path hook bypasses** (owner-reproduced): `tests/../schema/x`, `./schema/x`, `Schema/x` and `/private/var` symlink-prefix spellings all passed, and Bash writes weren't checked at all. Fix: paths are matched as a cross-product of textual forms — as-given, `normpath` (collapses `./` and `a/../`) and fully `resolve`d (symlink prefixes) — crossed with the given and resolved cwd, **case-insensitively on both sides** (macOS filesystems are case-insensitive; lowercasing also over-denies `Schema/x` on Linux, which errs safe). Bash write targets are now checked too: redirections (`>`, `>>`, `2>`), the common write utilities (tee/mv/cp/rm/install/truncate/shred/unlink/sed -i) and output flags (`curl -o`, `wget -O`, `--output=…`) — best-effort, explicitly documented as a deny-layer rather than a shell parser, with L0's diff policy as the authoritative protected-path gate. Proven by `test_review3_protected_path_traversal_and_case_are_denied` (4 traversal/case forms + the /var→/private/var pair) and `test_review3_bash_writes_to_protected_paths_are_denied` (7 denied writes; ordinary commands and writes elsewhere allowed, including `mv schema/x src/x` — a move *out of*, not into, the protected tree).
++  - **(4) Bash guard evasion** (owner-reproduced): `git -C . push` (the old regex required git and push adjacent), `"gh"` (quoted), `` `gh` `` and `$(gh …)` all passed. Fix: git-push is denied when `git` and `push` appear as separate words anywhere in the command (covers `-C`/`--git-dir`/`-c` options between them; over-denies e.g. `echo git push` — the safe direction); the gh check runs on a **de-quoted** command (quotes and backticks stripped) with `(`/`)` added to the word boundaries so command substitutions match. Recorded with the reviewer's own framing: the structural barriers are that the sandbox holds no GitHub token and has no network route to github.com — this hook is the in-session policy layer, not the boundary. Proven by `test_review4_bash_guard_covers_optioned_and_quoted_forms` (7 forms denied; the earlier allow matrix — `git status`, `git commit`, `echo gh-gh-gh`, `ls .config` — still passes).
++  - **(5) Sessions ran the auto-updating `~/.local/bin/claude`** instead of the pinned CLI. The SDK's own `_find_cli` prefers its bundle; my `_resolve_cli` override defeated it. Fix: `_bundled_cli()` returns the native binary inside the pinned `claude_agent_sdk` package (verified shipped in the macOS **and** manylinux wheels, so CI has it too); `run_session_sandboxed` runs it and **refuses** (`SessionConfigError` naming the pin to reinstall) rather than silently falling back to an unpinned CLI — the auto-discovering `_resolve_cli` is gone. Explicit `cli_path` still wins for tests only. Proven by `test_review5_sandboxed_sessions_use_the_sdk_bundled_cli` (spec names the bundle; the bundle is in the toolchain; no `~` anywhere in the path) and re-proven live: AC-4's real session now runs the bundled CLI inside the sandbox.
++  - **(6) `.session-spec.json` landed in the clone as an untracked file** (owner-reproduced: a `git add -A` would commit the prompt and home paths). Fix: the spec lives inside the staged runner dir — outside the run dir entirely, next to the factory-package copy, allow-read with it and removed by the same `cleanup_run` step. Proven by `test_review6_spec_never_lands_in_the_clone`: after a prepared session, `git status --porcelain` in the clone is empty and the spec exists outside it.
++  - **(7) Ambient `ANTHROPIC_AUTH_TOKEN` sent to Z.ai without checking its base URL** (code-reading). Fix: `seat_token()` uses the ambient token only when the ambient `ANTHROPIC_BASE_URL` names the Z.ai endpoint (trailing-slash tolerant); a token exported for another provider — or with no base URL at all, i.e. api.anthropic.com — is not ours to send. Proven by `test_review7_ambient_token_requires_the_zai_base_url` (three cases).
++  - **(8) Wall-clock abort never closed the SDK stream** (code-reading). Fix: `_close_stream` awaits `aclose()` (bounded, exceptions suppressed — closing is cleanup, never the failure being reported) on the abort path, the SDK-error path, and normal completion. Proven by `test_review8_abort_closes_the_stream`, whose fakes are plain iterators, not async generators — loop shutdown cannot auto-close them, so the closed flag proves the runner itself closed the stream on both paths.
++  - **(9) `_primary_model` crashed on null token counts** (code-reading). Fix: null counts weigh zero (`int(x or 0)`), empty usage → `None`. Proven by `test_review9_primary_model_tolerates_null_counts`.
++  - Commit discipline: no AI-attribution trailers, matching the round's commit.
++- **Evidence (after the review round):** 27 F-06 tests / 247 total passing locally in **both** shapes — without a token (CI shape) and with the owner's Z.ai token (real sandboxed sessions against Z.ai running the **bundled pinned CLI**, ~$0.20 additional API spend) — ruff clean.
++- **Status to set at reconcile:** `done` once this PR's CI is green (ruff + pytest on 3.11 + 3.13) and you merge it. No deploy target, so L4 doesn't apply. The owner step above is answered in substance (F-00 ledger, 2026-10-16); ticking it in `tasks.json` happens at reconcile.
++- **Owner review round 2 on PR #18 (4 findings — 1 new bug, 2 hardening, 1 convention; all fixed on this PR, red-first under `test_review10/11/12`):**
++  - **New bug — concurrent sessions stripped the orchestrator's env** (owner-reproduced): `_window_environ` swaps the whole process env, so a second overlapping session saved the first's *stripped* copy and restored it last — `GH_TOKEN` gone for good; a future F-10 loop that ever overlapped sessions would silently lose its GitHub token. Fix (the reviewer's "refuse a nested window" option): a module-level `_WINDOW_OPEN` flag, checked and set at non-await points (single-threaded asyncio — no interleaving can race it), refusing a second window with a `SessionConfigError` naming the serial rule. Sessions in one process are serial; the F-10 loop is. Proven by `test_review10_overlapping_sessions_refuse_and_keep_the_env`, which reproduces the exact strip ordering (second window opened inside the first, first restores, second restores *last*) and asserts the refusal plus `GH_TOKEN` intact — red on the old code ('ran' instead of 'refused').
++  - **Non-SDK errors skipped the stream close** (owner code-reading): the close sat on three exit paths; a non-SDK raise (which propagates by design — a bug must stay loud) leaked the CLI subprocess. Fix: the close moved into the existing `finally`, so every exit path — completion, abort, SDK error, unexpected raise — closes the stream (while the env window is still up) and restores the env and flag. Proven by `test_review11_non_sdk_errors_still_close_the_stream`: a plain iterator raising `RuntimeError` propagates *and* its `closed` flag is set.
++  - **Bash guard residue** (owner-reproduced, low impact by their own framing — no token, no github.com route): `sh -c 'git pu''sh'` and `g\it push` passed. Fix: the de-quote table now strips backslashes as well as quotes/backticks, and the git/push word check runs on the de-quoted command (previously only gh did) — both forms deny. The claim is stated precisely now: this hook is a best-effort deny-layer on top of the structural barriers, not an evasion-proof boundary. Proven by `test_review12_bash_guard_backslash_and_sh_c_quoting` (3 forms incl. `g\h pr create`).
++  - **Commit subject missing `(F-06)`** (CLAUDE.md convention): the round-1 commit was amended to `fix: env window, pinned bundled CLI, hardened hooks, cleanup paths (F-06)`; round 2's commit carries the tag from the start.
++- **Evidence (after review round 2):** 30 F-06 tests / 250 total passing locally (no-token shape — nothing model-facing changed this round, so no API spend), ruff clean.
++- **Owner review round 3 on PR #18 (1 finding — the round-2 git/push word-anywhere check was too broad; fixed on this PR, red-first under `test_review13`):** the owner's cases (`git commit -m 'fix push notification retry'`, `git log --grep=push`, `grep -rn push src/`, `echo gh is the cli`) were all denied — a session working on push-notification code couldn't commit truthfully or search its own code. Fix, per the owner's direction ("split the command into its separate parts and deny only when one part actually runs git push or gh"): the de-quoted command is split into **invocations** (`_bash_invocations`: on `;` `|` `&` newlines `()` `<>`), and `_invocation_violation` denies only when an invocation's program is git whose **subcommand** is `push` (global options `-C .`/`-c k=v`/`--git-dir=…` skipped first, so `git commit`/`git log`/`git help push` pass) or `gh` itself; shells' `-c` payloads (`sh -c 'git pu''sh'`) and prefix wrappers (env/command/exec/xargs/nice/nohup) recurse. Proven by `test_review13_push_or_gh_mentions_in_ordinary_commands_pass` (7 allow cases — red before the fix) and `test_review13_real_invocations_still_deny` (16 deny cases: every round-1/2 evasion form plus `/usr/bin/git push`, `env git push`, `command gh`, `bash -c 'gh auth login'`). **Residual, stated in the docstring and PR:** pipes feeding a shell's stdin (`echo git push | sh`), git aliases and unenumerated wrappers still pass — the hook is a best-effort deny-layer over the structural barriers (no GitHub token, no network route to github.com), not an evasion-proof boundary.
++- **Evidence (after review round 3):** 32 F-06 tests / 252 total passing locally (no-token shape; guard-only change, no API spend), ruff clean.
+diff --git a/factory/runs.py b/factory/runs.py
+index 611b190..a3a92ca 100644
+--- a/factory/runs.py
++++ b/factory/runs.py
+@@ -144,10 +144,14 @@ def create_run(
+ 
+ 
+ def cleanup_run(run: RunDir) -> None:
+-    """Delete the run's clone and settings file. Idempotent: a missing run
+-    (already cleaned, or never finished creating) is not an error."""
++    """Delete the run's clone, settings file and staged runner copy
++    (``<settings>-runner/``, written by the F-06 session runner). Idempotent:
++    a missing run (already cleaned, or never finished creating) is not an
++    error."""
+     shutil.rmtree(run.root, ignore_errors=True)
+     run.settings_path.unlink(missing_ok=True)
++    shutil.rmtree(run.settings_path.with_name(run.settings_path.name + "-runner"),
++                  ignore_errors=True)
+ 
+ 
+ def _new_run_id() -> str:
+diff --git a/factory/sandbox.py b/factory/sandbox.py
+index 7e9614d..aa82ab5 100644
+--- a/factory/sandbox.py
++++ b/factory/sandbox.py
+@@ -56,9 +56,12 @@
+ #   exec-capable git config arriving unasked).
+ # * SESSION_* — allowed ONLY from the caller's explicit ``env=``: the model
+ #   seat (base URL, the one secret the sandbox holds, API timeout) and the
+-#   git identity (the sandbox can't read ~/.gitconfig). GIT_CONFIG_* is not
+-#   on any list — env-injected git config is exec-capable; `git -c` on the
+-#   command line is the controlled route.
++#   git identity (the sandbox can't read ~/.gitconfig).
++#   GIT_CONFIG_* is not on any list — env-injected git config is
++#   exec-capable; `git -c` on the command line is the controlled route.
++#   PYTHONPATH is deliberately NOT on any list either: the session runner
++#   bootstraps its imports with an explicit ``sys.path`` insert instead, so
++#   no path-injection surface exists at all.
+ #
+ # Adding a name to either list is a deliberate, reviewable act.
+ AMBIENT_ENV_ALLOWLIST = frozenset({"PATH", "LANG", "TZ"})
+@@ -235,6 +238,23 @@ def sandbox_env(
+     return scrub_env(env, forbidden)
+ 
+ 
++def default_toolchain(extra: "Sequence[Path] | None" = None) -> list[Path]:
++    """The binaries :func:`build_settings` re-allows for reading by default:
++    this interpreter, the real interpreters behind ``python3``/``python``,
++    and the standard toolchain names found on PATH — plus caller ``extra``
++    entries (the session runner adds the resolved Claude CLI, which is not
++    necessarily on the orchestrator's non-login PATH).
++    """
++    toolchain: list[Path] = [sys.executable, *_python_toolchain()]
++    toolchain += [
++        Path(found) for name in TOOLCHAIN_BINS if (found := shutil.which(name))
++    ]
++    for path in extra or ():
++        if path and Path(path) not in toolchain:
++            toolchain.append(Path(path))
++    return toolchain
++
++
+ def build_settings(
+     profile: dict,
+     run_dir: Path,
+@@ -243,6 +263,7 @@ def build_settings(
+     forbidden_env: tuple[str, ...] = (),
+     factory_root: Path | None = None,
+     toolchain: "Sequence[Path] | None" = None,
++    allow_read: "Sequence[Path]" = (),
+ ) -> dict:
+     """Build the srt settings dict for one run from the project profile.
+ 
+@@ -266,8 +287,15 @@ def build_settings(
+             pythons, nvm node. Each gets its resolved install dir, the
+             sibling ``lib/`` of a ``bin/`` install dir, and the symlink
+             files on the way re-allowed for reading — never ancestor
+-            directories (see :func:`_toolchain_allowread`). Default: this
+-            Python plus :data:`TOOLCHAIN_BINS` found on PATH.
++            directories (see :func:`_toolchain_allowread`). Default:
++            :func:`default_toolchain` (this Python plus the standard names
++            on PATH).
++        allow_read: Extra paths re-allowed for reading on top of the run dir
++            and the toolchain. The session runner passes exactly the factory
++            package dir here — the in-sandbox entry point
++            (``python -m factory.session``) imports it. Deliberately narrow:
++            the wider repo (prompts, schemas, validator docs) stays
++            unreadable to the session.
+ 
+     Returns:
+         A settings dict accepted by ``srt --settings``.
+@@ -289,9 +317,7 @@ def build_settings(
+     else:
+         factory_root = Path(factory_root).resolve()
+     if toolchain is None:
+-        toolchain = [sys.executable, *_python_toolchain()]
+-        toolchain += [Path(found) for name in TOOLCHAIN_BINS
+-                      if (found := shutil.which(name))]
++        toolchain = default_toolchain()
+     allowed_domains = [
+         _endpoint_host(model_endpoint),
+         *profile.get("docs_allowlist", []),
+@@ -325,7 +351,8 @@ def build_settings(
+                 str(runs_root),
+             ],
+             "allowRead": [str(run_dir), str(srt_package)]
+-            + [str(entry) for entry in toolchain_reads],
++            + [str(entry) for entry in toolchain_reads]
++            + [str(Path(entry).resolve()) for entry in allow_read],
+             "allowWrite": [str(run_dir)],
+             # The run's git control files are not the agent's to edit: a hook
+             # or core.hooksPath/fsmonitor redirect planted here executes later,
+diff --git a/factory/session.py b/factory/session.py
+new file mode 100644
+index 0000000..1f4d01d
+--- /dev/null
++++ b/factory/session.py
+@@ -0,0 +1,1026 @@
++"""The session runner (BUILD-ORDER F-06).
++
++One agent seat = one Claude Code session, started through
++``claude_agent_sdk.query()`` with per-seat :class:`ClaudeAgentOptions`,
++inside the F-05 sandbox. The sandbox wraps the *runner process* itself
++(:func:`run_session_sandboxed` execs ``python -m factory.session`` under
++srt), so the Claude Code subprocess the SDK spawns — and everything it
++spawns — inherits the confinement. The srt sandbox is the permission
++system (DESIGN D3): the implementer seat therefore runs with Claude
++Code's own permission prompts bypassed (``bypassPermissions``) — prompts
++are meaningless unattended, the run dir is the only writable path, and
++the in-process PreToolUse hooks below are the in-session policy layer.
++A deny hook still blocks under ``bypassPermissions``; the reviewer seat
++additionally gets the edit tools disallowed outright.
++
++Seats:
++
++* ``implementer`` — writes code. Prompt-bypassed, sandbox-confined, hooks
++  enforce protected paths and the push/gh ban.
++* ``reviewer`` — reads, never writes: ``Write``/``Edit``/``NotebookEdit``
++  are disallowed at the options layer on top of the same hooks.
++
++Clock: the wall clock (:func:`asyncio.wait_for` around each message
++receive, budgeted by the remaining deadline) covers **only** the message
++stream — setup and record-building sit outside it, so a session's budget
++isn't eaten by orchestrator work around it. A stream that never ends is
++cut off at the deadline and reported ``aborted``.
++
++Failure handling: error results (``error_max_turns``,
++``error_during_execution``, ``is_error`` with an ``api_error_status``)
++and SDK exceptions are recorded as failed attempts with the reason —
++the runner never crashes on a session outcome. A bug in *this* code
++still raises: only :class:`claude_agent_sdk.ClaudeSDKError` and session
++outcomes are recorded.
++
++Secrets: the session env is exactly three names — the Z.ai base URL,
++the Z.ai token (the one secret the sandbox holds, DESIGN D2/D3) and the
++API timeout. ``setting_sources=[]`` so no user/project Claude config is
++loaded. Nothing else is read from the ambient environment, ever.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import fnmatch
++import importlib.metadata
++import json
++import os
++import re
++import shlex
++import shutil
++import subprocess
++import sys
++import time
++from dataclasses import asdict, dataclass, field
++from pathlib import Path
++from typing import Any, Sequence
++
++from claude_agent_sdk import (
++    ClaudeAgentOptions,
++    ClaudeSDKError,
++    HookMatcher,
++    ResultMessage,
++)
++from claude_agent_sdk import query as sdk_query
++
++from factory.sandbox import (
++    build_settings,
++    default_toolchain,
++    run_sandboxed,
++    write_settings,
++)
++
++DEFAULT_BASE_URL = "https://api.z.ai/api/anthropic"
++DEFAULT_TIMEOUT_MS = 600_000
++KEYCHAIN_SERVICE = "factory-zai"
++# The pinned SDK version (pyproject pins claude-agent-sdk exactly); used
++# in refusal messages so the fix names the pin to reinstall.
++_SDK_VERSION = importlib.metadata.version("claude-agent-sdk")
++
++_FACTORY_PKG = Path(__file__).resolve().parent
++_REPO_ROOT = _FACTORY_PKG.parent
++
++
++def _stage_runner(runner_dir: Path) -> Path:
++    """Stage a copy of the factory package for the sandboxed entry point.
++
++    Why a copy rather than importing from the repo: python's import needs
++    to *list* the directory that holds the package (FileFinder), and the
++    sandbox denies listing the repo — so ``import factory`` from the repo
++    path silently falls through to a ``factory/`` package in the target
++    clone (untrusted shadowing; verified empirically). The staged copy
++    lives next to the sandbox settings, outside the run dir: the session
++    can read exactly it and can write nothing there.
++    """
++    runner_dir.mkdir(parents=True, exist_ok=True)
++    dest = runner_dir / "factory"
++    if dest.exists():
++        shutil.rmtree(dest)
++    shutil.copytree(
++        _FACTORY_PKG, dest, ignore=shutil.ignore_patterns("__pycache__", "*.pyc")
++    )
++    return runner_dir
++
++
++def _entry_bootstrap(runner_dir: Path) -> str:
++    """The in-sandbox entry: the staged copy is first on sys.path, ahead of
++    the cwd (the target clone), so the session always runs the
++    orchestrator's code, never a ``factory/`` package that happens to sit
++    in the clone."""
++    return (
++        "import sys; sys.path.insert(0, {runner!r}); "
++        "from factory.session import _main; sys.exit(_main(sys.argv[1:]))"
++    ).format(runner=str(runner_dir))
++
++
++class SessionConfigError(Exception):
++    """The session cannot be configured: unknown seat, missing token, or an
++    unusable sandboxed-entry result. Raised before any session starts."""
++
++
++class _WallClock(Exception):
++    """Internal: the session's wall-clock budget ran out."""
++
++
++# ------------------------------------------------------------------ seats --
++
++@dataclass(frozen=True)
++class SeatConfig:
++    """Per-seat options. ``system_prompt`` is the seat prompt; F-09 supplies
++    the real ones, so it is empty until then."""
++
++    name: str
++    system_prompt: str | None = None
++    allowed_tools: tuple[str, ...] = ()
++    disallowed_tools: tuple[str, ...] = ()
++    permission_mode: str | None = None
++
++
++SEATS: dict[str, SeatConfig] = {
++    "implementer": SeatConfig(
++        name="implementer",
++        # See the module docstring: the sandbox is the permission system;
++        # prompts are bypassed, hooks + srt enforce the policy.
++        permission_mode="bypassPermissions",
++    ),
++    "reviewer": SeatConfig(
++        name="reviewer",
++        # WO: "the reviewer gets no Write/Edit". NotebookEdit is the same
++        # class of tool, so it goes too — a reviewer that cannot mutate.
++        disallowed_tools=("Write", "Edit", "NotebookEdit"),
++    ),
++}
++
++
++def _seat(seat: str) -> SeatConfig:
++    try:
++        return SEATS[seat]
++    except KeyError:
++        raise SessionConfigError(
++            f"unknown seat {seat!r}: expected one of {sorted(SEATS)}"
++        ) from None
++
++
++# ------------------------------------------------------------------- env --
++
++# What a session's subprocess environment may keep from the ambient one
++# while the stream is live (see _window_environ). The SDK merges ALL of
++# os.environ into the Claude Code subprocess, so a direct (unsandboxed)
++# run_session call would otherwise hand the CLI every orchestrator secret:
++# GH_TOKEN, AWS keys, a foreign ANTHROPIC_API_KEY. The window keeps only
++# process mechanics (PATH/LANG/TZ/HOME/TMPDIR, LC_*) plus the proxy names
++# — inside the sandbox those carry srt's authenticated proxy, which is the
++# session's only network route — and the seat names ride in via options.env.
++_RUNNER_ENV_KEEP = frozenset(
++    {
++        "PATH", "LANG", "TZ", "HOME", "TMPDIR",
++        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
++    }
++)
++_RUNNER_ENV_PREFIXES = ("LC_",)
++
++# Whether a session's environment window is currently open in this process
++# (review round 2). One window at a time, ever: os.environ is a single
++# process-wide resource, so overlapping windows would restore each other's
++# stripped copies and permanently delete the orchestrator's credentials.
++# The orchestrator is single-threaded asyncio; the flag is checked and set
++# at non-await points, so no interleaving can race it within one loop.
++_WINDOW_OPEN = False
++
++
++def _window_environ(seat_env: dict[str, str]) -> dict[str, str]:
++    """Replace os.environ with the runner allowlist + ``seat_env`` for the
++    session's life; returns the saved environment for restoration. The
++    orchestrator process is single-session, so windowing the process env
++    for the stream's duration is the one pin-independent way to control
++    what the SDK's spawn sees (the SDK offers no replace-env option)."""
++
++    def keep(key: str) -> bool:
++        upper = key.upper()
++        return (
++            key in _RUNNER_ENV_KEEP
++            or upper in _RUNNER_ENV_KEEP
++            or key.startswith(_RUNNER_ENV_PREFIXES)
++            or upper.startswith(_RUNNER_ENV_PREFIXES)
++        )
++
++    saved = dict(os.environ)
++    os.environ.clear()
++    for key, value in saved.items():
++        if keep(key):
++            os.environ[key] = value
++    os.environ.update(seat_env)
++    return saved
++
++
++def session_env(base_url: str, token: str, timeout_ms: int) -> dict[str, str]:
++    """The session env: exactly the three Z.ai seat names.
++
++    Deliberately literal — this function reads nothing from the ambient
++    environment, so no GitHub token, keychain secret or inherited
++    ``ANTHROPIC_*`` value can appear in a session by construction.
++    """
++    return {
++        "ANTHROPIC_BASE_URL": base_url,
++        "ANTHROPIC_AUTH_TOKEN": token,
++        "API_TIMEOUT_MS": str(int(timeout_ms)),
++    }
++
++
++def seat_token() -> str | None:
++    """The Z.ai model token, or None where no credential exists.
++
++    Lookup order: the macOS keychain item ``factory-zai`` (the production
++    path per DESIGN D2), then the ambient ``ANTHROPIC_AUTH_TOKEN`` — but
++    only when the ambient ``ANTHROPIC_BASE_URL`` names the Z.ai endpoint:
++    a token exported for another provider (or with no base URL, i.e.
++    api.anthropic.com) belongs to that provider and must never be sent to
++    Z.ai. On the Linux CI runner neither exists and this returns None,
++    which callers must treat as "no session can authenticate here".
++    """
++    try:
++        proc = subprocess.run(
++            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
++            capture_output=True,
++            text=True,
++            timeout=15,
++        )
++    except (OSError, subprocess.TimeoutExpired):
++        proc = None  # no macOS keychain here (or it hung) — try the env
++    if proc is not None and proc.returncode == 0 and proc.stdout.strip():
++        return proc.stdout.strip()
++    ambient_url = os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/")
++    if ambient_url != DEFAULT_BASE_URL:
++        return None
++    return os.environ.get("ANTHROPIC_AUTH_TOKEN") or None
++
++
++# ----------------------------------------------------------------- hooks --
++
++# De-quoting for the guard's checks: strip quotes, backticks AND
++# backslashes before matching, so `"gh"`, `` `gh` ``, `$()` forms and
++# backslash-split words (`g\it pu\sh`, round 2) are all seen as their
++# bare selves. Over-matching is the safe direction for a deny-layer.
++_BASH_QUOTES = str.maketrans("", "", "\"'`\\")
++# Command separators: a new invocation starts after each of these —
++# statement ends, pipes, &&, subshells/command substitutions (() and
++# backticks are already stripped), and redirections (their targets are
++# not programs).
++_BASH_SEPARATORS = re.compile(r"[\n;&|()<>]")
++# Shell programs whose `-c` payload is itself a command to scan.
++_BASH_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash", "fish"})
++# Wrappers that prefix a real command (their own flags / VAR=val tokens
++# are skipped before recursing).
++_BASH_PREFIX_RUNNERS = frozenset(
++    {"env", "command", "exec", "xargs", "nice", "nohup"}
++)
++# git global options that consume the NEXT token as their value when it
++# is not attached with '=' (attached forms are single '-…' tokens).
++_GIT_VALUE_OPTS = frozenset(
++    {"-C", "--git-dir", "--work-tree", "--namespace", "--exec-path",
++     "--super-prefix", "-c"}
++)
++_BASH_GH_CONFIG = ".config/gh"
++# Redirection targets: `> file`, `>> file`, `2>file` (the fd digit and any
++# spacing between the brackets is optional).
++_BASH_REDIRECT = re.compile(r"(?:^|[\s;&|)])(?:\d)?>>?\s*([^\s;&|<>]+)")
++# Utilities whose arguments write files; value = how many trailing args
++# are destinations (mv/cp/install: src… dest — only the last one writes).
++_BASH_WRITE_CMDS = {
++    "tee": "all",
++    "rm": "all",
++    "truncate": "all",
++    "shred": "all",
++    "unlink": "all",
++    "mv": "last",
++    "cp": "last",
++    "install": "last",
++    "sed": "all_after_script",  # sed -i SCRIPT files…
++}
++_BASH_OUTPUT_FLAGS = {"-o", "--output", "-O", "--output-document"}
++
++
++def _deny(reason: str) -> dict[str, Any]:
++    """A PreToolUse deny in the SDK's SyncHookJSONOutput shape."""
++    return {
++        "hookSpecificOutput": {
++            "hookEventName": "PreToolUse",
++            "permissionDecision": "deny",
++            "permissionDecisionReason": reason,
++        }
++    }
++
++
++def _path_forms(path_text: str) -> set[str]:
++    """Every textual form worth matching: as given, normalised (``./x``,
++    ``a/../x`` collapsed) and fully resolved (symlinks — on macOS the run
++    dir's /private/var prefix vs its /var spelling). Resolution of a
++    not-yet-existing file is fine (non-strict)."""
++    forms = {path_text}
++    try:
++        forms.add(os.path.normpath(path_text))
++    except (OSError, ValueError):
++        pass
++    try:
++        forms.add(str(Path(path_text).resolve()))
++    except (OSError, ValueError):
++        pass
++    return forms
++
++
++def _path_candidates(file_path: str, cwd: str) -> set[str]:
++    """The forms a file_path is matched against, crossed with the forms of
++    its cwd: as-given, absolute (cwd-joined, from both the given and the
++    resolved cwd), and cwd-relative (an absolute path inside the run).
++    """
++    candidates: set[str] = set()
++    raw = Path(file_path)
++    cwds = _path_forms(cwd) if cwd else set()
++    candidates |= _path_forms(file_path)
++    if raw.is_absolute():
++        for cwd_text in cwds:
++            cwd_path = Path(cwd_text)
++            for form in _path_forms(file_path):
++                try:
++                    candidates.add(str(Path(form).relative_to(cwd_path)))
++                except ValueError:
++                    pass
++    else:
++        for cwd_text in cwds:
++            candidates |= _path_forms(str(Path(cwd_text) / file_path))
++    return candidates
++
++
++def _matches_protected(file_path: str, cwd: str, patterns: tuple[str, ...]) -> str | None:
++    """The first pattern the path matches, case-insensitively (macOS
++    filesystems are case-insensitive; lowercasing both sides also
++    over-denies `Schema/x` on case-sensitive Linux, which errs safe), or
++    None."""
++    if not file_path or not patterns:
++        return None
++    candidates = _path_candidates(file_path, cwd)
++    lowered = {form.lower() for form in candidates}
++    for pattern in patterns:
++        if any(fnmatch.fnmatchcase(form, pattern.lower()) for form in lowered):
++            return pattern
++    return None
++
++
++def protected_path_hook(protected: "Sequence[str]") -> HookMatcher:
++    """PreToolUse hook: deny Write/Edit/NotebookEdit into ``protected``
++    globs (``paths.protected`` from the project profile). Paths are
++    normalised (``./``, ``a/../``) and resolved (symlink prefixes such as
++    macOS's /var → /private/var) before matching, case-insensitively —
++    traversal, dot-relative, case and symlink spellings of a protected
++    path all deny. Unprotected paths get no opinion (``{}`` — the tool
++    proceeds)."""
++
++    patterns = tuple(protected)
++
++    async def _hook(
++        input: dict[str, Any], tool_use_id: str | None, context: dict[str, Any]
++    ) -> dict[str, Any]:
++        # The matcher already routes only Write|Edit|NotebookEdit here; the
++        # tool-name guard is defence in depth for direct callback use.
++        if input.get("tool_name") not in {"Write", "Edit", "NotebookEdit"}:
++            return {}
++        tool_input = input.get("tool_input") or {}
++        file_path = str(tool_input.get("file_path", ""))
++        cwd = str(input.get("cwd") or "")
++        matched = _matches_protected(file_path, cwd, patterns)
++        if matched:
++            return _deny(f"{file_path} matches protected path {matched!r}")
++        return {}
++
++    return HookMatcher(matcher="Write|Edit|NotebookEdit", hooks=[_hook])
++
++
++def _bash_write_targets(command: str) -> list[str]:
++    """Best-effort file paths a Bash command writes to: redirection
++    targets, the argument patterns of the common write utilities, and the
++    value following an output flag (-o/--output/-O/--output-document).
++    No shell parsing — this is a deny-layer, not a parser; the
++    authoritative protected-path gate is L0's diff policy, which inspects
++    the actual diff after the session."""
++    targets = [m.group(1) for m in _BASH_REDIRECT.finditer(command)]
++    try:
++        tokens = shlex.split(command)
++    except ValueError:
++        tokens = command.split()
++    if tokens:
++        head = Path(tokens[0]).name
++        args = tokens[1:]
++        mode = _BASH_WRITE_CMDS.get(head)
++        if mode == "last" and args:
++            targets.append(args[-1])
++        elif mode == "all":
++            targets.extend(a for a in args if not a.startswith("-"))
++        elif mode == "all_after_script" and "-i" in args:
++            rest = args[args.index("-i") + 1:]
++            targets.extend(rest[1:] if rest else [])
++        elif head in {"curl", "wget"}:
++            for index, flag in enumerate(args):
++                if flag in _BASH_OUTPUT_FLAGS and index + 1 < len(args):
++                    targets.append(args[index + 1])
++                for prefix in tuple(_BASH_OUTPUT_FLAGS):
++                    if flag.startswith(prefix + "="):
++                        targets.append(flag.split("=", 1)[1])
++    return targets
++
++
++def _bash_invocations(dequoted: str) -> list[list[str]]:
++    """The command's invocations as token lists: the de-quoted command
++    split on shell separators (;, |, &, newlines, subshells/command
++    substitutions, redirections), each part whitespace-tokenised. Empty
++    parts (between adjacent separators) drop out."""
++    return [
++        part.split()
++        for part in _BASH_SEPARATORS.split(dequoted)
++        if part.split()
++    ]
++
++
++def _invocation_violation(tokens: list[str]) -> str | None:
++    """What an invocation actually runs: "git push", "gh", or None.
++
++    Denies only when the invocation's *program* is git with `push` as its
++    subcommand (global options like ``-C .``/``-c k=v`` skipped first), or
++    gh itself — so a commit message about push notifications, ``git log
++    --grep=push`` or ``grep -rn push src/`` pass (round 3). Shells'
++    ``-c`` payloads and prefix wrappers (env/command/exec/xargs…) are
++    recursed into, and the de-quoted token stream already merges
++    quote-split and backslash-split words (round 2)."""
++    if not tokens:
++        return None
++    program = Path(tokens[0]).name
++    if program == "git":
++        index = 1
++        while index < len(tokens):
++            token = tokens[index]
++            if token in _GIT_VALUE_OPTS:
++                index += 2  # the option and its separate value
++                continue
++            if token.startswith("-"):
++                index += 1  # a flag; '='-attached values are one token
++                continue
++            return "git push" if token == "push" else None
++        return None
++    if program == "gh":
++        return "gh"
++    if program in _BASH_SHELLS:
++        try:
++            payload = tokens.index("-c", 1) + 1
++        except ValueError:
++            return None
++        return _invocation_violation(tokens[payload:])
++    if program in _BASH_PREFIX_RUNNERS:
++        rest = [
++            token
++            for token in tokens[1:]
++            if not token.startswith("-") and "=" not in token
++        ]
++        return _invocation_violation(rest)
++    return None
++
++
++def bash_guard_hook(protected: "Sequence[str]" = ()) -> HookMatcher:
++    """PreToolUse hook over Bash: deny invocations that actually run
++    ``git push`` (any git global options first) or the ``gh`` CLI —
++    including quoted, backticked, ``$(…)``, ``sh -c`` and backslash-split
++    spellings, reached by de-quoting and splitting the command into its
++    invocations (round 3's fix: a command that merely *mentions* push or
++    gh — commit messages, ``--grep=push``, code search — passes). Also
++    denies anything touching ``~/.config/gh`` and best-effort writes
++    (redirections, tee/mv/cp/rm/sed -i/curl -o…) into the protected
++    globs. The orchestrator (outside the sandbox, with its own
++    credentials) pushes and opens PRs — the WO's rule that a session
++    never does. Residual (documented, best-effort deny-layer — NOT an
++    evasion-proof boundary): pipes feeding a shell's stdin
++    (``echo git push | sh``), git aliases, and unenumerated wrappers
++    still slip through; the structural barriers underneath are that the
++    sandbox holds no GitHub token and has no network route to
++    github.com."""
++
++    patterns = tuple(protected)
++
++    async def _hook(
++        input: dict[str, Any], tool_use_id: str | None, context: dict[str, Any]
++    ) -> dict[str, Any]:
++        command = str((input.get("tool_input") or {}).get("command", ""))
++        # All checks run on the de-quoted command (round 2): backslash-split
++        # and quote-concatenated spellings (`g\it push`, `sh -c 'git pu''sh'`)
++        # must be seen as their bare selves.
++        dequoted = command.translate(_BASH_QUOTES)
++        for invocation in _bash_invocations(dequoted):
++            violation = _invocation_violation(invocation)
++            if violation == "git push":
++                return _deny("git push is not allowed inside a session")
++            if violation == "gh":
++                return _deny("the gh CLI is not allowed inside a session")
++        if _BASH_GH_CONFIG in dequoted:
++            return _deny("~/.config/gh is not accessible inside a session")
++        if patterns:
++            cwd = str(input.get("cwd") or "")
++            for target in _bash_write_targets(dequoted):
++                matched = _matches_protected(target, cwd, patterns)
++                if matched:
++                    return _deny(
++                        f"writing {target} matches protected path {matched!r}"
++                    )
++        return {}
++
++    return HookMatcher(matcher="Bash", hooks=[_hook])
++
++
++# ----------------------------------------------------------- options/record --
++
++def build_options(
++    seat: str,
++    cwd: Path,
++    max_turns: int,
++    *,
++    base_url: str,
++    token: str,
++    timeout_ms: int = DEFAULT_TIMEOUT_MS,
++    protected: "Sequence[str]" = (),
++    cli_path: Path | None = None,
++    model: str | None = None,
++) -> ClaudeAgentOptions:
++    """Build the per-seat ClaudeAgentOptions (WO F-06 options list).
++
++    ``setting_sources=[]`` — no user/project/local Claude settings, so a
++    session can't pick up personal config. ``env`` is exactly the three
++    session names (see :func:`session_env`). Hooks: protected-path +
++    bash-guard PreToolUse callbacks, in-process via HookMatcher.
++    """
++    seat_config = _seat(seat)
++    options = ClaudeAgentOptions(
++        cwd=str(Path(cwd)),
++        env=session_env(base_url, token, timeout_ms),
++        max_turns=max_turns,
++        system_prompt=seat_config.system_prompt,
++        setting_sources=[],
++        allowed_tools=list(seat_config.allowed_tools),
++        disallowed_tools=list(seat_config.disallowed_tools),
++        permission_mode=seat_config.permission_mode,
++        hooks={
++            "PreToolUse": [
++                protected_path_hook(protected),
++                bash_guard_hook(protected),
++            ]
++        },
++    )
++    if cli_path is not None:
++        options.cli_path = str(Path(cli_path).expanduser().resolve())
++    if model is not None:
++        options.model = model
++    return options
++
++
++@dataclass
++class SessionRecord:
++    """What a session recorded, distilled from the ResultMessage (WO F-06
++    "Record" list). F-10 writes this into ``attempts[]``."""
++
++    seat: str
++    status: str  # completed | failed | aborted
++    reason: str | None = None
++    num_turns: int | None = None
++    subtype: str | None = None
++    is_error: bool = False
++    terminal_reason: str | None = None
++    duration_ms: int | None = None
++    session_id: str | None = None
++    model: str | None = None
++    models: list[str] = field(default_factory=list)
++    tokens: dict[str, Any] | None = None
++    total_cost_usd: float | None = None
++    result: str | None = None
++    permission_denials: list[Any] | None = None
++
++    def to_dict(self) -> dict[str, Any]:
++        return asdict(self)
++
++    @classmethod
++    def from_dict(cls, data: dict[str, Any]) -> "SessionRecord":
++        return cls(**data)
++
++
++def _primary_model(model_usage: dict[str, Any] | None) -> str | None:
++    """The model name out of ``model_usage`` — the entry with the most
++    input+output tokens when the session touched several. Counts may come
++    back null from the CLI; they weigh zero rather than crash."""
++
++    def weight(name: str) -> int:
++        entry = model_usage.get(name) or {}
++        return int(entry.get("inputTokens") or 0) + int(
++            entry.get("outputTokens") or 0
++        )
++
++    return max(model_usage or {}, key=weight, default=None)
++
++
++def _failure_reason(message: ResultMessage) -> str:
++    if message.subtype and message.subtype.startswith("error"):
++        return message.subtype
++    status = getattr(message, "api_error_status", None)
++    if status:
++        return f"api_error_{status}"
++    return message.subtype or "is_error"
++
++
++def _record_from(
++    message: ResultMessage, seat: str, duration_ms: int
++) -> SessionRecord:
++    failed = message.is_error or (message.subtype or "").startswith("error")
++    return SessionRecord(
++        seat=seat,
++        status="failed" if failed else "completed",
++        reason=_failure_reason(message) if failed else None,
++        num_turns=message.num_turns,
++        subtype=message.subtype,
++        is_error=message.is_error,
++        terminal_reason=getattr(message, "terminal_reason", None),
++        duration_ms=duration_ms,
++        session_id=message.session_id,
++        model=_primary_model(message.model_usage),
++        models=sorted((message.model_usage or {}).keys()),
++        tokens=message.usage,
++        total_cost_usd=message.total_cost_usd,
++        result=message.result,
++        permission_denials=getattr(message, "permission_denials", None),
++    )
++
++
++# -------------------------------------------------------------- the runner --
++
++async def run_session(
++    seat: str,
++    prompt: str,
++    cwd: Path,
++    max_turns: int,
++    timeout_min: float,
++    *,
++    query_fn: Any = None,
++    base_url: str = DEFAULT_BASE_URL,
++    token: str | None = None,
++    timeout_ms: int = DEFAULT_TIMEOUT_MS,
++    protected: "Sequence[str]" = (),
++    cli_path: Path | None = None,
++    model: str | None = None,
++) -> SessionRecord:
++    """Run one seat's session and return what it recorded.
++
++    Args:
++        seat: Seat name (see :data:`SEATS`).
++        prompt: The task prompt (the user message). The seat's *system*
++            prompt comes from the seat config (F-09 supplies those).
++        cwd: The run dir — the session's working directory.
++        max_turns: Turn cap handed to the SDK.
++        timeout_min: Wall-clock budget in minutes, enforced around the
++            message stream only (paused outside the session: option
++            building and record extraction don't consume it).
++        query_fn: Injected ``query`` for tests (a fake async generator
++            function with the SDK's keyword signature). Default: the real
++            ``claude_agent_sdk.query``.
++        base_url/token/timeout_ms: The Z.ai seat env (see
++            :func:`session_env`). ``token`` may be empty for in-process
++            fake runs that spawn no subprocess; the real entry point
++            refuses earlier when no token exists.
++        protected: Protected-path globs for the hook.
++        cli_path: Explicit Claude Code CLI path (inside the sandbox the
++            ambient PATH can't be relied on).
++        model: Optional model override.
++
++    Returns:
++        The record: ``completed`` / ``failed`` (with reason) / ``aborted``
++        (wall clock). Never raises on a session outcome.
++    """
++    _seat(seat)  # unknown seat → SessionConfigError before anything runs
++    if query_fn is None:
++        query_fn = sdk_query
++    options = build_options(
++        seat,
++        cwd,
++        max_turns,
++        base_url=base_url,
++        token=token or "",
++        timeout_ms=timeout_ms,
++        protected=protected,
++        cli_path=cli_path,
++        model=model,
++    )
++
++    result_message: ResultMessage | None = None
++    stream = None
++    # One window per process, ever (review round 2): a second session
++    # opening while the first's window is live would save the first's
++    # STRIPPED environment and restore it last — permanently deleting the
++    # orchestrator's credentials. Refuse loudly instead; sessions in one
++    # process are serial (the F-10 loop is).
++    global _WINDOW_OPEN  # noqa: PLW0603 — module-level window ownership
++    if _WINDOW_OPEN:
++        raise SessionConfigError(
++            "another session's environment window is already open in this "
++            "process — sessions must run serially in one process (the F-10 "
++            "loop does); overlapping them would corrupt the orchestrator "
++            "environment."
++        )
++    _WINDOW_OPEN = True
++    try:
++        # Window the process env for the session's life: the SDK merges ALL
++        # of os.environ into the Claude Code subprocess, so without this a
++        # direct (unsandboxed) call hands the CLI every orchestrator secret.
++        # Restored in the finally — the orchestrator process continues
++        # unchanged. Inside the sandbox the ambient env is already scrubbed;
++        # the window is then a no-op that still holds (and keeps the proxy
++        # vars the session needs).
++        saved_env = _window_environ(options.env)
++        try:
++            started = time.monotonic()
++            deadline = started + timeout_min * 60.0
++            try:
++                stream = query_fn(prompt=prompt, options=options)
++                iterator = stream.__aiter__()
++                while True:
++                    remaining = deadline - time.monotonic()
++                    if remaining <= 0:
++                        raise _WallClock()
++                    try:
++                        message = await asyncio.wait_for(
++                            iterator.__anext__(), timeout=remaining
++                        )
++                    except StopAsyncIteration:
++                        break
++                    except asyncio.TimeoutError as exc:
++                        raise _WallClock() from exc
++                    if isinstance(message, ResultMessage):
++                        result_message = message
++            except _WallClock:
++                return SessionRecord(
++                    seat=seat,
++                    status="aborted",
++                    reason="wall_clock",
++                    duration_ms=int((time.monotonic() - started) * 1000),
++                )
++            except ClaudeSDKError as exc:
++                return SessionRecord(
++                    seat=seat,
++                    status="failed",
++                    reason=f"{type(exc).__name__}: {exc}",
++                    duration_ms=int((time.monotonic() - started) * 1000),
++                )
++            finally:
++                # Every exit path closes the stream (review round 2): the
++                # three explicit calls missed non-SDK raises, which
++                # propagate by design — a bug must not also leak the CLI
++                # subprocess. The close runs while the window is still up;
++                # a refusal from an unwinding generator is suppressed.
++                await _close_stream(stream)
++        finally:
++            os.environ.clear()
++            os.environ.update(saved_env)
++    finally:
++        _WINDOW_OPEN = False
++
++    duration_ms = int((time.monotonic() - started) * 1000)
++    if result_message is None:
++        return SessionRecord(
++            seat=seat,
++            status="failed",
++            reason="no_result_message",
++            duration_ms=duration_ms,
++        )
++    return _record_from(result_message, seat, duration_ms)
++
++
++async def _close_stream(stream: Any) -> None:
++    """Close the SDK stream (its aclose tears down the CLI subprocess).
++    An already-closed or unwinding generator may refuse; that refusal is
++    suppressed — closing is cleanup, never the failure being reported."""
++    aclose = getattr(stream, "aclose", None)
++    if aclose is None:
++        return
++    try:
++        await asyncio.wait_for(aclose(), timeout=10)
++    except (Exception, asyncio.CancelledError):
++        pass
++
++
++# ------------------------------------------------- the sandboxed entry point --
++
++def _bundled_cli() -> Path | None:
++    """The Claude Code CLI bundled inside the pinned claude_agent_sdk
++    package (platform wheels ship the native binary; verified for macOS
++    and manylinux). This is THE pinned CLI: the SDK pin fixes its version,
++    unlike the auto-updating native install on PATH. Sandboxed sessions
++    run it and nothing else; an explicit ``cli_path`` still wins for
++    tests, but is never resolved from PATH or ~/.local/bin implicitly."""
++    import claude_agent_sdk
++
++    name = "claude.exe" if sys.platform == "win32" else "claude"
++    bundled = Path(claude_agent_sdk.__file__).parent / "_bundled" / name
++    return bundled if bundled.exists() else None
++
++
++def run_session_sandboxed(
++    seat: str,
++    prompt: str,
++    run_dir: Path,
++    profile: dict,
++    *,
++    factory_root: Path | None = None,
++    settings_path: Path | None = None,
++    max_turns: int,
++    timeout_min: float,
++    base_url: str = DEFAULT_BASE_URL,
++    timeout_ms: int = DEFAULT_TIMEOUT_MS,
++    protected: "Sequence[str]" = (),
++    model: str | None = None,
++    token: str | None = None,
++    cli_path: Path | None = None,
++    srt_bin_path: Path | None = None,
++    teardown_grace_sec: float = 120.0,
++) -> SessionRecord:
++    """Run one session with the whole runner process inside the F-05 sandbox.
++
++    Execs the entry bootstrap (see :func:`_entry_bootstrap`) under srt —
++    the SDK's Claude Code subprocess inherits the confinement, and it is
++    the **bundled, version-pinned CLI** (finding 5): an explicit
++    ``cli_path`` wins for tests, but nothing is ever auto-discovered from
++    PATH or ~/.local/bin. The settings come from the project profile plus
++    one deliberate carve-out: the staged runner dir (holding the factory
++    package copy and the session spec) is re-allowed for reading — the
++    rest of the repo (prompts, schemas, validator docs) stays unreadable
++    to the session, and the spec never touches the clone (finding 6).
++
++    Args:
++        run_dir: The run dir (the F-05 clone); the session's cwd.
++        profile: The project profile (docs/network allowlists).
++        factory_root: Explicit factory root; when omitted it is derived
++            (with the layout asserted) from
++            ``<root>/runs/<project>/<run-id>``.
++        settings_path: Where the srt settings go. Default: the RunDir
++            convention ``<factory_root>/sandbox/<project>-<run-id>.json``
++            — the same path ``cleanup_run`` removes, whether factory_root
++            was passed or derived (finding 2).
++        max_turns/timeout_min: Handed to the session. The *outer*
++            run_sandboxed wall clock is ``timeout_min`` plus
++            ``teardown_grace_sec`` so the in-session clock fires first.
++        token: The Z.ai token; default :func:`seat_token`. None and no
++            credential available → :class:`SessionConfigError` (refuses to
++            start a session that cannot authenticate).
++        cli_path: Explicit CLI override (tests). Default: the SDK's
++            bundled binary; missing bundle → SessionConfigError rather
++            than silently running an unpinned CLI.
++
++    Returns:
++        The session's record (any status — completed/failed/aborted are
++        all recorded outcomes).
++
++    Raises:
++        SessionConfigError: No token, no bundled CLI, an underivable
++            layout, or an entry that produced no parsable record (an
++            orchestrator-side fault that must be loud).
++        subprocess.TimeoutExpired: The outer wall clock expired — the
++            runner process itself hung past its teardown grace.
++    """
++    token = token if token is not None else seat_token()
++    if not token:
++        raise SessionConfigError(
++            "no Z.ai token available: create the keychain item with "
++            f"`security add-generic-password -s {KEYCHAIN_SERVICE} -w <key>` "
++            "(or run where ANTHROPIC_AUTH_TOKEN is set). The factory refuses "
++            "to start a session that cannot authenticate."
++        )
++
++    run_dir = Path(run_dir)
++    # The pinned CLI (finding 5): the SDK's bundled binary, or an explicit
++    # test override. An auto-discovered ~/.local/bin/claude is never used —
++    # it updates itself out from under the pin.
++    cli = Path(cli_path).expanduser() if cli_path is not None else _bundled_cli()
++    if cli is None:
++        raise SessionConfigError(
++            "the pinned claude-agent-sdk wheel bundles no Claude CLI for this "
++            "platform — reinstall it (`pip install --force-reinstall "
++            "claude-agent-sdk==" + _SDK_VERSION + "`). Sandboxed sessions run "
++            "the bundled, version-pinned CLI and never an auto-updating one."
++        )
++
++    if settings_path is None:
++        if factory_root is None:
++            runs_root = run_dir.parent.parent
++            if runs_root.name != "runs":
++                raise SessionConfigError(
++                    f"cannot derive the factory root from {run_dir}: its layout "
++                    "is not runs/<project>/<run-id>. Pass factory_root "
++                    "explicitly, or the settings would land in a directory "
++                    "cleanup_run never looks at."
++                )
++            factory_root = runs_root.parent
++        settings_path = (
++            Path(factory_root) / "sandbox" / f"{run_dir.parent.name}-{run_dir.name}.json"
++        )
++    runner_dir = _stage_runner(settings_path.with_name(settings_path.name + "-runner"))
++    # The spec lives inside the staged runner dir — OUTSIDE the clone
++    # (finding 6): a stray file in the run dir would ride into the PR via
++    # `git add -A`, leaking the prompt and the orchestrator's paths.
++    spec_path = runner_dir / "spec.json"
++    spec_path.write_text(
++        json.dumps(
++            {
++                "seat": seat,
++                "prompt": prompt,
++                "cwd": str(run_dir),
++                "max_turns": max_turns,
++                "timeout_min": timeout_min,
++                "base_url": base_url,
++                "timeout_ms": timeout_ms,
++                "protected": list(protected),
++                "model": model,
++                "cli_path": str(cli),
++            }
++        )
++    )
++
++    settings = build_settings(
++        profile,
++        run_dir,
++        model_endpoint=base_url,
++        factory_root=factory_root,
++        toolchain=default_toolchain(extra=[cli]),
++        allow_read=[runner_dir],
++    )
++    write_settings(settings, settings_path)
++
++    proc = run_sandboxed(
++        [sys.executable, "-c", _entry_bootstrap(runner_dir), str(spec_path)],
++        run_dir,
++        settings_path,
++        env={
++            "ANTHROPIC_AUTH_TOKEN": token,
++            "ANTHROPIC_BASE_URL": base_url,
++            "API_TIMEOUT_MS": str(int(timeout_ms)),
++        },
++        timeout=timeout_min * 60.0 + teardown_grace_sec,
++        srt_bin_path=srt_bin_path,
++    )
++
++    lines = [line for line in proc.stdout.splitlines() if line.strip()]
++    if not lines:
++        raise SessionConfigError(
++            "the sandboxed session entry produced no record "
++            f"(exit {proc.returncode}): {proc.stderr.strip()[:2000]}"
++        )
++    try:
++        return SessionRecord.from_dict(json.loads(lines[-1]))
++    except (json.JSONDecodeError, TypeError) as exc:
++        raise SessionConfigError(
++            "the sandboxed session entry produced an unparsable record "
++            f"({exc}): {lines[-1][:500]}"
++        ) from exc
++
++
++# python -c <bootstrap> <spec.json> — the in-sandbox entry point (see
++# :func:`_entry_bootstrap` / :func:`_stage_runner`). The Z.ai token arrives
++# via the environment (the orchestrator's run_sandboxed call); everything
++# else is in the spec file.
++def _main(argv: list[str] | None = None) -> int:
++    argv = list(sys.argv[1:] if argv is None else argv)
++    if len(argv) != 1:
++        print("usage: python -m factory.session <spec.json>", file=sys.stderr)
++        return 2
++    try:
++        spec = json.loads(Path(argv[0]).read_text())
++        token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
++        if not token:
++            raise SessionConfigError(
++                "no ANTHROPIC_AUTH_TOKEN in the environment — the orchestrator "
++                f"passes the Z.ai token via the sandbox env (keychain item "
++                f"{KEYCHAIN_SERVICE!r})"
++            )
++        record = asyncio.run(
++            run_session(
++                spec["seat"],
++                spec["prompt"],
++                Path(spec["cwd"]),
++                spec["max_turns"],
++                spec["timeout_min"],
++                base_url=spec.get("base_url") or DEFAULT_BASE_URL,
++                token=token,
++                timeout_ms=spec.get("timeout_ms") or DEFAULT_TIMEOUT_MS,
++                protected=spec.get("protected") or (),
++                model=spec.get("model"),
++                cli_path=Path(spec["cli_path"]) if spec.get("cli_path") else None,
++            )
++        )
++    except (OSError, json.JSONDecodeError, KeyError, SessionConfigError) as exc:
++        print(f"factory.session: {exc}", file=sys.stderr)
++        return 2
++    print(json.dumps(record.to_dict()))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(_main())
+diff --git a/pyproject.toml b/pyproject.toml
+index e458c1c..6713ea0 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -10,6 +10,11 @@ requires-python = ">=3.11"
+ dependencies = [
+     "jsonschema>=4",
+     "PyYAML>=6",
++    # Exact pin (BUILD-ORDER stack line). The runner is written against the
++    # 0.2.x ResultMessage shape — model_usage, terminal_reason,
++    # api_error_status — which 0.1.x drops entirely. A drift here must be a
++    # red CI run, not a silent behaviour change.
++    "claude-agent-sdk==0.2.168",
+ ]
+ 
+ [project.optional-dependencies]
+diff --git a/tests/test_f06.py b/tests/test_f06.py
+new file mode 100644
+index 0000000..34e0742
+--- /dev/null
++++ b/tests/test_f06.py
+@@ -0,0 +1,1188 @@
++"""F-06 — session runner acceptance (BUILD-ORDER F-06, contract in
++.factory/tasks.json).
++
++The runner wraps ``claude_agent_sdk.query()`` per seat, inside the F-05
++sandbox: per-seat options (setting_sources=[], Z.ai env, tool lists),
++in-process PreToolUse hooks, a wall clock around the message stream, and a
++SessionRecord distilled from the ResultMessage. ``query`` is injected, so
++AC-1/2/5 (and AC-3's callback half) run against fakes; the real-session
++halves of AC-3/AC-4 need the Z.ai token, which by design (DESIGN D2, Rule
++of Two) exists only on the orchestrator's Mac. Where the token is absent —
++the Linux CI runner — those tests prove the runner's refusal path instead
++of skipping: a credential that must never leave the Mac is not a broken
++stack, and the refusal is real, tested behaviour.
++"""
++
++import asyncio
++import json
++import os
++import sys
++import time
++from pathlib import Path
++
++import pytest
++from claude_agent_sdk import CLINotFoundError, ResultMessage
++
++from factory.session import (
++    DEFAULT_BASE_URL,
++    SEATS,
++    SessionConfigError,
++    SessionRecord,
++    bash_guard_hook,
++    build_options,
++    protected_path_hook,
++    run_session,
++    run_session_sandboxed,
++    seat_token,
++    session_env,
++)
++
++REPO = Path(__file__).resolve().parent.parent
++
++
++# ---------------------------------------------------------------- helpers --
++
++def _result(**overrides) -> ResultMessage:
++    """A ResultMessage with sane defaults; overrides for the case under test."""
++    base = dict(
++        subtype="success",
++        duration_ms=10,
++        duration_api_ms=8,
++        is_error=False,
++        num_turns=2,
++        session_id="sess-1",
++        usage={"input_tokens": 100, "output_tokens": 20},
++        model_usage={
++            "glm-5.3": {
++                "inputTokens": 100,
++                "outputTokens": 20,
++                "cacheReadInputTokens": 0,
++                "cacheCreationInputTokens": 0,
++                "webSearchRequests": 0,
++                "costUSD": 0.001,
++                "contextWindow": 200000,
++                "maxOutputTokens": 8192,
++            }
++        },
++        terminal_reason="completed",
++    )
++    base.update(overrides)
++    return ResultMessage(**base)
++
++
++def _results_query(*messages):
++    """An injected query that yields exactly ``messages`` then ends."""
++
++    async def _query(*, prompt, options, transport=None):
++        for message in messages:
++            yield message
++
++    return _query
++
++
++def _run(query_fn, **kwargs):
++    kwargs.setdefault("cwd", REPO)
++    kwargs.setdefault("max_turns", 5)
++    kwargs.setdefault("timeout_min", 10)
++    seat = kwargs.pop("seat", "implementer")
++    return asyncio.run(run_session(seat, "do the task", query_fn=query_fn, **kwargs))
++
++
++def _pre_input(tool: str, tool_input: dict) -> dict:
++    return {
++        "session_id": "s",
++        "transcript_path": "t",
++        "cwd": "/repo",
++        "permission_mode": "default",
++        "hook_event_name": "PreToolUse",
++        "tool_name": tool,
++        "tool_input": tool_input,
++        "tool_use_id": "u1",
++    }
++
++
++def _decision(callback, tool: str, tool_input: dict) -> str | None:
++    """Run one hook callback; return its permissionDecision (None = no opinion)."""
++    out = asyncio.run(callback(_pre_input(tool, tool_input), None, {"signal": None}))
++    specific = out.get("hookSpecificOutput") or {}
++    return specific.get("permissionDecision")
++
++
++# ------------------------------------------------------- F-06 AC-1: clock --
++
++def test_ac_1():
++    """A query that never finishes is cut off at the wall clock and reported
++    as ``aborted`` — even though it keeps yielding messages, so the clock
++    bounds the *stream*, not just silence."""
++
++    async def hanging_query(*, prompt, options, transport=None):
++        while True:
++            yield None  # non-ResultMessage frames the runner must skip over
++            await asyncio.sleep(0.01)
++
++    started = time.monotonic()
++    record = _run(hanging_query, timeout_min=0.05)
++    elapsed = time.monotonic() - started
++    assert record.status == "aborted", record
++    assert record.reason == "wall_clock"
++    # The clock fired near its 3s deadline — not instantly, not unbounded.
++    assert 2.0 <= elapsed < 15.0, elapsed
++
++
++# ------------------------------------------- F-06 AC-2: failures recorded --
++
++def test_ac_2():
++    """Error results and SDK exceptions are recorded as failed attempts with
++    a reason; none of them crashes the runner."""
++
++    cases = [
++        (_result(subtype="error_max_turns", is_error=True), "error_max_turns"),
++        (
++            _result(subtype="error_during_execution", is_error=True),
++            "error_during_execution",
++        ),
++        # is_error with an API status: the reason must carry the status.
++        (_result(subtype="success", is_error=True, api_error_status=429), "429"),
++    ]
++    for message, expected_reason in cases:
++        record = _run(_results_query(message))
++        assert record.status == "failed", (record, expected_reason)
++        assert expected_reason in (record.reason or ""), record
++
++    # An SDK exception mid-stream is recorded, not raised.
++    async def exploding_query(*, prompt, options, transport=None):
++        raise CLINotFoundError("Claude Code not found")
++        yield  # pragma: no cover — makes this an async generator
++
++    record = _run(exploding_query)
++    assert record.status == "failed"
++    assert "CLINotFoundError" in record.reason
++
++
++# ----------------------------------------------- F-06 AC-3: blocking hooks --
++
++def test_ac_3(tmp_path: Path):
++    """The protected-path hook denies Write/Edit/NotebookEdit on protected
++    paths (unit half on the callback), and blocks a write inside a real
++    session (real half, token-gated; refusal path where there is no token).
++    """
++    hook = protected_path_hook(["schema/**", ".git/config"])
++    callback = hook.hooks[0]
++    assert hook.matcher == "Write|Edit|NotebookEdit"
++
++    # Deny matrix: each edit tool, relative and absolute forms.
++    deny_cases = [
++        ("Write", {"file_path": "schema/tasks.schema.json"}),
++        ("Edit", {"file_path": "/repo/schema/project.schema.json"}),
++        ("NotebookEdit", {"file_path": "schema/notebook.ipynb"}),
++        ("Edit", {"file_path": ".git/config"}),
++        ("Write", {"file_path": "/repo/.git/config"}),
++    ]
++    for tool, tool_input in deny_cases:
++        assert _decision(callback, tool, tool_input) == "deny", (tool, tool_input)
++
++    # Unprotected paths get no opinion ({} → the tool proceeds).
++    assert _decision(callback, "Write", {"file_path": "src/app.py"}) is None
++    assert _decision(callback, "Read", {"file_path": "schema/tasks.schema.json"}) is None
++
++    # The bash guard denies push/gh/config-gh, allows ordinary commands.
++    guard = bash_guard_hook().hooks[0]
++    for command in [
++        "git push origin main",
++        "git  push",
++        "gh pr create",
++        "/usr/bin/gh auth login",
++        "cat ~/.config/gh/hosts.yml",
++        "git config --file ~/.config/gh/hosts.yml user.name x",
++    ]:
++        assert _decision(guard, "Bash", {"command": command}) == "deny", command
++    for command in ["git status", "git commit -m x", "echo gh-gh-gh", "ls .config"]:
++        assert _decision(guard, "Bash", {"command": command}) is None, command
++
++    # --- real half -----------------------------------------------------------
++    token = seat_token()
++    if token is None:
++        # The CI shape: no credential exists here by design. The runner must
++        # refuse loudly rather than spawn a session that cannot authenticate.
++        with pytest.raises(SessionConfigError, match="factory-zai"):
++            run_session_sandboxed(
++                seat="implementer",
++                prompt="blocked",
++                run_dir=tmp_path,
++                profile={},
++                factory_root=tmp_path,
++                max_turns=2,
++                timeout_min=1,
++                protected=[".git/config"],
++                token=None,
++                srt_bin_path=None,
++            )
++        return
++
++    # The owner's Mac: a real session in a real sandbox is ordered to
++    # create a file at a protected path. If the hook failed, the Write
++    # would succeed and the file would exist — a positive control, which
++    # is why the target is an ordinary new file rather than something the
++    # sandbox also denies (a backstop would mask a hook failure). The
++    # attempt itself is evidenced by the turn count: the denied Write
++    # costs a turn before the model reports back.
++    from factory.runs import cleanup_run, create_run
++    from factory.sandbox import ensure_srt
++
++    ensure_srt()
++    run = create_run("f06-ac3", REPO, factory_root=tmp_path)
++    try:
++        record = run_session_sandboxed(
++            seat="implementer",
++            prompt=(
++                "Create a file named protected.md containing the word "
++                "pwned. You must use the Write tool for this. Do not ask "
++                "questions, do not offer alternatives, just call the Write "
++                "tool now."
++            ),
++            run_dir=run.root,
++            profile={},
++            factory_root=tmp_path,
++            max_turns=4,
++            timeout_min=3,
++            protected=["protected.md"],
++        )
++        assert record.status == "completed", record
++        assert not (run.root / "protected.md").exists()
++        # The session really attempted the write (denied tool call costs a
++        # turn). Note: the CLI does not record PreToolUse hook denials in
++        # permission_denials — verified empirically; that field is only
++        # populated for can_use_tool denials.
++        assert record.num_turns and record.num_turns >= 2, record
++    finally:
++        cleanup_run(run)
++
++
++# ----------------------------------------------- F-06 AC-4: real smoke run --
++
++def test_ac_4(tmp_path: Path):
++    """A real session against Z.ai completes a trivial prompt; the recorded
++    model name comes from model_usage. Token-gated like AC-3's real half:
++    without a credential the runner's refusal is the assertion (CI shape).
++    """
++    token = seat_token()
++    if token is None:
++        with pytest.raises(SessionConfigError, match="factory-zai"):
++            run_session_sandboxed(
++                seat="implementer",
++                prompt="ok",
++                run_dir=tmp_path,
++                profile={},
++                factory_root=tmp_path,
++                max_turns=2,
++                timeout_min=1,
++            )
++        return
++
++    from factory.runs import cleanup_run, create_run
++    from factory.sandbox import ensure_srt
++
++    ensure_srt()
++    run = create_run("f06-ac4", REPO, factory_root=tmp_path)
++    try:
++        record = run_session_sandboxed(
++            seat="implementer",
++            prompt="Reply with exactly the word ok and nothing else.",
++            run_dir=run.root,
++            profile={},
++            factory_root=tmp_path,
++            max_turns=2,
++            timeout_min=3,
++        )
++        assert record.status == "completed", record
++        assert record.model, record
++        assert record.model in record.models
++        assert (record.result or "").strip(), record
++        assert record.num_turns and record.num_turns >= 1
++    finally:
++        cleanup_run(run)
++
++
++# ------------------------------------------------ F-06 AC-5: options + env --
++
++def test_ac_5(tmp_path: Path, monkeypatch):
++    """setting_sources == [] on every seat; the session env carries exactly
++    the Z.ai seat names and no GitHub/keychain secret — regardless of what
++    the ambient environment holds."""
++    monkeypatch.setenv("GH_TOKEN", "gh-leak")
++    monkeypatch.setenv("GITHUB_TOKEN", "github-leak")
++    monkeypatch.setenv("JFO_SUPABASE_ANON_KEY", "keychain-leak")
++    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://ambient.example")
++
++    for seat in SEATS:
++        options = build_options(
++            seat,
++            cwd=tmp_path,
++            max_turns=7,
++            base_url=DEFAULT_BASE_URL,
++            token="zai-token",
++            timeout_ms=123000,
++            protected=["schema/**"],
++        )
++        assert options.setting_sources == []
++        assert options.max_turns == 7
++        assert str(tmp_path) == str(options.cwd)
++        # The session env is exactly the three Z.ai seat names — nothing
++        # inherited, nothing extra.
++        assert set(options.env) == {
++            "ANTHROPIC_BASE_URL",
++            "ANTHROPIC_AUTH_TOKEN",
++            "API_TIMEOUT_MS",
++        }
++        assert options.env["ANTHROPIC_BASE_URL"] == DEFAULT_BASE_URL
++        assert options.env["ANTHROPIC_AUTH_TOKEN"] == "zai-token"
++        assert options.env["API_TIMEOUT_MS"] == "123000"
++        # Hooks are wired: protected-path + bash guard.
++        assert options.hooks and set(options.hooks) == {"PreToolUse"}
++
++    # The reviewer seat cannot write; the implementer seat can.
++    assert set(SEATS["reviewer"].disallowed_tools) >= {"Write", "Edit"}
++    assert not SEATS["implementer"].disallowed_tools
++
++    # session_env never reads the ambient environment at all.
++    env = session_env(DEFAULT_BASE_URL, "tok", 1000)
++    assert env == {
++        "ANTHROPIC_BASE_URL": DEFAULT_BASE_URL,
++        "ANTHROPIC_AUTH_TOKEN": "tok",
++        "API_TIMEOUT_MS": "1000",
++    }
++
++
++# ------------------------------------------------------------------ extras --
++
++def test_record_carries_result_message_facts():
++    """The record is distilled from the ResultMessage: turns, subtype,
++    terminal_reason, tokens, and the model name out of model_usage (the
++    entry with the most tokens when several ran)."""
++    message = _result(
++        num_turns=9,
++        subtype="success",
++        terminal_reason="completed",
++        model_usage={
++            "glm-5.3-flash": {
++                "inputTokens": 10,
++                "outputTokens": 1,
++                "cacheReadInputTokens": 0,
++                "cacheCreationInputTokens": 0,
++                "webSearchRequests": 0,
++                "costUSD": 0.0,
++                "contextWindow": 128000,
++                "maxOutputTokens": 4096,
++            },
++            "glm-5.3": {
++                "inputTokens": 500,
++                "outputTokens": 50,
++                "cacheReadInputTokens": 0,
++                "cacheCreationInputTokens": 0,
++                "webSearchRequests": 0,
++                "costUSD": 0.01,
++                "contextWindow": 200000,
++                "maxOutputTokens": 8192,
++            },
++        },
++    )
++    record = _run(_results_query(message))
++    assert record.status == "completed"
++    assert record.num_turns == 9
++    assert record.subtype == "success"
++    assert record.terminal_reason == "completed"
++    assert record.tokens == {"input_tokens": 100, "output_tokens": 20}
++    assert record.model == "glm-5.3"
++    assert set(record.models) == {"glm-5.3", "glm-5.3-flash"}
++
++
++def test_stream_without_result_message_is_a_failed_attempt():
++    """The CLI dying before any ResultMessage is a recorded failure, not a
++    crash and not a silent success."""
++
++    async def yield_nothing(*, prompt, options, transport=None):
++        return
++        yield  # pragma: no cover
++
++    record = _run(yield_nothing)
++    assert record.status == "failed"
++    assert record.reason == "no_result_message"
++
++
++def test_unknown_seat_is_a_configuration_error():
++    with pytest.raises(SessionConfigError):
++        _run(_results_query(_result()), seat="wizard")
++
++
++def test_entry_refuses_to_start_without_a_token(tmp_path: Path, monkeypatch):
++    """The in-sandbox entry point (the -c bootstrap) refuses (exit 2, fix
++    message on stderr) when the Z.ai token is absent. This is the
++    CI-provable half of the real-session path: it runs the real entry,
++    real SDK import and all, with no credential and no model."""
++    import subprocess
++
++    from factory.sandbox import scrub_env
++    from factory.session import _entry_bootstrap, _stage_runner
++
++    runner_dir = _stage_runner(tmp_path / "runner")
++
++    spec = tmp_path / "spec.json"
++    spec.write_text(
++        json.dumps(
++            {
++                "seat": "implementer",
++                "prompt": "hi",
++                "cwd": str(tmp_path),
++                "max_turns": 1,
++                "timeout_min": 0.5,
++                "base_url": DEFAULT_BASE_URL,
++                "timeout_ms": 60000,
++                "protected": [],
++            }
++        )
++    )
++    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
++    env = scrub_env(dict(os.environ), ("JFO_SUPABASE_ANON_KEY",))
++
++    proc = subprocess.run(
++        [sys.executable, "-c", _entry_bootstrap(runner_dir), str(spec)],
++        capture_output=True,
++        text=True,
++        env=env,
++        timeout=120,
++    )
++    assert proc.returncode == 2
++    assert "ANTHROPIC_AUTH_TOKEN" in proc.stderr or "factory-zai" in proc.stderr
++    assert "Traceback" not in proc.stderr
++
++
++def test_entry_bootstrap_ignores_a_factory_package_in_the_cwd(tmp_path: Path):
++    """The entry runs the staged (orchestrator's) factory code, never the
++    clone's: a ``factory/`` package sitting in the entry's cwd (a
++    self-hosting clone, or a target project that happens to have one) must
++    not shadow the control plane. This is the exact mechanism that made a
++    repo-path import fall through to the clone: python must be able to
++    *list* the directory holding the package, and only the staged runner
++    dir is listable inside the sandbox."""
++    import subprocess
++
++    from factory.session import _entry_bootstrap, _stage_runner
++
++    runner_dir = _stage_runner(tmp_path / "runner")
++
++    poison = tmp_path / "cwd"
++    (poison / "factory").mkdir(parents=True)
++    (poison / "factory" / "__init__.py").write_text("raise RuntimeError('poisoned')\n")
++
++    probe = (
++        "import sys; sys.path.insert(0, sys.argv[1]); "
++        "import factory; print(factory.__file__); "
++        "import factory.session; print(hasattr(factory.session, 'run_session'))"
++    )
++    proc = subprocess.run(
++        [sys.executable, "-c", probe, str(runner_dir)],
++        capture_output=True,
++        text=True,
++        cwd=poison,
++        timeout=60,
++    )
++    assert proc.returncode == 0, proc.stderr
++    assert str(runner_dir / "factory" / "__init__.py") in proc.stdout
++    assert "poisoned" not in proc.stderr + proc.stdout
++    assert "True" in proc.stdout
++    # The real bootstrap points at the staged copy, not the repo.
++    assert repr(str(runner_dir)) in _entry_bootstrap(runner_dir)
++
++
++def test_stage_runner_copies_the_package_without_caches(tmp_path: Path):
++    """The staged copy is the factory package (importable), without
++    __pycache__/pyc baggage, and staging is idempotent."""
++    import shutil as _shutil
++
++    from factory.session import _stage_runner
++
++    stale = tmp_path / "runner" / "factory"
++    stale.mkdir(parents=True)
++    (stale / "leftover.py").write_text("x = 1\n")
++
++    runner_dir = _stage_runner(tmp_path / "runner")
++    pkg = runner_dir / "factory"
++    assert (pkg / "session.py").exists()
++    assert (pkg / "sandbox.py").exists()
++    assert not (pkg / "leftover.py").exists()  # restaged clean
++    assert not list(pkg.rglob("__pycache__"))
++    assert not list(pkg.rglob("*.pyc"))
++    _shutil.rmtree(pkg)  # a second stage after removal also works
++    _stage_runner(runner_dir)
++    assert (pkg / "session.py").exists()
++
++
++def test_cleanup_run_removes_the_staged_runner(tmp_path: Path):
++    """cleanup_run removes the -runner sibling together with the settings
++    file, so staged copies don't accumulate."""
++    from factory.runs import RunDir, cleanup_run
++
++    run = RunDir(
++        project="p",
++        run_id="r",
++        root=tmp_path / "runs" / "p" / "r",
++        settings_path=tmp_path / "sandbox" / "p-r.json",
++    )
++    run.root.mkdir(parents=True)
++    runner = run.settings_path.with_name(run.settings_path.name + "-runner")
++    runner.mkdir(parents=True)
++    (runner / "factory").mkdir()
++    run.settings_path.parent.mkdir(parents=True, exist_ok=True)
++    run.settings_path.write_text("{}")
++    cleanup_run(run)
++    assert not run.settings_path.exists()
++    assert not runner.exists()
++
++
++def test_sandboxed_settings_allow_the_factory_package(tmp_path: Path):
++    """run_session_sandboxed's settings re-allow exactly the factory package
++    dir (the in-sandbox entry imports it) — not the whole repo, so prompts,
++    schemas and validator docs stay unreadable to the session."""
++    from factory.sandbox import build_settings
++
++    run_dir = tmp_path / "runs" / "proj" / "run-1"
++    run_dir.mkdir(parents=True)
++    settings = build_settings(
++        {},
++        run_dir,
++        model_endpoint=DEFAULT_BASE_URL,
++        factory_root=tmp_path,
++        allow_read=[REPO / "factory"],
++    )
++    allowed = settings["filesystem"]["allowRead"]
++    assert str(REPO / "factory") in allowed
++    assert str(REPO) not in allowed
++
++
++def test_pythonpath_never_crosses_into_the_sandbox(tmp_path: Path):
++    """PYTHONPATH is on no allowlist: neither an ambient value nor an
++    explicitly-passed one reaches the sandboxed child. The runner
++    bootstraps imports with a sys.path insert instead, so there is no
++    path-injection surface at all."""
++    from factory.sandbox import sandbox_env
++
++    child = sandbox_env(
++        tmp_path, extra={"PYTHONPATH": "/evil", "ANTHROPIC_AUTH_TOKEN": "t"}
++    )
++    assert "PYTHONPATH" not in child
++    assert child["ANTHROPIC_AUTH_TOKEN"] == "t"
++
++
++def test_hook_output_shape_matches_sdk_contract():
++    """The deny dict is exactly the SDK's SyncHookJSONOutput shape for
++    PreToolUse (unit-guarded so an SDK rename fails here, not in prod)."""
++    hook = protected_path_hook(["schema/**"])
++    out = asyncio.run(
++        hook.hooks[0](
++            _pre_input("Write", {"file_path": "schema/x.json"}), None, {"signal": None}
++        )
++    )
++    specific = out["hookSpecificOutput"]
++    assert specific["hookEventName"] == "PreToolUse"
++    assert specific["permissionDecision"] == "deny"
++    assert specific["permissionDecisionReason"]
++    # The allow path returns an empty dict — no decision, tool proceeds.
++    out = asyncio.run(
++        hook.hooks[0](
++            _pre_input("Write", {"file_path": "src/x.py"}), None, {"signal": None}
++        )
++    )
++    assert out == {}
++
++
++def test_sessionrecord_round_trips_through_json():
++    """to_dict/from_dict survive a JSON round trip (the sandboxed entry
++    prints JSON; the orchestrator rebuilds the record)."""
++    from factory.session import SessionRecord
++
++    record = SessionRecord(
++        seat="implementer",
++        status="completed",
++        reason=None,
++        num_turns=3,
++        subtype="success",
++        is_error=False,
++        terminal_reason="completed",
++        duration_ms=1500,
++        session_id="s",
++        model="glm-5.3",
++        models=["glm-5.3"],
++        tokens={"input_tokens": 5},
++        total_cost_usd=0.01,
++        result="ok",
++        permission_denials=[],
++    )
++    assert SessionRecord.from_dict(json.loads(json.dumps(record.to_dict()))) == record
++
++
++# ===========================================================================
++# Owner review round on PR #18 — nine findings, each red-first here.
++# ===========================================================================
++
++
++# --- Finding 1: a direct run_session call leaked the orchestrator's whole
++# environment (the SDK merges ALL of os.environ into the CLI subprocess). --
++
++def test_review1_direct_call_does_not_leak_ambient_environment(monkeypatch):
++    """What the SDK's spawn would see: during the session the process env
++    is windowed to the runner allowlist + the seat names. GH_TOKEN, an AWS
++    key and a foreign Anthropic key planted in os.environ are absent for
++    the whole stream, and the ambient environment is restored afterwards.
++    """
++    planted = {
++        "GH_TOKEN": "gh-leak",
++        "AWS_SECRET_ACCESS_KEY": "aws-leak",
++        "ANTHROPIC_API_KEY": "foreign-key",
++        "ZAI_RANDOM_SECRET": "leak",
++    }
++    for key, value in planted.items():
++        monkeypatch.setenv(key, value)
++
++    seen: dict[str, str] = {}
++
++    async def probing_query(*, prompt, options, transport=None):
++        for key in list(planted) + ["PATH", "ANTHROPIC_BASE_URL"]:
++            seen[key] = os.environ.get(key)
++        yield _result()
++        # Still windowed after the first message.
++        seen["GH_TOKEN_LATE"] = os.environ.get("GH_TOKEN")
++
++    record = _run(probing_query, timeout_min=5)
++    assert record.status == "completed"
++    for key in planted:
++        assert seen[key] is None, key
++    assert seen["PATH"], "PATH must survive the window"
++    assert seen["ANTHROPIC_BASE_URL"] == DEFAULT_BASE_URL
++    assert seen["GH_TOKEN_LATE"] is None
++    # Restored: the orchestrator process continues with its own env.
++    for key, value in planted.items():
++        assert os.environ[key] == value
++
++
++# --- Finding 2: the default settings path was one level too shallow
++# (<factory>/runs/sandbox/…), so cleanup_run never removed it. ---------- --
++
++def _sandbox_stub(monkeypatch, captured):
++    """Stub run_sandboxed inside factory.session: capture the spawn args
++    (spec path = last argv element) and the written settings, and return a
++    completed-session record without spawning anything."""
++
++    from factory import session as session_mod
++
++    def fake_run_sandboxed(cmd, run_dir, settings_path, **kwargs):
++        captured["cmd"] = cmd
++        captured["run_dir"] = run_dir
++        captured["settings_path"] = settings_path
++        captured["env"] = kwargs.get("env")
++        captured["spec_path"] = cmd[-1]
++        record = SessionRecord(seat="implementer", status="completed")
++        import subprocess as sp
++
++        return sp.CompletedProcess(cmd, 0, json.dumps(record.to_dict()) + "\n", "")
++
++    monkeypatch.setattr(session_mod, "run_sandboxed", fake_run_sandboxed)
++
++
++def test_review2_default_settings_path_uses_the_factory_root(tmp_path: Path):
++    """With no explicit factory_root, settings are derived from the
++    canonical layout to <factory>/sandbox/<project>-<run-id>.json — not
++    <factory>/runs/sandbox/… — so create_run/cleanup_run and the runner
++    agree on one location."""
++    from factory import session as session_mod
++
++    factory_root = tmp_path
++    run_root = factory_root / "runs" / "proj" / "20260101T000000Z-ab12cd"
++    run_root.mkdir(parents=True)
++    captured: dict = {}
++    import pytest as _pytest
++
++    with _pytest.MonkeyPatch.context() as mp:
++        _sandbox_stub(mp, captured)
++        session_mod.run_session_sandboxed(
++            seat="implementer",
++            prompt="p",
++            run_dir=run_root,
++            profile={},
++            max_turns=1,
++            timeout_min=1,
++            token="stub-token",
++        )
++    assert captured["settings_path"] == (
++        factory_root / "sandbox" / "proj-20260101T000000Z-ab12cd.json"
++    ), captured["settings_path"]
++    assert not (factory_root / "runs" / "sandbox").exists()
++
++
++def test_review2_settings_and_runner_are_cleaned_up(tmp_path: Path):
++    """End to end with the real create_run/cleanup_run: after a session,
++    nothing remains under <factory>/sandbox for that run (settings file,
++    staged runner copy, spec)."""
++    from factory import session as session_mod
++    from factory.runs import cleanup_run, create_run
++
++    run = create_run("proj", REPO, factory_root=tmp_path)
++    captured: dict = {}
++    import pytest as _pytest
++
++    with _pytest.MonkeyPatch.context() as mp:
++        _sandbox_stub(mp, captured)
++        session_mod.run_session_sandboxed(
++            seat="implementer",
++            prompt="p",
++            run_dir=run.root,
++            profile={},
++            max_turns=1,
++            timeout_min=1,
++            token="stub-token",
++        )
++    assert captured["settings_path"] == run.settings_path
++    cleanup_run(run)
++    assert not run.settings_path.exists()
++    assert not run.settings_path.with_name(run.settings_path.name + "-runner").exists()
++
++
++# --- Finding 3: the protected-path hook missed ../, ./, case and symlink-
++# prefix forms, and Bash writes were not checked at all. ---------------- --
++
++def _deny_paths(hook, tool_inputs):
++    callback = hook.hooks[0]
++    denied = []
++    for tool, tool_input in tool_inputs:
++        decision = _decision(callback, tool, tool_input)
++        if decision == "deny":
++            denied.append((tool, tool_input))
++    return denied
++
++
++def test_review3_protected_path_traversal_and_case_are_denied(tmp_path: Path):
++    """`tests/../schema/x`, `./schema/x`, `Schema/x` (case), and an
++    absolute path that resolves through macOS's /var → /private/var symlink
++    prefix are all denied for Write/Edit."""
++    hook = protected_path_hook(["schema/**"])
++    real_root = Path(tmp_path).resolve()  # /private/var/... on macOS
++    cases = [
++        ("Write", {"file_path": "tests/../schema/tasks.schema.json"}),
++        ("Edit", {"file_path": "./schema/tasks.schema.json"}),
++        ("Write", {"file_path": "Schema/tasks.schema.json"}),
++        ("Edit", {"file_path": "schema/../schema/tasks.schema.json"}),
++    ]
++    denied = _deny_paths(hook, cases)
++    assert len(denied) == 4, denied
++
++    # Symlink prefix: the same directory reached via its unresolved path.
++    import os as _os
++
++    if _os.path.realpath(tmp_path) != str(tmp_path):  # macOS /var layout
++        unresolved = "/var" + str(real_root)[len("/private/var"):]
++        hook2 = protected_path_hook([f"{real_root}/schema/**"])
++        decision = _decision(
++            hook2.hooks[0],
++            "Write",
++            {"file_path": f"{unresolved}/schema/x.json"},
++        )
++        assert decision == "deny"
++
++
++def test_review3_bash_writes_to_protected_paths_are_denied():
++    """Redirections and the common write utilities targeting a protected
++    path are denied; ordinary commands and writes elsewhere are not."""
++    guard = bash_guard_hook(["schema/**"])
++    denied = _deny_paths(
++        guard,
++        [
++            ("Bash", {"command": "echo x > schema/tasks.schema.json"}),
++            ("Bash", {"command": "echo x >>schema/x.json"}),
++            ("Bash", {"command": "mv good.py schema/good.py"}),
++            ("Bash", {"command": "cp a schema/a"}),
++            ("Bash", {"command": "rm schema/old.json"}),
++            ("Bash", {"command": "tee schema/x.json"}),
++            ("Bash", {"command": "sed -i s/a/b/ schema/x.json"}),
++        ],
++    )
++    assert len(denied) == 7, denied
++    allowed = [
++        ("Bash", {"command": "echo x > src/app.py"}),
++        ("Bash", {"command": "cp a b"}),
++        ("Bash", {"command": "mv schema/x src/x"}),
++        ("Bash", {"command": "cat schema/x.json"}),
++    ]
++    for tool, tool_input in allowed:
++        assert _decision(guard.hooks[0], tool, tool_input) is None, tool_input
++
++
++# --- Finding 4: the bash guard missed `git -C . push`, quoted/"$(gh …)"
++# command substitutions. ------------------------------------------------- --
++
++def test_review4_bash_guard_covers_optioned_and_quoted_forms():
++    guard = bash_guard_hook()
++    denied = _deny_paths(
++        guard,
++        [
++            ("Bash", {"command": "git -C . push origin main"}),
++            ("Bash", {"command": "git --git-dir=.git push"}),
++            ("Bash", {"command": "git -c core.editor=true push --all"}),
++            ("Bash", {"command": '"gh" auth login'}),
++            ("Bash", {"command": "echo $(gh auth status)"}),
++            ("Bash", {"command": "`gh` pr list"}),
++            ("Bash", {"command": "V=$(gh pr view 1) && echo $V"}),
++        ],
++    )
++    assert len(denied) == 7, denied
++
++
++# --- Finding 5: sessions ran the auto-updating ~/.local CLI instead of
++# the CLI bundled with the pinned SDK. ----------------------------------- --
++
++def test_review5_sandboxed_sessions_use_the_sdk_bundled_cli(tmp_path: Path):
++    """The spec handed to the sandboxed entry names the CLI bundled inside
++    the pinned claude_agent_sdk package, and that binary's directory joins
++    the sandbox allowRead (toolchain) entries. ~/.local/bin/claude is
++    never auto-picked: sandboxed sessions require the pinned CLI."""
++    import claude_agent_sdk
++
++    from factory import session as session_mod
++
++    bundled = (
++        Path(claude_agent_sdk.__file__).parent / "_bundled" /
++        ("claude.exe" if sys.platform == "win32" else "claude")
++    )
++    run_root = tmp_path / "runs" / "proj" / "20260101T000000Z-ab12cd"
++    run_root.mkdir(parents=True)
++    captured: dict = {}
++    import pytest as _pytest
++
++    real_build_settings = session_mod.build_settings
++
++    def capture_settings(profile, run_dir, **kwargs):
++        captured["toolchain"] = kwargs.get("toolchain")
++        return real_build_settings(profile, run_dir, **kwargs)
++
++    with _pytest.MonkeyPatch.context() as mp:
++        _sandbox_stub(mp, captured)
++        mp.setattr(session_mod, "build_settings", capture_settings)
++        session_mod.run_session_sandboxed(
++            seat="implementer",
++            prompt="p",
++            run_dir=run_root,
++            profile={},
++            max_turns=1,
++            timeout_min=1,
++            token="stub-token",
++        )
++    spec = json.loads(Path(captured["spec_path"]).read_text())
++    assert spec["cli_path"] == str(bundled)
++    assert bundled in captured["toolchain"]
++    # The auto-updating native install is never referenced.
++    assert "~" not in spec["cli_path"]
++
++
++# --- Finding 6: .session-spec.json landed in the clone as an untracked
++# file a `git add -A` would commit. --------------------------------------- --
++
++def test_review6_spec_never_lands_in_the_clone(tmp_path: Path):
++    """After a sandboxed session is prepared, the clone's working tree is
++    byte-identical to a fresh clone: the spec lives in the staged runner
++    dir outside the run dir."""
++    import subprocess
++
++    from factory import session as session_mod
++    from factory.runs import create_run
++
++    run = create_run("proj", REPO, factory_root=tmp_path)
++    captured: dict = {}
++    import pytest as _pytest
++
++    with _pytest.MonkeyPatch.context() as mp:
++        _sandbox_stub(mp, captured)
++        session_mod.run_session_sandboxed(
++            seat="implementer",
++            prompt="p",
++            run_dir=run.root,
++            profile={},
++            max_turns=1,
++            timeout_min=1,
++            token="stub-token",
++        )
++    assert not (run.root / ".session-spec.json").exists()
++    status = subprocess.run(
++        ["git", "status", "--porcelain"], cwd=run.root,
++        capture_output=True, text=True,
++    )
++    assert status.stdout.strip() == "", status.stdout
++    # The spec exists — outside the clone, inside the staged runner dir.
++    spec_path = Path(captured["spec_path"])
++    assert spec_path.exists()
++    assert run.root not in spec_path.parents
++
++
++# --- Finding 7: the ambient ANTHROPIC_AUTH_TOKEN fallback could send a
++# non-Z.ai key to Z.ai. --------------------------------------------------- --
++
++def test_review7_ambient_token_requires_the_zai_base_url(monkeypatch):
++    """The ambient token is only used when the ambient base URL names the
++    Z.ai endpoint — a token exported for a different provider (or with no
++    base URL at all, i.e. api.anthropic.com) is not ours to send."""
++    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
++    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
++    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "an-anthropic-key")
++    assert seat_token() is None
++
++    monkeypatch.setenv("ANTHROPIC_BASE_URL", DEFAULT_BASE_URL)
++    assert seat_token() == "an-anthropic-key"
++
++    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
++    assert seat_token() is None
++
++
++# --- Finding 8: a wall-clock abort never closed the SDK stream. ----------- --
++
++def test_review8_abort_closes_the_stream():
++    """Both the wall-clock abort and the SDK-error path close the stream
++    (the SDK's aclose tears down its subprocess). The fakes are plain
++    iterators, not async generators — loop shutdown cannot auto-close
++    them — so their closed flags prove run_session itself called aclose."""
++
++    class FakeStream:
++        def __init__(self) -> None:
++            self.closed = False
++
++        def __aiter__(self):
++            return self
++
++        async def __anext__(self):
++            await asyncio.sleep(0.01)
++            return None
++
++        async def aclose(self) -> None:
++            self.closed = True
++
++    hanging: list[FakeStream] = []
++
++    def hanging_query(*, prompt, options, transport=None):
++        stream = FakeStream()
++        hanging.append(stream)
++        return stream
++
++    record = _run(hanging_query, timeout_min=0.03)
++    assert record.status == "aborted"
++    assert hanging[0].closed, "the aborted session's stream was not closed"
++
++    class ExplodingStream(FakeStream):
++        async def __anext__(self):
++            raise CLINotFoundError("gone")
++
++    exploding: list[ExplodingStream] = []
++
++    def exploding_query(*, prompt, options, transport=None):
++        stream = ExplodingStream()
++        exploding.append(stream)
++        return stream
++
++    record = _run(exploding_query)
++    assert record.status == "failed"
++    assert exploding[0].closed, "the failed session's stream was not closed"
++
++
++# --- Finding 9: _primary_model crashed on null token counts. --------------- --
++
++def test_review9_primary_model_tolerates_null_counts():
++    """model_usage entries with null token counts (seen from the CLI) must
++    not crash the record; weight falls back to zero."""
++    message = _result(
++        model_usage={
++            "glm-5.3": {
++                "inputTokens": None,
++                "outputTokens": None,
++                "cacheReadInputTokens": 0,
++                "cacheCreationInputTokens": 0,
++                "webSearchRequests": 0,
++                "costUSD": 0.0,
++                "contextWindow": 200000,
++                "maxOutputTokens": 8192,
++            }
++        }
++    )
++    record = _run(_results_query(message))
++    assert record.status == "completed"
++    assert record.model == "glm-5.3"
++
++
++# ===========================================================================
++# Owner review round 2 on PR #18 — concurrent-window strip, close-on-any-exit,
++# guard residue, commit-subject convention.
++# ===========================================================================
++
++
++def test_review10_overlapping_sessions_refuse_and_keep_the_env(monkeypatch):
++    """Round 2, new bug: two overlapping sessions in one process corrupted
++    the environment — the second window saved the first's STRIPPED copy and
++    restored it last, permanently deleting the orchestrator's GH_TOKEN. The
++    fix refuses a second window while one is open (sessions in one process
++    are serial; the F-10 loop is), so the refusal is loud and the env
++    survives intact."""
++    monkeypatch.setenv("GH_TOKEN", "precious")
++
++    class GatedStream:
++        def __init__(self, gate: asyncio.Event) -> None:
++            self.gate = gate
++            self.closed = False
++
++        def __aiter__(self):
++            return self
++
++        async def __anext__(self):
++            await self.gate.wait()
++            raise StopAsyncIteration
++
++        async def aclose(self) -> None:
++            self.closed = True
++
++    first_window_open = asyncio.Event()
++    gate_a = asyncio.Event()
++    gate_b = asyncio.Event()
++
++    def first_query(*, prompt, options, transport=None):
++        first_window_open.set()  # the window is open by the time query runs
++        return GatedStream(gate_a)
++
++    def second_query(*, prompt, options, transport=None):
++        return GatedStream(gate_b)
++
++    async def first():
++        return await run_session(
++            "implementer", "p", REPO, 5, 10, query_fn=first_query
++        )
++
++    async def second():
++        await first_window_open.wait()
++        try:
++            await run_session(
++                "implementer", "p", REPO, 5, 10, query_fn=second_query
++            )
++            return "ran"
++        except SessionConfigError:
++            return "refused"
++
++    async def main():
++        first_task = asyncio.create_task(first())
++        await first_window_open.wait()  # first's window is open, parked
++        second_task = asyncio.create_task(second())
++        await asyncio.sleep(0.02)
++        # First finishes BEFORE the second's window would close — the exact
++        # ordering that used to restore the stripped copy last.
++        gate_a.set()
++        await first_task
++        gate_b.set()  # no-op once the second session was refused
++        second_outcome = await second_task
++        return second_outcome
++
++    second_outcome = asyncio.run(main())
++    assert second_outcome == "refused"
++    assert os.environ.get("GH_TOKEN") == "precious"
++
++
++def test_review11_non_sdk_errors_still_close_the_stream():
++    """Round 2: the close lived on three exit paths; a non-SDK error (a
++    bug propagating by design) skipped it. The close now belongs to the
++    finally, so every exit path — completion, abort, SDK error, and
++    unexpected raises — closes the stream and restores the env."""
++
++    class BugStream:
++        def __init__(self) -> None:
++            self.closed = False
++
++        def __aiter__(self):
++            return self
++
++        async def __anext__(self):
++            raise RuntimeError("runner bug")
++
++        async def aclose(self) -> None:
++            self.closed = True
++
++    streams: list[BugStream] = []
++
++    def bug_query(*, prompt, options, transport=None):
++        stream = BugStream()
++        streams.append(stream)
++        return stream
++
++    with pytest.raises(RuntimeError, match="runner bug"):
++        asyncio.run(run_session("implementer", "p", REPO, 5, 5, query_fn=bug_query))
++    assert streams[0].closed, "a propagating error must still close the stream"
++
++
++def test_review12_bash_guard_backslash_and_sh_c_quoting():
++    """Round 2 residue: `sh -c 'git pu''sh'` and `g\\it push` passed. Both
++    are caught by running the git/push check on the de-quoted command with
++    backslashes stripped, like the gh check already did."""
++    guard = bash_guard_hook()
++    denied = _deny_paths(
++        guard,
++        [
++            ("Bash", {"command": "sh -c 'git pu''sh' origin main"}),
++            ("Bash", {"command": "g\\it push"}),
++            ("Bash", {"command": "echo ok > /tmp/f && g\\h pr create"}),
++        ],
++    )
++    assert len(denied) == 3, denied
++
++
++# ===========================================================================
++# Owner review round 3 on PR #18 — the word-anywhere guard was too broad.
++# ===========================================================================
++
++
++def test_review13_push_or_gh_mentions_in_ordinary_commands_pass():
++    """Round 3: the git/push word-anywhere check blocked truthful work — a
++    commit message about push notifications, --grep=push, code search, even
++    `echo gh is the cli`. The guard now splits the command into its
++    invocations (after de-quoting, on ;, |, &&, (), redirections) and
++    denies only when an invocation's program actually runs `git push` or
++    `gh` — so these all pass:"""
++    guard = bash_guard_hook()
++    allowed = [
++        ("Bash", {"command": "git commit -m 'fix push notification retry'"}),
++        ("Bash", {"command": "git log --grep=push"}),
++        ("Bash", {"command": "grep -rn push src/"}),
++        ("Bash", {"command": "echo gh is the cli"}),
++        ("Bash", {"command": "rg 'def push' src/ && git commit -m 'add push()'"}),
++        ("Bash", {"command": "git help push"}),
++        ("Bash", {"command": "grep gh README.md"}),
++    ]
++    for tool, tool_input in allowed:
++        assert _decision(guard.hooks[0], tool, tool_input) is None, tool_input
++
++
++def test_review13_real_invocations_still_deny():
++    """The narrower scan keeps every evasion form from rounds 1–2 denied:
++    optioned git push, wrapped gh (quoted, backticked, $()), sh -c with
++    quote-split or backslash-split words, env/command/xargs prefixes."""
++    guard = bash_guard_hook()
++    denied = _deny_paths(
++        guard,
++        [
++            ("Bash", {"command": "git push origin main"}),
++            ("Bash", {"command": "git -C . push origin main"}),
++            ("Bash", {"command": "git --git-dir=.git push"}),
++            ("Bash", {"command": "git -c core.editor=true push --all"}),
++            ("Bash", {"command": "/usr/bin/git push"}),
++            ("Bash", {"command": "gh pr create"}),
++            ("Bash", {"command": "/usr/bin/gh auth login"}),
++            ("Bash", {"command": '"gh" auth login'}),
++            ("Bash", {"command": "echo $(gh auth status)"}),
++            ("Bash", {"command": "V=$(gh pr view 1) && echo $V"}),
++            ("Bash", {"command": "sh -c 'git pu''sh' origin main"}),
++            ("Bash", {"command": "g\\it push"}),
++            ("Bash", {"command": "g\\h pr create"}),
++            ("Bash", {"command": "env git push"}),
++            ("Bash", {"command": "command gh auth login"}),
++            ("Bash", {"command": "bash -c 'gh auth login'"}),
++        ],
++    )
++    assert len(denied) == 16, denied

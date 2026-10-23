@@ -11,22 +11,36 @@ result are produced together, so renaming a finding id can no longer
 silently orphan a sentinel result behind an always-``pass`` row:
 
 - ``assertion_removed`` — an assertion line removed from an existing test
-  without a replacement (a moved assertion trips it; a human reviews).
+  without a replacement. Replacement is per-file arithmetic (F-33):
+  verbatim re-adds pair up as moves, and a file that ends the diff with
+  as many assertion lines as it started is quiet; only a net loss flags,
+  naming every removed line no re-add matches (a comment line is neither
+  an assertion nor a replacement for one).
 - ``credential_added`` — a credential-shaped string (private-key block,
   well-known token prefixes, a generic secret assignment) on an added line
   in ANY file. The finding text names the matched shape and NEVER echoes
   the line: findings ride into reports, prompts and PR bodies, so the
-  sentinel must not become the leak it exists to catch. A credential also
-  ESCALATES ``credential_added`` — removing the line next round cannot
-  un-leak it from the branch history ("retrying can't make it safe").
+  sentinel must not become the leak it exists to catch. An environment
+  READ (``os.environ.get("TOKEN", ...)``) is the safe pattern, not a
+  leak: the generic assignment shape yields on env-read lines; the
+  prefix shapes (AKIA, ghp_, sk_live...) do not, so a hardcoded fallback
+  inside the lookup still fires. A credential also ESCALATES
+  ``credential_added`` — removing the line next round cannot un-leak it
+  from the branch history ("retrying can't make it safe").
 - ``lint_suppression_added`` — ``# noqa``, ``type: ignore`` or a
   lint-disable comment on an added line in a file under a ``paths.risk``
-  glob. Outside risk paths the same comment is ordinary code review
-  territory. The echoed line goes through :func:`redact_credentials`, as
-  do the skip-marker and assertion echoes, so a credential on the same
+  glob, and only where that syntax is a comment in the file's language:
+  ``# noqa`` inside JSON or markdown prose quotes the pattern, it cannot
+  silence a linter there (F-33 corpus: PRs #25/#37 documenting these
+  sentinels). Outside risk paths the same comment is ordinary code
+  review territory. The echoed line goes through :func:`redact_credentials`,
+  as do the skip-marker and assertion echoes, so a credential on the same
   line prints as ``[redacted]``.
 - ``skip_marker_added`` — a skip/xfail/only marker added on an existing
-  test.
+  test. The marker must be the statement (a decorator or a standalone
+  call): marker text inside a string literal is fixture data — the tests
+  that exercise these scanners embed ``@pytest.mark.skip`` inside quoted
+  patch fixtures (F-33 corpus, PR #8).
 
 Projects extend the set per risk flag in ``project.yaml``::
 
@@ -77,6 +91,17 @@ _CREDENTIAL_SHAPES = (
     ),
 )
 
+# An environment READ is the safe way for a secret to travel: the env
+# var's NAME next to the keyword (``token = os.environ.get(
+# "ANTHROPIC_AUTH_TOKEN", "")``) is not a committed secret — the F-33
+# corpus caught the "secret assignment" shape flagging exactly that
+# (PR #18's runner). Only that generic shape yields on env-read lines;
+# the prefix shapes still scan them, so a hardcoded fallback literal
+# inside the lookup still fires.
+_ENV_LOOKUP = re.compile(
+    r"(?i)\b(?:os\.)?(?:environ\.get|getenv)\s*\(|\benviron\s*\[|process\.env\."
+)
+
 # The credential shapes as bare patterns, in the same order — the list F-30
 # (trace redaction) and later consumers reuse.
 CREDENTIAL_PATTERNS = tuple(pattern for _, pattern in _CREDENTIAL_SHAPES)
@@ -95,15 +120,19 @@ def redact_credentials(text: str) -> str:
 
 
 # Added lines in test files matching any of these -> skip_marker_added.
+# Statement-anchored (matched against the stripped line): the marker must
+# BE the statement — a decorator or a standalone call. Marker text inside
+# a string literal is fixture data, not a marker (F-33 corpus, PR #8's
+# scanner tests embed markers inside quoted patch fixtures).
 SKIP_MARKER_PATTERNS = (
-    re.compile(r"pytest\.mark\.(?:skip|skipif|xfail)"),
-    re.compile(r"\bpytest\.skip\("),
-    re.compile(r"\bskipTest\("),
-    re.compile(r"@unittest\.skip"),
-    re.compile(r"\bthis\.skip\("),
-    re.compile(r"\b(?:it|describe|test|context)\.skip\("),
-    re.compile(r"\b(?:xit|xdescribe)\("),
-    re.compile(r"\b(?:it|describe|test)\.only\("),
+    re.compile(r"^@\s*pytest\.mark\.(?:skip|skipif|xfail)\b"),
+    re.compile(r"^pytest\.skip\("),
+    re.compile(r"^self\.skipTest\("),
+    re.compile(r"^@unittest\.skip\b"),
+    re.compile(r"^this\.skip\("),
+    re.compile(r"^(?:it|describe|test|context)\.skip\("),
+    re.compile(r"^(?:xit|xdescribe)\("),
+    re.compile(r"^(?:it|describe|test)\.only\("),
 )
 
 # Removed lines in test files matching any of these -> assertion_removed.
@@ -114,18 +143,55 @@ ASSERTION_PATTERNS = (
     re.compile(r"\bexpect\("),
 )
 
-# Added lines matching any of these in a file under a risk-path glob ->
-# lint_suppression_added.
+# Comment openers across the languages the marker and assertion patterns
+# cover: a line starting with one is prose about code, not code — it is
+# neither an assertion nor a replacement for one.
+_COMMENT_OPENERS = ("#", "//", "*", "<!--")
+
+
+def _is_code_line(text: str) -> bool:
+    """True when ``text`` is a code line (not blank, not a comment)."""
+    stripped = text.lstrip()
+    return bool(stripped) and not stripped.startswith(_COMMENT_OPENERS)
+
+# (required comment syntax, pattern) — a suppression is real only where
+# that syntax introduces a comment in the changed file: "# noqa" inside
+# JSON or markdown prose QUOTES the pattern, it cannot silence a linter
+# there (F-33 corpus: PRs #25 and #37 documenting these sentinels
+# tripped the unfiltered scan).
 LINT_SUPPRESSION_PATTERNS = (
-    re.compile(r"#\s*noqa"),
-    re.compile(r"#\s*type:\s*ignore\b"),
-    re.compile(r"@\s*ts-(?:ignore|expect-error)\b"),
-    re.compile(r"//\s*eslint-disable"),
-    re.compile(r"/\*\s*eslint-disable"),
-    re.compile(r"<!--\s*(?:eslint|ruff|biome)-disable"),
-    re.compile(r"#\s*(?:ruff|flake8)\s*:\s*(?:noqa|ignore)"),
-    re.compile(r"#\s*pylint:\s*(?:disable|skip-file)"),
+    ("hash", re.compile(r"#\s*noqa")),
+    ("hash", re.compile(r"#\s*type:\s*ignore\b")),
+    ("slash", re.compile(r"@\s*ts-(?:ignore|expect-error)\b")),
+    ("slash", re.compile(r"//\s*eslint-disable")),
+    ("slash", re.compile(r"/\*\s*eslint-disable")),
+    ("html", re.compile(r"<!--\s*(?:eslint|ruff|biome)-disable")),
+    ("hash", re.compile(r"#\s*(?:ruff|flake8)\s*:\s*(?:noqa|ignore)")),
+    ("hash", re.compile(r"#\s*pylint:\s*(?:disable|skip-file)")),
 )
+
+# Comment syntaxes by filename suffix. Unlisted suffixes allow every
+# syntax — a format the map doesn't know fails safe (flag; a human
+# reviews), the same direction as the whole sentinel set.
+_COMMENT_SYNTAX_BY_SUFFIX = {
+    ".json": frozenset(),            # JSON has no comments at all
+    ".md": frozenset({"html"}),      # '#' is a heading, not a comment
+    ".markdown": frozenset({"html"}),
+    ".html": frozenset({"html", "slash"}),
+    ".htm": frozenset({"html", "slash"}),
+    ".xml": frozenset({"html"}),
+    ".svg": frozenset({"html"}),
+}
+_EVERY_SYNTAX = frozenset({"hash", "slash", "html"})
+
+
+def _comment_syntaxes(path: str) -> frozenset:
+    """The comment syntaxes ``path``'s language can carry."""
+    name = path.rsplit("/", 1)[-1].lower()
+    for suffix, syntaxes in _COMMENT_SYNTAX_BY_SUFFIX.items():
+        if name.endswith(suffix):
+            return syntaxes
+    return _EVERY_SYNTAX
 
 # The standing built-in sentinel set, sorted for deterministic result order.
 BUILTIN_SENTINELS = (
@@ -160,8 +226,16 @@ def matched_risk_flags(risk_globs: dict, changes) -> set:
 
 
 def _credential_shape(text: str) -> str | None:
-    """The first credential shape that matches ``text``, else None."""
+    """The first credential shape that matches ``text``, else None.
+
+    The generic "secret assignment" shape yields on lines that read the
+    value from the environment — that is the pattern working as
+    intended, not a leak (see :data:`_ENV_LOOKUP`).
+    """
+    env_read = _ENV_LOOKUP.search(text)
     for name, pattern in _CREDENTIAL_SHAPES:
+        if name == "secret assignment" and env_read:
+            continue
         if pattern.search(text):
             return name
     return None
@@ -191,6 +265,7 @@ def builtin_sentinel_findings(changes, risk_globs: dict) -> list:
         # new path, one renamed OUT by its old.
         scan_path = change.old_path if is_test_file(change.old_path or "") else change.path
         test_file = is_test_file(scan_path)
+        syntaxes = _comment_syntaxes(change.path)
         for no, text in change.added_lines:
             shape = _credential_shape(text)
             if shape is not None:
@@ -208,7 +283,7 @@ def builtin_sentinel_findings(changes, risk_globs: dict) -> list:
             # token, and the credential scanner cannot be the only guard
             # on what findings print (round-2 finding 4).
             echo = redact_credentials(text.strip())
-            if test_file and any(p.search(text) for p in SKIP_MARKER_PATTERNS):
+            if test_file and any(p.match(text.strip()) for p in SKIP_MARKER_PATTERNS):
                 findings.append(
                     Finding(
                         "skip_marker_added",
@@ -217,7 +292,10 @@ def builtin_sentinel_findings(changes, risk_globs: dict) -> list:
                         line=no,
                     )
                 )
-            if in_risk_path and any(p.search(text) for p in LINT_SUPPRESSION_PATTERNS):
+            if in_risk_path and any(
+                s in syntaxes and p.search(text)
+                for s, p in LINT_SUPPRESSION_PATTERNS
+            ):
                 findings.append(
                     Finding(
                         "lint_suppression_added",
@@ -227,19 +305,51 @@ def builtin_sentinel_findings(changes, risk_globs: dict) -> list:
                     )
                 )
         if test_file:
-            for no, text in change.removed_lines:
-                if any(p.search(text) for p in ASSERTION_PATTERNS):
-                    findings.append(
-                        Finding(
-                            "assertion_removed",
-                            f"assertion removed in {scan_path}:{no}: "
-                            f"{redact_credentials(text.strip())}",
-                            file=scan_path,
-                            line=no,
-                        )
-                    )
+            _flag_weakened_assertions(change, scan_path, findings)
     findings.sort(key=lambda f: (f.id, f.file or "", f.line or 0))
     return findings
+
+
+def _flag_weakened_assertions(change, scan_path: str, findings: list) -> None:
+    """Append ``assertion_removed`` findings for a net-weakened test file.
+
+    F-25's first cut fired on every removed line that mentioned
+    "assert", so any real PR that moved or reformatted a test tripped it
+    — 11 false positives across six merged PRs of this repo's own
+    history (the F-33 corpus). "Without a replacement" is now per-file
+    arithmetic: verbatim re-adds pair up (moves), and a file that ends
+    the diff with as many assertion lines as it started is quiet —
+    moves, edits, replacements alike (whether a replacement is STRONG
+    is L2's judgement, not a line scan's). Only a net loss flags, and it
+    names every removed line no re-add matches: over-reporting the
+    excess is the safe side, under-reporting a weakened test is not.
+    """
+    removed = [
+        (no, text) for no, text in change.removed_lines
+        if _is_code_line(text) and any(p.search(text) for p in ASSERTION_PATTERNS)
+    ]
+    added = [
+        text.strip() for _no, text in change.added_lines
+        if _is_code_line(text) and any(p.search(text) for p in ASSERTION_PATTERNS)
+    ]
+    if not removed or len(added) >= len(removed):
+        return
+    n_removed, n_added = len(removed), len(added)
+    for no, text in removed:
+        stripped = text.strip()
+        if stripped in added:
+            added.remove(stripped)
+            continue
+        findings.append(
+            Finding(
+                "assertion_removed",
+                f"assertion removed in {scan_path}:{no} "
+                f"({n_removed} removed vs {n_added} added): "
+                f"{redact_credentials(stripped)}",
+                file=scan_path,
+                line=no,
+            )
+        )
 
 
 def builtin_sentinel_pass(profile: dict, changes, matched: set):

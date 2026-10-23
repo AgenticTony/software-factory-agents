@@ -1,0 +1,10 @@
+diff --git a/.factory/project.yaml b/.factory/project.yaml
+index 1a1a1a1..2b2b2b2 100644
+--- a/.factory/project.yaml
++++ b/.factory/project.yaml
+@@ -11,7 +11,7 @@ repo:
+ commands:
+   setup: pip install -e ".[dev]"
+-  lint: ruff check .
++  lint: ruff check .  # ruff: noqa
+   test: pytest -q

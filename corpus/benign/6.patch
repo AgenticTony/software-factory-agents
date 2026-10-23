@@ -1,0 +1,1482 @@
+diff --git a/.factory/BOOTSTRAP.md b/.factory/BOOTSTRAP.md
+index 148d1fe..6475b98 100644
+--- a/.factory/BOOTSTRAP.md
++++ b/.factory/BOOTSTRAP.md
+@@ -29,3 +29,31 @@ Entries record evidence, not claims. Each criterion is marked proven, pending, o
+ - **AC-2** proven: `tests/test_f02.py::test_ac_2` passes — order-insensitive, change-sensitive, exact SHA-256/canonical-JSON formula.
+ - **AC-3** proven: `tests/test_f02.py::test_ac_3` passes — the real `tasks.json` loads and validates; uniqueness/prefix asserted, contents deliberately not pinned.
+ - **Status to set at reconcile:** `done` once PR #4's CI is green and you merge it. No deploy target, so L4 doesn't apply.
++
++---
++
++## F-03 — State machine and picker
++
++- **Commits:** `feat/f03-state-machine` → [PR #6](https://github.com/AgenticTony/software-factory-agents/pull/6). Red-first: the suite failed on the missing `factory.state` module before implementation. First push drew 10 review findings (2 reproduced: concurrent writers silently losing updates; `ensure_ascii` escaping every non-ASCII character); all 10 fixed on the same PR, see the review-round notes below.
++- **Built:** 2026-10-16. Interactive session, then a review round the same day.
++- **Design notes:** TASK-CONTRACT §3 as an explicit 23-edge `ALLOWED_TRANSITIONS` table; the eight `X -> draft` edges exist solely for "contract changed" (§2), with `demote_changed_contracts()` as their caller — a demoted task needs human re-approval (F-04), so it can never auto-retry. `not_buildable` has no outgoing edges (importer sets it at creation). The §4 picker is a pure function plus a `TaskQueue` store that is the only write path: validate (F-02 `validate_queue`, new public fn in contract.py) → append-only attempts check → temp-file+`os.replace` atomic write → roll back memory on any failure.
++- **Review-round changes (all 10 findings):**
++  - **Concurrent writers** (reproduced): `save()` now takes an exclusive `flock` on `tasks.json.lock` (never renamed, so it's a stable lock point), re-reads the queue under it, and refuses with `ConcurrentWriteError` if the file changed since load — `factory loop` and a human `factory approve` can no longer lose each other's writes. The append-only check now runs against the queue re-read from disk, not the stale snapshot.
++  - **Slice continuation:** `deploying → ready` added; guards enforce that `done`/`awaiting_owner` require every slice merged and continuation requires an unmerged one. TASK-CONTRACT §3 gained a recovery/continuation edge table.
++  - **Stale `in_progress`:** `in_progress → ready` (aborted run) edge + `reclaim_abandoned(now)` using last-attempt `started` + `budget.wall_clock_min`.
++  - **Reclaim follow-up (2nd review):** the timestamp rule could reclaim a *live* run (setup and validation sit outside the session clock) and missed a crash before the first attempt record. Replaced with a **run lease**: an OS `flock` taken by `begin_run()` before the `ready → in_progress` transition and held for the session's life. `reclaim_abandoned()` acts only when the lease is free. Proven by `test_reclaim_never_takes_a_live_run`, `test_reclaim_frees_a_crash_before_the_first_attempt`, `test_begin_run_refuses_a_second_concurrent_run`, and `test_lease_is_freed_when_the_holding_process_dies` (a real subprocess exits via `os._exit` while holding the lease).
++  - **`done` on criteria change:** decision recorded — `done` tasks are never auto-demoted; `demote_changed_contracts` returns them in `flagged_done` for owner review. Reopening (`done → draft`) stays a human action. TASK-CONTRACT §2 updated.
++  - **`ensure_ascii=False`** (reproduced): the queue keeps literal em-dashes/arrows; no escape-noise diffs.
++  - **Duplicate task ids** now rejected in `validate_queue` with a readable error.
++  - **`StateError`/`TransitionError`/`ConcurrentWriteError` subclass `ContractError`** so `except ContractError` handlers catch state failures too.
++  - **PR rejection:** `in_review → in_progress` (fix round) edge.
++  - **Dependency drift:** `ready → blocked` edge + `sync_readiness()` reconciling both directions; cross-repo deps keep a task blocked.
++  - **Picker O(n²):** the id index is built once per `pick_next` call.
++- **AC-1** proven: `tests/test_f03.py::test_ac_1` walks **all** 100 status pairs — the 23 table edges return their reason, the other 77 raise `TransitionError`; the store-level refusal leaves file and memory untouched. One test per illegal edge class: `test_illegal_edge_class_raises` (self / forward skip / backward / lateral / exit-from-needs_human / exit-from-not_buildable).
++- **AC-2** proven: `test_ac_2` — any `in_progress` task makes `pick_next` and `TaskQueue.pick` return None.
++- **AC-3** proven: `test_ac_3` — P1 later in the queue beats P2 earlier; equal priority resolved by queue order; draft/blocked/in_review and decision/research/owner_only skipped; `docs` picked.
++- **AC-4** proven: `test_ac_4` — a `repo:id` dep is never met, even when a task with that literal id sits `done` in the same queue; same-repo dep on a `done` task is met (`test_dependency_must_be_done_in_this_queue` covers open and missing deps).
++- **AC-5** proven: `test_ac_5` — external acceptance edit without a hash update → `demote_changed_contracts()` demotes to `draft` and persists; a matching hash leaves the task untouched; `test_done_task_with_changed_contract_is_flagged_not_demoted` covers the `done` carve-out.
++- **AC-6** proven: `test_ac_6` — `os.replace` crashing mid-write leaves the previous `tasks.json` byte-identical, loadable, and no temp junk behind; `test_crash_during_serialisation_leaves_file_intact` covers the earlier crash window.
++- **Extra invariants tested:** append-only `attempts` (rewrite, clear, and task-removal each refused with file intact), `save` refuses schema-invalid state, attempts are schema-validated on append, `updated_at` stamped per write, slice selection (first incomplete / fall-through fully merged / unsliced = one unit), concurrency (both a lost-append and a lost-transition scenario), non-ASCII round-trip, duplicate-id rejection, error hierarchy, new edges, `reclaim_abandoned`, `sync_readiness`.
++- **Status to set at reconcile:** `done` once this PR's CI is green (ruff + pytest on 3.11 + 3.13) and you merge it. No deploy target, so L4 doesn't apply.
+diff --git a/.gitignore b/.gitignore
+index 93cc203..72dd463 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -22,3 +22,6 @@ out/
+ 
+ # OS
+ .DS_Store
++
++# Writer lock for tasks.json (F-03) — runtime artifact, never committed
++.factory/*.lock
+diff --git a/TASK-CONTRACT.md b/TASK-CONTRACT.md
+index 1342396..167395c 100644
+--- a/TASK-CONTRACT.md
++++ b/TASK-CONTRACT.md
+@@ -26,7 +26,7 @@ One record per work item (WO, story, or step). Big items are split into **slices
+ | `status` | See §3. |
+ | `risk` | Static flags declared from the doc: `auth`, `payments`, `rls`, `migration`, `safety`, `privacy`, `new_dependency`, `deploy`, `cross_repo`, `external_service`, `factory_control` (changes to how work is chosen or judged: schemas, contracts, validator config). The validator adds dynamic flags from the diff (§ VALIDATOR-SPEC L0). |
+ | `gates` | `spec_approval` (bool), `merge` (`human`/`auto`), `deploy` (`human`/`auto`). Any risk flag forces `human` on merge. In v0 everything is `human`. |
+-| `acceptance` | The **validation contract**: list of `{id, text, check}`. `check.type` is `test` (named test that must fail before / pass after), `command`, `holdout` (scenario id), `prod_probe` (post-deploy check), or `manual` (becomes an owner step). Frozen when the spec is approved: `acceptance_hash` = SHA-256 of the canonical JSON. A changed hash after approval sends the task back to `draft`. |
++| `acceptance` | The **validation contract**: list of `{id, text, check}`. `check.type` is `test` (named test that must fail before / pass after), `command`, `holdout` (scenario id), `prod_probe` (post-deploy check), or `manual` (becomes an owner step). Frozen when the spec is approved: `acceptance_hash` = SHA-256 of the canonical JSON. A changed hash after approval sends the task back to `draft` — except a `done` task, which is **flagged for your review** instead: reopening verified work is a human decision, never automatic. |
+ | `owner_steps` | `[{text, done}]` — things only you can do (JobFinderOS "Owner steps (not buildable by a session)"; SoloAdventurer 👤 items). |
+ | `slices` | `[{id, text, status, acceptance_ids}]` — ordered build units. One session builds one slice. |
+ | `budget` | `{size: S|M, max_attempts, max_turns, wall_clock_min}`. L-sized work must be sliced; the factory refuses an unsliced L. |
+@@ -66,6 +66,15 @@ draft ──(you approve spec + contract)──▶ ready ◀──(deps met)─
+ | `done` | orchestrator | All slices merged, L4 live check passed, owner steps ticked. **Requires live evidence — CI green is not enough.** |
+ | `not_buildable` | importer | `decision`/`research`/`owner_only` kinds. Listed in your daily summary. |
+ 
++Recovery and continuation edges (same allowed-transition table, kept out of the diagram for readability):
++
++| Edge | Set when |
++|---|---|
++| `in_progress → ready` | the run aborted with no PR and no outcome (orchestrator crash, killed session). The task re-enters the queue under the same attempt budget. Liveness comes from a **run lease**, an OS lock the session holds for its whole life and the OS releases when the process dies. `reclaim_abandoned` applies this edge only when the lease is free, so a live run is never reclaimed, and a run that died before its first attempt record still is. |
++| `in_review → in_progress` | you rejected the PR — the task returns for a fix round. |
++| `deploying → ready` | the previous slice merged and live-verified and more slices remain. Owner-step and `done` evaluation waits until the last slice merges; a task can only be `done`/`awaiting_owner` with every slice merged. |
++| `ready → blocked` | a dependency regressed (its task was reopened or demoted). `sync_readiness` reconciles both directions. |
++
+ Escalation reasons (enum): `attempts_exhausted`, `budget_exhausted`, `risk_path_touched`, `new_dependency`, `protected_path_touched`, `contract_ambiguous`, `quota_exhausted`, `live_check_failed`, `cross_repo`.
+ 
+ ## 4. Picking the next task
+diff --git a/factory/contract.py b/factory/contract.py
+index 041baea..418d069 100644
+--- a/factory/contract.py
++++ b/factory/contract.py
+@@ -101,10 +101,18 @@ def _check_semantics(tasks: Any, origin: str) -> None:
+     """
+     if not isinstance(tasks, list):
+         return
++    seen_ids: set[str] = set()
+     for task in tasks:
+         if not isinstance(task, dict):
+             continue
+         tid = task.get("id")
++        if isinstance(tid, str):
++            if tid in seen_ids:
++                raise ContractError(
++                    f"{origin}: duplicate task id {tid}; task ids must be "
++                    "unique or dependency and attempt records become ambiguous"
++                )
++            seen_ids.add(tid)
+         tid = tid if isinstance(tid, str) else "<missing id>"
+         risk = task.get("risk")
+         gates = task.get("gates") if isinstance(task.get("gates"), dict) else {}
+@@ -190,6 +198,26 @@ def _validate(instance: Any, schema_path: Path, origin: str) -> None:
+         raise ContractError(f"{origin}: schema violation at {loc}: {error.message}")
+ 
+ 
++def validate_queue(
++    data: Any, origin: str = "tasks", schema_path: Path | None = None
++) -> None:
++    """Validate a parsed queue document: semantics, then schema.
++
++    The write path (F-03) uses this before persisting so invalid queue
++    state can never be written; ``load_tasks`` uses it after parsing.
++
++    Args:
++        data: The parsed queue document.
++        origin: File name (or label) for error messages.
++        schema_path: Optional override for the tasks schema path.
++
++    Raises:
++        ContractError: On the first semantic or schema violation found.
++    """
++    _check_semantics(data.get("tasks") if isinstance(data, dict) else None, origin)
++    _validate(data, schema_path or SCHEMA_DIR / "tasks.schema.json", origin)
++
++
+ def load_tasks(path: Path | str, schema_path: Path | None = None) -> dict:
+     """Load and fully validate a tasks.json queue.
+ 
+@@ -210,8 +238,7 @@ def load_tasks(path: Path | str, schema_path: Path | None = None) -> dict:
+         data = json.loads(_read(path, origin))
+     except json.JSONDecodeError as exc:
+         raise ContractError(f"{origin}: invalid JSON: {exc}") from exc
+-    _check_semantics(data.get("tasks") if isinstance(data, dict) else None, origin)
+-    _validate(data, schema_path or SCHEMA_DIR / "tasks.schema.json", origin)
++    validate_queue(data, origin, schema_path)
+     return data
+ 
+ 
+diff --git a/factory/state.py b/factory/state.py
+new file mode 100644
+index 0000000..597dd39
+--- /dev/null
++++ b/factory/state.py
+@@ -0,0 +1,648 @@
++"""Task state machine and picker (F-03).
++
++TASK-CONTRACT §3 defines the task lifecycle as a diagram plus a recovery
++and continuation edge table; this module turns both into an explicit
++allowed-transition table (:data:`ALLOWED_TRANSITIONS`) and implements the
++§4 picker (:func:`pick_next`).
++
++The orchestrator is the only writer of ``tasks.json`` (§1 — agents never
++write it), and every write goes through :class:`TaskQueue`, which
++
++- refuses any transition not in the table,
++- validates the whole queue (F-02) before writing, so invalid state is
++  never persisted,
++- only ever appends to ``attempts``, refusing rewrites, edits and
++  removals (TASK-CONTRACT §2),
++- writes atomically — temp file in the same directory, then rename — so
++  a crash at any point leaves the previous file intact,
++- serialises writers through a lock file and re-reads the queue under
++  the lock, refusing to overwrite changes made by another writer
++  (``factory loop`` and a human-run ``factory approve`` are two such
++  writers).
++
++The ``X -> draft`` edges exist for one reason only: the approved contract
++changed (TASK-CONTRACT §2 — the recomputed acceptance hash no longer
++matches ``acceptance_hash``). :meth:`TaskQueue.demote_changed_contracts`
++is their intended caller; the task then needs human re-approval (F-04)
++before it can run again, so a demotion can never auto-retry work. A
++``done`` task is never auto-demoted — merged, live-verified work is
++flagged for your review instead, and reopening it (``done -> draft``)
++stays a human decision.
++
++``not_buildable`` is set by the importer at task-creation time (§3), not
++by an orchestrator transition, so it has no outgoing edges here.
++"""
++
++import contextlib
++import copy
++import fcntl
++import json
++import os
++import uuid
++from collections import namedtuple
++from dataclasses import dataclass
++from datetime import datetime, timezone
++from pathlib import Path
++
++from factory.contract import (
++    POST_APPROVAL_STATUSES,
++    ContractError,
++    acceptance_hash,
++    canonical_json,
++    load_tasks,
++    validate_queue,
++)
++
++# All task statuses. MIRRORS the schema's status enum
++# (schema/tasks.schema.json $defs/status); keep both in sync.
++STATUSES = frozenset(
++    {
++        "draft",
++        "blocked",
++        "ready",
++        "in_progress",
++        "in_review",
++        "deploying",
++        "awaiting_owner",
++        "needs_human",
++        "done",
++        "not_buildable",
++    }
++)
++
++# The TASK-CONTRACT §3 diagram plus its recovery/continuation edge table,
++# as one explicit table. (from, to) -> why the transition is legal.
++ALLOWED_TRANSITIONS: dict[tuple[str, str], str] = {
++    ("draft", "ready"): "spec + contract approved, dependencies met",
++    ("draft", "blocked"): "spec + contract approved, a dependency is open",
++    ("blocked", "ready"): "dependencies met",
++    ("blocked", "draft"): "contract changed",
++    ("ready", "in_progress"): "orchestrator picked the task",
++    ("ready", "blocked"): "a dependency regressed",
++    ("ready", "draft"): "contract changed",
++    ("in_progress", "in_review"): "validator L0-L3 passed, PR open",
++    ("in_progress", "needs_human"): "escalated (attempts/ambiguity/risk)",
++    ("in_progress", "ready"): "run aborted with no PR/outcome (crash recovery)",
++    ("in_progress", "draft"): "contract changed",
++    ("in_review", "deploying"): "PR merged",
++    ("in_review", "in_progress"): "you rejected the PR; fix round",
++    ("in_review", "draft"): "contract changed",
++    ("deploying", "needs_human"): "L4 live check failed (reverted)",
++    ("deploying", "awaiting_owner"): "L4 passed, owner steps still open",
++    ("deploying", "done"): "L4 passed, no open owner steps",
++    ("deploying", "ready"): "previous slice merged; more slices remain",
++    ("deploying", "draft"): "contract changed",
++    ("awaiting_owner", "done"): "owner steps ticked",
++    ("awaiting_owner", "draft"): "contract changed",
++    ("needs_human", "draft"): "contract changed",
++    ("done", "draft"): "contract changed (human reopen)",
++}
++
++LEGAL_TARGETS: dict[str, frozenset[str]] = {
++    status: frozenset(to for (frm, to) in ALLOWED_TRANSITIONS if frm == status)
++    for status in STATUSES
++}
++
++# §4: only build and docs are executed.
++ELIGIBLE_KINDS = frozenset({"build", "docs"})
++
++# §2: P1 is the highest priority; ties break by queue order.
++PRIORITY_ORDER = {"P1": 0, "P2": 1, "P3": 2}
++
++# Statuses that imply a frozen contract: the schema requires the hash for
++# POST_APPROVAL_STATUSES, and blocked / needs_human only arise after
++# approval. A hash mismatch in any of these sends the task back to draft —
++# except done, which is flagged for review instead (see module docstring).
++CONTRACT_FROZEN_STATUSES = frozenset(POST_APPROVAL_STATUSES | {"blocked", "needs_human"})
++
++# Outcome of a contract audit: which tasks were demoted to draft, and
++# which done tasks have a stale hash and need your review.
++ContractAudit = namedtuple("ContractAudit", ["demoted", "flagged_done"])
++
++
++class StateError(ContractError):
++    """Invalid queue-state operation (unknown task, append-only or
++    concurrency violation). Subclasses ContractError so callers that
++    catch contract problems also catch state problems."""
++
++
++class TransitionError(StateError):
++    """A status transition not in the allowed-transition table."""
++
++
++class ConcurrentWriteError(StateError):
++    """tasks.json changed on disk since this queue was loaded."""
++
++
++class RunInProgressError(StateError):
++    """Another session holds the run lease for this queue."""
++
++
++def check_transition(current: str, new: str) -> str:
++    """Validate one status transition against the table.
++
++    Args:
++        current: The task's current status.
++        new: The requested status.
++
++    Returns:
++        The reason the transition is legal.
++
++    Raises:
++        TransitionError: If ``(current, new)`` is not in the table; the
++            message names both statuses and the legal targets.
++    """
++    reason = ALLOWED_TRANSITIONS.get((current, new))
++    if reason is None:
++        targets = ", ".join(sorted(LEGAL_TARGETS.get(current, frozenset()))) or "none"
++        raise TransitionError(
++            f"illegal transition {current} -> {new}; allowed from {current}: {targets}"
++        )
++    return reason
++
++
++@dataclass(frozen=True)
++class Pick:
++    """What the picker hands a session: the task, and its slice if sliced.
++
++    ``slice`` is None for an unsliced task (the whole task is the unit);
++    otherwise it is the task's first slice that isn't merged.
++    """
++
++    task: dict
++    slice: dict | None
++
++
++def pick_next(tasks: list) -> Pick | None:
++    """Pick the next task to work on (TASK-CONTRACT §4).
++
++    eligible = status == ready
++               and kind in {build, docs}
++               and every depends_on is done
++               and no other writer task in_progress for this repo
++
++    v0 allows one writer task per repo, and one queue is one repo, so any
++    ``in_progress`` task blocks the whole queue. Eligible tasks are ordered
++    by priority (P1 first), ties by position in the queue; the pick is the
++    first eligible task's first incomplete slice.
++
++    Args:
++        tasks: The queue's ``tasks`` array (validated by F-02 on load).
++
++    Returns:
++        The pick, or None when nothing is eligible.
++    """
++    if any(task.get("status") == "in_progress" for task in tasks):
++        return None
++    by_id = {task.get("id"): task for task in tasks}
++    eligible = sorted(
++        (
++            task
++            for task in tasks
++            if task.get("status") == "ready"
++            and task.get("kind") in ELIGIBLE_KINDS
++            and _deps_met(task, by_id)
++        ),
++        key=lambda task: PRIORITY_ORDER.get(task.get("priority"), len(PRIORITY_ORDER)),
++    )  # sorted() is stable, so equal priorities keep queue order
++    for task in eligible:
++        slices = task.get("slices") or []
++        if not slices:
++            return Pick(task=task, slice=None)
++        for slice_ in slices:
++            if slice_.get("status") != "merged":
++                return Pick(task=task, slice=slice_)
++        # every slice merged: not runnable — fall through to the next task
++    return None
++
++
++def _unmerged_slices(task: dict) -> list:
++    """Return the task's slices that aren't merged yet."""
++    return [s for s in (task.get("slices") or []) if s.get("status") != "merged"]
++
++
++def _deps_met(task: dict, by_id: dict) -> bool:
++    """Check ``depends_on`` against this queue (TASK-CONTRACT §2).
++
++    A ``repo:id`` dependency (anything with a colon) is cross-repo and is
++    never met automatically — a human must mark it met. A same-repo
++    dependency is met only when the referenced task is ``done`` in this
++    queue; a dependency on an id not in the queue counts as unmet.
++
++    Args:
++        task: The task whose dependencies to check.
++        by_id: Queue index {id: task}, built once by the caller.
++    """
++    for dep in task.get("depends_on", []):
++        if not isinstance(dep, str) or ":" in dep:
++            return False
++        target = by_id.get(dep)
++        if target is None or target.get("status") != "done":
++            return False
++    return True
++
++
++def _now_iso() -> str:
++    """UTC now in the queue's timestamp style (second precision, Z)."""
++    return (
++        datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
++    )
++
++
++
++def _atomic_write_json(path: Path, doc: dict) -> None:
++    """Write ``doc`` to ``path`` atomically: temp file, then rename.
++
++    The temp file lives in the same directory so the rename never crosses
++    filesystems, and non-ASCII characters are written literally so the
++    queue stays review-friendly in diffs. Any failure removes the temp
++    file and re-raises; the previous contents of ``path`` are untouched
++    either way.
++
++    Args:
++        path: Destination file.
++        doc: Document to write.
++
++    Raises:
++        OSError: If writing or renaming fails (the destination is intact).
++    """
++    tmp = path.parent / f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
++    try:
++        with tmp.open("w", encoding="utf-8") as handle:
++            json.dump(doc, handle, indent=2, ensure_ascii=False)
++            handle.write("\n")
++            handle.flush()
++            os.fsync(handle.fileno())
++        os.replace(tmp, path)
++    except BaseException:
++        tmp.unlink(missing_ok=True)
++        raise
++
++
++def _check_attempts_append_only(old_doc: dict, new_doc: dict) -> None:
++    """Refuse any change to ``attempts`` other than appending (§2).
++
++    Every task present in both documents must keep its old attempts as an
++    exact prefix of the new list; a task that disappears must have had no
++    attempts, or its log would be lost.
++
++    Args:
++        old_doc: The queue as it currently is on disk.
++        new_doc: The queue about to be written.
++
++    Raises:
++        StateError: If an existing attempt entry would be modified,
++            removed, or dropped along with its task.
++    """
++    old_attempts = {
++        task.get("id"): task.get("attempts", [])
++        for task in old_doc.get("tasks", [])
++        if isinstance(task, dict)
++    }
++    for task in new_doc.get("tasks", []):
++        if not isinstance(task, dict):
++            continue
++        old = old_attempts.pop(task.get("id"), None)
++        if old is None:
++            continue
++        new = task.get("attempts", [])
++        if new[: len(old)] != old:
++            raise StateError(
++                f"{task.get('id')}: attempts is append-only; existing entries "
++                "cannot be modified or removed (TASK-CONTRACT §2)"
++            )
++    for task_id, attempts in old_attempts.items():
++        if attempts:
++            raise StateError(
++                f"{task_id}: task removed from the queue, which would drop "
++                "its append-only attempts log"
++            )
++
++
++def _check_slice_rules(task: dict, new_status: str) -> None:
++    """Enforce the slicing rules on task-level transitions.
++
++    ``done`` and ``awaiting_owner`` mean the whole task is finished, so
++    every slice must be merged first. ``deploying -> ready`` is slice
++    continuation, so it requires at least one unmerged slice; owner-step
++    and ``done`` evaluation waits until the last slice merges.
++
++    Args:
++        task: The task record.
++        new_status: The requested status.
++
++    Raises:
++        TransitionError: If the slice state contradicts the transition.
++    """
++    tid = task.get("id")
++    unmerged = _unmerged_slices(task)
++    if new_status in ("done", "awaiting_owner") and unmerged:
++        ids = ", ".join(s.get("id", "?") for s in unmerged)
++        raise TransitionError(
++            f"{tid}: slice(s) not merged: {ids}; the task cannot be "
++            f"{new_status} until every slice is merged"
++        )
++    if new_status == "ready" and task.get("status") == "deploying" and not unmerged:
++        raise TransitionError(
++            f"{tid}: no unmerged slices remain; deploying must resolve to "
++            "done, awaiting_owner or needs_human, not ready"
++        )
++
++
++class TaskQueue:
++    """The orchestrator's handle on a ``tasks.json`` — its only writer.
++
++    Loads through F-02 (schema + semantics) on construction. Every mutation
++    (``transition``, ``append_attempt``, ``demote_changed_contracts``)
++    validates the resulting queue and writes it atomically under an
++    exclusive lock, re-reading the file first and refusing if another
++    writer changed it since this instance loaded. A failed write rolls the
++    in-memory document back to what is on disk, so the instance never
++    holds state that outlives a refused save.
++    """
++
++    def __init__(self, path: Path | str, schema_path: Path | None = None) -> None:
++        """Load and validate the queue.
++
++        Args:
++            path: Path to the queue file (e.g. ``.factory/tasks.json``).
++            schema_path: Optional override for the tasks schema path.
++
++        Raises:
++            ContractError: If the file is unreadable or invalid (F-02).
++        """
++        self.path = Path(path)
++        self._schema_path = schema_path
++        self.doc = load_tasks(self.path, schema_path)
++        self._disk_doc = copy.deepcopy(self.doc)
++
++    def get(self, task_id: str) -> dict:
++        """Return the live task record.
++
++        Args:
++            task_id: Task id.
++
++        Returns:
++            The task dict; mutations are visible to ``save``.
++
++        Raises:
++            StateError: If no task has that id.
++        """
++        for task in self.doc.get("tasks", []):
++            if task.get("id") == task_id:
++                return task
++        raise StateError(f"unknown task: {task_id}")
++
++    def transition(self, task_id: str, new_status: str) -> None:
++        """Move a task to a new status through the allowed-transition table.
++
++        Args:
++            task_id: Task id.
++            new_status: Requested status.
++
++        Raises:
++            StateError: If the task doesn't exist.
++            TransitionError: If the edge isn't in the table, or the slice
++                state contradicts it (see ``_check_slice_rules``).
++            ContractError: If the resulting queue wouldn't validate.
++            ConcurrentWriteError: If another writer changed the file.
++        """
++        task = self.get(task_id)
++        check_transition(task.get("status"), new_status)
++        _check_slice_rules(task, new_status)
++        task["status"] = new_status
++        self.save()
++
++    def append_attempt(self, task_id: str, attempt: dict) -> None:
++        """Append one attempt record to a task's append-only log.
++
++        Args:
++            task_id: Task id.
++            attempt: Attempt record; must satisfy the schema's ``attempt``
++                (``run_id``, ``slice_id``, ``started``, ``outcome``,
++                ``prompt_versions``, ``skills``, …).
++
++        Raises:
++            StateError: If the task doesn't exist.
++            ContractError: If the attempt or resulting queue wouldn't
++                validate.
++            ConcurrentWriteError: If another writer changed the file.
++        """
++        task = self.get(task_id)
++        task.setdefault("attempts", []).append(attempt)
++        self.save()
++
++    def demote_changed_contracts(self) -> ContractAudit:
++        """Audit approved contracts against their stored hashes.
++
++        A task in a contract-frozen status whose recomputed acceptance
++        hash no longer matches its stored ``acceptance_hash`` goes back to
++        ``draft`` through the contract-changed edge, and the demotion is
++        persisted; the task then needs human re-approval (F-04) before it
++        can run again. A ``done`` task is never demoted — merged,
++        live-verified work is returned in ``flagged_done`` for your
++        review, and reopening it stays your decision. The stale hash and
++        approval fields are left in place as history; re-approval
++        overwrites them.
++
++        Returns:
++            ``ContractAudit(demoted, flagged_done)`` — task ids in queue
++            order whose contract changed, split by what happened to them.
++        """
++        demoted: list[str] = []
++        flagged_done: list[str] = []
++        for task in self.doc.get("tasks", []):
++            status = task.get("status")
++            frozen_hash = task.get("acceptance_hash")
++            if status not in CONTRACT_FROZEN_STATUSES or not frozen_hash:
++                continue
++            if acceptance_hash(task.get("acceptance", [])) != frozen_hash:
++                if status == "done":
++                    flagged_done.append(task.get("id"))
++                    continue
++                check_transition(status, "draft")
++                task["status"] = "draft"
++                demoted.append(task.get("id"))
++        if demoted:
++            self.save()
++        return ContractAudit(demoted=demoted, flagged_done=flagged_done)
++
++    @contextlib.contextmanager
++    def begin_run(self, task_id: str):
++        """Take the run lease and move a task to ``in_progress``.
++
++        The run lease is an exclusive OS lock on ``<queue>.run.lock``,
++        held for the whole session. The OS releases it the moment the
++        holding process exits, crashed or not, so liveness never depends
++        on timestamps. A session that dies leaves its task ``in_progress``
++        with the lease free, which :meth:`reclaim_abandoned` detects.
++        The lease is taken *before* the transition, so no window exists
++        where a task is ``in_progress`` without a live holder.
++
++        Args:
++            task_id: Task to start (must be ``ready``).
++
++        Yields:
++            None. The lease is released when the block exits; the task's
++            next status is the caller's to set.
++
++        Raises:
++            RunInProgressError: If another session holds the lease.
++            StateError: If the task doesn't exist.
++            TransitionError: If the task isn't ``ready``.
++        """
++        with self._run_lease(holder=task_id):
++            self.transition(task_id, "in_progress")
++            yield
++
++    def reclaim_abandoned(self) -> list[str]:
++        """Return ``in_progress`` tasks abandoned by a dead session to ``ready``.
++
++        If the run lease is held, a session is alive and nothing is
++        reclaimed, however long it has been running. If the lease is
++        free, no session is alive, so every ``in_progress`` task was
++        abandoned (crash, killed process, laptop sleep), including one that
++        died before recording its first attempt. Each goes back to
++        ``ready`` through the aborted-run edge and re-enters the queue
++        under the same attempt budget.
++
++        Returns:
++            The ids of reclaimed tasks, in queue order; empty while a run
++            is live.
++        """
++        try:
++            lease = self._run_lease(holder="reclaim")
++            lease.__enter__()
++        except RunInProgressError:
++            return []
++        try:
++            reclaimed: list[str] = []
++            for task in self.doc.get("tasks", []):
++                if task.get("status") == "in_progress":
++                    check_transition("in_progress", "ready")
++                    task["status"] = "ready"
++                    reclaimed.append(task.get("id"))
++            if reclaimed:
++                self.save()
++            return reclaimed
++        finally:
++            lease.__exit__(None, None, None)
++
++    @contextlib.contextmanager
++    def _run_lease(self, holder: str):
++        """Hold the non-blocking exclusive run lease on ``<queue>.run.lock``.
++
++        Args:
++            holder: Recorded in the lock file, for diagnostics.
++
++        Raises:
++            RunInProgressError: If the lease is already held; the message
++                names the holder.
++        """
++        lease_path = self.path.with_name(self.path.name + ".run.lock")
++        with lease_path.open("a+") as handle:
++            try:
++                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
++            except BlockingIOError as exc:
++                current = lease_path.read_text().strip() or "unknown"
++                raise RunInProgressError(
++                    f"{self.path}: a run is in progress (lease held by {current}); "
++                    "one writer task per repo"
++                ) from exc
++            try:
++                handle.seek(0)
++                handle.truncate()
++                handle.write(holder)
++                handle.flush()
++                yield
++            finally:
++                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
++
++    def sync_readiness(self) -> list[str]:
++        """Reconcile ``ready``/``blocked`` with dependencies.
++
++        A ``ready`` task whose dependencies are no longer met (a
++        dependency regressed — reopened or demoted) goes to ``blocked``;
++        a ``blocked`` task whose dependencies are all met goes to
++        ``ready``. Cross-repo dependencies are never met automatically,
++        so a task blocked on one stays blocked. The picker re-checks
++        dependencies anyway; this keeps the status truthful for the daily
++        summary (F-11) and for you.
++
++        Returns:
++            The ids of tasks whose status changed, in queue order.
++        """
++        by_id = {task.get("id"): task for task in self.doc.get("tasks", [])}
++        changed: list[str] = []
++        for task in self.doc.get("tasks", []):
++            status = task.get("status")
++            if status not in ("ready", "blocked"):
++                continue
++            met = _deps_met(task, by_id)
++            if status == "ready" and not met:
++                check_transition("ready", "blocked")
++                task["status"] = "blocked"
++                changed.append(task.get("id"))
++            elif status == "blocked" and met:
++                check_transition("blocked", "ready")
++                task["status"] = "ready"
++                changed.append(task.get("id"))
++        if changed:
++            self.save()
++        return changed
++
++    def pick(self) -> Pick | None:
++        """Pick the next task to work on (see :func:`pick_next`)."""
++        return pick_next(self.doc.get("tasks", []))
++
++    @contextlib.contextmanager
++    def _exclusive_lock(self):
++        """Hold an exclusive advisory lock on ``<queue>.lock``.
++
++        The lock file is never renamed, so every cooperating writer
++        serialises on it; ``tasks.json`` itself is replaced by rename and
++        can't carry a stable lock.
++        """
++        lock_path = self.path.with_name(self.path.name + ".lock")
++        with lock_path.open("w") as handle:
++            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
++            try:
++                yield
++            finally:
++                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
++
++    def save(self) -> None:
++        """Validate and atomically write the queue.
++
++        Stamps ``updated_at``, validates the whole document (F-02), then
++        under an exclusive lock re-reads the file and refuses if another
++        writer changed it since this instance loaded, checks that
++        ``attempts`` only grew against the queue now on disk, and writes
++        temp-file + rename. On any failure the in-memory document is
++        rolled back to what is on disk, which the failure left intact.
++
++        Raises:
++            ContractError: If the new document wouldn't validate.
++            StateError: If ``attempts`` shrank or was rewritten.
++            ConcurrentWriteError: If the file changed on disk since this
++                queue was loaded; reload and retry.
++            OSError: If the write fails; the previous file is intact.
++        """
++        candidate = copy.deepcopy(self.doc)
++        candidate["updated_at"] = _now_iso()
++        try:
++            validate_queue(candidate, str(self.path), self._schema_path)
++            with self._exclusive_lock():
++                disk_now = load_tasks(self.path, self._schema_path)
++                if canonical_json(disk_now) != canonical_json(self._disk_doc):
++                    raise ConcurrentWriteError(
++                        f"{self.path}: changed on disk since this queue was "
++                        "loaded (another writer?); reload the queue and retry"
++                    )
++                _check_attempts_append_only(disk_now, candidate)
++                _atomic_write_json(self.path, candidate)
++        except BaseException:
++            self.doc = copy.deepcopy(self._disk_doc)
++            raise
++        self.doc = candidate
++        self._disk_doc = copy.deepcopy(candidate)
+diff --git a/tests/test_f03.py b/tests/test_f03.py
+new file mode 100644
+index 0000000..9eb9095
+--- /dev/null
++++ b/tests/test_f03.py
+@@ -0,0 +1,686 @@
++"""F-03 acceptance tests — BUILD-ORDER.md, work order F-03.
++
++Contract rule (CLAUDE.md): an acceptance ref ``tests/test_f03.py::test_ac_N``
++means a test function with exactly that name. The extra descriptive tests
++below cover paths the acceptance refs don't name: one test per illegal edge
++class (AC-1), the legal lifecycle branches, slice selection, dependency
++handling and the append-only enforcement on ``attempts``.
++"""
++
++import copy
++import json
++import os
++from datetime import datetime
++
++import pytest
++
++from factory.contract import ContractError, acceptance_hash
++from factory.state import (
++    ALLOWED_TRANSITIONS,
++    CONTRACT_FROZEN_STATUSES,
++    STATUSES,
++    ConcurrentWriteError,
++    RunInProgressError,
++    StateError,
++    TaskQueue,
++    TransitionError,
++    check_transition,
++    pick_next,
++)
++
++ACCEPTANCE = [
++    {
++        "id": "AC-1",
++        "text": "it works",
++        "check": {"type": "test", "ref": "tests/x.py::test_works"},
++    }
++]
++HASH = acceptance_hash(ACCEPTANCE)
++
++
++def _task(**overrides):
++    base = {
++        "id": "T-1",
++        "title": "fixture task",
++        "source": "docs/fixture.md#t-1",
++        "kind": "build",
++        "priority": "P2",
++        "status": "ready",
++        "depends_on": [],
++        "risk": [],
++        "gates": {"spec_approval": True, "merge": "human", "deploy": "human"},
++        "acceptance": copy.deepcopy(ACCEPTANCE),
++        "acceptance_hash": HASH,
++        "approved_at": "2026-10-16T00:00:00Z",
++        "budget": {"size": "S", "max_attempts": 3, "max_turns": 80, "wall_clock_min": 60},
++    }
++    base.update(overrides)
++    return base
++
++
++def _queue_file(tmp_path, tasks, name="tasks.json"):
++    path = tmp_path / name
++    path.write_text(
++        json.dumps({"version": 1, "project": "fixture", "tasks": tasks}, indent=2)
++    )
++    return path
++
++
++_ATTEMPT = {
++    "run_id": "r1",
++    "slice_id": "S-1",
++    "started": "2026-10-16T01:00:00Z",
++    "ended": "2026-10-16T01:05:00Z",
++    "outcome": "fail",
++    "rounds": 3,
++    "prompt_versions": {"implementer": "abc123"},
++    "skills": [],
++}
++
++
++# --- AC-1: illegal transitions -------------------------------------------
++
++
++def test_ac_1(tmp_path):
++    # Exhaustive: every (from, to) pair of statuses. Pairs in the table are
++    # accepted and return their reason; every other pair raises.
++    for current in sorted(STATUSES):
++        for new in sorted(STATUSES):
++            if (current, new) in ALLOWED_TRANSITIONS:
++                assert check_transition(current, new)
++            else:
++                with pytest.raises(TransitionError, match="illegal transition"):
++                    check_transition(current, new)
++
++    # The store enforces the same table, and a refusal leaves both the
++    # in-memory task and the file untouched.
++    path = _queue_file(tmp_path, [_task(id="T-1", status="ready")])
++    before = path.read_text()
++    queue = TaskQueue(path)
++    with pytest.raises(TransitionError) as exc:
++        queue.transition("T-1", "done")
++    assert "illegal transition ready -> done" in str(exc.value)
++    assert "allowed from ready: blocked, draft, in_progress" in str(exc.value)
++    assert queue.get("T-1")["status"] == "ready"
++    assert path.read_text() == before
++
++
++# One representative test per class of illegal edge (AC-1).
++ILLEGAL_EDGE_CLASSES = {
++    "self": [("draft", "draft"), ("ready", "ready"), ("needs_human", "needs_human")],
++    "forward_skip": [
++        ("draft", "in_progress"),
++        ("draft", "done"),
++        ("ready", "in_review"),
++        ("ready", "done"),
++        ("in_progress", "deploying"),
++    ],
++    "backward_without_contract_change": [
++        ("deploying", "in_review"),
++        ("deploying", "in_progress"),
++        ("awaiting_owner", "deploying"),
++        ("done", "awaiting_owner"),
++        ("in_review", "ready"),
++    ],
++    "lateral": [
++        ("in_review", "needs_human"),
++        ("in_review", "awaiting_owner"),
++        ("blocked", "in_progress"),
++        ("blocked", "done"),
++    ],
++    "exit_from_needs_human": [
++        ("needs_human", "ready"),
++        ("needs_human", "in_progress"),
++        ("needs_human", "in_review"),
++        ("needs_human", "done"),
++    ],
++    "exit_from_not_buildable": [
++        ("not_buildable", "draft"),
++        ("not_buildable", "ready"),
++        ("not_buildable", "done"),
++    ],
++}
++
++
++@pytest.mark.parametrize("edge_class", sorted(ILLEGAL_EDGE_CLASSES))
++def test_illegal_edge_class_raises(edge_class):
++    for current, new in ILLEGAL_EDGE_CLASSES[edge_class]:
++        with pytest.raises(TransitionError, match="illegal transition"):
++            check_transition(current, new)
++
++
++# --- Legal lifecycle branches --------------------------------------------
++
++
++def test_full_lifecycle_happy_path(tmp_path):
++    path = _queue_file(tmp_path, [_task(id="T-1", status="draft")])
++    queue = TaskQueue(path)
++    for status in ["ready", "in_progress", "in_review", "deploying", "done"]:
++        queue.transition("T-1", status)
++    assert TaskQueue(path).get("T-1")["status"] == "done"
++
++
++def test_blocked_round_trip_then_escalation_is_legal(tmp_path):
++    path = _queue_file(tmp_path, [_task(id="T-1", status="draft")])
++    queue = TaskQueue(path)
++    queue.transition("T-1", "blocked")
++    queue.transition("T-1", "ready")
++    queue.transition("T-1", "in_progress")
++    queue.transition("T-1", "needs_human")
++    with pytest.raises(TransitionError):  # no automatic exit from needs_human
++        queue.transition("T-1", "ready")
++
++
++def test_l4_branches_from_deploying(tmp_path):
++    # live check FAIL -> needs_human; PASS with open owner steps ->
++    # awaiting_owner -> done (steps ticked)
++    path = _queue_file(tmp_path, [_task(id="T-FAIL", status="deploying")])
++    TaskQueue(path).transition("T-FAIL", "needs_human")
++
++    path = _queue_file(
++        tmp_path,
++        [
++            _task(
++                id="T-OWNER",
++                status="deploying",
++                owner_steps=[{"text": "flip the flag", "done": False}],
++            )
++        ],
++        name="tasks2.json",
++    )
++    queue = TaskQueue(path)
++    queue.transition("T-OWNER", "awaiting_owner")
++    queue.transition("T-OWNER", "done")
++    assert TaskQueue(path).get("T-OWNER")["status"] == "done"
++
++
++@pytest.mark.parametrize("start", sorted(CONTRACT_FROZEN_STATUSES))
++def test_contract_change_edge_returns_to_draft(tmp_path, start):
++    # The X -> draft edges exist solely for "contract changed" (§2); they are
++    # legal from every status that implies an approved contract.
++    path = _queue_file(tmp_path, [_task(id="T-1", status=start)])
++    TaskQueue(path).transition("T-1", "draft")
++
++
++# --- AC-2: single writer --------------------------------------------------
++
++
++def test_ac_2(tmp_path):
++    tasks = [
++        _task(id="T-BUSY", status="in_progress"),
++        _task(id="T-READY", status="ready"),
++    ]
++    assert pick_next(tasks) is None
++    path = _queue_file(tmp_path, tasks)
++    assert TaskQueue(path).pick() is None
++
++
++# --- AC-3: priority, queue order, eligibility -----------------------------
++
++
++def test_ac_3():
++    # priority first: a P1 task later in the queue beats a P2 task earlier
++    tasks = [
++        _task(id="T-P2-FIRST", priority="P2"),
++        _task(id="T-P1-LATER", priority="P1"),
++    ]
++    assert pick_next(tasks).task["id"] == "T-P1-LATER"
++
++    # ties broken by queue order
++    tasks = [_task(id="T-A", priority="P1"), _task(id="T-B", priority="P1")]
++    assert pick_next(tasks).task["id"] == "T-A"
++
++    # non-ready statuses are skipped; non-executable kinds are skipped
++    # (defensively: the schema can't produce decision+ready, but the picker
++    # is specified to filter on both conditions); docs is executable
++    tasks = [
++        _task(id="T-DRAFT", status="draft"),
++        _task(id="T-BLOCKED", status="blocked"),
++        _task(id="T-IN-REVIEW", status="in_review"),
++        _task(id="T-DECISION", kind="decision"),
++        _task(id="T-RESEARCH", kind="research"),
++        _task(id="T-OWNER", kind="owner_only"),
++        _task(id="T-DOCS", kind="docs"),
++    ]
++    assert pick_next(tasks).task["id"] == "T-DOCS"
++
++
++# --- AC-4: cross-repo dependencies ----------------------------------------
++
++
++def test_ac_4():
++    done_dep = _task(id="DEP", status="done")
++    task = _task(id="T-X", depends_on=["soloadventurer-mobile:9b"])
++    assert pick_next([done_dep, task]) is None
++    # even when a task with that literal id exists and is done in this queue:
++    # a ":" dep is cross-repo by construction and never met automatically
++    foreign = _task(id="soloadventurer-mobile:9b", status="done")
++    assert pick_next([foreign, task]) is None
++    # a same-repo dep on a done task IS met
++    ok = _task(id="T-OK", depends_on=["DEP"])
++    assert pick_next([done_dep, ok]).task["id"] == "T-OK"
++
++
++def test_dependency_must_be_done_in_this_queue():
++    open_dep = _task(id="DEP", status="in_review")
++    assert pick_next([open_dep, _task(id="T", depends_on=["DEP"])]) is None
++    assert pick_next([_task(id="T", depends_on=["NOPE"])]) is None
++
++
++# --- AC-5: changed contract goes back to draft -----------------------------
++
++
++def test_ac_5(tmp_path):
++    path = _queue_file(tmp_path, [_task(id="T-1", status="in_review")])
++    # an external edit changes the acceptance text without updating the hash
++    doc = json.loads(path.read_text())
++    doc["tasks"][0]["acceptance"][0]["text"] = "it works differently"
++    path.write_text(json.dumps(doc, indent=2))
++
++    queue = TaskQueue(path)
++    audit = queue.demote_changed_contracts()
++    assert audit.demoted == ["T-1"]
++    assert audit.flagged_done == []
++    assert TaskQueue(path).get("T-1")["status"] == "draft"
++    # a matching hash leaves the task alone
++    path = _queue_file(tmp_path, [_task(id="T-2", status="ready")])
++    queue = TaskQueue(path)
++    audit = queue.demote_changed_contracts()
++    assert audit.demoted == []
++    assert audit.flagged_done == []
++    assert queue.get("T-2")["status"] == "ready"
++
++
++def test_done_task_with_changed_contract_is_flagged_not_demoted(tmp_path):
++    # merged, live-verified work is never auto-reopened: a stale hash on a
++    # done task surfaces in flagged_done and the status stays done
++    path = _queue_file(tmp_path, [_task(id="T-DONE", status="done")])
++    doc = json.loads(path.read_text())
++    doc["tasks"][0]["acceptance"][0]["text"] = "it works differently"
++    path.write_text(json.dumps(doc, indent=2))
++
++    audit = TaskQueue(path).demote_changed_contracts()
++    assert audit.demoted == []
++    assert audit.flagged_done == ["T-DONE"]
++    assert TaskQueue(path).get("T-DONE")["status"] == "done"
++
++
++# --- AC-6: crash mid-write -------------------------------------------------
++
++
++def test_ac_6(tmp_path, monkeypatch):
++    path = _queue_file(tmp_path, [_task(id="T-1", status="ready")])
++    before = path.read_text()
++    queue = TaskQueue(path)
++
++    def crash(src, dst):
++        raise OSError("simulated crash mid-write")
++
++    monkeypatch.setattr(os, "replace", crash)
++    with pytest.raises(OSError, match="simulated crash"):
++        queue.transition("T-1", "in_progress")
++    monkeypatch.undo()
++
++    assert path.read_text() == before
++    assert TaskQueue(path).get("T-1")["status"] == "ready"
++    assert not list(tmp_path.glob(".tasks.json.tmp-*"))
++
++
++def test_crash_during_serialisation_leaves_file_intact(tmp_path, monkeypatch):
++    import factory.state as state_mod
++
++    path = _queue_file(tmp_path, [_task(id="T-1", status="ready")])
++    before = path.read_text()
++    queue = TaskQueue(path)
++
++    def broken_dump(*args, **kwargs):
++        raise ValueError("simulated serialisation crash")
++
++    monkeypatch.setattr(state_mod.json, "dump", broken_dump)
++    with pytest.raises(ValueError, match="simulated serialisation crash"):
++        queue.transition("T-1", "in_progress")
++
++    assert path.read_text() == before
++    assert not list(tmp_path.glob(".tasks.json.tmp-*"))
++
++
++# --- Picker: slices --------------------------------------------------------
++
++
++def test_picker_takes_first_incomplete_slice():
++    task = _task(
++        id="T",
++        slices=[
++            {"id": "S-1", "text": "a", "status": "merged"},
++            {"id": "S-2", "text": "b", "status": "todo"},
++            {"id": "S-3", "text": "c", "status": "todo"},
++        ],
++    )
++    assert pick_next([task]).slice["id"] == "S-2"
++
++
++def test_picker_falls_through_a_fully_merged_task():
++    merged = _task(
++        id="T-MERGED",
++        priority="P1",
++        slices=[{"id": "S-1", "text": "a", "status": "merged"}],
++    )
++    nxt = _task(id="T-NEXT", priority="P2")
++    assert pick_next([merged, nxt]).task["id"] == "T-NEXT"
++
++
++def test_picker_treats_an_unsliced_task_as_one_unit():
++    pick = pick_next([_task(id="T")])
++    assert pick.task["id"] == "T"
++    assert pick.slice is None
++
++
++# --- Store: persistence and invariants --------------------------------------
++
++
++def test_append_attempt_persists_and_can_only_grow(tmp_path):
++    path = _queue_file(tmp_path, [_task(id="T-1", status="in_progress")])
++    queue = TaskQueue(path)
++    queue.append_attempt("T-1", dict(_ATTEMPT))
++    assert TaskQueue(path).get("T-1")["attempts"] == [_ATTEMPT]
++    queue = TaskQueue(path)
++    queue.append_attempt("T-1", {**_ATTEMPT, "run_id": "r2"})
++    assert len(TaskQueue(path).get("T-1")["attempts"]) == 2
++
++
++def test_attempt_rewrites_are_refused(tmp_path):
++    path = _queue_file(
++        tmp_path, [_task(id="T-1", status="in_progress", attempts=[dict(_ATTEMPT)])]
++    )
++    queue = TaskQueue(path)
++    queue.get("T-1")["attempts"][0]["outcome"] = "pass"
++    with pytest.raises(StateError, match="append-only"):
++        queue.save()
++    assert TaskQueue(path).get("T-1")["attempts"][0]["outcome"] == "fail"
++
++
++def test_attempt_removal_is_refused(tmp_path):
++    path = _queue_file(
++        tmp_path, [_task(id="T-1", status="in_progress", attempts=[dict(_ATTEMPT)])]
++    )
++    queue = TaskQueue(path)
++    queue.get("T-1")["attempts"].clear()
++    with pytest.raises(StateError, match="append-only"):
++        queue.save()
++
++
++def test_removing_a_task_with_attempts_is_refused(tmp_path):
++    path = _queue_file(
++        tmp_path,
++        [
++            _task(id="T-1", status="in_progress", attempts=[dict(_ATTEMPT)]),
++            _task(id="T-2", status="ready"),
++        ],
++    )
++    queue = TaskQueue(path)
++    queue.doc["tasks"] = [t for t in queue.doc["tasks"] if t["id"] != "T-1"]
++    with pytest.raises(StateError, match="T-1"):
++        queue.save()
++
++
++def test_append_attempt_is_schema_validated(tmp_path):
++    path = _queue_file(tmp_path, [_task(id="T-1", status="in_progress")])
++    queue = TaskQueue(path)
++    with pytest.raises(ContractError):
++        queue.append_attempt("T-1", {"run_id": "r1"})
++
++
++def test_save_refuses_invalid_state(tmp_path):
++    path = _queue_file(tmp_path, [_task(id="T-1", status="ready")])
++    queue = TaskQueue(path)
++    queue.get("T-1")["status"] = "bogus"
++    with pytest.raises(ContractError):
++        queue.save()
++    assert TaskQueue(path).get("T-1")["status"] == "ready"
++
++
++def test_unknown_task_is_refused(tmp_path):
++    path = _queue_file(tmp_path, [_task()])
++    queue = TaskQueue(path)
++    with pytest.raises(StateError, match="unknown task"):
++        queue.transition("NOPE", "ready")
++    with pytest.raises(StateError, match="unknown task"):
++        queue.append_attempt("NOPE", dict(_ATTEMPT))
++    with pytest.raises(TransitionError, match="not_a_status"):
++        queue.transition("T-1", "not_a_status")
++
++
++def test_save_stamps_updated_at(tmp_path):
++    path = _queue_file(tmp_path, [_task(id="T-1", status="draft")])
++    TaskQueue(path).transition("T-1", "ready")
++    doc = json.loads(path.read_text())
++    assert doc["updated_at"].endswith("Z")
++    datetime.fromisoformat(doc["updated_at"].replace("Z", "+00:00"))
++
++
++# --- Review fixes: concurrency --------------------------------------------
++
++
++def test_concurrent_writer_cannot_silently_overwrite(tmp_path):
++    # factory loop and a human-run factory approve are two writers on one
++    # tasks.json; the second writer must be refused, not lose the first's
++    # attempt
++    path = _queue_file(tmp_path, [_task(id="T-1", status="in_progress")])
++    writer_a = TaskQueue(path)
++    writer_b = TaskQueue(path)
++
++    writer_a.append_attempt("T-1", dict(_ATTEMPT))
++    with pytest.raises(ConcurrentWriteError, match="changed on disk"):
++        writer_b.append_attempt("T-1", {**_ATTEMPT, "run_id": "r2"})
++
++    # A's attempt survives; a reloaded writer sees both orders
++    attempts = TaskQueue(path).get("T-1")["attempts"]
++    assert [a["run_id"] for a in attempts] == ["r1"]
++    TaskQueue(path).append_attempt("T-1", {**_ATTEMPT, "run_id": "r2"})
++    attempts = TaskQueue(path).get("T-1")["attempts"]
++    assert [a["run_id"] for a in attempts] == ["r1", "r2"]
++
++
++def test_concurrent_writer_cannot_overwrite_a_transition(tmp_path):
++    path = _queue_file(tmp_path, [_task(id="T-1", status="ready")])
++    writer_a = TaskQueue(path)
++    writer_b = TaskQueue(path)
++
++    writer_a.transition("T-1", "in_progress")
++    # legal in B's stale view (it still sees ready), refused at the disk check
++    with pytest.raises(ConcurrentWriteError):
++        writer_b.transition("T-1", "in_progress")
++    assert TaskQueue(path).get("T-1")["status"] == "in_progress"
++
++
++# --- Review fixes: file format and validation ------------------------------
++
++
++def test_non_ascii_survives_a_save(tmp_path):
++    # the reviewed queue file uses literal em-dashes and arrows; escaping
++    # them would put every such line into every future diff
++    path = _queue_file(tmp_path, [_task(id="T-1", title="ship — done → prod ✓")])
++    TaskQueue(path).transition("T-1", "blocked")
++    raw = path.read_text(encoding="utf-8")
++    assert "— done → prod ✓" in raw
++    assert "\\u2014" not in raw
++
++
++def test_duplicate_task_ids_are_rejected(tmp_path):
++    path = tmp_path / "tasks.json"
++    doc = {"version": 1, "project": "fixture", "tasks": [_task(id="WO-15"), _task(id="WO-15")]}
++    path.write_text(json.dumps(doc))
++    with pytest.raises(ContractError, match="duplicate task id WO-15"):
++        TaskQueue(path)
++
++
++# --- Review fixes: error hierarchy -----------------------------------------
++
++
++def test_state_errors_are_contract_errors():
++    # callers wrap queue operations in `except ContractError`; state and
++    # concurrency failures must not fly past that handler
++    assert issubclass(StateError, ContractError)
++    assert issubclass(TransitionError, ContractError)
++    assert issubclass(ConcurrentWriteError, ContractError)
++
++
++def test_illegal_transition_is_caught_as_contract_error(tmp_path):
++    path = _queue_file(tmp_path, [_task(id="T-1", status="ready")])
++    with pytest.raises(ContractError):
++        TaskQueue(path).transition("T-1", "done")
++
++
++# --- Review fixes: recovery and continuation edges --------------------------
++
++
++def test_rejected_pr_returns_for_a_fix_round(tmp_path):
++    path = _queue_file(tmp_path, [_task(id="T-1", status="in_review")])
++    TaskQueue(path).transition("T-1", "in_progress")
++    assert TaskQueue(path).get("T-1")["status"] == "in_progress"
++
++
++def test_aborted_run_returns_to_ready(tmp_path):
++    path = _queue_file(tmp_path, [_task(id="T-1", status="in_progress")])
++    TaskQueue(path).transition("T-1", "ready")
++    assert TaskQueue(path).get("T-1")["status"] == "ready"
++
++
++def test_slice_continuation_from_deploying(tmp_path):
++    slices = [
++        {"id": "S-1", "text": "a", "status": "merged"},
++        {"id": "S-2", "text": "b", "status": "todo"},
++    ]
++    path = _queue_file(tmp_path, [_task(id="T-1", status="deploying", slices=slices)])
++    queue = TaskQueue(path)
++    queue.transition("T-1", "ready")  # previous slice merged; S-2 remains
++    assert TaskQueue(path).get("T-1")["status"] == "ready"
++
++    # done/awaiting_owner require every slice merged
++    path = _queue_file(tmp_path, [_task(id="T-1", status="deploying", slices=slices)])
++    queue = TaskQueue(path)
++    with pytest.raises(TransitionError, match="S-2"):
++        queue.transition("T-1", "done")
++    with pytest.raises(TransitionError, match="S-2"):
++        queue.transition("T-1", "awaiting_owner")
++
++    # all slices merged: terminal edges legal, continuation refused
++    merged = [dict(s, status="merged") for s in slices]
++    path = _queue_file(tmp_path, [_task(id="T-1", status="deploying", slices=merged)])
++    queue = TaskQueue(path)
++    with pytest.raises(TransitionError, match="no unmerged slices"):
++        queue.transition("T-1", "ready")
++    queue.transition("T-1", "done")
++
++    # an unsliced task has no continuation either
++    path = _queue_file(tmp_path, [_task(id="T-1", status="deploying")])
++    queue = TaskQueue(path)
++    with pytest.raises(TransitionError, match="no unmerged slices"):
++        queue.transition("T-1", "ready")
++    queue.transition("T-1", "done")
++
++
++def test_reclaim_abandoned_runs(tmp_path):
++    # No run lease is held, so every in_progress task is abandoned — whether
++    # its last attempt is old, recent, or (crash before the first attempt
++    # record) missing entirely. Reclaim no longer guesses from timestamps.
++    stale = {**_ATTEMPT, "started": "2026-10-16T10:00:00Z"}
++    fresh = {**_ATTEMPT, "started": "2026-10-16T11:55:00Z"}
++    path = _queue_file(
++        tmp_path,
++        [
++            _task(id="T-STALE", status="in_progress", attempts=[stale]),
++            _task(id="T-FRESH", status="in_progress", attempts=[fresh]),
++            _task(id="T-NOATTEMPT", status="in_progress"),
++        ],
++    )
++    reclaimed = TaskQueue(path).reclaim_abandoned()
++    assert reclaimed == ["T-STALE", "T-FRESH", "T-NOATTEMPT"]
++    reloaded = TaskQueue(path)
++    for tid in reclaimed:
++        assert reloaded.get(tid)["status"] == "ready"
++
++
++def test_reclaim_never_takes_a_live_run(tmp_path):
++    # A live session must not be reclaimed, however long it runs (setup and
++    # L0-L3 validation are outside the session clock, so elapsed time says
++    # nothing about liveness).
++    path = _queue_file(tmp_path, [_task(id="T-1")])
++    runner = TaskQueue(path)
++    with runner.begin_run("T-1"):
++        old = {**_ATTEMPT, "started": "2000-01-01T00:00:00Z"}
++        runner.append_attempt("T-1", old)
++        assert TaskQueue(path).reclaim_abandoned() == []
++        assert TaskQueue(path).get("T-1")["status"] == "in_progress"
++
++
++def test_reclaim_frees_a_crash_before_the_first_attempt(tmp_path):
++    # Picked (in_progress) but the session died before recording an attempt.
++    path = _queue_file(tmp_path, [_task(id="T-1")])
++    runner = TaskQueue(path)
++    with pytest.raises(RuntimeError):
++        with runner.begin_run("T-1"):
++            raise RuntimeError("session died")
++    assert TaskQueue(path).get("T-1")["status"] == "in_progress"
++    assert TaskQueue(path).reclaim_abandoned() == ["T-1"]
++    assert TaskQueue(path).get("T-1")["status"] == "ready"
++
++
++def test_begin_run_refuses_a_second_concurrent_run(tmp_path):
++    path = _queue_file(tmp_path, [_task(id="T-1"), _task(id="T-2")])
++    with TaskQueue(path).begin_run("T-1"):
++        with pytest.raises(RunInProgressError, match="T-1"):
++            with TaskQueue(path).begin_run("T-2"):
++                pass
++    assert TaskQueue(path).get("T-2")["status"] == "ready"
++
++
++def test_run_lease_is_a_contract_error():
++    assert issubclass(RunInProgressError, ContractError)
++
++
++def test_sync_readiness_reconciles_with_dependencies(tmp_path):
++    path = _queue_file(
++        tmp_path,
++        [
++            _task(id="DEP", status="in_review"),
++            _task(id="T-REGRESSED", depends_on=["DEP"]),
++            _task(id="DEP-2", status="done"),
++            _task(id="T-UNBLOCKED", status="blocked", depends_on=["DEP-2"]),
++            _task(id="T-CROSSREPO", status="blocked", depends_on=["soloadventurer-mobile:9b"]),
++        ],
++    )
++    changed = TaskQueue(path).sync_readiness()
++    assert changed == ["T-REGRESSED", "T-UNBLOCKED"]
++    reloaded = TaskQueue(path)
++    assert reloaded.get("T-REGRESSED")["status"] == "blocked"
++    assert reloaded.get("T-UNBLOCKED")["status"] == "ready"
++    # cross-repo deps are never met automatically: stays blocked
++    assert reloaded.get("T-CROSSREPO")["status"] == "blocked"
++
++
++def test_ready_to_blocked_edge_is_legal(tmp_path):
++    path = _queue_file(tmp_path, [_task(id="T-1", status="ready")])
++    TaskQueue(path).transition("T-1", "blocked")
++    assert TaskQueue(path).get("T-1")["status"] == "blocked"
++
++
++def test_lease_is_freed_when_the_holding_process_dies(tmp_path):
++    # The point of an OS lock: a process that dies without cleanup (here
++    # os._exit, no finally blocks run) still releases it.
++    import subprocess
++    import sys
++
++    path = _queue_file(tmp_path, [_task(id="T-1")])
++    script = (
++        "import os, sys\n"
++        "sys.path.insert(0, sys.argv[2])\n"
++        "from factory.state import TaskQueue\n"
++        "q = TaskQueue(sys.argv[1])\n"
++        "ctx = q.begin_run('T-1'); ctx.__enter__()\n"
++        "os._exit(0)\n"
++    )
++    repo = str(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++    subprocess.run([sys.executable, "-c", script, str(path), repo], check=True)
++    assert TaskQueue(path).get("T-1")["status"] == "in_progress"
++    assert TaskQueue(path).reclaim_abandoned() == ["T-1"]

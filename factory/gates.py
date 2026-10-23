@@ -358,3 +358,47 @@ def _parse_unified_diff(text: str) -> dict:
             removed.append((old_no, line[1:]))
             old_no += 1
     return result
+
+
+def changes_from_patch(text: str) -> list:
+    """``FileChange`` list parsed from a unified-diff patch, no repo.
+
+    The F-33 corpus replay reads ``gh pr diff`` output through here:
+    statuses come from the git headers (``new file mode``, ``deleted
+    file mode``, ``rename from``/``rename to``, ``copy from``/``copy
+    to`` — anything else is a modification), and the line detail reuses
+    :func:`_parse_unified_diff`, so a replayed patch and
+    :func:`diff_file_changes` can never disagree about hunk line
+    numbers.
+
+    Args:
+        text: The patch text (``git diff`` / ``gh pr diff`` output).
+
+    Returns:
+        ``FileChange`` list, one per ``diff --git`` block, in patch order.
+    """
+    header = re.compile(r"^diff --git a/(.+) b/(.+)$")
+    changes: list[FileChange] = []
+    for line in text.splitlines():
+        m = header.match(line)
+        if m:
+            changes.append(FileChange(m.group(2), "M"))
+            continue
+        if not changes:
+            continue
+        change = changes[-1]
+        if line.startswith("new file mode"):
+            change.status = "A"
+        elif line.startswith("deleted file mode"):
+            change.status = "D"
+        elif line.startswith("rename from "):
+            change.old_path = line[len("rename from "):]
+            change.status = "R"
+        elif line.startswith("copy from "):
+            change.old_path = line[len("copy from "):]
+            change.status = "C"
+    hunks = _parse_unified_diff(text)
+    for change in changes:
+        added, removed = hunks.get(change.path, ([], []))
+        change.added_lines, change.removed_lines = added, removed
+    return changes
