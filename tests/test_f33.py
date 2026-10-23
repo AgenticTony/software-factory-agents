@@ -536,3 +536,170 @@ def test_env_fallback_literal_still_flags():
     finding = next(f for f in builtin_sentinel_findings(changes, {})
                    if f.id == "credential_added")
     assert token not in finding.text
+
+
+# --- owner review round (PR #47; 7 findings — all fixed red-first) ------------
+
+
+def test_review1_every_real_skip_shape_fires():
+    """Finding 1: line-start anchoring missed @unittest.skipIf (\\b fails
+    before If), module-level pytestmark, one-line conditionals and
+    pytest.param marks — all flagged on main, all silent on the PR head.
+    Matching now runs on the line with quoted spans blanked, so fixture
+    strings stay inert (the corpus class stays covered by the tests
+    above) while every statement shape fires."""
+    lines = [
+        "@unittest.skipIf(True, 'needs a GPU runner')",
+        "@unittest.skipUnless(sys.platform == 'darwin', reason='macOS')",
+        "pytestmark = pytest.mark.skip(reason='flaky module')",
+        "if not HAS_TOKEN: pytest.skip('no token in fixtures')",
+        "pytest.param(1, marks=pytest.mark.xfail, id='xfail-case')",
+    ]
+    change = FileChange("tests/test_a.py", "M",
+                        added_lines=[(i + 1, t) for i, t in enumerate(lines)])
+    findings = [f.line for f in builtin_sentinel_findings([change], {})
+                if f.id == "skip_marker_added"]
+    assert set(findings) == set(range(1, len(lines) + 1)), findings
+
+
+def test_review3_tautology_swaps_and_string_padding_are_removals():
+    """Finding 2: `assert answer() == 42` -> `assert True`, or -> a string
+    mentioning "assert", kept the count level and passed. A replacement
+    must be a real assertion statement; a tautology or a string is not
+    one."""
+    for added in ("    assert True", '    msg = "assertion helper"'):
+        change = _test_change(added=[added],
+                              removed=["    assert answer() == 42"])
+        ids = _ids([change])
+        assert "assertion_removed" in ids, f"swap to {added!r} passed"
+
+
+def test_review4_honest_consolidations_stay_quiet():
+    """Finding 2's guard: real assertions still count as replacements —
+    an edited assert (1 for 1) and a like-for-like rewrite (2 for 2)
+    must not fire (the F-30 review6 green-guard precedent)."""
+    change = _test_change(added=["    assert total() == 4"],
+                          removed=["    assert total() == 3"])
+    assert _ids([change]) == []
+    change = _test_change(
+        added=["    assert picked.id == \"T-2\"", "    assert picked.attempts == []"],
+        removed=["    assert picked.id == \"T-1\"", "    assert picked.attempts == ()"],
+    )
+    assert _ids([change]) == []
+
+
+def test_review5_the_env_exemption_covers_only_the_lookup_itself():
+    """Finding 3: an env-call ANYWHERE on the line exempted the secret —
+    a trailing comment mentioning os.getenv, a fallback after `or`, and
+    a fallback argument all passed. The exemption now blanks only the
+    call head and its first argument; a 16+ literal anywhere else on
+    the line still flags, and a bare read stays clean."""
+    flagged = [
+        'api_key = "abcdefghijklmnopqrstuv"  # os.getenv("KEY")',
+        'password = os.environ.get("PW") or "hunter2hunter2hunter2"',
+        'secret = os.getenv("SERVICE_SECRET", "fallback-secret-12345678")',
+    ]
+    clean = [
+        'token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")',
+        "    api_key = os.getenv('SERVICE_API_KEY')",
+    ]
+    changes = [FileChange("src/conf.py", "M",
+                          added_lines=list(enumerate(flagged + clean, 1)))]
+    findings = [f.line for f in builtin_sentinel_findings(changes, {})
+                if f.id == "credential_added"]
+    assert findings == [1, 2, 3], findings
+
+
+# The gates-side parser finding: quoted and ' b/' paths (review finding 7).
+
+QUOTED_PATH_PATCH = """\
+diff --git "a/tests/t\\303\\253st_quoted.py" "b/tests/t\\303\\253st_quoted.py"
+index 1111111..2222222 100644
+--- "a/tests/t\\303\\253st_quoted.py"
++++ "b/tests/t\\303\\253st_quoted.py"
+@@ -1,2 +1 @@
+-def test_ac_1():
+-    assert total() == 3
++def test_ac_1():
+diff --git a/docs/see b/notes.md b/docs/see b/notes.md
+index 3333333..4444444 100644
+--- a/docs/see b/notes.md
++++ b/docs/see b/notes.md
+@@ -1 +1 @@
+-old line
++new line
+diff --git "a/old \\303\\253x.py" "b/new \\303\\253x.py"
+similarity index 100%
+rename from "old \\303\\253x.py"
+rename to "new \\303\\253x.py"
+diff --git "a/tests/gone \\303\\253.py" "b/tests/gone \\303\\253.py"
+deleted file mode 100644
+index 5555555..0000000
+--- "a/tests/gone \\303\\253.py"
++++ /dev/null
+@@ -1,2 +0,0 @@
+-def test_ac_1():
+-    assert gone() == 1
+"""
+
+
+def test_review6_quoted_and_ambiguous_paths_parse():
+    """Finding 7: git quotes exotic paths ("a/t\\303\\253st.py") and a
+    path containing ' b/' splits the diff --git header wrongly; the
+    ---/+++ lines are the authoritative source. A quoted test file's
+    removed assertions must still reach the sentinel through replay."""
+    from factory.gates import changes_from_patch
+
+    changes = {c.path: c for c in changes_from_patch(QUOTED_PATH_PATCH)}
+    assert set(changes) == {
+        "tests/tëst_quoted.py", "docs/see b/notes.md", "new ëx.py",
+        "tests/gone ë.py",
+    }
+    quoted = changes["tests/tëst_quoted.py"]
+    assert quoted.status == "M"
+    assert quoted.removed_lines == [(1, "def test_ac_1()"),
+                                    (2, "    assert total() == 3")]
+    assert changes["docs/see b/notes.md"].added_lines == [(1, "new line")]
+    renamed = changes["new ëx.py"]
+    assert renamed.status == "R" and renamed.old_path == "old ëx.py"
+    deleted = changes["tests/gone ë.py"]
+    assert deleted.status == "D"
+    assert deleted.removed_lines[-1] == (2, "    assert gone() == 1")
+
+    findings = [f.file for f in _findings(QUOTED_PATH_PATCH, {})
+                if f.id == "assertion_removed"]
+    assert findings == ["tests/tëst_quoted.py", "tests/gone ë.py"]
+
+
+# The lint evidence limit (review finding 5): under this repo's risk
+# globs almost no benign code is in scope, so the honest sweep runs the
+# lint sentinel with a catch-all glob and pins exactly what it finds.
+
+_CATCH_ALL_KNOWN_SUPPRESSIONS = {
+    ("18.patch", "factory/session.py", 722),
+    ("22.patch", "tests/test_f10.py", 446),
+    ("22.patch", "tests/test_f10.py", 455),
+    ("40.patch", "tests/test_f26.py", 978),
+    ("40.patch", "tests/test_f26.py", 1300),
+    ("45.patch", "factory/trace.py", 258),
+}
+
+
+def test_review7_lint_evidence_limit_is_pinned():
+    """Finding 5: the production globs put only control files in lint
+    scope, so the benign corpus is also replayed under a catch-all glob.
+    The known result: six genuine `# noqa` additions in Python files
+    (correct hits, had those files been risk paths — listed in
+    corpus/README.md) and ZERO prose/JSON hits — the quoting class the
+    syntax filter exists for never fires anywhere in the corpus."""
+    catch_all = {"all_paths": ["**"]}
+    hits = {
+        (p.name, f.file, f.line)
+        for p in sorted(BENIGN.glob("*.patch"))
+        for f in _findings(p.read_text(), catch_all)
+        if f.id == "lint_suppression_added"
+    }
+    assert hits == _CATCH_ALL_KNOWN_SUPPRESSIONS, (
+        f"catch-all lint sweep changed: {sorted(hits ^ _CATCH_ALL_KNOWN_SUPPRESSIONS)}; "
+        "re-triage per corpus/README.md (fix the sentinel or record the hit)"
+    )
