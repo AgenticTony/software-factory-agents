@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-23T09:49:39Z",
+  "updated_at": "2026-10-23T11:33:50Z",
   "tasks": [
     {
       "id": "F-00",
@@ -873,6 +873,14 @@
             "type": "test",
             "ref": "tests/test_f11.py::test_ac_3"
           }
+        },
+        {
+          "id": "AC-4",
+          "text": "`factory status` lists the week's vents grouped by category, from the F-27 `weeks_vents` seam (no second implementation).",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f11.py::test_ac_4"
+          }
         }
       ],
       "budget": {
@@ -1292,6 +1300,14 @@
           "check": {
             "type": "test",
             "ref": "tests/test_f19.py::test_ac_5"
+          }
+        },
+        {
+          "id": "AC-6",
+          "text": "The weekly review reads the week's vents (the F-27 `weeks_vents` seam) alongside failures and transcripts, so friction that never became a failure still reaches you.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f19.py::test_ac_6"
           }
         }
       ],
@@ -1798,7 +1814,7 @@
         },
         {
           "id": "AC-4",
-          "text": "`factory status` (F-11) lists the week's vents grouped by category, and F-19's review reads them.",
+          "text": "The week's vents are readable grouped by category through the read-only `weeks_vents` seam, whose docstring names its consumers: `factory status` (F-11) lists them, F-19's review reads them.",
           "check": {
             "type": "test",
             "ref": "tests/test_f27.py::test_ac_4"
@@ -1813,8 +1829,8 @@
       },
       "attempts": [],
       "links": {},
-      "acceptance_hash": "d72fb2124956b2279bcd8475d46b9ea924983eb8c1085b0c5837aaa3d70a7428",
-      "approved_at": "2026-10-23T09:49:39Z",
+      "acceptance_hash": "77861e0165fe487f8b359feb870e7035532855250efa810f58e73c2c1a2551e7",
+      "approved_at": "2026-10-23T11:33:50Z",
       "approved_by": "Anthony"
     },
     {
