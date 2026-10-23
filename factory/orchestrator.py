@@ -97,7 +97,12 @@ from factory.runs import (
     new_run_id,
 )
 from factory.sandbox import build_settings, run_sandboxed, write_settings
-from factory.session import DEFAULT_BASE_URL, SessionRecord, run_session_sandboxed
+from factory.session import (
+    DEFAULT_BASE_URL,
+    SessionRecord,
+    run_session_sandboxed,
+    seat_token,
+)
 from factory.state import (
     RECOVERY_ESCALATIONS,
     RunInProgressError,
@@ -106,7 +111,7 @@ from factory.state import (
     recovery_task_eligible,
     unmet_dependencies,
 )
-from factory.trace import TraceWriter
+from factory.trace import TraceWriter, prune_traces
 from factory.vent import flush_vents
 
 __all__ = [
@@ -279,6 +284,10 @@ def reclaim_runs(queue: TaskQueue, project: str, factory_root: Path) -> list[Pat
                         shutil.rmtree(entry, ignore_errors=True)
                     else:
                         entry.unlink(missing_ok=True)
+        # Traces outlive their runs but not the retention window: they
+        # hold repo content (PII on some projects), so they are aged out
+        # here, under the same lease that says no run can be appending.
+        prune_traces(factory_root, project)
     finally:
         lease.__exit__(None, None, None)
     return removed
@@ -1410,8 +1419,12 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
     work = create_run(project, source, factory_root=ctx.factory_root, ref=default_branch)
     # F-30: this run's live trace — one writer per run, appended to as the
     # events happen and never allowed to change the run itself (AC-5's
-    # failure policy lives in the writer).
-    trace = TraceWriter(ctx.factory_root, project, work.run_id, task_id)
+    # failure policy lives in the writer). The seat token is handed over
+    # as a literal secret: orchestrator-written events (error reasons,
+    # gate notes) bypass the session-side tap, and the writer scrubs at
+    # every boundary — the token in a shape F-25 cannot match included.
+    trace = TraceWriter(ctx.factory_root, project, work.run_id, task_id,
+                        extra_secrets=[seat_token() or ""])
     try:
         with trace.phase("setup"):
             _build_on_remote_default(work, repo_cfg["remote"], default_branch)
@@ -1850,11 +1863,15 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                 queue.transition(task_id, "ready")
                 return RunResult("error", task_id,
                                  escalation="orchestrator_error", reports=reports)
-    except BaseException:
+    except BaseException as exc:
         # F-30: a run that ends without a recorded outcome still gets its
         # terminal marker — idempotent, so a re-raise after a recorded
-        # outcome (the opened-PR path above) never rewrites it.
-        trace.run_end("failed")
+        # outcome (the opened-PR path above) never rewrites it. Operator
+        # stops (Ctrl-C, SystemExit) are aborts, not failures: metrics
+        # read "failed" as "the factory or the agent broke".
+        trace.run_end(
+            "aborted" if isinstance(exc, (KeyboardInterrupt, SystemExit))
+            else "failed")
         raise
     finally:
         cleanup_run(work)

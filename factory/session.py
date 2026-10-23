@@ -92,9 +92,8 @@ from factory.sandbox import (
     run_sandboxed,
     write_settings,
 )
-from factory.sentinels import redact_credentials
 from factory.state import now_iso
-from factory.trace import SNIPPET_CAP, STREAM_PREFIX, scrub_literal
+from factory.trace import STREAM_PREFIX, scrub_literal, snippet
 from factory.vent import VENT_QUALIFIED_NAME, VENT_TOOL_NAME, VentCollector, vent_server
 
 DEFAULT_BASE_URL = "https://api.z.ai/api/anthropic"
@@ -861,21 +860,6 @@ def _record_from(
 
 # --------------------------------------------------- the F-30 stream tap --
 
-# Tool args/result snippets carry one marker when capped (redaction runs
-# before the cap — capping first could cut a credential in half and leave
-# a prefix no pattern matches; the F-27 review's finding 2, held here too).
-_TRACE_TRUNCATED = " …[trace truncated]"
-
-
-def _trace_snippet(text: str, token: str | None) -> str:
-    """Redact (seat token literal, then the F-25 shapes), then cap."""
-    text = scrub_literal(text, token)
-    text = redact_credentials(text)
-    if len(text) > SNIPPET_CAP:
-        text = text[: SNIPPET_CAP - len(_TRACE_TRUNCATED)] + _TRACE_TRUNCATED
-    return text
-
-
 def _content_text(content: Any) -> str:
     """Tool-result content as flat text: a string as-is, a block list by
     its text fields, anything else as JSON."""
@@ -924,7 +908,7 @@ def _tap_tool_calls(
                     "seat": seat,
                     "tool": use["tool"],
                     "args": use["args"],
-                    "result": _trace_snippet(
+                    "result": snippet(
                         _content_text(getattr(block, "content", None)), token),
                     "ok": not is_error,
                     "started": use["started"],
@@ -936,7 +920,7 @@ def _tap_tool_calls(
         if name is not None and block_id is not None:  # a tool_use opens one
             pending[str(block_id)] = {
                 "tool": str(name),
-                "args": _trace_snippet(
+                "args": snippet(
                     json.dumps(getattr(block, "input", None) or {},
                                ensure_ascii=False, default=str),
                     token,
@@ -965,7 +949,10 @@ def trace_line_forwarder(
     back to events. The secret (the seat token) is scrubbed from the raw
     line before parsing; foreign lines (the record, stray output) and
     malformed ones are ignored, never raised — transport can only lose
-    events, never crash a run."""
+    events, never crash a run. Only ``tool_call`` crosses: the pipe is
+    the sandbox's stdout, where anything inside can print a prefixed
+    line, so no other event type — no forged terminal marker, no
+    re-stamped phase — is taken on trust."""
 
     def forward(line: str) -> None:
         if not line.startswith(STREAM_PREFIX):
@@ -976,7 +963,7 @@ def trace_line_forwarder(
             event = json.loads(line[len(STREAM_PREFIX):])
         except json.JSONDecodeError:
             return
-        if isinstance(event, dict):
+        if isinstance(event, dict) and event.get("type") == "tool_call":
             sink(event)
 
     return forward

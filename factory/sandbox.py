@@ -608,11 +608,17 @@ def _pump(streams: dict, buffers: dict, wait: float, *,
         if chunk:
             buffers[name] += chunk
             if on_stdout_line is not None and name == "out":
-                partials["out"] += chunk
-                data = bytes(partials["out"])
-                *complete, remainder = data.split(b"\n")
-                partials["out"] = bytearray(remainder)
-                for raw in complete:
+                # Search only the new chunk for a newline; the accumulated
+                # partial is copied just once, when a line is actually
+                # emitted — a long newline-free line over many small reads
+                # must not cost a full copy per read.
+                idx = chunk.rfind(b"\n")
+                if idx < 0:
+                    partials["out"] += chunk
+                    continue
+                data = bytes(partials["out"]) + chunk[: idx + 1]
+                partials["out"] = bytearray(chunk[idx + 1:])
+                for raw in data.split(b"\n")[:-1]:
                     if raw.strip():
                         with suppress(Exception):
                             on_stdout_line(raw.decode(errors="replace"))

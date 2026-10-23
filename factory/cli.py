@@ -107,7 +107,8 @@ def build_parser() -> argparse.ArgumentParser:
     trace.add_argument("run_id", help="run id, e.g. 20261023T101010Z-1a2b3c")
     trace.add_argument("--follow", action="store_true",
                        help="keep printing new events until the attempt ends "
-                            "(published, failed or aborted)")
+                            "(published, failed or aborted) or can no longer "
+                            "write its end marker (killed run)")
     trace.add_argument("--queue", default=".factory/tasks.json",
                        help="queue path; the project is read from its profile "
                             "(default: %(default)s)")
@@ -205,7 +206,12 @@ def _run_trace(args: argparse.Namespace) -> int:
         if not path.is_file():
             print(f"factory trace: no trace for run {args.run_id}", file=sys.stderr)
             return 1
-        read_trace(path, follow=args.follow)
+        # --follow's stop condition besides run_end: a run whose dir is
+        # gone (killed, reclaimed, or its writer disabled) can never write
+        # the marker — read_trace gives it a grace window, then stops.
+        run_dir = root / "runs" / profile["name"] / args.run_id
+        read_trace(path, follow=args.follow,
+                   live=run_dir.exists if args.follow else None)
         return 0
     except (ContractError, OSError) as exc:
         print(f"factory trace: {exc}", file=sys.stderr)

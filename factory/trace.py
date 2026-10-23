@@ -34,10 +34,19 @@ Failure (AC-5): tracing never changes a run. A write that fails (disk
 full, permission) is reported once on stderr and the writer disables
 itself; no exception ever leaves this module through a write path.
 
-Reading (AC-6): :func:`read_trace` prints the file in order, one line per
-event, and with ``follow=True`` keeps printing appended lines until an
+Privacy: a trace holds capped snippets of everything its run read and
+wrote — on a PII-bearing project that is personal data. So the file is
+owner-only (0600 under a 0700 dir) and does not live forever:
+:func:`prune_traces` age-out, run by ``reclaim_runs`` under the lease
+(no run of the project is alive), deletes files past
+:data:`RETENTION_DAYS`.
+
+Reading (AC-6): :func:`read_trace` prints the whole file in order, one
+line per event — events after a ``run_end`` included (cleanup-time lines
+exist). With ``follow=True`` it keeps printing appended lines until the
 attempt ends — a ``run_end`` event, the terminal marker the orchestrator
-stamps on every outcome (published, failed or aborted). It reads only.
+stamps on every outcome (published, failed or aborted) — or until the
+run can no longer write one (see ``live`` there). It reads only.
 """
 
 from __future__ import annotations
@@ -49,6 +58,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
+from factory.runs import RUN_ID_RE
 from factory.sentinels import redact_credentials
 from factory.state import now_iso
 
@@ -80,6 +90,14 @@ REDACTED = "[redacted]"
 _NOTE_TAIL = 200
 # --follow poll interval (seconds).
 POLL_SEC = 0.2
+# --follow's escape hatch: a run that can no longer write its run_end (a
+# killed orchestrator, a writer disabled by a failed write) would else be
+# followed forever. After this many no-growth polls past the run's death,
+# the reader stops and says why.
+GONE_POLLS = 25  # 5 s at POLL_SEC
+# Trace retention: files older than this are pruned (they hold repo
+# content, PII on some projects — evidence, but not forever).
+RETENTION_DAYS = 14
 
 # L0 finding ids produced by the diff scan (as opposed to the command and
 # sentinel rows): the diff_policy row speaks for these.
@@ -101,6 +119,16 @@ def scrub_literal(text: str, secret: str | None) -> str:
     if secret and len(secret) >= MIN_SECRET_LEN:
         return text.replace(secret, REDACTED)
     return text
+
+
+def snippet(text: str, secret: str | None = None, *,
+            cap: int = SNIPPET_CAP) -> str:
+    """Redact (the literal secret, then the F-25 shapes), then cap — the
+    ONE implementation, shared by the writer's tool_call events and the
+    session-side tap (two copies of this order can drift; the F-27
+    review's finding 2 is why the order is redact-then-cap at all)."""
+    text = scrub_literal(text, secret)
+    return _cap(redact_credentials(text), cap)
 
 
 def _cap(text: str, limit: int) -> str:
@@ -167,8 +195,16 @@ class TraceWriter:
         self.seq = 0
         self.disabled = False
         self._ended = False
+        self._private = False
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # Traces hold repo content: a directory this writer creates is
+            # owner-only. An existing directory keeps its mode — never
+            # widen one, and a deliberately read-only trace dir stays
+            # read-only (AC-5's sabotage must not be silently repaired);
+            # the file itself is chmod 0600 on first write either way.
+            if not self.path.parent.exists():
+                self.path.parent.mkdir(parents=True)
+                self.path.parent.chmod(0o700)
         except OSError as exc:
             self._fail(exc)
 
@@ -184,22 +220,27 @@ class TraceWriter:
 
     def append(self, event: dict) -> None:
         """Stamp, redact and append one event; a failing write is reported
-        once and the writer goes silent (the run never notices)."""
+        once and the writer goes silent (the run never notices). The
+        stamps merge AFTER the event, so no event dict — and nothing an
+        untrusted source put inside one — can override them."""
         if self.disabled:
             return
         self.seq += 1
         record = {
+            **event,
             "seq": self.seq,
             "ts": now_iso(),
             "run_id": self.run_id,
             "task_id": self.task_id,
             "attempt": self.attempt,
-            **event,
         }
         line = json.dumps(_clean(record, self.secrets), ensure_ascii=False)
         try:
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
+            if not self._private:
+                self.path.chmod(0o600)
+                self._private = True
         except OSError as exc:
             self._fail(exc)
 
@@ -373,21 +414,31 @@ def _is_run_end(line: str) -> bool:
 
 
 def read_trace(path: Path, *, follow: bool = False,
-               out: Callable[[str], None] = print) -> None:
-    """Print the trace in order, one line per event (AC-6). With
-    ``follow``, keep printing appended lines until the attempt ends — a
-    ``run_end`` event. Reads only: nothing is written, created or locked.
+               out: Callable[[str], None] = print,
+               live: Callable[[], bool] | None = None) -> None:
+    """Print the trace in order, one line per event (AC-6) — the whole
+    file; a ``run_end`` line never truncates the read (cleanup-time events
+    can follow one). With ``follow``, keep printing appended lines until
+    the attempt ends — a ``run_end`` event — or until no marker can come:
+    ``live`` says whether the run might still write (the CLI passes "the
+    run dir exists"), and once it stops being true the reader waits
+    :data:`GONE_POLLS` polls for stragglers, then stops and says why on
+    stderr; a trace file deleted under the reader (retention) stops it
+    too. Without ``live``, follow waits for the ``run_end`` however long
+    it takes. Reads only: nothing is written, created or locked.
 
     In follow mode a line caught mid-write (readable but not yet
     newline-terminated) is pushed back and waited on, so one event never
     prints as two fragments."""
-    with Path(path).open(encoding="utf-8") as handle:
+    path = Path(path)
+    gone_polls = 0
+    with path.open(encoding="utf-8") as handle:
         while True:
             position = handle.tell()
             line = handle.readline()
             if line and line.endswith("\n"):
                 out(line.rstrip("\n"))
-                if _is_run_end(line):
+                if follow and _is_run_end(line):
                     return
                 continue
             if line and not follow:
@@ -397,4 +448,48 @@ def read_trace(path: Path, *, follow: bool = False,
                 handle.seek(position)
             if not follow:
                 return
+            if not path.exists():  # pruned (retention) under the reader
+                print(f"factory trace: {path.name} was removed; stopping",
+                      file=sys.stderr)
+                return
+            if live is not None and not live():
+                gone_polls += 1
+                if gone_polls >= GONE_POLLS:
+                    print("factory trace: the run is no longer live and "
+                          "wrote no run_end; stopping", file=sys.stderr)
+                    return
+            else:
+                gone_polls = 0
             time.sleep(POLL_SEC)
+
+
+def prune_traces(factory_root: Path | str, project: str, *,
+                 days: int = RETENTION_DAYS,
+                 now: float | None = None) -> list[Path]:
+    """Delete this project's trace files older than the retention window.
+
+    Traces outlive their runs (that is their point) but not the window:
+    they hold capped snippets of everything a run read and wrote, which on
+    a PII-bearing project is personal data. ``reclaim_runs`` calls this
+    with the lease held — no run of the project is alive, so no trace is
+    being appended to. Only run-id-shaped ``.jsonl`` files are touched.
+
+    Returns:
+        The files removed.
+    """
+    directory = Path(factory_root) / "trace" / project
+    if not directory.is_dir():
+        return []
+    cutoff = (time.time() if now is None else now) - days * 86400.0
+    removed: list[Path] = []
+    for entry in sorted(directory.iterdir()):
+        if entry.suffix != ".jsonl" or not RUN_ID_RE.fullmatch(entry.stem):
+            continue
+        try:
+            if entry.stat().st_mtime >= cutoff:
+                continue
+            entry.unlink()
+        except OSError:
+            continue
+        removed.append(entry)
+    return removed
