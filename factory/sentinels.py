@@ -14,19 +14,24 @@ silently orphan a sentinel result behind an always-``pass`` row:
   without a replacement. Replacement is per-file arithmetic (F-33):
   verbatim re-adds pair up as moves, and a file that ends the diff with
   as many assertion lines as it started is quiet; only a net loss flags,
-  naming every removed line no re-add matches (a comment line is neither
-  an assertion nor a replacement for one).
+  naming every removed line no re-add matches. A replacement must be a
+  real assertion statement — a tautology or a string mentioning "assert"
+  levels nothing (PR #47 review round), and a comment line is neither an
+  assertion nor a replacement for one.
 - ``credential_added`` — a credential-shaped string (private-key block,
   well-known token prefixes, a generic secret assignment) on an added line
   in ANY file. The finding text names the matched shape and NEVER echoes
   the line: findings ride into reports, prompts and PR bodies, so the
   sentinel must not become the leak it exists to catch. An environment
   READ (``os.environ.get("TOKEN", ...)``) is the safe pattern, not a
-  leak: the generic assignment shape yields on env-read lines; the
-  prefix shapes (AKIA, ghp_, sk_live...) do not, so a hardcoded fallback
-  inside the lookup still fires. A credential also ESCALATES
-  ``credential_added`` — removing the line next round cannot un-leak it
-  from the branch history ("retrying can't make it safe").
+  leak: the generic assignment shape is tested against the line with
+  the env call's head and first argument blanked, so the lookup itself
+  is exempt while a 16+ literal anywhere else — a fallback argument, an
+  ``or`` after the call, a comment's env mention — still flags; the
+  prefix shapes (AKIA, ghp_, sk_live...) scan env-read lines anyway. A
+  credential also ESCALATES ``credential_added`` — removing the line
+  next round cannot un-leak it from the branch history ("retrying
+  can't make it safe").
 - ``lint_suppression_added`` — ``# noqa``, ``type: ignore`` or a
   lint-disable comment on an added line in a file under a ``paths.risk``
   glob, and only where that syntax is a comment in the file's language:
@@ -37,10 +42,11 @@ silently orphan a sentinel result behind an always-``pass`` row:
   as do the skip-marker and assertion echoes, so a credential on the same
   line prints as ``[redacted]``.
 - ``skip_marker_added`` — a skip/xfail/only marker added on an existing
-  test. The marker must be the statement (a decorator or a standalone
-  call): marker text inside a string literal is fixture data — the tests
-  that exercise these scanners embed ``@pytest.mark.skip`` inside quoted
-  patch fixtures (F-33 corpus, PR #8).
+  test. Substring-level against the line with quoted spans blanked, so
+  every statement shape fires (a decorator, module-level ``pytestmark``,
+  a one-line conditional, ``pytest.param`` marks, the JS forms) while
+  marker text inside a string fixture stays inert — fixture data, not
+  a marker (F-33 corpus, PR #8).
 
 Projects extend the set per risk flag in ``project.yaml``::
 
@@ -95,11 +101,17 @@ _CREDENTIAL_SHAPES = (
 # var's NAME next to the keyword (``token = os.environ.get(
 # "ANTHROPIC_AUTH_TOKEN", "")``) is not a committed secret — the F-33
 # corpus caught the "secret assignment" shape flagging exactly that
-# (PR #18's runner). Only that generic shape yields on env-read lines;
-# the prefix shapes still scan them, so a hardcoded fallback literal
-# inside the lookup still fires.
-_ENV_LOOKUP = re.compile(
-    r"(?i)\b(?:os\.)?(?:environ\.get|getenv)\s*\(|\benviron\s*\[|process\.env\."
+# (PR #18's runner). The exemption blanks ONLY the call head and its
+# first argument (the name): a 16+ literal anywhere else on the line —
+# a fallback argument, an ``or`` after the call, a trailing comment's
+# env mention — is still tested and still flags (PR #47 review finding
+# 3; matching the call's text anywhere on the line exempted committed
+# secrets). Prefix shapes (AKIA, ghp_, sk_live…) scan env-read lines
+# regardless.
+_ENV_CALL_SPAN = re.compile(
+    r"(?i)\b(?:os\.)?(?:environ\.get|getenv)\s*\(\s*(?:\"[^\"]*\"|'[^']*')?"
+    r"|\benviron\s*\[[^\]]*\]"
+    r"|process\.env\.\w+"
 )
 
 # The credential shapes as bare patterns, in the same order — the list F-30
@@ -119,29 +131,70 @@ def redact_credentials(text: str) -> str:
     return text
 
 
+# A single- or double-quoted span, escapes included — the tool that
+# separates code from data on a diff line. Matching a marker or an
+# assertion inside one would flag fixture strings (the F-33 corpus
+# class: PR #8's scanner tests embed markers inside quoted patches), so
+# every substring-level pattern below runs against the line with these
+# spans blanked (PR #47 review finding 1: blanking spans, not anchoring
+# to line start, keeps every statement shape catchable).
+_QUOTED_SPAN = re.compile(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"")
+
+
+def _outside_strings(text: str) -> str:
+    """``text`` with quoted spans blanked: matches here are code, not data."""
+    return _QUOTED_SPAN.sub(" ", text)
+
+
 # Added lines in test files matching any of these -> skip_marker_added.
-# Statement-anchored (matched against the stripped line): the marker must
-# BE the statement — a decorator or a standalone call. Marker text inside
-# a string literal is fixture data, not a marker (F-33 corpus, PR #8's
-# scanner tests embed markers inside quoted patch fixtures).
+# Substring-level against the string-blanked line: a marker is code
+# wherever it sits on the line (a decorator, module-level ``pytestmark``,
+# a one-line conditional, ``pytest.param`` marks, mocha forms), while the
+# same text inside a quoted fixture is data and stays inert.
 SKIP_MARKER_PATTERNS = (
-    re.compile(r"^@\s*pytest\.mark\.(?:skip|skipif|xfail)\b"),
-    re.compile(r"^pytest\.skip\("),
-    re.compile(r"^self\.skipTest\("),
-    re.compile(r"^@unittest\.skip\b"),
-    re.compile(r"^this\.skip\("),
-    re.compile(r"^(?:it|describe|test|context)\.skip\("),
-    re.compile(r"^(?:xit|xdescribe)\("),
-    re.compile(r"^(?:it|describe|test)\.only\("),
+    re.compile(r"pytest\.mark\.(?:skip|skipif|xfail)\b"),
+    re.compile(r"\bpytest\.skip\("),
+    re.compile(r"\bskipTest\("),
+    re.compile(r"@unittest\.skip"),  # covers skipIf/skipUnless: no \b
+    re.compile(r"\bthis\.skip\("),
+    re.compile(r"\b(?:it|describe|test|context)\.skip\("),
+    re.compile(r"\b(?:xit|xdescribe)\("),
+    re.compile(r"\b(?:it|describe|test)\.only\("),
 )
 
 # Removed lines in test files matching any of these -> assertion_removed.
-# Substring-level on purpose: catches assertEqual/expect(...) variants;
-# comments mentioning "assert" can false-positive — a human reviews.
+# Substring-level on purpose: the removed side stays broad (a human
+# reviews); what counts as a REPLACEMENT is the stricter classifier
+# below (PR #47 review finding 2).
 ASSERTION_PATTERNS = (
     re.compile(r"\bassert"),
     re.compile(r"\bexpect\("),
 )
+
+# What counts as a replacement assertion: a real statement, not a
+# tautology and not a string mentioning "assert". Runs against the
+# string-blanked line so padding with prose can never level the count.
+_TAUTOLOGY_ASSERT = re.compile(
+    r"""^assert\s+(?:True|False|None|[-\d.]+|(["']).*\1)\s*$"""
+)
+_ASSERTION_STATEMENT = (
+    re.compile(r"^assert\b"),           # a bare assert statement
+    re.compile(r"^\w+\.assert\w*\("),   # self.assertEqual / mock.assert_…
+    re.compile(r"\bexpect\("),          # jest/vitest
+)
+
+
+def _is_replacement_assertion(text: str) -> bool:
+    """True when ``text`` is an assertion that can replace a removed one.
+
+    ``assert True`` (or any constant) is a tautology, a string or
+    comment mentioning "assert" is prose: neither restores what a
+    removed assertion checked, so neither levels the per-file count.
+    """
+    line = text.strip()
+    if not _is_code_line(text) or _TAUTOLOGY_ASSERT.fullmatch(line):
+        return False
+    return any(p.search(_outside_strings(line)) for p in _ASSERTION_STATEMENT)
 
 # Comment openers across the languages the marker and assertion patterns
 # cover: a line starting with one is prose about code, not code — it is
@@ -228,13 +281,16 @@ def matched_risk_flags(risk_globs: dict, changes) -> set:
 def _credential_shape(text: str) -> str | None:
     """The first credential shape that matches ``text``, else None.
 
-    The generic "secret assignment" shape yields on lines that read the
-    value from the environment — that is the pattern working as
-    intended, not a leak (see :data:`_ENV_LOOKUP`).
+    The generic "secret assignment" shape is tested against the line
+    with env-call spans blanked when one is present: the lookup itself
+    is exempt, everything else on the line is not (see
+    :data:`_ENV_CALL_SPAN`).
     """
-    env_read = _ENV_LOOKUP.search(text)
+    env_read = _ENV_CALL_SPAN.search(text)
     for name, pattern in _CREDENTIAL_SHAPES:
         if name == "secret assignment" and env_read:
+            if pattern.search(_ENV_CALL_SPAN.sub(" ", text)):
+                return name
             continue
         if pattern.search(text):
             return name
@@ -283,7 +339,9 @@ def builtin_sentinel_findings(changes, risk_globs: dict) -> list:
             # token, and the credential scanner cannot be the only guard
             # on what findings print (round-2 finding 4).
             echo = redact_credentials(text.strip())
-            if test_file and any(p.match(text.strip()) for p in SKIP_MARKER_PATTERNS):
+            if test_file and any(
+                p.search(_outside_strings(text)) for p in SKIP_MARKER_PATTERNS
+            ):
                 findings.append(
                     Finding(
                         "skip_marker_added",
@@ -320,9 +378,15 @@ def _flag_weakened_assertions(change, scan_path: str, findings: list) -> None:
     arithmetic: verbatim re-adds pair up (moves), and a file that ends
     the diff with as many assertion lines as it started is quiet —
     moves, edits, replacements alike (whether a replacement is STRONG
-    is L2's judgement, not a line scan's). Only a net loss flags, and it
-    names every removed line no re-add matches: over-reporting the
+    is L2's judgement, not a line scan's). Only a net loss flags, and
+    it names every removed line no re-add matches: over-reporting the
     excess is the safe side, under-reporting a weakened test is not.
+    A REPLACEMENT must be a real assertion statement (:func:
+    `_is_replacement_assertion`): a tautology (``assert True``) or a
+    string mentioning "assert" levels nothing (PR #47 review finding
+    2). The removed side stays deliberately broad — substring matches
+    on code lines — so an honest consolidation that reduces the count
+    still escalates to a human, exactly as F-25 intended.
     """
     removed = [
         (no, text) for no, text in change.removed_lines
@@ -330,7 +394,7 @@ def _flag_weakened_assertions(change, scan_path: str, findings: list) -> None:
     ]
     added = [
         text.strip() for _no, text in change.added_lines
-        if _is_code_line(text) and any(p.search(text) for p in ASSERTION_PATTERNS)
+        if _is_replacement_assertion(text)
     ]
     if not removed or len(added) >= len(removed):
         return

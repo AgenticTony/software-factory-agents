@@ -657,7 +657,7 @@ def test_review6_quoted_and_ambiguous_paths_parse():
     }
     quoted = changes["tests/tëst_quoted.py"]
     assert quoted.status == "M"
-    assert quoted.removed_lines == [(1, "def test_ac_1()"),
+    assert quoted.removed_lines == [(1, "def test_ac_1():"),
                                     (2, "    assert total() == 3")]
     assert changes["docs/see b/notes.md"].added_lines == [(1, "new line")]
     renamed = changes["new ëx.py"]
@@ -666,9 +666,9 @@ def test_review6_quoted_and_ambiguous_paths_parse():
     assert deleted.status == "D"
     assert deleted.removed_lines[-1] == (2, "    assert gone() == 1")
 
-    findings = [f.file for f in _findings(QUOTED_PATH_PATCH, {})
-                if f.id == "assertion_removed"]
-    assert findings == ["tests/tëst_quoted.py", "tests/gone ë.py"]
+    findings = {f.file for f in _findings(QUOTED_PATH_PATCH, {})
+                if f.id == "assertion_removed"}
+    assert findings == {"tests/tëst_quoted.py", "tests/gone ë.py"}
 
 
 # The lint evidence limit (review finding 5): under this repo's risk
@@ -703,3 +703,38 @@ def test_review7_lint_evidence_limit_is_pinned():
         f"catch-all lint sweep changed: {sorted(hits ^ _CATCH_ALL_KNOWN_SUPPRESSIONS)}; "
         "re-triage per corpus/README.md (fix the sentinel or record the hit)"
     )
+
+
+def test_review6b_diff_file_changes_attaches_hunks_to_quoted_paths(tmp_path):
+    """Finding 7's sibling, found sweeping the same surface: git quotes
+    exotic paths in --name-status output too (single-quoted C style),
+    so diff_file_changes merged quoted rows against decoded hunk keys
+    and attached no lines. The name-status rows must decode the same
+    way the hunk parser does."""
+    import subprocess
+
+    from factory.gates import diff_file_changes
+
+    repo = tmp_path / "exotic"
+    repo.mkdir()
+
+    def g(*args: str) -> None:
+        subprocess.run(["git", "-C", str(repo), *args], check=True,
+                       capture_output=True, text=True)
+
+    g("init", "-q", "-b", "main")
+    g("config", "user.email", "fixture@example.com")
+    g("config", "user.name", "Fixture")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "tëst_ünïcode.py").write_text(
+        "def test_ac_1():\n    assert total() == 3\n")
+    g("add", "-A")
+    g("commit", "-qm", "base")
+    g("checkout", "-q", "-b", "feature")
+    (repo / "tests" / "tëst_ünïcode.py").write_text(
+        "def test_ac_1():\n    total()\n")
+    g("add", "-A")
+    g("commit", "-qm", "change")
+    changes = diff_file_changes(repo, "main", "feature")
+    (change,) = [c for c in changes if c.path.endswith("tëst_ünïcode.py")]
+    assert change.removed_lines == [(2, "    assert total() == 3")], change
