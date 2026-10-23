@@ -61,6 +61,7 @@ loaded. Nothing else is read from the ambient environment, ever.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import fnmatch
 import importlib.metadata
 import json
@@ -73,7 +74,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, NamedTuple, Sequence
+from typing import Any, Callable, NamedTuple, Sequence
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -91,6 +92,9 @@ from factory.sandbox import (
     run_sandboxed,
     write_settings,
 )
+from factory.sentinels import redact_credentials
+from factory.state import now_iso
+from factory.trace import SNIPPET_CAP, STREAM_PREFIX, scrub_literal
 from factory.vent import VENT_QUALIFIED_NAME, VENT_TOOL_NAME, VentCollector, vent_server
 
 DEFAULT_BASE_URL = "https://api.z.ai/api/anthropic"
@@ -855,6 +859,129 @@ def _record_from(
     )
 
 
+# --------------------------------------------------- the F-30 stream tap --
+
+# Tool args/result snippets carry one marker when capped (redaction runs
+# before the cap — capping first could cut a credential in half and leave
+# a prefix no pattern matches; the F-27 review's finding 2, held here too).
+_TRACE_TRUNCATED = " …[trace truncated]"
+
+
+def _trace_snippet(text: str, token: str | None) -> str:
+    """Redact (seat token literal, then the F-25 shapes), then cap."""
+    text = scrub_literal(text, token)
+    text = redact_credentials(text)
+    if len(text) > SNIPPET_CAP:
+        text = text[: SNIPPET_CAP - len(_TRACE_TRUNCATED)] + _TRACE_TRUNCATED
+    return text
+
+
+def _content_text(content: Any) -> str:
+    """Tool-result content as flat text: a string as-is, a block list by
+    its text fields, anything else as JSON."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                parts.append(str(block.get("text") or block.get("content") or ""))
+            else:
+                parts.append(str(getattr(block, "text", "") or ""))
+        return "\n".join(part for part in parts if part)
+    return json.dumps(content, ensure_ascii=False, default=str)
+
+
+def _tap_tool_calls(
+    message: Any,
+    pending: dict[str, dict[str, Any]],
+    seat: str,
+    token: str | None,
+    sink: Callable[[dict[str, Any]], None],
+) -> None:
+    """Turn one SDK stream message into tool_call trace events (F-30).
+
+    A ``tool_use`` block (id, name, input) opens a pending call with its
+    arrival time; the matching ``tool_result`` block (tool_use_id) closes
+    it as one event — tool name, args snippet, result snippet, ok,
+    started/ended. Duck-typed like the vent tap: blocks are identified by
+    the fields they carry, not by class, so server tool blocks trace too.
+    The sink is never allowed to change the run (AC-5): a raising sink
+    costs the event, never the session."""
+    stamp = now_iso()
+    for block in getattr(message, "content", None) or []:
+        use_id = getattr(block, "tool_use_id", None)
+        if use_id is not None:  # a tool_result closes its call
+            use = pending.pop(str(use_id), None)
+            if use is None:
+                continue
+            is_error = bool(getattr(block, "is_error", False))
+            with contextlib.suppress(Exception):
+                sink({
+                    "type": "tool_call",
+                    "seat": seat,
+                    "tool": use["tool"],
+                    "args": use["args"],
+                    "result": _trace_snippet(
+                        _content_text(getattr(block, "content", None)), token),
+                    "ok": not is_error,
+                    "started": use["started"],
+                    "ended": stamp,
+                })
+            continue
+        name = getattr(block, "name", None)
+        block_id = getattr(block, "id", None)
+        if name is not None and block_id is not None:  # a tool_use opens one
+            pending[str(block_id)] = {
+                "tool": str(name),
+                "args": _trace_snippet(
+                    json.dumps(getattr(block, "input", None) or {},
+                               ensure_ascii=False, default=str),
+                    token,
+                ),
+                "started": stamp,
+            }
+
+
+def stdout_trace_sink() -> Callable[[dict[str, Any]], None]:
+    """The in-sandbox half of the F-30 transport: one prefixed, flushed
+    stdout line per event, crossing the srt pipe as it happens (the trace
+    path itself is not writable from inside the sandbox, by AC-1's
+    design). The final record line is printed un-prefixed after these."""
+
+    def sink(event: dict[str, Any]) -> None:
+        print(STREAM_PREFIX + json.dumps(event, ensure_ascii=False, default=str),
+              flush=True)
+
+    return sink
+
+
+def trace_line_forwarder(
+    sink: Callable[[dict[str, Any]], None], *, secret: str | None = None
+) -> Callable[[str], None]:
+    """The orchestrator-side half of the transport: prefixed stdout lines
+    back to events. The secret (the seat token) is scrubbed from the raw
+    line before parsing; foreign lines (the record, stray output) and
+    malformed ones are ignored, never raised — transport can only lose
+    events, never crash a run."""
+
+    def forward(line: str) -> None:
+        if not line.startswith(STREAM_PREFIX):
+            return
+        if secret:
+            line = scrub_literal(line, secret)
+        try:
+            event = json.loads(line[len(STREAM_PREFIX):])
+        except json.JSONDecodeError:
+            return
+        if isinstance(event, dict):
+            sink(event)
+
+    return forward
+
+
 # -------------------------------------------------------------- the runner --
 
 async def run_session(
@@ -875,6 +1002,7 @@ async def run_session(
     run_id: str | None = None,
     task_id: str | None = None,
     vent_collector: VentCollector | None = None,
+    trace_sink: Callable[[dict[str, Any]], None] | None = None,
 ) -> SessionRecord:
     """Run one seat's session and return what it recorded.
 
@@ -907,6 +1035,13 @@ async def run_session(
             or not the ids are known.
         vent_collector: Tests may pass the collector the session should
             use; default is a fresh one stamped with ``run_id``/``task_id``.
+        trace_sink: F-30's live tap — a callable receiving one event dict
+            per tool call as the stream yields it (before the result
+            message; see :func:`_tap_tool_calls`). The sink is called
+            defensively: a raising sink loses events, never the session.
+            The sandboxed entry point passes :func:`stdout_trace_sink`;
+            in-process callers pass a :class:`~factory.trace.TraceWriter`'s
+            append (or anything else) directly.
 
     Returns:
         The record: ``completed`` / ``failed`` (with reason) / ``aborted``
@@ -944,6 +1079,9 @@ async def run_session(
 
     result_message: ResultMessage | None = None
     stream = None
+    # F-30: tool_use blocks seen in the stream, not yet closed by their
+    # tool_result — flushed as open-call events on every exit path below.
+    pending_calls: dict[str, dict[str, Any]] = {}
     # One window per process, ever (review round 2): a second session
     # opening while the first's window is live would save the first's
     # STRIPPED environment and restore it last — permanently deleting the
@@ -990,6 +1128,12 @@ async def run_session(
                         # ids counted, and each vent re-stamped with the
                         # turn of its own tool_use block (VentCollector).
                         vent_collector.observe(message)
+                    if trace_sink is not None:
+                        # F-30: the stream is tapped as it flows — a
+                        # tool_call event is on the wire before the
+                        # stream yields its ResultMessage (AC-2).
+                        _tap_tool_calls(message, pending_calls, seat,
+                                        token, trace_sink)
                     if isinstance(message, ResultMessage):
                         result_message = message
             except _WallClock:
@@ -1012,6 +1156,23 @@ async def run_session(
                 # propagate by design — a bug must not also leak the CLI
                 # subprocess. The close runs while the window is still up;
                 # a refusal from an unwinding generator is suppressed.
+                # First, F-30: a stream that ended (or died) without a
+                # result for every call still traces the calls it opened —
+                # started, no result, ok unknown. An aborted turn's
+                # evidence rides out with everything else.
+                if trace_sink is not None and pending_calls:
+                    for use in pending_calls.values():
+                        with contextlib.suppress(Exception):
+                            trace_sink({
+                                "type": "tool_call",
+                                "seat": seat,
+                                "tool": use["tool"],
+                                "args": use["args"],
+                                "result": None,
+                                "ok": None,
+                                "started": use["started"],
+                                "ended": None,
+                            })
                 await _close_stream(stream)
         finally:
             os.environ.clear()
@@ -1080,6 +1241,7 @@ def run_session_sandboxed(
     teardown_grace_sec: float = 120.0,
     run_id: str | None = None,
     task_id: str | None = None,
+    trace_sink: Callable[[dict[str, Any]], None] | None = None,
 ) -> SessionRecord:
     """Run one session with the whole runner process inside the F-05 sandbox.
 
@@ -1115,6 +1277,10 @@ def run_session_sandboxed(
         cli_path: Explicit CLI override (tests). Default: the SDK's
             bundled binary; missing bundle → SessionConfigError rather
             than silently running an unpinned CLI.
+        trace_sink: F-30's live trace — every tool_call event the runner
+            observes inside the sandbox is handed to this callable as its
+            prefixed stdout line arrives (see :func:`trace_line_forwarder`);
+            None runs the session untraced.
 
     Returns:
         The session's record (any status — completed/failed/aborted are
@@ -1183,7 +1349,7 @@ def run_session_sandboxed(
             token=token, cli_path=cli_path, srt_bin_path=srt_bin_path,
             teardown_grace_sec=teardown_grace_sec,
             read_only=review_guard, writable_roots=reviewer_writable,
-            run_id=run_id, task_id=task_id,
+            run_id=run_id, task_id=task_id, trace_sink=trace_sink,
         )
     finally:
         try:
@@ -1227,6 +1393,7 @@ def _run_prepared(
     writable_roots: "Sequence[Path]",
     run_id: str | None = None,
     task_id: str | None = None,
+    trace_sink: Callable[[dict[str, Any]], None] | None = None,
 ) -> SessionRecord:
     """Stage the runner, write settings, run the sandboxed entry and parse
     its record. :func:`run_session_sandboxed` wraps this in the reviewer
@@ -1293,20 +1460,31 @@ def _run_prepared(
         },
         timeout=timeout_min * 60.0 + teardown_grace_sec,
         srt_bin_path=srt_bin_path,
+        # F-30: tool_call events stream out as prefixed lines while the
+        # session runs; the record stays the last un-prefixed line.
+        on_stdout_line=(
+            trace_line_forwarder(trace_sink, secret=token)
+            if trace_sink is not None else None
+        ),
     )
 
     lines = [line for line in proc.stdout.splitlines() if line.strip()]
-    if not lines:
+    record_line = next(
+        (line for line in reversed(lines)
+         if not line.startswith(STREAM_PREFIX)),
+        None,
+    )
+    if record_line is None:
         raise SessionConfigError(
             "the sandboxed session entry produced no record "
             f"(exit {proc.returncode}): {proc.stderr.strip()[:2000]}"
         )
     try:
-        record = SessionRecord.from_dict(json.loads(lines[-1]))
+        record = SessionRecord.from_dict(json.loads(record_line))
     except (json.JSONDecodeError, TypeError) as exc:
         raise SessionConfigError(
             "the sandboxed session entry produced an unparsable record "
-            f"({exc}): {lines[-1][:500]}"
+            f"({exc}): {record_line[:500]}"
         ) from exc
 
     return record
@@ -1346,6 +1524,10 @@ def _main(argv: list[str] | None = None) -> int:
                 cli_path=Path(spec["cli_path"]) if spec.get("cli_path") else None,
                 run_id=spec.get("run_id"),
                 task_id=spec.get("task_id"),
+                # F-30: tool_call events ride stdout as prefixed lines;
+                # the orchestrator's on_stdout_line callback appends them
+                # to the trace (the trace path is not writable in here).
+                trace_sink=stdout_trace_sink(),
             )
         )
     except (OSError, json.JSONDecodeError, KeyError, SessionConfigError) as exc:

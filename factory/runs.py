@@ -9,6 +9,7 @@ settings without a trace.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import uuid
@@ -17,6 +18,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 FACTORY_ROOT_DEFAULT = Path.home() / "factory"
+
+# The run-id shape (:func:`new_run_id`). The trace reader (F-30) checks its
+# argument against this too, so a trace path can never be argued outside
+# ``<factory_root>/trace/<project>/`` by argument spelling.
+RUN_ID_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{6}")
 
 # Every git command the orchestrator runs outside the sandbox disables hooks
 # and fsmonitor: a hook planted inside a run (or a stale one from a bypassed
