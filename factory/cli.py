@@ -1,8 +1,8 @@
 """Factory CLI — the control-plane entry point.
 
-``approve`` (F-04), ``run`` and ``loop`` (F-10) and ``tick`` (F-29) are real. Every other
-subcommand is a stub naming the work order that implements it
-(BUILD-ORDER.md).
+``approve`` (F-04), ``run`` and ``loop`` (F-10), ``tick`` (F-29) and
+``trace`` (F-30) are real. Every other subcommand is a stub naming the
+work order that implements it (BUILD-ORDER.md).
 """
 
 import argparse
@@ -17,17 +17,18 @@ from factory.approve import (
     recover_task,
 )
 from factory.config import ConfigError, load_config
-from factory.contract import ContractError
+from factory.contract import ContractError, load_profile
 from factory.gates import GateError
 from factory.orchestrator import run_loop, run_once
 from factory.prbody import PRBodyError
 from factory.progress import ProgressLogError
 from factory.publish import PublishError, PushRefused
-from factory.runs import RunError
+from factory.runs import FACTORY_ROOT_DEFAULT, RUN_ID_RE, RunError
 from factory.sandbox import SandboxError
 from factory.session import SessionConfigError
-from factory.state import TaskQueue
+from factory.state import TaskQueue, run_lease_held
 from factory.tick import TickError, tick_steps
+from factory.trace import read_trace, trace_path
 
 # run/loop exit codes: 0 = a PR opened, nothing to do, the peak window, or
 # the F-26 open-PR limit reached (a ready task waits); 1 = an escalation
@@ -101,6 +102,18 @@ def build_parser() -> argparse.ArgumentParser:
     tick.add_argument("--queue", default=".factory/tasks.json",
                       help="queue path (default: %(default)s)")
     tick.add_argument("--done-by", default=None, help="your name (default: git user.name)")
+
+    trace = sub.add_parser("trace", help="print a run's trace, live or whole (F-30)")
+    trace.add_argument("run_id", help="run id, e.g. 20261023T101010Z-1a2b3c")
+    trace.add_argument("--follow", action="store_true",
+                       help="keep printing new events until the attempt ends "
+                            "(published, failed or aborted) or can no longer "
+                            "write its end marker (killed run)")
+    trace.add_argument("--queue", default=".factory/tasks.json",
+                       help="queue path; the project is read from its profile "
+                            "(default: %(default)s)")
+    trace.add_argument("--factory-root", default=None,
+                       help="factory root (default: ~/factory)")
 
     for name, text in (
         ("run", "pick the next ready task and take it to a PR (F-10)"),
@@ -177,6 +190,44 @@ def _run_tick(args: argparse.Namespace) -> int:
         return 130
     print(f"{args.task_id}: ticked step(s) {', '.join(map(str, args.steps))} -> {status}")
     return 0
+
+
+def _run_trace(args: argparse.Namespace) -> int:
+    """Dispatch the trace subcommand (F-30 AC-6). It reads only; a run id
+    that isn't one (the pattern check keeps trace paths inside
+    ``<factory_root>/trace/<project>/``) or has no trace exits 1."""
+    if not RUN_ID_RE.fullmatch(args.run_id):
+        print(f"factory trace: {args.run_id!r} is not a run id", file=sys.stderr)
+        return 1
+    try:
+        profile = load_profile(Path(args.queue).parent / "project.yaml")
+        root = Path(args.factory_root) if args.factory_root else FACTORY_ROOT_DEFAULT
+        path = trace_path(root, profile["name"], args.run_id)
+        if not path.is_file():
+            print(f"factory trace: no trace for run {args.run_id}", file=sys.stderr)
+            return 1
+        # --follow's stop condition besides run_end: a run that can no
+        # longer write the marker. Live means its run dir still exists AND
+        # the queue's run lease is held — the OS drops the lease the moment
+        # the orchestrator dies, while a killed run's dir stays behind until
+        # the next loop reclaims it. read_trace gives a dead run a grace
+        # window, then stops. (The lease is per queue: a later run of the
+        # same project holding it keeps this follow waiting until that run
+        # ends — bounded, never forever.)
+        run_dir = root / "runs" / profile["name"] / args.run_id
+        queue_path = Path(args.queue)
+
+        def live() -> bool:
+            return run_dir.exists() and run_lease_held(queue_path)
+
+        read_trace(path, follow=args.follow, live=live if args.follow else None)
+        return 0
+    except (ContractError, OSError) as exc:
+        print(f"factory trace: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("factory trace: interrupted", file=sys.stderr)
+        return 130
 
 
 def _run_extra(result) -> str:
@@ -259,6 +310,8 @@ def main(argv: list | None = None) -> int:
         return _run_orchestrator(args)
     if args.command == "tick":
         return _run_tick(args)
+    if args.command == "trace":
+        return _run_trace(args)
     print(
         f"factory {args.command}: not implemented yet (scheduled in {STUBS[args.command]})",
         file=sys.stderr,

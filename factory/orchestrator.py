@@ -89,6 +89,7 @@ from factory.publish import PublishError, PullRequest, PushRefused, gh_pr_create
 from factory.runs import (
     FACTORY_ROOT_DEFAULT,
     GIT_HARDENING,
+    RUN_ID_RE,
     RunDir,
     RunError,
     cleanup_run,
@@ -96,7 +97,12 @@ from factory.runs import (
     new_run_id,
 )
 from factory.sandbox import build_settings, run_sandboxed, write_settings
-from factory.session import DEFAULT_BASE_URL, SessionRecord, run_session_sandboxed
+from factory.session import (
+    DEFAULT_BASE_URL,
+    SessionRecord,
+    run_session_sandboxed,
+    seat_token,
+)
 from factory.state import (
     RECOVERY_ESCALATIONS,
     RunInProgressError,
@@ -105,6 +111,7 @@ from factory.state import (
     recovery_task_eligible,
     unmet_dependencies,
 )
+from factory.trace import TraceWriter, prune_traces
 from factory.vent import flush_vents
 
 __all__ = [
@@ -239,7 +246,7 @@ def _gate_settings(profile: dict, clean: RunDir, factory_root: Path) -> None:
 
 # ------------------------------------------------------------- housekeeping --
 
-_RUN_ID = r"\d{8}T\d{6}Z-[0-9a-f]{6}"
+_RUN_ID = RUN_ID_RE.pattern
 
 
 def reclaim_runs(queue: TaskQueue, project: str, factory_root: Path) -> list[Path]:
@@ -277,6 +284,10 @@ def reclaim_runs(queue: TaskQueue, project: str, factory_root: Path) -> list[Pat
                         shutil.rmtree(entry, ignore_errors=True)
                     else:
                         entry.unlink(missing_ok=True)
+        # Traces outlive their runs but not the retention window: they
+        # hold repo content (PII on some projects), so they are aged out
+        # here, under the same lease that says no run can be appending.
+        prune_traces(factory_root, project)
     finally:
         lease.__exit__(None, None, None)
     return removed
@@ -1406,14 +1417,23 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
     round_no = 0
 
     work = create_run(project, source, factory_root=ctx.factory_root, ref=default_branch)
+    # F-30: this run's live trace — one writer per run, appended to as the
+    # events happen and never allowed to change the run itself (AC-5's
+    # failure policy lives in the writer). The seat token is handed over
+    # as a literal secret: orchestrator-written events (error reasons,
+    # gate notes) bypass the session-side tap, and the writer scrubs at
+    # every boundary — the token in a shape F-25 cannot match included.
+    trace = TraceWriter(ctx.factory_root, project, work.run_id, task_id,
+                        extra_secrets=[seat_token() or ""])
     try:
-        _build_on_remote_default(work, repo_cfg["remote"], default_branch)
-        branch = _branch_name(task_id, work.run_id)
-        created = frozenset({branch})
-        hardened_git(work.root, "checkout", "-q", "-b", branch)
-        base_sha = _git_out(work.root, "rev-parse", "--verify", "HEAD^{commit}")
-        reports_dir = ctx.factory_root / "reports" / project / re.sub(r"[^\w.-]", "_", task_id)
-        reports_dir.mkdir(parents=True, exist_ok=True)
+        with trace.phase("setup"):
+            _build_on_remote_default(work, repo_cfg["remote"], default_branch)
+            branch = _branch_name(task_id, work.run_id)
+            created = frozenset({branch})
+            hardened_git(work.root, "checkout", "-q", "-b", branch)
+            base_sha = _git_out(work.root, "rev-parse", "--verify", "HEAD^{commit}")
+            reports_dir = ctx.factory_root / "reports" / project / re.sub(r"[^\w.-]", "_", task_id)
+            reports_dir.mkdir(parents=True, exist_ok=True)
 
         def attempt_record(attempt_no, started, outcome, records, report_path, **extra):
             record = {
@@ -1437,6 +1457,11 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
             record.update({k: v for k, v in extra.items() if v is not None})
             return record
 
+        # F-30: the attempt every trace event of this round is stamped with,
+        # and the attempt outcome mapped to --follow's terminal marker.
+        _RUN_END = {"pass": "published", "fail": "failed",
+                    "escalated": "failed", "aborted": "aborted"}
+
         def finish(attempt, status, findings, finding_keys=None, **result):
             entry = {
                 "run_id": attempt["run_id"],
@@ -1452,11 +1477,17 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
             queue.append_attempt(task_id, attempt)
             log.append(entry)
             if status is not None:
+                # The run ends here (a ``None`` status is a failed round
+                # that continues into the next attempt): one terminal
+                # marker per run, and it is the run's last event.
+                trace.run_end(_RUN_END.get(attempt["outcome"], "failed"),
+                              escalation=attempt.get("escalation"))
                 queue.transition(task_id, status)
             return result
 
         while True:
             attempt_no = used + 1
+            trace.attempt = attempt_no
             started = now_iso()
             if attempt_no > max_attempts:
                 attempt = attempt_record(
@@ -1474,6 +1505,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                 return RunResult("needs_human", task_id, escalation="budget_exhausted")
             if in_peak_window(ctx.now(), ctx.config.peak_window):
                 queue.transition(task_id, "ready")
+                trace.run_end("aborted")  # no attempt recorded: the run stopped
                 return RunResult("peak_window", task_id)
 
             # This round's state, initialised before anything can raise: the
@@ -1496,40 +1528,44 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                 # so that entry renders without them (read once, not
                 # twice — the entry itself still renders, F-10 AC-10) and
                 # no entry ever renders the seeding hashes.
-                prompt = _implementer_prompt(
-                    task, slice_, branch,
-                    log.render(omit_last_findings=prev_findings is not None),
-                    attempt_no, max_attempts, fix_findings=prev_findings)
-                t0 = time.monotonic()
-                impl = ctx.session_runner(
-                    "implementer", prompt, work.root, profile,
-                    factory_root=ctx.factory_root, max_turns=budget["max_turns"],
-                    timeout_min=remaining_min, protected=protected,
-                    system_prompt=implementer_system, srt_bin_path=ctx.srt_bin_path,
-                    run_id=work.run_id, task_id=task_id,
-                )
-                session_seconds += time.monotonic() - t0
-                records = [impl]
-                # F-27: the session's vents reach the task's progress log
-                # the moment the session returns — before any gate can
-                # crash, and whatever the session's outcome was.
-                _log_vents(log, impl, "implementer", work.run_id, task_id)
-                if _is_quota(impl):
-                    attempt = attempt_record(attempt_no, started, "aborted", records, None,
-                                             escalation="quota_exhausted", note=impl.reason)
-                    finish(attempt, "ready", [f"1. quota: {impl.reason}"])
-                    return RunResult("quota_exhausted", task_id, escalation="quota_exhausted")
+                with trace.phase("implementer") as impl_spend:
+                    prompt = _implementer_prompt(
+                        task, slice_, branch,
+                        log.render(omit_last_findings=prev_findings is not None),
+                        attempt_no, max_attempts, fix_findings=prev_findings)
+                    t0 = time.monotonic()
+                    impl = ctx.session_runner(
+                        "implementer", prompt, work.root, profile,
+                        factory_root=ctx.factory_root, max_turns=budget["max_turns"],
+                        timeout_min=remaining_min, protected=protected,
+                        system_prompt=implementer_system, srt_bin_path=ctx.srt_bin_path,
+                        run_id=work.run_id, task_id=task_id,
+                        trace_sink=trace.append,  # F-30: live tool_call events
+                    )
+                    session_seconds += time.monotonic() - t0
+                    records = [impl]
+                    impl_spend.add(impl)
+                    # F-27: the session's vents reach the task's progress log
+                    # the moment the session returns — before any gate can
+                    # crash, and whatever the session's outcome was.
+                    _log_vents(log, impl, "implementer", work.run_id, task_id)
+                    trace.session_end(impl, "implementer")  # F-30
+                    if _is_quota(impl):
+                        attempt = attempt_record(attempt_no, started, "aborted", records, None,
+                                                 escalation="quota_exhausted", note=impl.reason)
+                        finish(attempt, "ready", [f"1. quota: {impl.reason}"])
+                        return RunResult("quota_exhausted", task_id, escalation="quota_exhausted")
 
-                if impl.status != "completed":
-                    extra_findings.append(
-                        f"[session {impl.status}] the implementer session ended: {impl.reason}"
-                    )
-                else:
-                    head_sha, void = _commit_work(
-                        work, branch, base_sha, f"{task_id}: attempt {attempt_no}"
-                    )
-                    if void:
-                        extra_findings.append(void)
+                    if impl.status != "completed":
+                        extra_findings.append(
+                            f"[session {impl.status}] the implementer session ended: {impl.reason}"
+                        )
+                    else:
+                        head_sha, void = _commit_work(
+                            work, branch, base_sha, f"{task_id}: attempt {attempt_no}"
+                        )
+                        if void:
+                            extra_findings.append(void)
 
                 if head_sha is not None:
                     clean = create_run(project, work.root, factory_root=ctx.factory_root,
@@ -1538,9 +1574,11 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                         _gate_settings(profile, clean, ctx.factory_root)
                         runner = sandboxed_runner(clean.root, clean.settings_path,
                                                   srt_bin_path=ctx.srt_bin_path)
-                        l0 = run_l0(profile, clean.root, base_sha, head_sha, task=task,
-                                    runner=runner, timeout_sec=ctx.gate_timeout_sec)
-                        reports["L0"] = l0.to_dict()
+                        with trace.phase("L0"):
+                            l0 = run_l0(profile, clean.root, base_sha, head_sha, task=task,
+                                        runner=runner, timeout_sec=ctx.gate_timeout_sec)
+                            reports["L0"] = l0.to_dict()
+                            trace.gate_checks(reports["L0"])  # F-30 AC-3
                         if l0.escalations:
                             escalation = next(e for e in _L0_ESCALATION_ORDER
                                               if e in l0.escalations)
@@ -1560,131 +1598,138 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                             return RunResult("needs_human", task_id, escalation=escalation,
                                              reports=reports)
                         if l0.verdict == "pass":
-                            l1 = run_l1(profile, clean.root, base_sha, head_sha, task=task,
-                                        runner=runner, timeout_sec=ctx.gate_timeout_sec)
-                            reports["L1"] = l1.to_dict()
+                            with trace.phase("L1"):
+                                l1 = run_l1(profile, clean.root, base_sha, head_sha, task=task,
+                                            runner=runner, timeout_sec=ctx.gate_timeout_sec)
+                                reports["L1"] = l1.to_dict()
+                                trace.gate_checks(reports["L1"])  # F-30 AC-3
                         if l1 is not None and l1.verdict == "pass":
                             # ---- reviewer (a session start: the checks apply)
-                            if in_peak_window(ctx.now(), ctx.config.peak_window):
-                                # The round is validated but the window stops the
-                                # next session start. The tokens and the attempt
-                                # are recorded (aborted — the window is nobody's
-                                # fault) and the next session is told the change
-                                # existed and was discarded with the run.
-                                path = _store(reports_dir, work.run_id, attempt_no, reports)
-                                attempt = attempt_record(
-                                    attempt_no, started, "aborted", records, path,
-                                    note=f"peak window before the L2 review; the change "
-                                         f"(head {head_sha[:12]}, passed L0 and L1) was "
-                                         f"discarded with the run",
+                            with trace.phase("L2") as review_spend:
+                                if in_peak_window(ctx.now(), ctx.config.peak_window):
+                                    # The round is validated but the window stops the
+                                    # next session start. The tokens and the attempt
+                                    # are recorded (aborted — the window is nobody's
+                                    # fault) and the next session is told the change
+                                    # existed and was discarded with the run.
+                                    path = _store(reports_dir, work.run_id, attempt_no, reports)
+                                    attempt = attempt_record(
+                                        attempt_no, started, "aborted", records, path,
+                                        note=f"peak window before the L2 review; the change "
+                                             f"(head {head_sha[:12]}, passed L0 and L1) was "
+                                             f"discarded with the run",
+                                    )
+                                    finish(attempt, "ready", [
+                                        f"1. peak window stopped attempt {attempt_no} before "
+                                        f"the L2 review: its change (head {head_sha[:12]}) had "
+                                        f"passed L0 and L1 and was discarded with the run — "
+                                        f"redo it",
+                                    ])
+                                    return RunResult("peak_window", task_id, reports=reports)
+                                remaining_review = budget["wall_clock_min"] - session_seconds / 60.0
+                                if remaining_review <= 0:
+                                    path = _store(reports_dir, work.run_id, attempt_no, reports)
+                                    attempt = attempt_record(
+                                        attempt_no, started, "escalated", records, path,
+                                        escalation="budget_exhausted",
+                                        note="wall-clock budget spent before the L2 review",
+                                    )
+                                    finish(attempt, "needs_human",
+                                           ["1. wall-clock budget spent before the L2 review"])
+                                    return RunResult("needs_human", task_id,
+                                                     escalation="budget_exhausted", reports=reports)
+                                diff = hardened_git(clean.root, "diff", "--no-color",
+                                                    "--no-ext-diff",
+                                                    f"{base_sha}...{head_sha}")
+                                # F-23: from this run's second review on, the
+                                # delta since the last reviewed sha is the
+                                # reviewer's primary scope and the convergence
+                                # rules (carried repeats, out-of-delta drops)
+                                # apply — but only if that sha still exists in
+                                # this clone: an implementer that amended or
+                                # reset the reviewed round's commit makes it
+                                # unreachable, and this round falls back to the
+                                # full diff instead of dying on a bad object.
+                                delta = delta_files = None
+                                if last_reviewed is not None and _is_ancestor(
+                                        clean.root, last_reviewed, head_sha):
+                                    delta = hardened_git(
+                                        clean.root, "diff", "--no-color", "--no-ext-diff",
+                                        f"{last_reviewed}...{head_sha}")
+                                    delta_files = frozenset(
+                                        path
+                                        for change in diff_name_status(
+                                            clean.root, last_reviewed, head_sha)
+                                        for path in (change.path, change.old_path)
+                                        if path
+                                    )
+                                t0 = time.monotonic()
+                                review_prompt = _review_prompt(
+                                    task, diff, reports["L0"], reports["L1"],
+                                    delta=delta, carried=raised)
+                                review = ctx.session_runner(
+                                    "reviewer", review_prompt,
+                                    clean.root, profile, factory_root=ctx.factory_root,
+                                    max_turns=budget["max_turns"], timeout_min=remaining_review,
+                                    protected=protected, system_prompt=reviewer_system,
+                                    srt_bin_path=ctx.srt_bin_path,
+                                    # The reviewer sits in the clean gate clone,
+                                    # but its vents belong to the task's run.
+                                    run_id=work.run_id, task_id=task_id,
+                                    trace_sink=trace.append,  # F-30
                                 )
-                                finish(attempt, "ready", [
-                                    f"1. peak window stopped attempt {attempt_no} before "
-                                    f"the L2 review: its change (head {head_sha[:12]}) had "
-                                    f"passed L0 and L1 and was discarded with the run — "
-                                    f"redo it",
-                                ])
-                                return RunResult("peak_window", task_id, reports=reports)
-                            remaining_review = budget["wall_clock_min"] - session_seconds / 60.0
-                            if remaining_review <= 0:
-                                path = _store(reports_dir, work.run_id, attempt_no, reports)
-                                attempt = attempt_record(
-                                    attempt_no, started, "escalated", records, path,
-                                    escalation="budget_exhausted",
-                                    note="wall-clock budget spent before the L2 review",
+                                session_seconds += time.monotonic() - t0
+                                records.append(review)
+                                review_spend.add(review)
+                                _log_vents(log, review, "reviewer",  # F-27, as above
+                                           work.run_id, task_id)
+                                trace.session_end(review, "reviewer")  # F-30
+                                if _is_quota(review):
+                                    attempt = attempt_record(
+                                        attempt_no, started, "aborted", records, None,
+                                        escalation="quota_exhausted", note=review.reason,
+                                    )
+                                    finish(attempt, "ready", [f"1. quota: {review.reason}"])
+                                    return RunResult("quota_exhausted", task_id,
+                                                     escalation="quota_exhausted", reports=reports)
+                                l2 = apply_convergence(
+                                    parse_verdict(
+                                        review.result if review.status == "completed"
+                                        else None),
+                                    prior,
+                                    delta_files if delta_files is not None else frozenset(),
+                                    delta_mode=delta is not None,
                                 )
-                                finish(attempt, "needs_human",
-                                       ["1. wall-clock budget spent before the L2 review"])
-                                return RunResult("needs_human", task_id,
-                                                 escalation="budget_exhausted", reports=reports)
-                            diff = hardened_git(clean.root, "diff", "--no-color",
-                                                "--no-ext-diff",
-                                                f"{base_sha}...{head_sha}")
-                            # F-23: from this run's second review on, the
-                            # delta since the last reviewed sha is the
-                            # reviewer's primary scope and the convergence
-                            # rules (carried repeats, out-of-delta drops)
-                            # apply — but only if that sha still exists in
-                            # this clone: an implementer that amended or
-                            # reset the reviewed round's commit makes it
-                            # unreachable, and this round falls back to the
-                            # full diff instead of dying on a bad object.
-                            delta = delta_files = None
-                            if last_reviewed is not None and _is_ancestor(
-                                    clean.root, last_reviewed, head_sha):
-                                delta = hardened_git(
-                                    clean.root, "diff", "--no-color", "--no-ext-diff",
-                                    f"{last_reviewed}...{head_sha}")
-                                delta_files = frozenset(
-                                    path
-                                    for change in diff_name_status(
-                                        clean.root, last_reviewed, head_sha)
-                                    for path in (change.path, change.old_path)
-                                    if path
+                                if review.status != "completed":
+                                    extra_findings.append(
+                                        f"[session {review.status}] the reviewer session ended: "
+                                        f"{review.reason}"
+                                    )
+                                reports["L2"] = l2.to_dict()
+                                trace.gate_checks(reports["L2"])  # F-30 AC-3
+                                # Only a review that produced a parseable verdict
+                                # moves the frontier. A crashed, timed-out or
+                                # invalid review reviewed nothing: the next
+                                # round's delta must still cover this head, or
+                                # code no reviewer ever saw would become "outside
+                                # the delta" and its findings dropped.
+                                reviewed = (
+                                    review.status == "completed" and l2.parse_error is None
                                 )
-                            t0 = time.monotonic()
-                            review_prompt = _review_prompt(
-                                task, diff, reports["L0"], reports["L1"],
-                                delta=delta, carried=raised)
-                            review = ctx.session_runner(
-                                "reviewer", review_prompt,
-                                clean.root, profile, factory_root=ctx.factory_root,
-                                max_turns=budget["max_turns"], timeout_min=remaining_review,
-                                protected=protected, system_prompt=reviewer_system,
-                                srt_bin_path=ctx.srt_bin_path,
-                                # The reviewer sits in the clean gate clone,
-                                # but its vents belong to the task's run.
-                                run_id=work.run_id, task_id=task_id,
-                            )
-                            session_seconds += time.monotonic() - t0
-                            records.append(review)
-                            _log_vents(log, review, "reviewer",  # F-27, as above
-                                       work.run_id, task_id)
-                            if _is_quota(review):
-                                attempt = attempt_record(
-                                    attempt_no, started, "aborted", records, None,
-                                    escalation="quota_exhausted", note=review.reason,
-                                )
-                                finish(attempt, "ready", [f"1. quota: {review.reason}"])
-                                return RunResult("quota_exhausted", task_id,
-                                                 escalation="quota_exhausted", reports=reports)
-                            l2 = apply_convergence(
-                                parse_verdict(
-                                    review.result if review.status == "completed"
-                                    else None),
-                                prior,
-                                delta_files if delta_files is not None else frozenset(),
-                                delta_mode=delta is not None,
-                            )
-                            if review.status != "completed":
-                                extra_findings.append(
-                                    f"[session {review.status}] the reviewer session ended: "
-                                    f"{review.reason}"
-                                )
-                            reports["L2"] = l2.to_dict()
-                            # Only a review that produced a parseable verdict
-                            # moves the frontier. A crashed, timed-out or
-                            # invalid review reviewed nothing: the next
-                            # round's delta must still cover this head, or
-                            # code no reviewer ever saw would become "outside
-                            # the delta" and its findings dropped.
-                            reviewed = (
-                                review.status == "completed" and l2.parse_error is None
-                            )
-                            if reviewed:
-                                last_valid_l2 = l2.to_dict()
-                                round_keys = [
-                                    f.key for f in l2.findings
-                                    if isinstance(f, L2Finding) and f.key
-                                ]
-                                raised = [
-                                    {"key": f.key, "file": f.file,
-                                     "severity": f.severity, "text": f.text}
-                                    for f in l2.findings if isinstance(f, L2Finding)
-                                ]
-                                for key in round_keys:
-                                    prior[key] = head_sha
-                                last_reviewed = head_sha
+                                if reviewed:
+                                    last_valid_l2 = l2.to_dict()
+                                    round_keys = [
+                                        f.key for f in l2.findings
+                                        if isinstance(f, L2Finding) and f.key
+                                    ]
+                                    raised = [
+                                        {"key": f.key, "file": f.file,
+                                         "severity": f.severity, "text": f.text}
+                                        for f in l2.findings if isinstance(f, L2Finding)
+                                    ]
+                                    for key in round_keys:
+                                        prior[key] = head_sha
+                                    last_reviewed = head_sha
                         changed = [c.path for c in diff_name_status(clean.root, base_sha, head_sha)]
                     finally:
                         cleanup_run(clean)
@@ -1694,38 +1739,40 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                 passed = all(x is not None and x.verdict == "pass" for x in (l0, l1, l2))
 
                 if passed:
-                    task = queue.get(task_id)
-                    for tail in (_PR_OUTPUT_TAIL, 200, 0):  # shrink outputs to fit GitHub
-                        body = build_pr_body(
-                            task, profile, branch=branch, base_sha=base_sha, head_sha=head_sha,
-                            changed_paths=changed,
-                            reports={k: _compact(v, tail) for k, v in reports.items()},
-                            l1_report=l1, extra_flags=l0.risk_flags_added,
-                            implementer_notes=(impl.result or "")[:_PR_NOTES_CAP],
-                            attempt=attempt_no,
-                        )
-                        if len(body) <= _PR_BODY_LIMIT:
-                            break
-                    check_pr_body(body)  # no PR without every section
-                    push_branch(work.root, repo_cfg["remote"], branch, sha=head_sha,
-                                created=created, default_branch=default_branch)
-                    pushed = True
-                    url = ctx.open_pr(PullRequest(
-                        remote=repo_cfg["remote"], base=default_branch, head=branch,
-                        title=f"{task_id}: {task.get('title', '')}", body=body,
-                    ))
-                    opened = True
-                    attempt = attempt_record(attempt_no, started, "pass", records, path,
-                                             pr=url, sentinels=list(l0.sentinel_results))
-                    queue.append_attempt(task_id, attempt)
-                    # A passed round's findings were accepted as non-blocking:
-                    # recording their keys would poison a later fix round
-                    # after a rejected PR (only failed reviews seed).
-                    log.append({"run_id": work.run_id, "attempt": attempt_no, "outcome": "pass",
-                                "pr": url, "findings": findings})
-                    task = queue.get(task_id)
-                    task["links"] = {**(task.get("links") or {}), "pr": url, "branch": branch}
-                    queue.transition(task_id, "in_review")
+                    with trace.phase("publish"):
+                        task = queue.get(task_id)
+                        for tail in (_PR_OUTPUT_TAIL, 200, 0):  # shrink outputs to fit GitHub
+                            body = build_pr_body(
+                                task, profile, branch=branch, base_sha=base_sha, head_sha=head_sha,
+                                changed_paths=changed,
+                                reports={k: _compact(v, tail) for k, v in reports.items()},
+                                l1_report=l1, extra_flags=l0.risk_flags_added,
+                                implementer_notes=(impl.result or "")[:_PR_NOTES_CAP],
+                                attempt=attempt_no,
+                            )
+                            if len(body) <= _PR_BODY_LIMIT:
+                                break
+                        check_pr_body(body)  # no PR without every section
+                        push_branch(work.root, repo_cfg["remote"], branch, sha=head_sha,
+                                    created=created, default_branch=default_branch)
+                        pushed = True
+                        url = ctx.open_pr(PullRequest(
+                            remote=repo_cfg["remote"], base=default_branch, head=branch,
+                            title=f"{task_id}: {task.get('title', '')}", body=body,
+                        ))
+                        opened = True
+                        attempt = attempt_record(attempt_no, started, "pass", records, path,
+                                                 pr=url, sentinels=list(l0.sentinel_results))
+                        queue.append_attempt(task_id, attempt)
+                        # A passed round's findings were accepted as non-blocking:
+                        # recording their keys would poison a later fix round
+                        # after a rejected PR (only failed reviews seed).
+                        log.append({"run_id": work.run_id, "attempt": attempt_no, "outcome": "pass",
+                                    "pr": url, "findings": findings})
+                        task = queue.get(task_id)
+                        task["links"] = {**(task.get("links") or {}), "pr": url, "branch": branch}
+                        queue.transition(task_id, "in_review")
+                    trace.run_end("published")  # after phase_end: the last line
                     return RunResult("pr_opened", task_id, pr=url, reports=reports)
 
                 # F-23 no-progress stop: apply_convergence decided, where
@@ -1802,6 +1849,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                 log.append({"run_id": work.run_id, "attempt": attempt_no,
                             "outcome": attempt["outcome"], "escalation": escalation,
                             "findings": findings})
+                trace.run_end("failed", escalation=escalation)  # F-30
                 if pushed:
                     task = queue.get(task_id)
                     task["links"] = {**(task.get("links") or {}), "branch": branch}
@@ -1815,6 +1863,16 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                 queue.transition(task_id, "ready")
                 return RunResult("error", task_id,
                                  escalation="orchestrator_error", reports=reports)
+    except BaseException as exc:
+        # F-30: a run that ends without a recorded outcome still gets its
+        # terminal marker — idempotent, so a re-raise after a recorded
+        # outcome (the opened-PR path above) never rewrites it. Operator
+        # stops (Ctrl-C, SystemExit) are aborts, not failures: metrics
+        # read "failed" as "the factory or the agent broke".
+        trace.run_end(
+            "aborted" if isinstance(exc, (KeyboardInterrupt, SystemExit))
+            else "failed")
+        raise
     finally:
         cleanup_run(work)
 

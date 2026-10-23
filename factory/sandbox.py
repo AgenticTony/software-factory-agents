@@ -447,6 +447,7 @@ def run_sandboxed(
     timeout: float | None = None,
     cwd: Path | None = None,
     srt_bin_path: Path | None = None,
+    on_stdout_line=None,
 ) -> subprocess.CompletedProcess:
     """Run ``cmd`` under srt confined to ``run_dir``.
 
@@ -482,6 +483,10 @@ def run_sandboxed(
         cwd: Working dir (default: the run dir).
         srt_bin_path: Test injection for the srt binary (still pin-checked).
             There is no production override path.
+        on_stdout_line: Called with each complete stdout line as it arrives
+            — before the child exits (F-30's live event transport; the
+            captured output is unchanged). Exceptions from the callback are
+            suppressed: transport observes, it never steers.
 
     Returns:
         The completed process (text mode, output captured).
@@ -531,6 +536,11 @@ def run_sandboxed(
         os.set_blocking(fd, False)
     timed_out = False
     deadline = None if timeout is None else time.monotonic() + timeout
+    # F-30: complete stdout lines are handed to the caller as they arrive.
+    # A partial line waits for its newline; a UTF-8 character split across
+    # chunks is completed by the chunk carrying its rest, which precedes
+    # the newline by construction — only whole lines are decoded.
+    partials = {"out": bytearray()}
 
     # Phase 1: pump while the leader runs. Polling (not wait()) so a leader
     # that exits while a background child still holds the pipes is noticed
@@ -543,7 +553,8 @@ def run_sandboxed(
             wait = 0.5
         else:
             wait = max(0.0, min(0.5, deadline - time.monotonic()))
-        _pump(streams, buffers, wait)
+        _pump(streams, buffers, wait,
+              on_stdout_line=on_stdout_line, partials=partials)
 
     # Kill every remaining group member: on timeout the leader is one of
     # them; on a normal exit this reaps background children the session
@@ -562,7 +573,8 @@ def run_sandboxed(
     while any(fd >= 0 for fd in streams.values()):
         if time.monotonic() >= drain_deadline:
             break
-        _pump(streams, buffers, max(0.0, drain_deadline - time.monotonic()))
+        _pump(streams, buffers, max(0.0, drain_deadline - time.monotonic()),
+              on_stdout_line=on_stdout_line, partials=partials)
     # Close the owning file objects exactly once each (single-threaded here,
     # so nothing can be mid-read on them): raw os.close would race the
     # buffered objects' own close at GC time and leak unraisable warnings.
@@ -576,9 +588,12 @@ def run_sandboxed(
     return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
 
-def _pump(streams: dict, buffers: dict, wait: float) -> None:
+def _pump(streams: dict, buffers: dict, wait: float, *,
+          on_stdout_line=None, partials: dict | None = None) -> None:
     """One bounded select+read round over the open pipes. EOF marks the
-    stream closed by setting its fd entry to -1."""
+    stream closed by setting its fd entry to -1. Complete stdout lines are
+    dispatched to ``on_stdout_line`` as they arrive (suppressed errors:
+    observation never steers)."""
     open_fds = [fd for fd in streams.values() if fd >= 0]
     if not open_fds:
         return
@@ -592,6 +607,21 @@ def _pump(streams: dict, buffers: dict, wait: float) -> None:
             continue
         if chunk:
             buffers[name] += chunk
+            if on_stdout_line is not None and name == "out":
+                # Search only the new chunk for a newline; the accumulated
+                # partial is copied just once, when a line is actually
+                # emitted — a long newline-free line over many small reads
+                # must not cost a full copy per read.
+                idx = chunk.rfind(b"\n")
+                if idx < 0:
+                    partials["out"] += chunk
+                    continue
+                data = bytes(partials["out"]) + chunk[: idx + 1]
+                partials["out"] = bytearray(chunk[idx + 1:])
+                for raw in data.split(b"\n")[:-1]:
+                    if raw.strip():
+                        with suppress(Exception):
+                            on_stdout_line(raw.decode(errors="replace"))
         else:  # EOF: every writer on this pipe is gone
             streams[name] = -1
 

@@ -553,6 +553,44 @@ def _check_owner_step_rules(task: dict, new_status: str) -> None:
         )
 
 
+def run_lease_held(queue_path: Path | str) -> bool:
+    """Whether a live process holds the run lease of this queue (F-30).
+
+    The lease is an exclusive ``flock`` on ``<queue>.run.lock`` that the OS
+    drops the moment its holder dies, so this is the liveness signal a
+    killed run can't fake (a left-behind run dir can). The probe opens the
+    lock file read-only — never creating it, never writing the holder
+    line — and tries a non-blocking *shared* lock: refused means an
+    exclusive holder is alive. On success the shared lock is released at
+    once; for those few microseconds a ``begin_run`` racing the probe would
+    see the lease busy and refuse with :class:`RunInProgressError` (its
+    normal, retryable message), which is why readers call this only while
+    a trace is idle, never in a hot loop.
+
+    Args:
+        queue_path: The queue file whose lease to probe.
+
+    Returns:
+        True if the lease is held; False if it is free or the lock file
+        doesn't exist (no run ever took it).
+    """
+    path = Path(queue_path)
+    lock_path = path.with_name(path.name + ".run.lock")
+    try:
+        fd = os.open(lock_path, os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
 class TaskQueue:
     """The orchestrator's handle on a ``tasks.json`` — its only writer.
 
