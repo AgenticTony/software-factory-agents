@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-22T12:09:59Z",
+  "updated_at": "2026-10-23T09:49:39Z",
   "tasks": [
     {
       "id": "F-00",
@@ -1758,7 +1758,7 @@
       "source": "BUILD-ORDER.md#f-27--vent-tool",
       "kind": "build",
       "priority": "P2",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-06",
         "F-10"
@@ -1812,7 +1812,10 @@
         "wall_clock_min": 90
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "acceptance_hash": "d72fb2124956b2279bcd8475d46b9ea924983eb8c1085b0c5837aaa3d70a7428",
+      "approved_at": "2026-10-23T09:49:39Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-28",
