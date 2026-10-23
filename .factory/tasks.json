@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-23T11:33:50Z",
+  "updated_at": "2026-10-23T13:59:49Z",
   "tasks": [
     {
       "id": "F-00",
@@ -1966,7 +1966,7 @@
       "source": "BUILD-ORDER.md#f-30--run-trace-live-event-log-per-run",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-06",
         "F-07",
@@ -2047,7 +2047,10 @@
         "wall_clock_min": 150
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "acceptance_hash": "7cc05c4cbf451b5db01848d8406e5c8123a643ca6a5cf9493f61f750a32de729",
+      "approved_at": "2026-10-23T13:59:49Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-31",
