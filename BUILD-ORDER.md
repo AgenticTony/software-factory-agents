@@ -40,7 +40,7 @@ The factory's own build plan, written in the format the factory will consume: on
 | **F-25** | Sensitive-path sentinels | 1b | F-07 | factory_control | M |
 | **F-26** | Merges in order | 1b | F-10 | factory_control | S |
 | **F-27** | Vent tool | 1b | F-06, F-10 | factory_control | S |
-| **F-28** | Dogfood pilot: the factory builds its own safe WOs | 1b | F-23, F-24, F-25, F-26, F-29, F-30 | — | owner |
+| **F-28** | Dogfood pilot: the factory builds its own safe WOs | 1b | F-23, F-24, F-25, F-26, F-29, F-30, F-33 | — | owner |
 | **F-29** | Owner-step tick (`factory tick`) | 1b | F-03, F-04 | factory_control | S |
 | **F-30** | Run trace: live event log per run | 1b | F-06, F-07, F-08, F-10, F-25 | factory_control | M |
 | **F-31** | Read-only dashboard (`factory dashboard`) | 1b | F-11, F-30 | — | M |
