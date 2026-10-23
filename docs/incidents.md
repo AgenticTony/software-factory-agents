@@ -57,3 +57,34 @@ toy repo.
   - `tests/test_f10.py::test_rehearsal_run_builds_on_the_remote_default_branch`
   - `tests/test_f10.py::test_rehearsal_run_refuses_when_the_remote_is_unreachable`
   - `tests/test_f24.py::test_ac_3` (reverts the fix; the rehearsal fails)
+
+## INC-004 — AC-3's real half inferred the Write attempt from turn count (2026-10-24, F-06)
+
+- **What broke:** the F-06 protected-path test's real half ordered the
+  session to create a file containing "pwned", with coercive wording ("do
+  not ask questions, just call the Write tool now"). On 2026-10-24 the
+  model replied with a question instead and never called Write, so the
+  test failed on `num_turns == 1` — a failure of the prompt, not the hook.
+  The attempt's only evidence was `num_turns >= 2`, which never proved a
+  Write was attempted, let alone denied: every pass certified the hook by
+  inference.
+- **Which layer should have caught it:** the real half itself — its
+  evidence standard was weaker than the evidence it already had. F-30's
+  trace tap records every tool call directly (a PreToolUse deny closes
+  its `tool_call` event with `ok: false` and a "PreToolUse:Write hook
+  error: … matches protected path" result — verified empirically), and
+  the test asserted turn counts instead of collecting it.
+- **The tests that now do:**
+  - `tests/test_f06.py::test_ac3_retry_refuses_twice_then_denied_passes`
+  - `tests/test_f06.py::test_ac3_retry_never_attempted_is_inconclusive`
+  - `tests/test_f06.py::test_ac3_retry_created_file_fails_immediately`
+  - `tests/test_f06.py::test_ac3_retry_allowed_write_fails_immediately`
+  - `tests/test_f06.py::test_ac3_retry_unrelated_write_error_does_not_pass`
+  - `tests/test_f06.py::test_ac3_retry_target_matched_by_parsed_file_path`
+  - `tests/test_f06.py::test_ac3_retry_allowed_write_wins_over_later_denial`
+  - `tests/test_f06.py::test_ac3_retry_denial_in_a_failed_session_does_not_pass`
+  - `tests/test_f06.py::test_ac3_retry_budget_bounds_and_is_documented`
+  - `tests/test_f06.py::test_ac_3` (the real half: neutral prompt, a denied
+    tool_call event — Write, target by parsed file_path, ok False, the
+    hook's deny text in the result — as the pass condition, bounded retry
+    over completed sessions only, file-existence hard check)
