@@ -13,6 +13,12 @@ enforced, not trusted: every entry carries its number and the SHA-256 of
 the previous entry's line (a hash chain), so rewriting, dropping or
 reordering an earlier entry breaks the chain and the next read or append
 raises :class:`ProgressLogError`. The module has no edit API at all.
+
+Vent entries (F-27, ``kind: "vent"``) share the same chain: each
+``vent(category, text)`` tool call a session made becomes exactly one
+entry, flushed by the orchestrator when the session returns. They are
+telemetry for the owner, `factory status` (F-11) and the F-19 review —
+never rendered into fresh-session prompts (:meth:`ProgressLog.render`).
 """
 
 from __future__ import annotations
@@ -35,7 +41,10 @@ def _digest(line: str) -> str:
     return hashlib.sha256(line.encode()).hexdigest()
 
 
-def _safe(name: str) -> str:
+def safe_name(name: str) -> str:
+    """Filesystem-safe form of a project/task id (public: F-27's vent
+    reader walks the same ``progress/<project>/`` layout as
+    :meth:`ProgressLog.for_task`)."""
     return re.sub(r"[^A-Za-z0-9._-]", "_", name)
 
 
@@ -48,7 +57,10 @@ class ProgressLog:
     @classmethod
     def for_task(cls, factory_root: Path | str, project: str, task_id: str) -> "ProgressLog":
         """The canonical log location for a task (outside every clone)."""
-        return cls(Path(factory_root) / "progress" / _safe(project) / f"{_safe(task_id)}.jsonl")
+        return cls(
+            Path(factory_root) / "progress" / safe_name(project)
+            / f"{safe_name(task_id)}.jsonl"
+        )
 
     def _read(self) -> tuple[list[dict], str]:
         """Parse and chain-verify every entry; return (entries, last digest)."""
@@ -97,21 +109,47 @@ class ProgressLog:
             ProgressLogError: The existing log fails verification, or the
                 entry tries to set ``n``/``prev`` itself.
         """
-        if {"n", "prev"} & set(entry):
-            raise ProgressLogError("entries may not set 'n' or 'prev': the log numbers them")
+        return self.append_many([entry])[0]
+
+    def append_many(self, entries: "list[dict]") -> list[dict]:
+        """Append several entries under one lock, one read-and-verify and
+        one fsync — chained exactly as the same number of :meth:`append`
+        calls would chain them (F-27: a session's vents flush as a batch).
+
+        Args:
+            entries: JSON-serialisable mappings; none may set ``n``/``prev``.
+
+        Returns:
+            The stored entries, in order ([] for an empty batch, which
+            touches nothing).
+
+        Raises:
+            ProgressLogError: The existing log fails verification, or an
+                entry tries to set ``n``/``prev`` itself (nothing is written).
+        """
+        for entry in entries:
+            if {"n", "prev"} & set(entry):
+                raise ProgressLogError("entries may not set 'n' or 'prev': the log numbers them")
+        if not entries:
+            return []
         self.path.parent.mkdir(parents=True, exist_ok=True)
         lock = self.path.with_name(self.path.name + ".lock")
         with lock.open("w") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
-                entries, prev = self._read()
-                record = {"n": len(entries) + 1, "prev": prev, **entry}
-                line = json.dumps(record, sort_keys=True, ensure_ascii=False)
+                existing, prev = self._read()
+                stored, lines = [], []
+                for offset, entry in enumerate(entries):
+                    record = {"n": len(existing) + offset + 1, "prev": prev, **entry}
+                    line = json.dumps(record, sort_keys=True, ensure_ascii=False)
+                    prev = _digest(line)
+                    stored.append(record)
+                    lines.append(line + "\n")
                 with self.path.open("a") as fh:
-                    fh.write(line + "\n")
+                    fh.write("".join(lines))
                     fh.flush()
                     os.fsync(fh.fileno())
-                return record
+                return stored
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
@@ -128,10 +166,18 @@ class ProgressLog:
         outcome, escalation, run id — still renders: F-10 AC-10, every
         round receives entries 1..N.
 
+        Vent entries (``kind: "vent"``, F-27) do NOT render: they are
+        owner telemetry for `factory status` (F-11) and the F-19 review,
+        not fresh-session context — a vent says what friction the last
+        sessions hit, which the round entries already summarise better.
+
         Args:
             omit_last_findings: Drop the newest entry's findings field.
         """
-        entries = self.entries()
+        entries = [
+            record for record in self.entries()
+            if record.get("kind") != "vent"
+        ]
         if not entries:
             return ""
         blocks = []

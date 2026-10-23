@@ -31,6 +31,10 @@ Trust boundaries, each enforced in code rather than prose:
   implementer's account is rendered as inert fenced text below them.
 * **Fresh sessions get the task's progress log** (``factory.progress``),
   entries 1..N, read-only, from outside the clone.
+* **Sessions can vent** (F-27, ``factory.vent``): each seat's
+  ``vent(category, text)`` calls are flushed into the task's progress log
+  the moment the session returns — telemetry for `factory status` (F-11)
+  and the F-19 review, never part of the attempt record or the budget.
 
 Escalation rules (VALIDATOR-SPEC "Rounds and escalation"): L0's
 credential, protected-path, sentinel-failure, new-dependency and
@@ -59,6 +63,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -100,6 +105,7 @@ from factory.state import (
     recovery_task_eligible,
     unmet_dependencies,
 )
+from factory.vent import flush_vents
 
 __all__ = [
     "LoopResult",
@@ -282,6 +288,26 @@ def reclaim_runs(queue: TaskQueue, project: str, factory_root: Path) -> list[Pat
 def _branch_name(task_id: str, run_id: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", task_id.lower()).strip("-") or "task"
     return f"factory/{slug}-{run_id.lower()}"
+
+
+def _log_vents(log: ProgressLog, record: SessionRecord, seat: str,
+               run_id: str, task_id: str) -> None:
+    """Flush a session's vents into the task's progress log (F-27).
+
+    Telemetry, never control flow (AC-3, review finding 5): a flush that
+    fails — a broken log chain, a full disk — costs the vents, reported on
+    stderr, never the attempt record or the run. The orchestrator stamps
+    the run, task and seat it actually ran; the record's own claims about
+    them are untrusted (they crossed the sandbox boundary).
+    """
+    try:
+        flush_vents(log, record.vents, run_id=run_id, task_id=task_id, seat=seat)
+    except Exception as exc:  # noqa: BLE001 — telemetry must not crash a run
+        print(
+            f"factory: {task_id} {seat} vents not logged "
+            f"({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
 
 
 def _is_quota(record: SessionRecord) -> bool:
@@ -1480,9 +1506,14 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                     factory_root=ctx.factory_root, max_turns=budget["max_turns"],
                     timeout_min=remaining_min, protected=protected,
                     system_prompt=implementer_system, srt_bin_path=ctx.srt_bin_path,
+                    run_id=work.run_id, task_id=task_id,
                 )
                 session_seconds += time.monotonic() - t0
                 records = [impl]
+                # F-27: the session's vents reach the task's progress log
+                # the moment the session returns — before any gate can
+                # crash, and whatever the session's outcome was.
+                _log_vents(log, impl, "implementer", work.run_id, task_id)
                 if _is_quota(impl):
                     attempt = attempt_record(attempt_no, started, "aborted", records, None,
                                              escalation="quota_exhausted", note=impl.reason)
@@ -1601,9 +1632,14 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                 max_turns=budget["max_turns"], timeout_min=remaining_review,
                                 protected=protected, system_prompt=reviewer_system,
                                 srt_bin_path=ctx.srt_bin_path,
+                                # The reviewer sits in the clean gate clone,
+                                # but its vents belong to the task's run.
+                                run_id=work.run_id, task_id=task_id,
                             )
                             session_seconds += time.monotonic() - t0
                             records.append(review)
+                            _log_vents(log, review, "reviewer",  # F-27, as above
+                                       work.run_id, task_id)
                             if _is_quota(review):
                                 attempt = attempt_record(
                                     attempt_no, started, "aborted", records, None,

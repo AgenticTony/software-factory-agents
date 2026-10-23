@@ -104,7 +104,7 @@ attempt 3: fix → L0 → L1 → L2
 PASS → L3 → PR opened → you merge → deploy → L4
 ```
 
-Not every round shares a session: an aborted run re-enters the queue, and a PR you reject comes back as a fix round, maybe days later. A **fresh** session carries no context, so the orchestrator keeps a per-task **progress log**, an append-only record of each attempt's report and findings (from Anthropic's long-running-harness `progress.txt` pattern). The log lives outside the clone, and every new session gets a read-only copy. The agent never edits earlier entries.
+Not every round shares a session: an aborted run re-enters the queue, and a PR you reject comes back as a fix round, maybe days later. A **fresh** session carries no context, so the orchestrator keeps a per-task **progress log**, an append-only record of each attempt's report and findings (from Anthropic's long-running-harness `progress.txt` pattern). The log lives outside the clone, and every new session gets a read-only copy. The agent never edits earlier entries. The log also carries **vent** entries (F-27): every `vent(category, text)` call a session's in-process tool collected is flushed in — one entry per call, the moment the session returns — as owner telemetry for `factory status` (F-11) and the F-19 review; vents never render into fresh-session prompts and never touch the attempt record or the budget.
 
 `max_attempts` defaults to 3, matching your existing `loop.md`. Risk, protected-path, new-dependency and cross-repo hits escalate **immediately**: no retries, since retrying won't make them safe.
 
