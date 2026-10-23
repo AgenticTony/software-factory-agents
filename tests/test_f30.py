@@ -901,3 +901,75 @@ def test_review6_pump_handles_lines_split_across_chunks(tmp_path: Path):
     run_sandboxed(["true"], run_dir, settings, timeout=30,
                   srt_bin_path=fake, on_stdout_line=seen.append)
     assert seen == ['factory-trace {"a": 1}', '{"seat": "implementer"}']
+
+
+def test_review7_follow_stops_on_a_killed_run_and_waits_on_a_held_lease(
+        tmp_path: Path, capsys, monkeypatch):
+    """Review round 2: a SIGKILLed orchestrator leaves its run dir behind
+    (only the next ``loop`` reclaims it), so "run dir exists" is no live
+    signal. The run lease is: the OS releases ``<queue>.run.lock`` the
+    moment its holder dies. --follow stops once the lease is free, and
+    keeps waiting while a holder has it — without ever taking it."""
+    import fcntl
+
+    env = Env(tmp_path)
+    _write_fixture_trace(env.root, run_id=RUN_ID_2, terminal=False)
+    # The killed run's dir is still on disk; nothing holds the lease.
+    (env.root / "runs" / "fixture" / RUN_ID_2).mkdir(parents=True)
+    real_sleep = time_mod.sleep
+    slept = {"n": 0}
+
+    def guarded_sleep(seconds):
+        slept["n"] += 1
+        if slept["n"] > 200:
+            raise AssertionError("--follow is still polling a killed run")
+        real_sleep(0.001)
+
+    monkeypatch.setattr(trace_module, "GONE_POLLS", 3)
+    monkeypatch.setattr(trace_module, "time", SimpleNamespace(sleep=guarded_sleep))
+    code = cli_main([
+        "trace", RUN_ID_2, "--follow", "--queue", str(env.queue_path),
+        "--factory-root", str(env.root),
+    ])
+    out = capsys.readouterr()
+    assert code == 0
+    assert len(out.out.splitlines()) == 2 and "no run_end" in out.err
+    assert slept["n"] <= 10  # stopped on the grace window, not the guard
+
+    # A live holder (another open file description, as another process
+    # would have) keeps it following; releasing the lease ends it.
+    lock_path = env.queue_path.with_name(env.queue_path.name + ".run.lock")
+    holder = lock_path.open("a+")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    slept["n"] = 0
+
+    def held_then_released(seconds):
+        slept["n"] += 1
+        if slept["n"] == 20:
+            fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+        if slept["n"] > 200:
+            raise AssertionError("--follow never noticed the lease was released")
+        real_sleep(0.001)
+
+    monkeypatch.setattr(trace_module, "time", SimpleNamespace(sleep=held_then_released))
+    try:
+        code = cli_main([
+            "trace", RUN_ID_2, "--follow", "--queue", str(env.queue_path),
+            "--factory-root", str(env.root),
+        ])
+    finally:
+        holder.close()
+    out = capsys.readouterr()
+    assert code == 0 and "no run_end" in out.err
+    assert slept["n"] >= 20  # waited while the lease was held
+
+    # Probing never takes the lease in a way a run would notice: the lock
+    # file's holder line is untouched, and a missing lock file reads as
+    # "no run" without being created.
+    lock_path.write_text("T-1")
+    from factory.state import run_lease_held
+    assert run_lease_held(env.queue_path) is False
+    assert lock_path.read_text() == "T-1"
+    lock_path.unlink()
+    assert run_lease_held(env.queue_path) is False
+    assert not lock_path.exists()

@@ -26,7 +26,7 @@ from factory.publish import PublishError, PushRefused
 from factory.runs import FACTORY_ROOT_DEFAULT, RUN_ID_RE, RunError
 from factory.sandbox import SandboxError
 from factory.session import SessionConfigError
-from factory.state import TaskQueue
+from factory.state import TaskQueue, run_lease_held
 from factory.tick import TickError, tick_steps
 from factory.trace import read_trace, trace_path
 
@@ -206,12 +206,21 @@ def _run_trace(args: argparse.Namespace) -> int:
         if not path.is_file():
             print(f"factory trace: no trace for run {args.run_id}", file=sys.stderr)
             return 1
-        # --follow's stop condition besides run_end: a run whose dir is
-        # gone (killed, reclaimed, or its writer disabled) can never write
-        # the marker — read_trace gives it a grace window, then stops.
+        # --follow's stop condition besides run_end: a run that can no
+        # longer write the marker. Live means its run dir still exists AND
+        # the queue's run lease is held — the OS drops the lease the moment
+        # the orchestrator dies, while a killed run's dir stays behind until
+        # the next loop reclaims it. read_trace gives a dead run a grace
+        # window, then stops. (The lease is per queue: a later run of the
+        # same project holding it keeps this follow waiting until that run
+        # ends — bounded, never forever.)
         run_dir = root / "runs" / profile["name"] / args.run_id
-        read_trace(path, follow=args.follow,
-                   live=run_dir.exists if args.follow else None)
+        queue_path = Path(args.queue)
+
+        def live() -> bool:
+            return run_dir.exists() and run_lease_held(queue_path)
+
+        read_trace(path, follow=args.follow, live=live if args.follow else None)
         return 0
     except (ContractError, OSError) as exc:
         print(f"factory trace: {exc}", file=sys.stderr)
