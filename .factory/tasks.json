@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-24T13:48:20Z",
+  "updated_at": "2026-10-24T14:54:12Z",
   "tasks": [
     {
       "id": "F-00",
@@ -2063,7 +2063,9 @@
         "F-11",
         "F-30"
       ],
-      "risk": [],
+      "risk": [
+        "privacy"
+      ],
       "gates": {
         "spec_approval": true,
         "merge": "human",
@@ -2309,7 +2311,7 @@
         },
         {
           "id": "AC-2",
-          "text": "Every POST requires a per-launch random token embedded in the served page, a `Host` of `127.0.0.1:<port>` and a matching `Origin`. A cross-site form post, a DNS-rebinding `Host` or a missing or wrong token gets 403 and starts no session (one test per case).",
+          "text": "Every POST requires a per-launch random token embedded in the served page, a `Host` of exactly `127.0.0.1:<port>` or `localhost:<port>` (F-31 AC-2's set) and a matching `Origin`. A cross-site form post, a DNS-rebinding `Host` or a missing or wrong token gets 403 and starts no session (one test per case); a test drives one chat turn and one confirm from a page served as `localhost`, end to end.",
           "check": {
             "type": "test",
             "ref": "tests/test_f34.py::test_ac_2"
@@ -2459,7 +2461,7 @@
       "acceptance": [
         {
           "id": "AC-1",
-          "text": "The F-34 panel offers a `planner` seat (`POST /operator/chat` with `seat: planner`) in the same read-only sandbox as the operator, plus network access to the project's `docs_allowlist`. Files you attach (a client brief, say) upload through a token-gated POST (F-34 AC-2) into `<factory_root>/plans/<project>/inbox/` (0600 files in 0700 directories).",
+          "text": "The F-34 panel offers a `planner` seat (`POST /operator/chat` with `seat: planner`) in the same read-only sandbox as the operator: no network beyond the model provider. Documentation lookups go through an in-process `fetch_doc(url)` tool that accepts only exact hosts from the project's `docs_allowlist` and strips query strings and fragments; anything else is refused (tests: a query string, a fragment, a non-allowlisted host, and the planner's own sandbox reaching no host). Files you attach (a client brief, say) upload through a token-gated POST (F-34 AC-2) into `<factory_root>/plans/<project>/inbox/` (0600 files in 0700 directories), with a size cap from config and text types only — anything else is refused at upload. Inbox files and saved plans are pruned by the same retention window as operator transcripts (F-34 AC-5), and `factory plans purge <project>` deletes them on demand.",
           "check": {
             "type": "test",
             "ref": "tests/test_f37.py::test_ac_1"
@@ -2483,7 +2485,7 @@
         },
         {
           "id": "AC-4",
-          "text": "Planning resumes across days: a planner session for a project starts with that project's plan index and `decisions.md` from `<factory_root>/plans/<project>/`, and no other memory source. A test asserts a resumed session's prompt carries both.",
+          "text": "Planning resumes across days: a planner session for a project starts with that project's plan index and `decisions.md` from `<factory_root>/plans/<project>/`, and no other memory source. A test asserts a resumed session's prompt carries both. `decisions.md` changes only through your confirmation, like a work order: the planner proposes decision entries for the panel, `save_plan` refuses that name, and a test asserts a scripted session leaves the file byte-identical.",
           "check": {
             "type": "test",
             "ref": "tests/test_f37.py::test_ac_4"
