@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-23T21:05:49Z",
+  "updated_at": "2026-10-24T14:54:12Z",
   "tasks": [
     {
       "id": "F-00",
@@ -2063,7 +2063,9 @@
         "F-11",
         "F-30"
       ],
-      "risk": [],
+      "risk": [
+        "privacy"
+      ],
       "gates": {
         "spec_approval": true,
         "merge": "human",
@@ -2072,7 +2074,7 @@
       "acceptance": [
         {
           "id": "AC-1",
-          "text": "`factory dashboard [--port N]` serves on `127.0.0.1` only (a test asserts the bound address), using the standard library HTTP server and static files shipped in the package. No new dependency.",
+          "text": "`factory dashboard [--port N]` serves on `127.0.0.1` only (a test asserts the bound address), using the standard library's `http.server.ThreadingHTTPServer` and static files shipped in the package. No new dependency. A test holds one event stream open and asserts a second request is still answered.",
           "check": {
             "type": "test",
             "ref": "tests/test_f31.py::test_ac_1"
@@ -2080,7 +2082,7 @@
         },
         {
           "id": "AC-2",
-          "text": "The server answers `GET` only; every other method gets 405. A test runs every route against a fixture factory root and asserts no file under it changed (mtime and hash).",
+          "text": "The server answers `GET` only; every other method gets 405. Every route checks the `Host` header: anything other than `127.0.0.1:<port>` or `localhost:<port>` gets 403 (DNS rebinding), with one test per route. A test runs every route against a fixture factory root and asserts no file under it changed (mtime and hash).",
           "check": {
             "type": "test",
             "ref": "tests/test_f31.py::test_ac_2"
@@ -2096,7 +2098,7 @@
         },
         {
           "id": "AC-4",
-          "text": "Run view: phases as swim lanes on a time axis, tool calls inside each lane, gate checks with their evidence, tokens and cost per phase, from the F-30 trace. A running task updates by polling without a page reload.",
+          "text": "Run view: phases as swim lanes on a time axis, tool calls inside each lane, gate checks with their evidence, tokens and cost per phase, from the F-30 trace. A running task updates live over `GET /runs/<run-id>/events`, a server-sent event stream fed by the same follower as `factory trace --follow` (same stop conditions: `run_end`, a run that is no longer live, a pruned trace); the page falls back to polling if the stream drops. A test appends events to a fixture trace and asserts the stream delivers them in order and closes on `run_end`.",
           "check": {
             "type": "test",
             "ref": "tests/test_f31.py::test_ac_4"
@@ -2116,6 +2118,14 @@
           "check": {
             "type": "test",
             "ref": "tests/test_f31.py::test_ac_6"
+          }
+        },
+        {
+          "id": "AC-7",
+          "text": "`GET /healthz` returns 200 with body `ok` without reading the queue or any trace, so a smoke test (and F-35's confirm flow) can tell a dead server from a broken queue.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f31.py::test_ac_7"
           }
         }
       ],
@@ -2269,6 +2279,243 @@
       "acceptance_hash": "8fe0db50cec682e986e8ebb29a49535c05f2cf9d466c3f0a3f50a47f72703cb0",
       "approved_at": "2026-10-23T21:05:49Z",
       "approved_by": "Anthony"
+    },
+    {
+      "id": "F-34",
+      "title": "Operator chat (read-only)",
+      "source": "BUILD-ORDER.md#f-34--operator-chat-read-only",
+      "kind": "build",
+      "priority": "P2",
+      "status": "draft",
+      "depends_on": [
+        "F-31",
+        "F-30",
+        "F-11"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "`factory dashboard --operator` adds a chat panel and exactly one `POST /operator/chat` route. Without `--operator`, F-31 AC-2 holds unchanged (GET only, everything else 405); a test runs F-31's route sweep both ways.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f34.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Every POST requires a per-launch random token embedded in the served page, a `Host` of exactly `127.0.0.1:<port>` or `localhost:<port>` (F-31 AC-2's set) and a matching `Origin`. A cross-site form post, a DNS-rebinding `Host` or a missing or wrong token gets 403 and starts no session (one test per case); a test drives one chat turn and one confirm from a page served as `localhost`, end to end.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f34.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "A new `operator` seat: read-only sandbox (`build_settings(read_only=True)`), no Write/Edit/NotebookEdit/Bash, no GitHub token, no network except the model provider. Reads are limited to the queue, traces, progress logs, reports and the repo. Its prompt `prompts/operator.md` is pinned like the other seats (F-09 AC-2).",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f34.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "`POST /operator/chat` starts the turn and returns its run id; the panel renders the turn from F-31's `GET /runs/<run-id>/events` stream, so chat has no second streaming path. Tool calls reach the trace through the same `_tap_tool_calls` path as F-30, with the same redaction (seat token plus F-25 shapes); every chat turn is a trace run under its own run id.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f34.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "Transcripts are saved to `<factory_root>/operator/<session-id>.jsonl` (0600 file in a 0700 directory) and pruned by the F-30 retention window. A turn has a `max_turns` cap and a wall-clock limit from config; hitting either ends the turn with a visible message, never a hang.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f34.py::test_ac_5"
+          }
+        },
+        {
+          "id": "AC-6",
+          "text": "The chat changes nothing: a test runs a scripted operator session against a fixture factory root and asserts every file outside `operator/` and `trace/` is byte-identical afterwards.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f34.py::test_ac_6"
+          }
+        }
+      ],
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      },
+      "attempts": [],
+      "links": {}
+    },
+    {
+      "id": "F-35",
+      "title": "Operator actions (proposals you confirm)",
+      "source": "BUILD-ORDER.md#f-35--operator-actions-proposals-you-confirm",
+      "kind": "build",
+      "priority": "P2",
+      "status": "draft",
+      "depends_on": [
+        "F-34",
+        "F-29",
+        "F-04"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "The operator seat gets one more in-process tool, `propose_action(kind, task_id, step?)`. Kinds are limited to `approve`, `tick` and `recover`. `run`, `loop`, merging and anything else is refused with a reason.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f35.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "The proposal card is built by the server from `tasks.json`, never from the agent's text. `approve` shows `render_contract(task)`, the same text `factory approve` prints, with its `acceptance_hash`; `tick` shows the step text and an empty evidence box only you fill in. A test proves the agent's own description of a proposal never reaches the card.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f35.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "Confirming is `POST /operator/confirm` with a one-time nonce bound to the proposal's kind, task id, step and `acceptance_hash`. A reused nonce, or one whose task changed since the card was shown, gets 409 and writes nothing.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f35.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "A confirmed action runs `approve_task`, `tick_steps` or `recover_task` with your click as the `confirm` callback, never `assume_yes`. Every existing refusal still applies (no acceptance items, already ticked, blank evidence, and so on) and shows on the card. Risk-flagged tasks need a second explicit checkbox, the click-level equivalent of F-04 AC-3's \"always interactive\".",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f35.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "No agent path can confirm: the operator seat has no route, tool or token that reaches `/operator/confirm`. A test drives a session that tries every tool and asserts the queue is unchanged.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f35.py::test_ac_5"
+          }
+        },
+        {
+          "id": "AC-6",
+          "text": "Every proposal and every confirm or decline goes into the operator transcript and the F-30 trace, with who clicked and when.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f35.py::test_ac_6"
+          }
+        }
+      ],
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      },
+      "attempts": [],
+      "links": {}
+    },
+    {
+      "id": "F-37",
+      "title": "Planning partner (planner seat)",
+      "source": "BUILD-ORDER.md#f-37--planning-partner-planner-seat",
+      "kind": "build",
+      "priority": "P2",
+      "status": "draft",
+      "depends_on": [
+        "F-34",
+        "F-35",
+        "F-12"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "The F-34 panel offers a `planner` seat (`POST /operator/chat` with `seat: planner`) in the same read-only sandbox as the operator: no network beyond the model provider. Documentation lookups go through an in-process `fetch_doc(url)` tool that accepts only exact hosts from the project's `docs_allowlist` and strips query strings and fragments; anything else is refused (tests: a query string, a fragment, a non-allowlisted host, and the planner's own sandbox reaching no host). Files you attach (a client brief, say) upload through a token-gated POST (F-34 AC-2) into `<factory_root>/plans/<project>/inbox/` (0600 files in 0700 directories), with a size cap from config and text types only — anything else is refused at upload. Inbox files and saved plans are pruned by the same retention window as operator transcripts (F-34 AC-5), and `factory plans purge <project>` deletes them on demand.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f37.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "The planner's only write is an in-process `save_plan(name, markdown)` tool into `<factory_root>/plans/<project>/`, with `name` matched against `[a-z0-9-]+\\.md`. A test asserts it cannot write outside that directory (`..`, absolute paths, symlinks) and that the repo, `tasks.json` and every trace other than the session's own are byte-identical after a scripted planning session.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f37.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "`propose_work_orders(tasks)` validates the proposed tasks against `schema/tasks.schema.json` and shows them in the panel as the same diff `factory import` (F-12) shows; your confirm writes them through F-12's write path as `draft` only. A proposal carrying any other status, approval fields or attempts is refused, and nothing reaches `tasks.json` without the click (test).",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f37.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "Planning resumes across days: a planner session for a project starts with that project's plan index and `decisions.md` from `<factory_root>/plans/<project>/`, and no other memory source. A test asserts a resumed session's prompt carries both. `decisions.md` changes only through your confirmation, like a work order: the planner proposes decision entries for the panel, `save_plan` refuses that name, and a test asserts a scripted session leaves the file byte-identical.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f37.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "The planner's model comes from config (`seats.planner.model`, defaulting to the factory default), so it can run on a stronger model than the builders. The trace records the model of every planner turn (test).",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f37.py::test_ac_5"
+          }
+        },
+        {
+          "id": "AC-6",
+          "text": "No path from the planner to approval: the planner seat has no tool, route or token that reaches F-35's confirm or `factory approve`, and a test drives a session that tries every tool and asserts no task changes status.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f37.py::test_ac_6"
+          }
+        }
+      ],
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      },
+      "attempts": [],
+      "links": {}
     }
   ]
 }
