@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-24T14:54:12Z",
+  "updated_at": "2026-10-24T15:22:52Z",
   "tasks": [
     {
       "id": "F-00",
@@ -2293,7 +2293,8 @@
         "F-11"
       ],
       "risk": [
-        "factory_control"
+        "factory_control",
+        "privacy"
       ],
       "gates": {
         "spec_approval": true,
@@ -2311,7 +2312,7 @@
         },
         {
           "id": "AC-2",
-          "text": "Every POST requires a per-launch random token embedded in the served page, a `Host` of exactly `127.0.0.1:<port>` or `localhost:<port>` (F-31 AC-2's set) and a matching `Origin`. A cross-site form post, a DNS-rebinding `Host` or a missing or wrong token gets 403 and starts no session (one test per case); a test drives one chat turn and one confirm from a page served as `localhost`, end to end.",
+          "text": "Every POST requires a per-launch random token embedded in the served page, a `Host` of exactly `127.0.0.1:<port>` or `localhost:<port>` (F-31 AC-2's set) and a matching `Origin`. A cross-site form post, a DNS-rebinding `Host` or a missing or wrong token gets 403 and starts no session (one test per case); a test drives one chat turn from a page served as `localhost`, end to end. The confirm half of that e2e lands with F-35's confirm route (F-35 AC-3), which enforces the same checks.",
           "check": {
             "type": "test",
             "ref": "tests/test_f34.py::test_ac_2"
@@ -2398,7 +2399,7 @@
         },
         {
           "id": "AC-3",
-          "text": "Confirming is `POST /operator/confirm` with a one-time nonce bound to the proposal's kind, task id, step and `acceptance_hash`. A reused nonce, or one whose task changed since the card was shown, gets 409 and writes nothing.",
+          "text": "Confirming is `POST /operator/confirm` with a one-time nonce bound to the proposal's kind, task id, step and `acceptance_hash`. A reused nonce, or one whose task changed since the card was shown, gets 409 and writes nothing. The confirm POST enforces F-34 AC-2's token, `Host` and `Origin` checks (403, one test per case), and the end-to-end test completes here: one confirm from a page served as `localhost`.",
           "check": {
             "type": "test",
             "ref": "tests/test_f35.py::test_ac_3"
@@ -2451,7 +2452,8 @@
         "F-12"
       ],
       "risk": [
-        "factory_control"
+        "factory_control",
+        "privacy"
       ],
       "gates": {
         "spec_approval": true,
@@ -2461,7 +2463,7 @@
       "acceptance": [
         {
           "id": "AC-1",
-          "text": "The F-34 panel offers a `planner` seat (`POST /operator/chat` with `seat: planner`) in the same read-only sandbox as the operator: no network beyond the model provider. Documentation lookups go through an in-process `fetch_doc(url)` tool that accepts only exact hosts from the project's `docs_allowlist` and strips query strings and fragments; anything else is refused (tests: a query string, a fragment, a non-allowlisted host, and the planner's own sandbox reaching no host). Files you attach (a client brief, say) upload through a token-gated POST (F-34 AC-2) into `<factory_root>/plans/<project>/inbox/` (0600 files in 0700 directories), with a size cap from config and text types only — anything else is refused at upload. Inbox files and saved plans are pruned by the same retention window as operator transcripts (F-34 AC-5), and `factory plans purge <project>` deletes them on demand.",
+          "text": "The F-34 panel offers a `planner` seat (`POST /operator/chat` with `seat: planner`) in the same read-only sandbox as the operator: no network beyond the model provider. Documentation lookups go through an in-process `fetch_doc(url)` tool that accepts only `https` URLs whose host is an exact member of the project's `docs_allowlist`; a URL carrying a query string or fragment is refused, not stripped, a redirect response is refused rather than followed, and the fetched body honors the same size cap and text types as an inbox upload with a timeout from config (one test per refusal: non-https scheme, query string, fragment, non-allowlisted host, redirect; plus the planner's own sandbox reaching no host). Files you attach (a client brief, say) upload through a token-gated POST (F-34 AC-2) into `<factory_root>/plans/<project>/inbox/` (0600 files in 0700 directories), with a size cap from config and text types only — anything else is refused at upload. Inbox files and saved plans are pruned by the same retention window as operator transcripts (F-34 AC-5), and `factory plans purge <project>` deletes them on demand.",
           "check": {
             "type": "test",
             "ref": "tests/test_f37.py::test_ac_1"
@@ -2469,7 +2471,7 @@
         },
         {
           "id": "AC-2",
-          "text": "The planner's only write is an in-process `save_plan(name, markdown)` tool into `<factory_root>/plans/<project>/`, with `name` matched against `[a-z0-9-]+\\.md`. A test asserts it cannot write outside that directory (`..`, absolute paths, symlinks) and that the repo, `tasks.json` and every trace other than the session's own are byte-identical after a scripted planning session.",
+          "text": "The planner's only write is an in-process `save_plan(name, markdown)` tool into `<factory_root>/plans/<project>/`, with `name` matched against `[a-z0-9-]+\\.md` minus the reserved `decisions` and `index` names: `decisions.md` is yours alone, and `index.md` is regenerated by the factory after each save, so neither is planner-writable. A test asserts `save_plan` cannot write outside that directory (`..`, absolute paths, symlinks) or under either reserved name, and that the repo, `tasks.json`, every trace other than the session's own and every plans file other than the session's own saves are byte-identical after a scripted planning session.",
           "check": {
             "type": "test",
             "ref": "tests/test_f37.py::test_ac_2"
@@ -2485,7 +2487,7 @@
         },
         {
           "id": "AC-4",
-          "text": "Planning resumes across days: a planner session for a project starts with that project's plan index and `decisions.md` from `<factory_root>/plans/<project>/`, and no other memory source. A test asserts a resumed session's prompt carries both. `decisions.md` changes only through your confirmation, like a work order: the planner proposes decision entries for the panel, `save_plan` refuses that name, and a test asserts a scripted session leaves the file byte-identical.",
+          "text": "Planning resumes across days: a planner session for a project starts with that project's plan index and `decisions.md` from `<factory_root>/plans/<project>/`, and no other memory source. A test asserts a resumed session's prompt carries both. `decisions.md` changes only by your hand: no tool or route writes it — the planner drafts proposed decision entries as an ordinary plan and you add them to the file yourself — and a test asserts a scripted session leaves the file byte-identical.",
           "check": {
             "type": "test",
             "ref": "tests/test_f37.py::test_ac_4"
