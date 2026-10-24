@@ -14,7 +14,12 @@ repo:
   branch_protection: unavailable
 
 commands:
-  setup: pip install -e ".[dev]"
+  # The documented setup is both halves (README "Setup", CI): pip for the
+  # package, npm ci for the pinned sandbox runtime (node_modules/.bin/srt)
+  # that the suite's sandbox tests resolve inside the repo. The F-28 step-2
+  # readiness run caught setup missing npm ci: a cold clone failed 142
+  # tests, all "srt not found" (sandbox.py srt_bin is repo-relative).
+  setup: pip install -e ".[dev]" && npm ci
   lint: ruff check .
   test: pytest -q
 
@@ -97,5 +102,8 @@ docs_allowlist:
 network_allowlist:
   - pypi.org
   - files.pythonhosted.org
+  # F-28 step 2: setup's npm ci (the pinned sandbox runtime) runs inside
+  # the sandboxed gate runner and fetches from the npm registry.
+  - registry.npmjs.org
 
 cross_repo: []
