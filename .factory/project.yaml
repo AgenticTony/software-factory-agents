@@ -7,6 +7,11 @@ repo:
   default_branch: main
   remote: https://github.com/AgenticTony/software-factory-agents.git
   merge_method: squash
+  # Private repo on a free plan: GitHub answers the protection call with
+  # its plan-limit 403, so the factory enforces up-to-date itself (F-26
+  # AC-1's exception, F-28 step 1). Merge a factory PR only after
+  # `factory run` has reported it ready against the current main.
+  branch_protection: unavailable
 
 commands:
   setup: pip install -e ".[dev]"
@@ -28,6 +33,45 @@ paths:
     # F-33: the corpus that judges the sentinels is itself evidence a
     # session must not edit.
     - "corpus/**"
+    # F-28 step 1: what judges agents is protected before the dogfood
+    # pilot runs sessions on this repo (Principle 5: agents never edit
+    # what judges them).
+    - "factory/l0.py"
+    - "factory/l1.py"
+    - "factory/l2.py"
+    - "factory/gates.py"
+    - "factory/sandbox.py"
+    - "factory/session.py"
+    - "factory/publish.py"
+    - "factory/orchestrator.py"
+    - "factory/prompts.py"
+    - "factory/trace.py"
+    - "prompts/**"
+    # Existing contract tests, enumerated file by file and NOT as a
+    # tests/test_f*.py glob: the session hook denies file creation too,
+    # and the dogfood implementers must write tests/test_f11.py and
+    # tests/test_f12.py red-first. A task's own contract tests are
+    # protected separately, locked at approval (factory/gates.py
+    # contract_test_files). tests/test_f28.py lands with this change.
+    - "tests/test_f01.py"
+    - "tests/test_f02.py"
+    - "tests/test_f03.py"
+    - "tests/test_f04.py"
+    - "tests/test_f05.py"
+    - "tests/test_f06.py"
+    - "tests/test_f07.py"
+    - "tests/test_f08.py"
+    - "tests/test_f09.py"
+    - "tests/test_f10.py"
+    - "tests/test_f23.py"
+    - "tests/test_f24.py"
+    - "tests/test_f25.py"
+    - "tests/test_f26.py"
+    - "tests/test_f27.py"
+    - "tests/test_f28.py"
+    - "tests/test_f29.py"
+    - "tests/test_f30.py"
+    - "tests/test_f33.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 

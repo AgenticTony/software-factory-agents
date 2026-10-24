@@ -1866,7 +1866,7 @@
       "links": {},
       "owner_steps": [
         {
-          "text": "Extend `paths.protected` in this repo's `.factory/project.yaml` (by PR) to cover what judges agents: `factory/l0.py`, `factory/l1.py`, `factory/l2.py`, `factory/gates.py`, `factory/sandbox.py`, `factory/session.py`, `factory/publish.py`, `factory/orchestrator.py`, `factory/prompts.py`, `prompts/**` and every existing `tests/test_f*.py`, on top of today's `.factory/**`, `.github/workflows/**`, `schema/**`, the two spec files and `CLAUDE.md`. This repo is private on a free plan, so it can't have branch protection (see F-10 AC-13): declare `branch_protection: unavailable` in the same PR, so F-26 runs with its own up-to-date check instead of refusing. Nothing server-side then stops a stale merge, so merge factory PRs only after `factory run` has reported them ready against the current `main`.",
+          "text": "Extend `paths.protected` in this repo's `.factory/project.yaml` (by PR) to cover what judges agents: `factory/l0.py`, `factory/l1.py`, `factory/l2.py`, `factory/gates.py`, `factory/sandbox.py`, `factory/session.py`, `factory/publish.py`, `factory/orchestrator.py`, `factory/prompts.py`, `factory/trace.py`, `prompts/**` and every existing `tests/test_f*.py`, on top of today's `.factory/**`, `.github/workflows/**`, `schema/**`, the two spec files and `CLAUDE.md`. This repo is private on a free plan, so it can't have branch protection (see F-10 AC-13): declare `branch_protection: unavailable` in the same PR, so F-26 runs with its own up-to-date check instead of refusing. Nothing server-side then stops a stale merge, so merge factory PRs only after `factory run` has reported them ready against the current `main`.",
           "done": false
         },
         {
