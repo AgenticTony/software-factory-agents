@@ -81,6 +81,27 @@ def test_enumerated_test_files_exist():
         assert (REPO / path).is_file(), f"{path} is protected but missing"
 
 
+def test_setup_provisions_the_pinned_sandbox_runtime():
+    """A cold clone must become fully runnable from the profile's own
+    setup command. F-28 step 2 found the gap for real: a clean clone
+    passed setup and lint, then failed 142 suite tests, every one
+    tracing to ``srt not found at <repo>/node_modules/.bin/srt``. The
+    sandbox tests resolve srt inside the repo, so setup must run
+    ``npm ci`` alongside pip — the documented setup (README, CI) — and
+    the sandbox network allowlist must let it reach the npm registry."""
+    profile = _profile()
+    setup = profile["commands"]["setup"]
+    assert "pip install" in setup and "npm ci" in setup, (
+        "commands.setup must provision both halves of the documented "
+        'setup (pip install -e ".[dev]" and npm ci): a cold clone fails '
+        "the sandbox tests without node_modules"
+    )
+    assert "registry.npmjs.org" in profile["network_allowlist"], (
+        "setup runs inside the sandboxed gate runner; npm ci cannot "
+        "fetch without registry.npmjs.org in network_allowlist"
+    )
+
+
 def test_branch_protection_declared_unavailable():
     """The repo declares the free-plan protection limit (F-26 AC-1's
     exception), so admission accepts the factory's own up-to-date check.
