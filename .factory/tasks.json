@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-24T15:22:52Z",
+  "updated_at": "2026-10-24T23:22:16Z",
   "tasks": [
     {
       "id": "F-00",
@@ -835,7 +835,7 @@
       "source": "BUILD-ORDER.md#f-11--factory-status-daily-summary--metrics",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "ready",
       "depends_on": [
         "F-03",
         "F-23",
@@ -890,7 +890,10 @@
         "wall_clock_min": 60
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "acceptance_hash": "17b554e9eb39ee0a63bb9a4af65eac91d35440b10c621c59bf36628b6038e647",
+      "approved_at": "2026-10-24T23:22:15Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-12",
@@ -898,7 +901,7 @@
       "source": "BUILD-ORDER.md#f-12--importer-factory-import",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "ready",
       "depends_on": [
         "F-06",
         "F-02",
@@ -954,7 +957,10 @@
         "wall_clock_min": 150
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "acceptance_hash": "c951aa6ef9d7b1b1cf4140383281e97db4b63cc826b3355ea1e75f6444b3ba2e",
+      "approved_at": "2026-10-24T23:22:16Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-13",
