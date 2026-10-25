@@ -213,6 +213,77 @@ def test_ac_3(tmp_path: Path):
     )
 
 
+# --- INC-006: git init works inside the sandbox ------------------------------
+
+
+def test_sandbox_env_sets_empty_git_templates(tmp_path: Path):
+    """The child env points GIT_TEMPLATE_DIR at an empty scratch dir:
+    git init/clone then write nothing into .git/hooks/, which srt
+    blocks beneath the child's cwd (INC-006)."""
+    run, _root, _settings = _make_run(tmp_path)
+    env = sandbox_env(run.root)
+    templates = Path(env["GIT_TEMPLATE_DIR"])
+    assert templates.is_dir()
+    assert templates.parent == run.root / ".home"
+    assert not any(templates.iterdir()), "template dir must start empty"
+
+
+def test_build_settings_relaxes_git_config_but_not_the_run_clone(tmp_path):
+    """init/clone must write .git/config, so the built-in .git/config
+    block is relaxed (allowGitConfig) — while the run clone's own
+    .git/{hooks,config,info} stay on the explicit denyWrite list: the
+    agent still cannot plant hooks or redirect the remote of the clone
+    the orchestrator commits from."""
+    _run, _root, settings = _make_run(tmp_path)
+    assert settings["filesystem"]["allowGitConfig"] is True
+    denied = settings["filesystem"]["denyWrite"]
+    assert any(d.endswith("/.git/hooks") for d in denied)
+    assert any(d.endswith("/.git/config") for d in denied)
+
+
+def test_git_init_succeeds_inside_the_sandbox(tmp_path: Path):
+    """The incident itself: the project's whole suite runs in the L0
+    sandbox and builds a fixture repo per test — `git init` there must
+    succeed confined (the suite inits via ``git -C`` into its tmp area,
+    not at the child's cwd)."""
+    run, _root, _settings = _make_run(tmp_path)
+    work = run.root / ".tmp" / "inc006"
+    work.mkdir(parents=True, exist_ok=True)
+    proc = run_sandboxed(
+        ["git", "-C", str(work), "init", "-q", "-b", "main"],
+        run.root,
+        run.settings_path,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (work / ".git" / "HEAD").is_file()
+
+
+def test_git_clone_succeeds_inside_the_sandbox(tmp_path: Path):
+    """clone runs the same template-copy path as init (INC-006's sibling):
+    a local clone made confined must come out with a HEAD and an empty
+    hooks dir — nothing ever written into the blocked path."""
+    run, _root, _settings = _make_run(tmp_path)
+    origin = run.root / ".tmp" / "origin"
+    origin.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "-C", str(origin), "init", "-q", "-b", "main"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(origin), "-c", "user.email=f@x", "-c", "user.name=f",
+         "commit", "-q", "--allow-empty", "-m", "base"],
+        check=True,
+    )
+    proc = run_sandboxed(
+        ["git", "-C", str(run.root / ".tmp"), "clone", "-q", str(origin), "work"],
+        run.root,
+        run.settings_path,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (run.root / ".tmp" / "work" / ".git" / "HEAD").is_file()
+
+
 # --- F-05 AC-4: no GitHub/keychain credentials inside the sandbox ----------
 
 

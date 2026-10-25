@@ -218,12 +218,24 @@ def sandbox_env(
     HOME points at ``<run_dir>/.home`` and TMPDIR at ``<run_dir>/.tmp`` —
     writable scratch (the real home is denyRead; writes are allowed nowhere
     outside the run). Both are git-excluded by ``create_run``.
+
+    GIT_TEMPLATE_DIR points at an empty dir under that scratch (INC-006):
+    ``git init``/``git clone`` copy hook samples from git's installation
+    templates into ``.git/hooks/`` of the new repo, and srt blocks writes
+    into every ``**/.git/hooks/**`` beneath the child's cwd — so the
+    project's own suite, which builds a fixture repo per test inside the
+    L0 sandbox, could never init. With empty templates nothing is copied
+    into the blocked path and init is a config write (allowed by
+    ``allowGitConfig`` in :func:`build_settings`). Hook samples are dead
+    weight here anyway: this factory's git runs hardened, hooks off.
     """
     run_dir = Path(run_dir)
     home = run_dir / ".home"
     home.mkdir(parents=True, exist_ok=True)
     tmp = run_dir / ".tmp"
     tmp.mkdir(parents=True, exist_ok=True)
+    git_templates = home / ".git-templates"
+    git_templates.mkdir(parents=True, exist_ok=True)
     env = {
         key: value
         for key, value in os.environ.items()
@@ -237,6 +249,7 @@ def sandbox_env(
                 env[key] = value
     env["HOME"] = str(home)
     env["TMPDIR"] = str(tmp)
+    env["GIT_TEMPLATE_DIR"] = str(git_templates)
     return scrub_env(env, forbidden)
 
 
@@ -280,6 +293,42 @@ def default_toolchain(extra: "Sequence[Path] | None" = None) -> list[Path]:
         if path and Path(path) not in toolchain:
             toolchain.append(Path(path))
     return toolchain
+
+
+def git_template_dir(git_bin: "str | Path | None" = None) -> Path | None:
+    """The share dir git copies repo templates (hook samples) from at
+    init/clone, for the git on PATH.
+
+    Diagnostics for INC-006: the sandbox cannot let ``git init`` read the
+    installation's real templates, because srt blocks writes into every
+    ``.git/hooks/**`` beneath the child's cwd and init copies hook
+    samples there — the empty-``GIT_TEMPLATE_DIR`` fix in
+    :func:`sandbox_env` sidesteps the whole copy. This helper stays for
+    tests and incident forensics: it names the dir the blocked copy
+    would have read.
+
+    Args:
+        git_bin: The git binary to ask (default: PATH's git).
+
+    Returns:
+        The templates dir, or None where git is missing or its templates
+        cannot be located.
+    """
+    binary = str(git_bin) if git_bin else (shutil.which("git") or "git")
+    try:
+        proc = subprocess.run(
+            [binary, "--exec-path"], capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    exec_path = Path(proc.stdout.strip().rstrip("/"))
+    candidates = (
+        exec_path.parent.parent / "share" / "git-core" / "templates",  # prefix/libexec
+        exec_path.parent / "share" / "git-core" / "templates",  # <prefix>/libexec sibling
+    )
+    return next((c.resolve() for c in candidates if c.is_dir()), None)
 
 
 def build_settings(
@@ -423,6 +472,15 @@ def build_settings(
                 str(run_dir / ".git" / "config"),
                 str(run_dir / ".git" / "info"),
             ],
+            # srt blocks .git/config writes beneath cwd by default; init
+            # and clone must write config, so relax the built-in rule —
+            # the RUN's own .git/config stays denied by the explicit
+            # denyWrite above (hook/core.hooksPath planting is still
+            # impossible in the clone the orchestrator commits from).
+            # What this re-allows is config for repos the WORK creates
+            # (test fixtures, the agent's scratch repos), which die with
+            # the run dir (INC-006).
+            "allowGitConfig": True,
         },
         "credentials": {
             "envVars": [{"mode": "deny", "name": name} for name in denied_names]
