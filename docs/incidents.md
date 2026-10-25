@@ -179,3 +179,17 @@ toy repo.
   - `tests/test_f05.py::test_can_apply_seatbelt_is_true_where_tests_run`
   - `tests/test_f05.py::test_conftest_guards_sandbox_spawning_tests_when_nested`
   - `tests/test_f05.py::test_nested_suite_skips_instead_of_failing`
+
+*Completion (same day, run 20261025T181522Z-fea1f7):* the first fix
+covered tests that spawn srt through `run_sandboxed`. Run 4's L0 then
+failed on the second class: host-capability tests — the probe's own
+host-truth assertion, a test that plants a hook in the run clone's
+`.git/hooks` deliberately (the sandbox denies that by design), one
+that spawns `srt` raw via `subprocess`, two that write a fixture's
+`.git/info/exclude`, and two that assert real-`$HOME` toolchain
+layout (HOME is the sandbox scratch inside). All gated with the same
+skipif probe; `functools.wraps` keeps the wrapper transparent to the
+docstring-contract test. Full-suite nested validation: **83 passed,
+37 skipped, 0 failed** for the two affected files; the whole suite
+nested matches the L0 shape. CI and hosts are unchanged: every gated
+test runs for real wherever a seatbelt can be applied.

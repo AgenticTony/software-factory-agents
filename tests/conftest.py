@@ -37,10 +37,16 @@ def pytest_configure(config: pytest.Config) -> None:
 # under test; they skip instead — the probe is the environment's truth
 # (an agent inside its sandbox cannot forge it, nothing it does makes
 # applying a second profile succeed), and the skipped tests run for
-# real in CI's unsandboxed run of the same PR.
+# real in CI's unsandboxed run of the same PR. functools.wraps carries
+# the real function's identity onto the wrapper, so introspection tests
+# (docstring contracts) still see the truth.
+import functools  # noqa: E402
+
 from factory import sandbox as _sandbox_module  # noqa: E402
 
 if not _sandbox_module.can_apply_seatbelt():
     def _nested_unavailable(*args, **kwargs):
         pytest.skip("nested seatbelt cannot apply a profile (INC-007)")
-    _sandbox_module.run_sandboxed = _nested_unavailable
+    _sandbox_module.run_sandboxed = functools.wraps(
+        _sandbox_module.run_sandboxed
+    )(_nested_unavailable)
