@@ -114,3 +114,34 @@ toy repo.
   - `tests/test_f07.py::test_parse_errors_carries_the_diagnostic_message`
   - `tests/test_f07.py::test_repo_owned_rejects_framework_locations`
   - `tests/test_f07.py::test_l0_new_error_findings_name_the_repo_line_with_its_message`
+
+## INC-006 — the sandbox categorically denied `git init`/`git clone`, so the suite could never run inside L0 (2026-10-25, F-11 dogfood run 20261025T112658Z-1c5f65)
+
+- **What broke:** L0 runs the project's whole test suite inside the
+  F-05 sandbox (F-10 AC-11), and this suite builds a fixture git repo
+  per test. Every one died: srt blocks writes into every
+  `**/.git/hooks/**` beneath the child's cwd (hook-planting guard) and
+  `.git/config` as well — and `git init`/`git clone` must write both
+  (config always, hook samples copied from git's installation
+  templates). ~300 new_error findings across tests/test_f05–f33;
+  attempt burned on an environment no session could fix (the failing
+  test files are protected paths). Never seen before because nothing
+  had ever run the project's own suite sandboxed: local runs are
+  unconfined, CI's Linux git lays out differently, and the F-24
+  rehearsal sandboxes only the fixture's commands, never the project's.
+- **Which layer should have caught it:** F-05 — the sandbox was
+  specified (DESIGN D3: "a clone per task", suites run there) but never
+  proven against a repo whose tests themselves use git. The rehearsal
+  fixture covers setup/lint/test of a toy project, not git-using tests.
+- **The fix:** `GIT_TEMPLATE_DIR` in the child env points at an empty
+  scratch dir (nothing is ever copied into the blocked `hooks/` path —
+  hook samples are dead weight here anyway: this factory's git runs
+  hardened, hooks off), and the settings set `allowGitConfig` so init's
+  config write passes — the run clone's own `.git/{hooks,config,info}`
+  stay on the explicit denyWrite list, so hook/remote planting in the
+  clone the orchestrator commits from remains impossible.
+- **The tests that now do:**
+  - `tests/test_f05.py::test_sandbox_env_sets_empty_git_templates`
+  - `tests/test_f05.py::test_build_settings_relaxes_git_config_but_not_the_run_clone`
+  - `tests/test_f05.py::test_git_init_succeeds_inside_the_sandbox`
+  - `tests/test_f05.py::test_git_clone_succeeds_inside_the_sandbox`
