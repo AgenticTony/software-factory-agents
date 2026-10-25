@@ -38,6 +38,7 @@ from factory.sandbox import (
 )
 
 MODEL_ENDPOINT = "api.z.ai"
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -282,6 +283,62 @@ def test_git_clone_succeeds_inside_the_sandbox(tmp_path: Path):
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert (run.root / ".tmp" / "work" / ".git" / "HEAD").is_file()
+
+
+# --- INC-007: nesting is detected, not fought -------------------------------
+
+
+def test_can_apply_seatbelt_is_true_where_tests_run():
+    """On a host (and CI) the probe answers True: the sandbox tests
+    below run for real. Inside a macOS sandbox it answers False and
+    conftest turns run_sandboxed into a skip — macOS cannot apply a
+    seatbelt profile from inside one, so a nested srt is refused by the
+    kernel whatever the settings allow."""
+    from factory.sandbox import can_apply_seatbelt
+
+    assert can_apply_seatbelt() is True
+
+
+def test_conftest_guards_sandbox_spawning_tests_when_nested():
+    """The skip lives in tests/conftest.py, one point for every test
+    that spawns a sandbox (INC-007): patched only when the seatbelt
+    probe says nesting is impossible, never on a host."""
+    conftest = (REPO_ROOT / "tests" / "conftest.py").read_text()
+    assert "can_apply_seatbelt" in conftest
+    assert "INC-007" in conftest
+
+
+def test_nested_suite_skips_instead_of_failing(tmp_path: Path):
+    """The L0 shape end to end: this suite run inside a sandbox skips
+    its sandbox-spawning tests and still passes its unit tests. A
+    sandboxed pytest over the seatbelt-independent tests of this module
+    must come back green with skips, not red on sandbox_apply."""
+    from factory.sandbox import (
+        can_apply_seatbelt,
+        run_sandboxed,
+    )
+
+    if not can_apply_seatbelt():  # already nested: this test's probe is the claim
+        pytest.skip("nested seatbelt cannot apply a profile (INC-007)")
+    run, _root, _settings = _make_run(tmp_path)
+    # The real code under test must live in the sandbox-readable tree: the
+    # editable install points under the owner's home (denyRead), so the
+    # package and the tests are copied in — copied, not linked, ditto.
+    shutil.copytree(REPO_ROOT / "factory", run.root / "factory",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(REPO_ROOT / "tests", run.root / "tests",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    proc = run_sandboxed(
+        [sys.executable, "-m", "pytest",
+         "tests/test_f05.py::test_conftest_guards_sandbox_spawning_tests_when_nested",
+         "tests/test_f05.py::test_ac_1", "-q", "--no-header"],
+        run.root, run.settings_path, timeout=300,
+    )
+    out = proc.stdout
+    # the seatbelt-independent test passed inside; the spawning test
+    # skipped inside (the reason itself is asserted by the conftest
+    # content test — -q does not print skip reasons)
+    assert "1 passed, 1 skipped" in out, f"nested suite run:\n{out[-2000:]}"
 
 
 # --- F-05 AC-4: no GitHub/keychain credentials inside the sandbox ----------
