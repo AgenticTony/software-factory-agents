@@ -35,6 +35,7 @@ from factory.prompts import (
     prompt_hash,
     prompt_versions,
 )
+from factory.sandbox import can_apply_seatbelt
 from factory.session import build_options, run_session
 
 REPO = Path(__file__).resolve().parent.parent
@@ -1340,6 +1341,13 @@ def test_review11_branch_switch_counts_as_mutation(tmp_path, monkeypatch):
     assert _rev(repo, "branch", "--list", "other") == ""
 
 
+# INC-007 host-capability tests: these two write into a fixture repo's
+# .git/info deliberately (the exclude file the guard must respect); a
+# sandbox denies .git-internal writes by design, so nested they skip.
+@pytest.mark.skipif(
+    not can_apply_seatbelt(),
+    reason="nested seatbelt cannot apply a profile (INC-007)",
+)
 def test_review11_ignored_artifact_counts_as_mutation(tmp_path, monkeypatch):
     # A file written into a gitignored dir is invisible to plain porcelain.
     # It counts as a mutation and is removed, while ignored files that
@@ -1362,6 +1370,10 @@ def test_review11_ignored_artifact_counts_as_mutation(tmp_path, monkeypatch):
     assert (repo / "build" / "keep.txt").read_text() == "warm cache"
 
 
+@pytest.mark.skipif(
+    not can_apply_seatbelt(),
+    reason="nested seatbelt cannot apply a profile (INC-007)",
+)
 def test_review11_quiet_review_with_preexisting_ignored_files_passes(
     tmp_path, monkeypatch
 ):

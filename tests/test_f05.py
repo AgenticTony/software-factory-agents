@@ -30,6 +30,7 @@ from factory.sandbox import (
     SandboxError,
     _toolchain_allowread,
     build_settings,
+    can_apply_seatbelt,
     ensure_srt,
     run_sandboxed,
     sandbox_env,
@@ -287,7 +288,16 @@ def test_git_clone_succeeds_inside_the_sandbox(tmp_path: Path):
 
 # --- INC-007: nesting is detected, not fought -------------------------------
 
+# Host-capability tests: what they assert (or deliberately do — planting
+# hooks in a run clone, spawning srt raw, asserting the probe itself)
+# only works where a seatbelt can be applied. Nested, they skip.
+pytestmark_nested = pytest.mark.skipif(
+    not can_apply_seatbelt(),
+    reason="nested seatbelt cannot apply a profile (INC-007)",
+)
 
+
+@pytestmark_nested
 def test_can_apply_seatbelt_is_true_where_tests_run():
     """On a host (and CI) the probe answers True: the sandbox tests
     below run for real. Inside a macOS sandbox it answers False and
@@ -631,6 +641,7 @@ def test_git_hook_and_config_planting_is_denied_in_sandbox(tmp_path: Path):
     )
 
 
+@pytestmark_nested
 def test_planted_hook_never_fires_for_orchestrator_git(tmp_path: Path):
     """Even if a hook somehow gets planted (deny bypass, stale run), the
     orchestrator's own git commands must never execute it: every git call
@@ -1200,6 +1211,7 @@ def test_ambient_seat_and_git_config_names_do_not_cross(tmp_path: Path, monkeypa
     )
 
 
+@pytestmark_nested
 def test_toolchain_allowread_is_install_dir_only():
     """Only the resolved install dir is re-allowed (plus the sibling lib/
     when the binary sits in a bin/), never the ancestors: re-allowing the
@@ -1334,6 +1346,7 @@ def test_toolchain_symlink_under_home_executes(tmp_path: Path):
         shutil.rmtree(base, ignore_errors=True)
 
 
+@pytestmark_nested
 def test_bin_dir_parent_never_reopens_a_shared_prefix():
     """A binary living in ~/.local/bin must not re-allow all of ~/.local
     (uv credentials, cursor-agent, ... under ~/.local/share). For a bin/ dir
@@ -1356,6 +1369,7 @@ def test_run_sandboxed_docstring_matches_the_select_pump():
 # --- review follow-ups (fresh-context review of d898f10) ------------------
 
 
+@pytestmark_nested
 def test_settings_backstop_denies_every_github_name_in_the_environment(
     tmp_path: Path, monkeypatch
 ):
