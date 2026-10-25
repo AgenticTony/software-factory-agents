@@ -496,6 +496,43 @@ def write_settings(settings: dict, path: Path) -> Path:
     return path
 
 
+@lru_cache(maxsize=1)
+def can_apply_seatbelt() -> bool:
+    """Whether this process may apply a macOS seatbelt profile.
+
+    The nesting probe (INC-007): macOS refuses ``sandbox_apply`` from
+    inside an existing sandbox — a sandboxed process that tries to
+    launch another srt gets ``sandbox-exec: sandbox_apply: Operation not
+    permitted`` no matter what the settings allow (the wall was probed
+    through five layers: template reads, .git writes, unix-socket bind,
+    loopback listen, then this — the last one is the kernel's, not
+    srt's). The project's own suite runs inside the L0 sandbox and its
+    sandbox tests spawn srt again, so they cannot run nested; they skip
+    on this probe instead (tests/conftest.py) and run for real wherever
+    the seatbelt stack is available — CI and any unsandboxed run.
+
+    The probe is the truth, not an env var: nothing an agent does from
+    inside its sandbox can make applying a second profile succeed, so
+    the skip cannot be forged from within.
+
+    Returns:
+        True where a seatbelt profile can be applied (or the platform
+        has no seatbelt — non-darwin answers True and lets srt's own
+        Linux path decide), False inside a macOS sandbox.
+    """
+    if sys.platform != "darwin":
+        return True
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)",
+             "/usr/bin/true"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
 def run_sandboxed(
     cmd: list[str],
     run_dir: Path,

@@ -28,3 +28,19 @@ def pytest_configure(config: pytest.Config) -> None:
             "or with PYTHONPATH=., or give this checkout its own "
             "environment."
         )
+
+
+# INC-007: macOS cannot apply a seatbelt profile from inside one, so a
+# sandboxed run of this suite (the L0 gate runs it inside the F-05
+# sandbox, F-10 AC-11) can never spawn a second srt. Tests that reach
+# for run_sandboxed would fail on the kernel's refusal, not on the code
+# under test; they skip instead — the probe is the environment's truth
+# (an agent inside its sandbox cannot forge it, nothing it does makes
+# applying a second profile succeed), and the skipped tests run for
+# real in CI's unsandboxed run of the same PR.
+from factory import sandbox as _sandbox_module  # noqa: E402
+
+if not _sandbox_module.can_apply_seatbelt():
+    def _nested_unavailable(*args, **kwargs):
+        pytest.skip("nested seatbelt cannot apply a profile (INC-007)")
+    _sandbox_module.run_sandboxed = _nested_unavailable

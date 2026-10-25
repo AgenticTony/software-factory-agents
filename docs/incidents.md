@@ -145,3 +145,37 @@ toy repo.
   - `tests/test_f05.py::test_build_settings_relaxes_git_config_but_not_the_run_clone`
   - `tests/test_f05.py::test_git_init_succeeds_inside_the_sandbox`
   - `tests/test_f05.py::test_git_clone_succeeds_inside_the_sandbox`
+
+## INC-007 — nested seatbelt is architecturally impossible; the suite's sandbox tests now detect it and skip (2026-10-25, F-11 dogfood run 20261025T125400Z-b8fb83)
+
+- **What broke:** with the suite finally able to run inside the L0
+  sandbox (INC-006 fixed), every test that spawns a sandbox died:
+  this suite's own F-05 tests call `run_sandboxed`, which launches a
+  second srt inside the first. Probed live, layer by layer: git's
+  template reads (allowable), `.git/hooks`/`.git/config` writes
+  (srt settings keys exist), unix-socket bind in a short scratch
+  (`allowUnixSockets`), loopback listen (`allowLocalBinding`) — each
+  fixable, each revealing the next — until
+  `sandbox-exec: sandbox_apply: Operation not permitted`: **macOS
+  refuses to apply a seatbelt profile from inside one.** The wall is
+  the kernel's, not srt's; no settings cross it. Nested srt on macOS
+  cannot exist.
+- **Which layer should have caught it:** the design assumed "the
+  suite runs in the sandbox" and "the suite's tests spawn sandboxes"
+  could coexist — they cannot, on this platform. The F-24 rehearsal
+  fixture never spawns a sandbox inside a sandbox, so the conflict
+  was invisible until the factory ran its own suite through its own
+  gate.
+- **The fix:** `can_apply_seatbelt()` in `factory/sandbox.py` probes
+  the truth (a trivial `sandbox-exec` apply; the answer cannot be
+  forged from inside a sandbox — nothing an agent does there makes
+  applying a second profile succeed). `tests/conftest.py` swaps
+  `run_sandboxed` for a skip carrying the incident's name when the
+  probe says nested — one point for every spawning test in the suite.
+  CI and every unsandboxed run still execute them for real; this
+  repo's profile declares no baseline floor, so the skip count cannot
+  fail L0.
+- **The tests that now do:**
+  - `tests/test_f05.py::test_can_apply_seatbelt_is_true_where_tests_run`
+  - `tests/test_f05.py::test_conftest_guards_sandbox_spawning_tests_when_nested`
+  - `tests/test_f05.py::test_nested_suite_skips_instead_of_failing`
