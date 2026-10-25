@@ -21,6 +21,7 @@ from factory.l0 import (
     diff_file_changes,
     parse_errors,
     parse_test_count,
+    repo_owned,
     run_l0,
 )
 
@@ -396,9 +397,105 @@ def test_parse_errors_and_test_count():
         "noise without location\n"
         "=== 46 passed, 2 failed in 0.1s ===\n"
     )
-    assert parse_errors(out) == [("lib/a.py", 10), ("src/x.ts", 12)]
+    assert parse_errors(out) == [
+        ("lib/a.py", 10, "E999 first"),
+        ("src/x.ts", 12, "TS2322: bad"),
+    ]
     assert parse_test_count(out) == 46
     assert parse_test_count("no counts here") is None
+
+
+# --- INC-005: findings must name the repo's line, with its message ------------
+
+
+def test_parse_errors_carries_the_diagnostic_message():
+    """The message after the location reaches the finding text, so a fix
+    prompt says *what* is wrong at the line, not only where."""
+    out = (
+        "tests/test_f11.py:59:41: SyntaxError: Expected one or more "
+        "keyword parameter after '*' separator\n"
+        "bare/location.py:7: \n"
+    )
+    assert parse_errors(out) == [
+        ("bare/location.py", 7, ""),
+        ("tests/test_f11.py", 59,
+         "SyntaxError: Expected one or more keyword parameter after '*' separator"),
+    ]
+
+
+def test_repo_owned_rejects_framework_locations():
+    """A location is repo-owned only when the repo's baseline can speak
+    about it. Interpreter, stdlib and installed-package frames — the
+    sandbox HOME scratch user-site, the framework Python, anything
+    absolute outside the repo, parent escapes, frozen modules — are
+    someone else's code (INC-005)."""
+    assert repo_owned("tests/test_f11.py")
+    assert repo_owned("factory/l0.py")
+    assert not repo_owned(
+        ".home/Library/Python/3.12/lib/python/site-packages/_pytest/python.py")
+    assert not repo_owned(
+        "/Library/Frameworks/Python.framework/Versions/3.12/bin/pytest")
+    assert not repo_owned(
+        "/Library/Frameworks/Python.framework/Versions/3.12/lib/"
+        "python3.12/importlib/__init__.py")
+    assert not repo_owned("../outside/the/repo.py")
+    assert not repo_owned("<frozen importlib._bootstrap>")
+    assert not repo_owned("venv/lib/site-packages/pkg/mod.py")
+
+
+def test_l0_new_error_findings_name_the_repo_line_with_its_message(tmp_path):
+    """The incident end to end: a failing lint+test whose output carries
+    framework traceback frames plus one repo line produces exactly one
+    new_error finding — the repo line, message included — and no
+    finding mentions a framework path."""
+    from factory.gates import CommandResult
+
+    repo = _repo(tmp_path, "inc005", {"tests/test_f11.py": "def ok(): pass\n"})
+    _change(repo, files={"tests/test_f11.py": "def broken(:\n"})
+    profile = dict(BASE_PROFILE)
+    profile["commands"] = {
+        "setup": "true",
+        "lint": "ruff check .",
+        "test": "pytest -q",
+    }
+    lint_out = (
+        "tests/test_f11.py:59:41: SyntaxError: Expected one or more "
+        "keyword parameter after '*' separator\n"
+        "   |\n"
+        "59 |     def _task(task_id: str, status: str, *, **overrides) -> dict:\n"
+    )
+    test_out = (
+        "==================================== ERRORS ============================\n"
+        "____________________ ERROR collecting tests/test_f11.py ________________\n"
+        ".home/Library/Python/3.12/lib/python/site-packages/_pytest/python.py:508:"
+        " in importtestmodule\n"
+        ".home/Library/Python/3.12/lib/python/site-packages/_pytest/pathlib.py:596:"
+        " in import_path\n"
+        "/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/"
+        "importlib/__init__.py:90: in import_module\n"
+        "/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/"
+        "ast.py:52: in parse\n"
+        "E   SyntaxError: invalid syntax\n"
+        "ERROR tests/test_f11.py\n"
+    )
+
+    def fake_runner(name, command, repo_path, timeout_sec):
+        if name == "setup":
+            return CommandResult(name, command, 0, "")
+        outputs = {"lint": lint_out, "test": test_out}
+        return CommandResult(name, command, 1, outputs[name])
+
+    report = _run(repo, profile, runner=fake_runner)
+
+    assert report.verdict == "fail"
+    new_errors = [f for f in report.findings if f.id == "new_error"]
+    assert [(f.file, f.line) for f in new_errors] == [("tests/test_f11.py", 59)]
+    assert "SyntaxError" in new_errors[0].text
+    assert "keyword parameter after '*' separator" in new_errors[0].text
+    for f in report.findings:
+        assert "site-packages" not in f.text, f.text
+        assert "/Library/" not in f.text, f.text
+        assert ".home/" not in f.text, f.text
 
 
 def test_diff_file_changes_reads_git(tmp_path):

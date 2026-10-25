@@ -88,3 +88,29 @@ toy repo.
     tool_call event — Write, target by parsed file_path, ok False, the
     hook's deny text in the result — as the pass condition, bounded retry
     over completed sessions only, file-existence hard check)
+
+## INC-005 — L0 findings buried the repo's error location under framework frames (2026-10-25, F-11 dogfood run 20261024T195143Z-830228)
+
+- **What broke:** the F-11 implementer wrote a Python syntax error
+  (`def _task(task_id, status, *, **overrides)` — a bare `*` before
+  `**kwargs`, at `tests/test_f11.py:59`). L0 caught it in every
+  attempt — and then failed to tell the agent: `parse_errors` extracted
+  every `file:line` in the output, including pytest and interpreter
+  traceback frames (user-site `_pytest` under the sandbox HOME scratch,
+  the `/Library` framework Python, stdlib `importlib`/`ast`), and each
+  foreign frame became its own `new_error` finding. Findings sort by
+  path, and `.home/…` and `/Library/…` order before `tests/…`, so the
+  seven noise findings came first and the one repo-owned finding came
+  last. That finding carried no message, so the fix prompts held a wall
+  of framework noise, a bare line number in position eight, and the
+  word "SyntaxError" nowhere. Both fix rounds (32 and 33 turns) burned
+  without the character changing; the task escalated
+  `attempts_exhausted`.
+- **Which layer should have caught it:** L0 itself, at finding
+  construction — a location the repo's baseline can never speak about
+  (someone else's code) was reported as a repo error, and the
+  diagnostic message L0 already held was dropped at the same seam.
+- **The tests that now do:**
+  - `tests/test_f07.py::test_parse_errors_carries_the_diagnostic_message`
+  - `tests/test_f07.py::test_repo_owned_rejects_framework_locations`
+  - `tests/test_f07.py::test_l0_new_error_findings_name_the_repo_line_with_its_message`

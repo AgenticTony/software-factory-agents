@@ -159,22 +159,58 @@ class L0Report(GateReport):
 
 
 def parse_errors(output: str) -> list:
-    """Extract reported ``file:line`` error locations from command output.
+    """Extract reported ``file:line`` error locations with their messages.
 
     Args:
         output: Combined stdout+stderr of a failed command.
 
     Returns:
-        Sorted, de-duplicated ``[(file, line), ...]``.
+        Sorted, de-duplicated ``[(file, line, message), ...]``. The
+        message is the rest of the matched line, stripped and capped
+        ("" when the tool printed a bare location). Findings carry it so
+        a fix prompt says what is wrong at the line, not only where
+        (INC-005: the agent knew ``tests/test_f11.py:59`` and spent two
+        rounds failing to see a syntax error the message would have
+        named).
     """
-    found = set()
+    found: dict[tuple[str, int], str] = {}
     for line in output.splitlines():
         for pattern in ERROR_LINE_PATTERNS:
             m = pattern.match(line)
             if m:
-                found.add((m.group("file"), int(m.group("line"))))
+                key = (m.group("file"), int(m.group("line")))
+                found.setdefault(key, line[m.end():].strip()[:240])
                 break
-    return sorted(found)
+    return [(file, line, found[(file, line)]) for file, line in sorted(found)]
+
+
+def repo_owned(path: str) -> bool:
+    """Whether an error location is this repo's code, so its baseline
+    can speak about it.
+
+    Traceback frames in the interpreter, the standard library or
+    installed packages are locations in someone else's code: they can
+    never appear in this repo's baseline, so as new_error findings they
+    are pure noise — noise that sorts before the repo's own line and
+    buried it (INC-005). The sandbox's HOME scratch (``<run>/.home``,
+    where a user-site install lands), absolute paths outside the repo,
+    parent escapes and frozen modules are the same class.
+
+    Args:
+        path: A repo-relative (or not) posix path, already through
+            :func:`repo_relative`.
+
+    Returns:
+        True when the path names a repo location.
+    """
+    if posixpath.isabs(path):
+        return False
+    parts = posixpath.normpath(path).split("/")
+    return (
+        parts[0] not in ("", "..", ".home")
+        and "site-packages" not in parts
+        and not parts[0].startswith("<frozen")
+    )
 
 
 def parse_test_count(output: str) -> int | None:
@@ -589,15 +625,23 @@ def run_l0(
                 )
                 continue
             cwd = command_cwd(command)
-            errors = sorted({(repo_relative(f, cwd, repo), n) for f, n in errors})
-            for file, line in errors:
+            errors = sorted(
+                {
+                    (repo_relative(f, cwd, repo), n, msg)
+                    for f, n, msg in errors
+                }
+            )
+            for file, line, message in errors:
+                if not repo_owned(file):
+                    continue  # a framework frame: never baselineable noise
                 if line in known_errors.get(file, set()):
                     preexisting.append(f"{file}:{line} pre-existing (baselined), not a failure")
                 else:
+                    where = f"{file}:{line}" + (f": {message}" if message else "")
                     findings.append(
                         Finding(
                             "new_error",
-                            f"{name}: new error at {file}:{line} (not in baseline)",
+                            f"{name}: new error at {where} (not in baseline)",
                             file=file,
                             line=line,
                         )
