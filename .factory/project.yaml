@@ -35,6 +35,10 @@ paths:
     - "TASK-CONTRACT.md"
     - "VALIDATOR-SPEC.md"
     - "CLAUDE.md"
+    # The code-owners' review contract (2026-10-26): it shapes what every
+    # reviewer judges, so a session can't edit it — same class as the
+    # spec docs above.
+    - "REVIEW.md"
     # F-33: the corpus that judges the sentinels is itself evidence a
     # session must not edit.
     - "corpus/**"
@@ -105,9 +109,13 @@ docs_allowlist:
 # independent review found 6 of 8 findings L2 missed, including a
 # convention violation CLAUDE.md states outright. The reviewer reads
 # these; the implementer never does (F-09 AC-5: standards live with the
-# reviewer, not under context pressure).
+# reviewer, not under context pressure). REVIEW.md is the code-owners'
+# review contract (evidence, truthfulness, nit budget) — the pattern
+# Anthropic's Claude Code team credits for their review-quality jump
+# (claude.dev/blog/solving-code-review-at-anthropic).
 standards:
   - CLAUDE.md
+  - REVIEW.md
 
 network_allowlist:
   - pypi.org
