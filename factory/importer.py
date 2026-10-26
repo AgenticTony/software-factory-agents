@@ -323,6 +323,11 @@ def _task_from_proposal(raw: Any, index: int, record_paths: set[str]) -> tuple[d
     task.setdefault(
         "gates", {"spec_approval": True, "merge": "human", "deploy": "human"}
     )
+    # attempts is the orchestrator's append-only log (TASK-CONTRACT §2) —
+    # never proposed (FORBIDDEN_FIELDS), but the record is born with the
+    # key so every reader of an imported task sees a list, never a
+    # KeyError on a field the schema leaves optional.
+    task.setdefault("attempts", [])
     return task, match
 
 
@@ -340,6 +345,10 @@ def _merge_task(existing: dict, proposed: dict) -> tuple[dict, list[str]]:
     merged = copy.deepcopy(existing)
     for spec_field in changed:
         merged[spec_field] = copy.deepcopy(proposed[spec_field])
+    # Same normalisation as a fresh task (_task_from_proposal): a queue
+    # written before the key existed (or by hand) still merges out with a
+    # list, not a missing key.
+    merged.setdefault("attempts", [])
     return merged, changed
 
 

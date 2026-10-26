@@ -68,20 +68,25 @@ def _profile_yaml() -> str:
 
 def _repo(tmp_path: Path, *, oos: dict[str, str] | None = None) -> Path:
     """A fixture project: planning docs, a profile, optionally the
-    out-of-scope register."""
+    out-of-scope register.
+
+    Idempotent: a test may call it twice against the same ``tmp_path``
+    (to add the register to a project it already built) — every
+    directory is created ``exist_ok`` so the second call extends the
+    first instead of raising ``FileExistsError``."""
     repo = tmp_path / "proj"
     docs = repo / "docs"
-    docs.mkdir(parents=True)
+    docs.mkdir(parents=True, exist_ok=True)
     (docs / "PLAN.md").write_text(
         "# Plan\n\n## WO-1: add search\n\nAcceptance: search finds a word.\n\n"
         "## WO-2: billing page\n\nAcceptance: the page renders an invoice.\n"
     )
     factory_dir = repo / ".factory"
-    factory_dir.mkdir()
+    factory_dir.mkdir(exist_ok=True)
     (factory_dir / "project.yaml").write_text(_profile_yaml())
     if oos:
         register = factory_dir / "out-of-scope"
-        register.mkdir()
+        register.mkdir(exist_ok=True)
         for name, text in oos.items():
             (register / name).write_text(text)
     return repo
