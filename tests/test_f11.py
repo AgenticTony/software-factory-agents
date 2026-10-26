@@ -235,7 +235,7 @@ def _history_repo(tmp_path: Path) -> Path:
     """A real repo whose history merges PRs 7 and 9 and reverts PR 7."""
     repo = tmp_path / "history"
     repo.mkdir()
-    _git(repo, "init", "-b", "main")
+    _review_git(repo, "init", "-b", "main")
     _git(repo, "config", "user.email", "test@factory.local")
     _git(repo, "config", "user.name", "factory test")
     (repo / "f.txt").write_text("a\n")
@@ -415,3 +415,156 @@ def test_ac_4(tmp_path: Path):
         for line in section.splitlines() if line.startswith("- ")
     ]
     assert rendered == list(VENT_CATEGORIES)
+
+
+# ------------------------------ review round (8 findings, 2026-10-26) -------
+
+
+def _review_git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(repo), *args], check=True,
+                   capture_output=True, text=True)
+
+
+def _review_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _review_git(repo, "init", "-q", "-b", "main")
+    (repo / "f").write_text("base\n")
+    _review_git(repo, "add", "-A")
+    _review_git(repo, "-c", "user.email=s@x", "-c", "user.name=s",
+         "commit", "-q", "-m", "base")
+    _review_git(repo, "checkout", "-q", "-b", "feature")
+    (repo / "g").write_text("later\n")
+    _review_git(repo, "add", "-A")
+    _review_git(repo, "-c", "user.email=s@x", "-c", "user.name=s",
+         "commit", "-q", "-m", "work on feature")
+    _review_git(repo, "checkout", "-q", "main")
+    (repo / "m").write_text("merged\n")
+    _review_git(repo, "add", "-A")
+    _review_git(repo, "-c", "user.email=s@x", "-c", "user.name=s",
+         "commit", "-q", "-m", "Task T-A (#7)")
+    _review_git(repo, "checkout", "-q", "feature")
+    return repo
+
+
+def test_review_f1_history_spans_all_branches(tmp_path: Path):
+    """F1: git_commits read HEAD only, so a clone checked out on a
+    feature branch (the orchestrator's clones always are) missed every
+    merge on main — approval-to-merge and reverts silently degraded to
+    nothing. History must span all refs."""
+    repo = _review_repo(tmp_path)
+    subjects = [c["subject"] for c in git_commits(repo)]
+    assert "Task T-A (#7)" in subjects, (
+        f"merge on main invisible from the feature checkout: {subjects}"
+    )
+
+
+def test_review_f4_merge_commit_style_prs_are_dated(tmp_path: Path):
+    """F4: only squash-merge subjects '(#N)' were recognised; repos
+    merged with merge commits ('Merge pull request #N from ...') were
+    never dated and their reverts never detected — the measure quietly
+    reads 0 there (the JobFinderOS pilot merges this way)."""
+    from factory.status import _merge_commit_for
+
+    commits = [
+        {"sha": "b" * 40, "subject": "Merge pull request #7 from owner/branch",
+         "body": "", "at": "2026-10-02T09:00:00Z"},
+    ]
+    found = _merge_commit_for(commits, "7")
+    assert found is not None and found["sha"] == "b" * 40
+    doc = _doc()
+    metrics = compute_metrics(doc, commits=commits)
+    assert metrics["approval_to_merge_days"] is not None
+
+
+def test_review_f2_awaiting_owner_all_done_is_truthful(tmp_path: Path):
+    """F2: an awaiting_owner task with every step ticked rendered 'no
+    owner steps recorded' — a false statement hiding a stuck task. The
+    page must distinguish all-done from none-exist."""
+    steps_done = [
+        {"text": "do the thing", "done": True,
+         "done_at": "2026-10-02T00:00:00Z", "done_by": "owner",
+         "evidence": "did it"},
+    ]
+    queue = {
+        "version": 1,
+        "tasks": [
+            _task("T-D", "awaiting_owner", owner_steps=steps_done),
+            _task("T-E", "awaiting_owner", owner_steps=[]),
+        ],
+    }
+    page = render_status(queue, project="fixture",
+                         factory_root=tmp_path, now=NOW)
+    assert "no owner steps recorded" in page  # T-E: none exist
+    assert "all owner steps done" in page, (
+        "all-done renders as 'no owner steps recorded': "
+        "a false statement hiding a stuck task\n" + page
+    )
+
+
+def test_review_f5b_unparsable_started_counts_as_a_note(tmp_path: Path):
+    """F5(b): attempts whose started stamp cannot be parsed were
+    silently dropped from the week's quota — spend hidden with no
+    signal, inconsistent with the vents seam's keep-and-note posture."""
+    bad = _attempt("20260101T000000Z-xx11", in_tok=500, out_tok=50)
+    bad["started"] = "not-a-stamp"
+    queue = {"version": 1, "tasks": [_task("T-F", "done", attempts=[bad])]}
+    page = render_status(queue, project="fixture",
+                         factory_root=tmp_path, now=NOW)
+    assert "1 attempt(s) without a parsable started stamp" in page, (
+        f"unparsable spend hidden silently:\n{page}"
+    )
+
+
+def test_review_f6_merge_before_approval_is_its_own_note(tmp_path: Path):
+    """F6: a merge stamp older than the approval was conflated with 'no
+    merge time'; neither cause was true. The anomaly gets its own arm."""
+    doc = _doc()
+    commits = [
+        {"sha": "a" * 40, "subject": "Task T-A (#7)", "body": "",
+         "at": "2026-09-01T09:00:00Z"},  # before approved_at (10-01)
+        {"sha": "c" * 40, "subject": "Task T-C (#9)", "body": "",
+         "at": "2026-10-07T12:00:00Z"},
+    ]
+    metrics = compute_metrics(doc, commits=commits)
+    assert metrics["merges_anomalous"] == 1
+    assert metrics["merges_undated"] == 0
+
+
+def test_review_f5_dead_merge_times_parameter_is_gone():
+    """F5: compute_metrics' merge_times parameter was dead code with a
+    docstring claiming tests used it — they never did."""
+    import inspect
+
+    params = inspect.signature(compute_metrics).parameters
+    assert "merge_times" not in params
+
+
+def test_review_f7_render_uses_the_group_it_already_has(tmp_path):
+    """F7: render re-walked the whole queue through needs_human_tasks
+    although by_status already held exactly the needs-human tasks. The
+    render must not depend on the second walk."""
+    import factory.status as status_module
+
+    queue = {
+        "version": 1,
+        "tasks": [
+            _task("T-G", "needs_human",
+                  attempts=[_attempt("20260101T000000Z-xx12",
+                                     outcome="escalated",
+                                     escalation="attempts_exhausted",
+                                     note="stub failed thrice")]),
+        ],
+    }
+    original = status_module.needs_human_tasks
+
+    def _boom(queue):
+        raise AssertionError("render re-walked the queue (F7)")
+
+    status_module.needs_human_tasks = _boom
+    try:
+        page = render_status(queue, project="fixture",
+                             factory_root=tmp_path, now=NOW)
+    finally:
+        status_module.needs_human_tasks = original
+    assert "T-G" in page and "attempts_exhausted" in page

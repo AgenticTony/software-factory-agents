@@ -48,9 +48,6 @@ from typing import Any
 from factory.vent import VENT_CATEGORIES, weeks_vents
 
 WEEK_DAYS = 7
-# A stamp that never falls inside the week window: an attempt without a
-# parsable start time can't be attributed to this week's spend.
-_EPOCH = datetime(1, 1, 1, tzinfo=timezone.utc)
 
 
 class StatusError(Exception):
@@ -101,6 +98,10 @@ def git_commits(repo: Path | str) -> list[dict[str, str]]:
 
     One subprocess, read-only. ``at`` is the committer date in ISO-8601 —
     the time a merge (or its revert) actually landed on the branch.
+    ``--all`` spans every ref: the caller may sit on a feature branch
+    (the orchestrator's clones always do) while the merges live on the
+    default branch, and the measures must not silently degrade to zero
+    there.
 
     Raises:
         StatusError: ``repo`` is not a git repository (or has no commits,
@@ -110,7 +111,7 @@ def git_commits(repo: Path | str) -> list[dict[str, str]]:
     try:
         proc = subprocess.run(
             [
-                "git", "-C", str(repo), "log",
+                "git", "-C", str(repo), "log", "--all",
                 "--pretty=format:%H%x1f%s%x1f%b%x1f%cI%x1e",
             ],
             capture_output=True,
@@ -136,10 +137,19 @@ def git_commits(repo: Path | str) -> list[dict[str, str]]:
 def _merge_commit_for(
     commits: list[dict[str, str]], number: str
 ) -> dict[str, str] | None:
-    """The newest commit whose subject ends in ``(#<number>)``."""
-    pattern = re.compile(rf"\(#{re.escape(number)}\)\s*$")
+    """The newest commit whose subject names the PR.
+
+    Both GitHub merge styles: a squash merge ends its subject with
+    ``(#N)``; a merge commit reads ``Merge pull request #N from ...``.
+    Repos that merge with merge commits (the JobFinderOS pilot does)
+    must date merges and detect reverts exactly like squash-merged ones.
+    """
+    squash = re.compile(rf"\(#{re.escape(number)}\)\s*$")
+    merge_commit = re.compile(rf"^Merge pull request #{re.escape(number)} from ")
     for commit in commits:
-        if pattern.search(commit["subject"]):
+        if squash.search(commit["subject"]) or merge_commit.match(
+            commit["subject"]
+        ):
             return commit
     return None
 
@@ -160,18 +170,15 @@ def _tokens(attempts: list[dict]) -> int:
 def compute_metrics(
     queue: dict,
     *,
-    merge_times: dict[str, str] | None = None,
     commits: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """The outcome measures (RESEARCH-SOFTWARE-FACTORY §9) from ``attempts``.
 
     Args:
         queue: The parsed, validated queue document.
-        merge_times: Optional ``pr url -> ISO stamp`` map; when given it
-            overrides the git-derived merge time (this is how tests pin
-            times without a repo).
         commits: Optional commit history (:func:`git_commits` shape) used
-            both to date merges (subject ``(#N)``) and to detect reverts.
+            both to date merges (squash ``(#N)`` and merge-commit
+            ``Merge pull request #N`` subjects) and to detect reverts.
 
     Returns:
         A dict with, per the module docstring: ``interventions_per_task``,
@@ -179,9 +186,11 @@ def compute_metrics(
         ``approval_to_merge_days`` (median), ``approval_to_merge_detail``
         (per-task ``(id, days)``), ``revert_share`` plus ``reverted`` /
         ``merged`` counts, the raw ``interventions`` / ``attempted_tasks``
-        / ``attempts`` / ``rounds`` counts, and ``merges_undated`` (merged
-        tasks whose merge time could not be established). Measures with no
-        data are None, never invented.
+        / ``attempts`` / ``rounds`` counts, ``merges_undated`` (merged
+        tasks whose merge time could not be established) and
+        ``merges_anomalous`` (a merge stamp older than the approval —
+        a wrong subject match or a hand-edited stamp, never missing
+        history). Measures with no data are None, never invented.
     """
     tasks = queue.get("tasks") or []
     attempts = [a for task in tasks for a in task.get("attempts") or []]
@@ -192,6 +201,7 @@ def compute_metrics(
 
     durations: list[tuple[str, float]] = []
     undated = 0
+    anomalous = 0
     merge_shas: list[str] = []
     for task in merged:
         url = (task.get("links") or {}).get("pr") or ""
@@ -199,11 +209,13 @@ def compute_metrics(
         commit = _merge_commit_for(commits, number) if commits and number else None
         if commit is not None:
             merge_shas.append(commit["sha"])
-        stamp = (merge_times or {}).get(url) or (commit or {}).get("at")
         approved = _parse_time(task.get("approved_at"))
-        merged_at = _parse_time(stamp)
-        if approved is None or merged_at is None or merged_at < approved:
+        merged_at = _parse_time((commit or {}).get("at"))
+        if approved is None or merged_at is None:
             undated += 1
+            continue
+        if merged_at < approved:
+            anomalous += 1
             continue
         durations.append((task.get("id", "?"), (merged_at - approved).total_seconds() / 86400))
 
@@ -230,25 +242,27 @@ def compute_metrics(
         "attempts": len(attempts),
         "rounds": rounds,
         "merges_undated": undated,
+        "merges_anomalous": anomalous,
     }
 
 
-def needs_human_tasks(queue: dict) -> list[dict[str, Any]]:
-    """Every ``needs_human`` task with its escalation reason.
+def _escalation_of(task: dict) -> tuple[str | None, str | None]:
+    """The task's escalation reason and note: the most recent attempt
+    that carries one (the orchestrator appends the escalation to the
+    attempt that produced it)."""
+    for attempt in reversed(task.get("attempts") or []):
+        if attempt.get("escalation"):
+            return attempt["escalation"], attempt.get("note")
+    return None, None
 
-    The reason is the most recent attempt that carries one (the orchestrator
-    appends the escalation to the attempt that produced it), plus its note.
-    """
+
+def needs_human_tasks(queue: dict) -> list[dict[str, Any]]:
+    """Every ``needs_human`` task with its escalation reason."""
     out: list[dict[str, Any]] = []
     for task in queue.get("tasks") or []:
         if task.get("status") != "needs_human":
             continue
-        escalation, note = None, None
-        for attempt in reversed(task.get("attempts") or []):
-            if attempt.get("escalation"):
-                escalation = attempt["escalation"]
-                note = attempt.get("note")
-                break
+        escalation, note = _escalation_of(task)
         out.append(
             {
                 "id": task.get("id", "?"),
@@ -315,6 +329,12 @@ def _render_metrics(metrics: dict[str, Any], notes: list[str]) -> list[str]:
             f"{metrics['merges_undated']} merged PR(s) without a merge time "
             "(no git history for the repo, or no (#N) merge commit)"
         )
+    if metrics["merges_anomalous"]:
+        notes.append(
+            f"{metrics['merges_anomalous']} merged PR(s) stamped before "
+            "approval (wrong subject match or hand-edited stamp — not "
+            "missing history)"
+        )
 
     if metrics["merged"] == 0:
         lines.append("- merged PRs later reverted: no merged PRs yet")
@@ -380,24 +400,33 @@ def render_status(
             continue
         if status == "needs_human":
             lines.append(f"- needs you ({len(group)}):")
-            for item in needs_human_tasks(queue):
-                reason = item["escalation"] or "no escalation recorded"
-                suffix = f": {item['note']}" if item["note"] else ""
-                lines.append(f"  - {item['id']} — {reason}{suffix}")
+            for task in group:
+                escalation, note = _escalation_of(task)
+                reason = escalation or "no escalation recorded"
+                suffix = f": {note}" if note else ""
+                lines.append(f"  - {task.get('id', '?')} — {reason}{suffix}")
         elif status == "awaiting_owner":
             lines.append(f"- awaiting owner ({len(group)}):")
             for task in group:
                 steps = task.get("owner_steps") or []
                 open_steps = [s for s in steps if not s.get("done")]
-                if open_steps:
+                if not steps:
+                    lines.append(
+                        f"  - {task.get('id', '?')} — no owner steps recorded"
+                    )
+                elif open_steps:
                     names = "; ".join(f'"{s.get("text", "?")}"' for s in open_steps)
                     lines.append(
                         f"  - {task.get('id', '?')} — "
                         f"{len(open_steps)} of {len(steps)} owner steps open: {names}"
                     )
                 else:
+                    # Every step done and still awaiting_owner: the closing
+                    # transition has not run (or was refused). Saying "no
+                    # steps" would be a false statement hiding a stuck task.
                     lines.append(
-                        f"  - {task.get('id', '?')} — no owner steps recorded"
+                        f"  - {task.get('id', '?')} — all owner steps done "
+                        "(still awaiting the done transition)"
                     )
         else:
             ids = ", ".join(t.get("id", "?") for t in group)
@@ -408,12 +437,23 @@ def render_status(
         lines.append(f"- {status} ({len(group)}): {ids}")
 
     # -- Quota used this week ---------------------------------------------
-    week_attempts = [
-        a
-        for task in tasks
-        for a in task.get("attempts") or []
-        if (_parse_time(a.get("started")) or _EPOCH) >= horizon
-    ]
+    notes: list[str] = []
+    week_attempts = []
+    unparsable = 0
+    for task in tasks:
+        for attempt in task.get("attempts") or []:
+            started = _parse_time(attempt.get("started"))
+            if started is None:
+                # Keep the gap visible (the vents seam's posture): a
+                # malformed stamp must not hide spend from the owner.
+                unparsable += 1
+            elif started >= horizon:
+                week_attempts.append(attempt)
+    if unparsable:
+        notes.append(
+            f"{unparsable} attempt(s) without a parsable started stamp, "
+            "excluded from the week's quota"
+        )
     lines += ["", "## Quota used this week", ""]
     lines.append(
         f"{_tokens(week_attempts):,} tokens across {len(week_attempts)} attempt(s) "
@@ -421,7 +461,6 @@ def render_status(
     )
 
     # -- The week's vents (through the F-27 seam) --------------------------
-    notes: list[str] = []
     unreadable: list[str] = []
     grouped = weeks_vents(factory_root, project, now=moment, unreadable=unreadable)
     lines += ["", "## The week's vents", ""]
