@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-25T18:49:31Z",
+  "updated_at": "2026-10-26T13:29:01Z",
   "tasks": [
     {
       "id": "F-00",
@@ -835,7 +835,7 @@
       "source": "BUILD-ORDER.md#f-11--factory-status-daily-summary--metrics",
       "kind": "build",
       "priority": "P1",
-      "status": "ready",
+      "status": "in_review",
       "depends_on": [
         "F-03",
         "F-23",
@@ -889,8 +889,55 @@
         "max_turns": 80,
         "wall_clock_min": 60
       },
-      "attempts": [],
-      "links": {},
+      "attempts": [
+        {
+          "run_id": "20261025T195007Z-de366c",
+          "slice_id": "F-11",
+          "started": "2026-10-25T19:50:08Z",
+          "ended": "2026-10-25T20:25:36Z",
+          "outcome": "pass",
+          "rounds": 1,
+          "turns": 63,
+          "input_tokens": 209573,
+          "output_tokens": 54000,
+          "prompt_versions": {
+            "implementer": "450474df374a4532602a1acb92244fc808e83d9fe75f2165fd2a92bd77c37863",
+            "reviewer": "2a21f504adfc3d054351a84b0f2f57684bf3b08f17bf05e3cc6f61f79bf46f6f"
+          },
+          "skills": [],
+          "model": "implementer=claude-opus-5-5 reviewer=claude-opus-5-5",
+          "validator_report": "/Users/anthonyforan/factory/reports/software-factory/F-11/20261025T195007Z-de366c-a1.json",
+          "pr": "https://github.com/AgenticTony/software-factory-agents/pull/58",
+          "sentinels": [
+            {
+              "name": "assertion_removed",
+              "kind": "builtin",
+              "verdict": "pass"
+            },
+            {
+              "name": "credential_added",
+              "kind": "builtin",
+              "verdict": "pass"
+            },
+            {
+              "name": "lint_suppression_added",
+              "kind": "builtin",
+              "verdict": "pass",
+              "detail": "no risk path touched"
+            },
+            {
+              "name": "skip_marker_added",
+              "kind": "builtin",
+              "verdict": "pass"
+            }
+          ]
+        }
+      ],
+      "links": {
+        "pr": "https://github.com/AgenticTony/software-factory-agents/pull/58",
+        "branch": "factory/f-11-20261025t195007z-de366c",
+        "merged": "https://github.com/AgenticTony/software-factory-agents/pull/58"
+      },
       "acceptance_hash": "17b554e9eb39ee0a63bb9a4af65eac91d35440b10c621c59bf36628b6038e647",
       "approved_at": "2026-10-24T23:22:15Z",
       "approved_by": "Anthony"
@@ -901,7 +948,7 @@
       "source": "BUILD-ORDER.md#f-12--importer-factory-import",
       "kind": "build",
       "priority": "P1",
-      "status": "ready",
+      "status": "in_review",
       "depends_on": [
         "F-06",
         "F-02",
@@ -956,8 +1003,100 @@
         "max_turns": 200,
         "wall_clock_min": 150
       },
-      "attempts": [],
-      "links": {},
+      "attempts": [
+        {
+          "run_id": "20261026T101110Z-3e3d49",
+          "slice_id": "F-12",
+          "started": "2026-10-26T10:11:11Z",
+          "ended": "2026-10-26T10:40:11Z",
+          "outcome": "fail",
+          "rounds": 1,
+          "turns": 56,
+          "input_tokens": 374200,
+          "output_tokens": 50092,
+          "prompt_versions": {
+            "implementer": "f0250840595e297922e1313a419f7de14de32bc2d4b6392ef15386fa9b70856b",
+            "reviewer": "0129bcf66ca222b186318704bea9bcd4801c70756a4d2f75926deb258f5a83ae"
+          },
+          "skills": [],
+          "model": "implementer=claude-opus-5-5",
+          "validator_report": "/Users/anthonyforan/factory/reports/software-factory/F-12/20261026T101110Z-3e3d49-a1.json",
+          "sentinels": [
+            {
+              "name": "assertion_removed",
+              "kind": "builtin",
+              "verdict": "pass"
+            },
+            {
+              "name": "credential_added",
+              "kind": "builtin",
+              "verdict": "pass"
+            },
+            {
+              "name": "lint_suppression_added",
+              "kind": "builtin",
+              "verdict": "pass",
+              "detail": "no risk path touched"
+            },
+            {
+              "name": "skip_marker_added",
+              "kind": "builtin",
+              "verdict": "pass"
+            }
+          ]
+        },
+        {
+          "run_id": "20261026T101110Z-3e3d49",
+          "slice_id": "F-12",
+          "started": "2026-10-26T10:40:11Z",
+          "ended": "2026-10-26T11:04:15Z",
+          "outcome": "pass",
+          "rounds": 2,
+          "turns": 33,
+          "input_tokens": 143266,
+          "output_tokens": 27983,
+          "prompt_versions": {
+            "implementer": "f0250840595e297922e1313a419f7de14de32bc2d4b6392ef15386fa9b70856b",
+            "reviewer": "0129bcf66ca222b186318704bea9bcd4801c70756a4d2f75926deb258f5a83ae"
+          },
+          "skills": [],
+          "model": "implementer=claude-opus-5-5 reviewer=claude-opus-5-5",
+          "validator_report": "/Users/anthonyforan/factory/reports/software-factory/F-12/20261026T101110Z-3e3d49-a2.json",
+          "pr": "https://github.com/AgenticTony/software-factory-agents/pull/61",
+          "sentinels": [
+            {
+              "name": "assertion_removed",
+              "kind": "builtin",
+              "verdict": "pass"
+            },
+            {
+              "name": "credential_added",
+              "kind": "builtin",
+              "verdict": "pass"
+            },
+            {
+              "name": "lint_suppression_added",
+              "kind": "builtin",
+              "verdict": "pass",
+              "detail": "no risk path touched"
+            },
+            {
+              "name": "skip_marker_added",
+              "kind": "builtin",
+              "verdict": "pass"
+            }
+          ]
+        }
+      ],
+      "links": {
+        "pr": "https://github.com/AgenticTony/software-factory-agents/pull/61",
+        "branch": "factory/f-12-20261026t101110z-3e3d49",
+        "revalidated": {
+          "pr": "e291ddf4f185769c48a62eebc4e8e381774d13d3",
+          "default": "832d066e69ea10fd8903e63ffc939a8f62364485"
+        },
+        "merged": "https://github.com/AgenticTony/software-factory-agents/pull/61"
+      },
       "acceptance_hash": "c951aa6ef9d7b1b1cf4140383281e97db4b63cc826b3355ea1e75f6444b3ba2e",
       "approved_at": "2026-10-24T23:22:16Z",
       "approved_by": "Anthony"
@@ -1845,7 +1984,7 @@
       "source": "BUILD-ORDER.md#f-28--dogfood-pilot-the-factory-builds-its-own-safe-work-orders",
       "kind": "owner_only",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-23",
         "F-24",
@@ -1873,23 +2012,38 @@
       "owner_steps": [
         {
           "text": "Extend `paths.protected` in this repo's `.factory/project.yaml` (by PR) to cover what judges agents: `factory/l0.py`, `factory/l1.py`, `factory/l2.py`, `factory/gates.py`, `factory/sandbox.py`, `factory/session.py`, `factory/publish.py`, `factory/orchestrator.py`, `factory/prompts.py`, `factory/trace.py`, `prompts/**` and every existing `tests/test_f*.py`, on top of today's `.factory/**`, `.github/workflows/**`, `schema/**`, the two spec files and `CLAUDE.md`. This repo is private on a free plan, so it can't have branch protection (see F-10 AC-13): declare `branch_protection: unavailable` in the same PR, so F-26 runs with its own up-to-date check instead of refusing. Nothing server-side then stops a stale merge, so merge factory PRs only after `factory run` has reported them ready against the current `main`.",
-          "done": false
+          "done": true,
+          "done_at": "2026-10-26T13:29:01Z",
+          "done_by": "Anthony",
+          "evidence": "PR #52 (protected paths enumerated, glob-deadlock avoided, branch_protection verified vs plan-limit 403); readiness clean-clone green on 1192d02 after PR #53 fixed setup's missing npm ci (142 failures caught); F-11+F-12 approved 2026-10-24 (hashes 17b554e9/c951aa6e); factory run -> PR #58 (1 round) and factory loop -> PR #61 (2 rounds), both owner-reviewed and merged; baseline recorded: F-11 needed fix PR #59 (independent review 8 findings, L2 missed 6), F-12 L2 sharper with standards wired; INC-005/006/007 harness fixes through PRs #54/#55/#57"
         },
         {
           "text": "Readiness run on a clean clone: every profile command passes unattended (the F-24 rehearsal covers the mechanics).",
-          "done": false
+          "done": true,
+          "done_at": "2026-10-26T13:29:01Z",
+          "done_by": "Anthony",
+          "evidence": "PR #52 (protected paths enumerated, glob-deadlock avoided, branch_protection verified vs plan-limit 403); readiness clean-clone green on 1192d02 after PR #53 fixed setup's missing npm ci (142 failures caught); F-11+F-12 approved 2026-10-24 (hashes 17b554e9/c951aa6e); factory run -> PR #58 (1 round) and factory loop -> PR #61 (2 rounds), both owner-reviewed and merged; baseline recorded: F-11 needed fix PR #59 (independent review 8 findings, L2 missed 6), F-12 L2 sharper with standards wired; INC-005/006/007 harness fixes through PRs #54/#55/#57"
         },
         {
           "text": "Approve F-11 and F-12 only. Their code (`factory/cli.py` status and import commands, new modules) is outside every protected path; the orchestrator adds their own contract tests to the protected set at approval.",
-          "done": false
+          "done": true,
+          "done_at": "2026-10-26T13:29:01Z",
+          "done_by": "Anthony",
+          "evidence": "PR #52 (protected paths enumerated, glob-deadlock avoided, branch_protection verified vs plan-limit 403); readiness clean-clone green on 1192d02 after PR #53 fixed setup's missing npm ci (142 failures caught); F-11+F-12 approved 2026-10-24 (hashes 17b554e9/c951aa6e); factory run -> PR #58 (1 round) and factory loop -> PR #61 (2 rounds), both owner-reviewed and merged; baseline recorded: F-11 needed fix PR #59 (independent review 8 findings, L2 missed 6), F-12 L2 sharper with standards wired; INC-005/006/007 harness fixes through PRs #54/#55/#57"
         },
         {
           "text": "`factory run` once, watching; review and merge or reject the PR yourself. Then `factory loop` for the second.",
-          "done": false
+          "done": true,
+          "done_at": "2026-10-26T13:29:01Z",
+          "done_by": "Anthony",
+          "evidence": "PR #52 (protected paths enumerated, glob-deadlock avoided, branch_protection verified vs plan-limit 403); readiness clean-clone green on 1192d02 after PR #53 fixed setup's missing npm ci (142 failures caught); F-11+F-12 approved 2026-10-24 (hashes 17b554e9/c951aa6e); factory run -> PR #58 (1 round) and factory loop -> PR #61 (2 rounds), both owner-reviewed and merged; baseline recorded: F-11 needed fix PR #59 (independent review 8 findings, L2 missed 6), F-12 L2 sharper with standards wired; INC-005/006/007 harness fixes through PRs #54/#55/#57"
         },
         {
           "text": "Record per attempt: rounds, your review time, findings you raised that L2 missed, and whether the merged change needed a fix later. That is the baseline F-11 then reports automatically.",
-          "done": false
+          "done": true,
+          "done_at": "2026-10-26T13:29:01Z",
+          "done_by": "Anthony",
+          "evidence": "PR #52 (protected paths enumerated, glob-deadlock avoided, branch_protection verified vs plan-limit 403); readiness clean-clone green on 1192d02 after PR #53 fixed setup's missing npm ci (142 failures caught); F-11+F-12 approved 2026-10-24 (hashes 17b554e9/c951aa6e); factory run -> PR #58 (1 round) and factory loop -> PR #61 (2 rounds), both owner-reviewed and merged; baseline recorded: F-11 needed fix PR #59 (independent review 8 findings, L2 missed 6), F-12 L2 sharper with standards wired; INC-005/006/007 harness fixes through PRs #54/#55/#57"
         }
       ]
     },
