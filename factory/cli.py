@@ -1,9 +1,9 @@
 """Factory CLI — the control-plane entry point.
 
-``approve`` (F-04), ``run`` and ``loop`` (F-10), ``tick`` (F-29),
-``trace`` (F-30) and ``sentinels replay`` (F-33) are real. Every other
-subcommand is a stub naming the work order that implements it
-(BUILD-ORDER.md).
+``approve`` (F-04), ``run`` and ``loop`` (F-10), ``status`` (F-11),
+``tick`` (F-29), ``trace`` (F-30) and ``sentinels replay`` (F-33) are
+real. Every other subcommand is a stub naming the work order that
+implements it (BUILD-ORDER.md).
 """
 
 import argparse
@@ -18,7 +18,7 @@ from factory.approve import (
     recover_task,
 )
 from factory.config import ConfigError, load_config
-from factory.contract import ContractError, load_profile
+from factory.contract import ContractError, load_profile, load_tasks
 from factory.gates import GateError
 from factory.orchestrator import run_loop, run_once
 from factory.prbody import PRBodyError
@@ -29,6 +29,7 @@ from factory.runs import FACTORY_ROOT_DEFAULT, RUN_ID_RE, RunError
 from factory.sandbox import SandboxError
 from factory.session import SessionConfigError
 from factory.state import TaskQueue, run_lease_held
+from factory.status import StatusError, render_status
 from factory.tick import TickError, tick_steps
 from factory.trace import read_trace, trace_path
 
@@ -44,7 +45,6 @@ _RUN_ERRORS = (ConfigError, ContractError, GateError, PRBodyError, ProgressLogEr
 
 # subcommand -> the work order that implements it
 STUBS: dict[str, str] = {
-    "status": "F-11",
     "import": "F-12",
     "verify-live": "F-14",
 }
@@ -146,6 +146,21 @@ def build_parser() -> argparse.ArgumentParser:
         cmd.add_argument("--config", default=None,
                          help="factory config (default: <factory-root>/config.yaml)")
 
+    status = sub.add_parser("status", help="daily summary and metrics (F-11)")
+    status.add_argument(
+        "--queue", default=".factory/tasks.json",
+        help="queue file (default: %(default)s)",
+    )
+    status.add_argument(
+        "--factory-root", default=None,
+        help="factory root (default: ~/factory)",
+    )
+    status.add_argument(
+        "--repo", default=".",
+        help="project repo, for merge times and revert detection "
+             "(default: the current directory)",
+    )
+
     for name, wo in STUBS.items():
         sub.add_parser(name, help=f"stub — implemented in {wo}")
     return parser
@@ -244,6 +259,23 @@ def _run_trace(args: argparse.Namespace) -> int:
         return 1
     except KeyboardInterrupt:
         print("factory trace: interrupted", file=sys.stderr)
+        return 130
+
+
+def _run_status(args: argparse.Namespace) -> int:
+    """Dispatch the status subcommand (F-11). It reads only; an unreadable
+    queue exits 1 with a message, never a traceback."""
+    try:
+        queue = load_tasks(args.queue)
+        root = Path(args.factory_root) if args.factory_root else FACTORY_ROOT_DEFAULT
+        print(render_status(queue, project=queue["project"], factory_root=root,
+                            repo=Path(args.repo)))
+        return 0
+    except (ContractError, StatusError, KeyError, OSError) as exc:
+        print(f"factory status: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("factory status: interrupted", file=sys.stderr)
         return 130
 
 
@@ -350,6 +382,8 @@ def main(argv: list | None = None) -> int:
         return _run_tick(args)
     if args.command == "trace":
         return _run_trace(args)
+    if args.command == "status":
+        return _run_status(args)
     if args.command == "sentinels":
         return _run_sentinels_replay(args)
     print(
