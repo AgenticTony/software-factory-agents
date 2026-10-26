@@ -1,9 +1,9 @@
 """Factory CLI — the control-plane entry point.
 
 ``approve`` (F-04), ``run`` and ``loop`` (F-10), ``status`` (F-11),
-``tick`` (F-29), ``trace`` (F-30) and ``sentinels replay`` (F-33) are
-real. Every other subcommand is a stub naming the work order that
-implements it (BUILD-ORDER.md).
+``tick`` (F-29), ``trace`` (F-30), ``sentinels replay`` (F-33) and
+``import`` (F-12) are real. Every other subcommand is a stub naming the
+work order that implements it (BUILD-ORDER.md).
 """
 
 import argparse
@@ -20,6 +20,7 @@ from factory.approve import (
 from factory.config import ConfigError, load_config
 from factory.contract import ContractError, load_profile, load_tasks
 from factory.gates import GateError
+from factory.importer import apply_import, run_import
 from factory.orchestrator import run_loop, run_once
 from factory.prbody import PRBodyError
 from factory.progress import ProgressLogError
@@ -45,7 +46,6 @@ _RUN_ERRORS = (ConfigError, ContractError, GateError, PRBodyError, ProgressLogEr
 
 # subcommand -> the work order that implements it
 STUBS: dict[str, str] = {
-    "import": "F-12",
     "verify-live": "F-14",
 }
 
@@ -159,6 +159,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--repo", default=".",
         help="project repo, for merge times and revert detection "
              "(default: the current directory)",
+    )
+
+    import_cmd = sub.add_parser(
+        "import", help="propose tasks.json from the planning docs (F-12)"
+    )
+    import_cmd.add_argument(
+        "--repo", default=".",
+        help="project repo root (default: the current directory)",
+    )
+    import_cmd.add_argument(
+        "--queue", default=None,
+        help="queue file (default: <repo>/.factory/tasks.json)",
+    )
+    import_cmd.add_argument(
+        "--docs", default="docs",
+        help="planning-docs directory, repo-relative (default: %(default)s)",
+    )
+    import_cmd.add_argument(
+        "--proposal", default=None,
+        help="review a prepared proposal JSON instead of running the "
+             "importer session",
     )
 
     for name, wo in STUBS.items():
@@ -279,6 +300,40 @@ def _run_status(args: argparse.Namespace) -> int:
         return 130
 
 
+def _run_import(args: argparse.Namespace) -> int:
+    """Dispatch the import subcommand (F-12). Proposes ``tasks.json``
+    from the project's planning docs, shows the full diff and writes
+    nothing until you confirm; a refusal exits 1, never a traceback."""
+    session = None
+    if args.proposal:
+        proposal_text = Path(args.proposal).read_text()
+
+        def session(prompt: str) -> str:
+            return proposal_text
+
+    try:
+        result = run_import(
+            Path(args.repo), args.queue, docs_dir=args.docs, session=session
+        )
+        print(result.summary)
+        if not result.plan.diff:
+            print("factory import: nothing to change.")
+            return 0
+        answer = input(f"Apply this import to {result.queue_path}? [y/N] ")
+        if answer.strip().lower() != "y":
+            print("factory import: nothing written.")
+            return 0
+        apply_import(result.plan, result.queue_path, confirm=lambda: True)
+        print(f"factory import: wrote {result.queue_path}")
+        return 0
+    except (ContractError, OSError) as exc:
+        print(f"factory import: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("factory import: interrupted", file=sys.stderr)
+        return 130
+
+
 def _run_sentinels_replay(args: argparse.Namespace) -> int:
     """Dispatch the sentinels replay subcommand (F-33 AC-4). It reads
     only; misuse, a missing corpus and a missing patch exit 1 with a
@@ -357,9 +412,10 @@ def main(argv: list | None = None) -> int:
         argv: Arguments without the program name; defaults to sys.argv[1:].
 
     Returns:
-        Process exit code. Stubs return 2 (not implemented); approve
-        and tick return 0 on success and 1 on any refusal or decline; run/loop
-        per ``_EXIT`` (2 when the orchestrator itself failed).
+        Process exit code. Stubs return 2 (not implemented); approve,
+        tick and import return 0 on success and 1 on any refusal or
+        decline; run/loop per ``_EXIT`` (2 when the orchestrator itself
+        failed).
     """
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -386,6 +442,8 @@ def main(argv: list | None = None) -> int:
         return _run_status(args)
     if args.command == "sentinels":
         return _run_sentinels_replay(args)
+    if args.command == "import":
+        return _run_import(args)
     print(
         f"factory {args.command}: not implemented yet (scheduled in {STUBS[args.command]})",
         file=sys.stderr,
