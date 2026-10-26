@@ -256,3 +256,8 @@ The strongest warnings in the set, chiefly from HumanLayer's talk:
 ---
 
 *Synthesized from full transcripts, Oct 15 2026. Original transcripts (cleaned) retained at `/tmp/watch_sf/*/clean.txt` until cleanup.*
+
+## 15. Sources addendum (October 2026, F-28 dogfood)
+
+- [Anthropic — When to fold subagents into your main agent loop](https://claude.com/resources/articles/building-agents-when-to-fold-subagents-into-your-main-agent-loop): split seats by context, not problem type; procedures belong in skills, hard limits in tools; measure before adding structure. Validates the factory's implementer/reviewer context split (reviewer independence) and the F-32/F-22 direction; rules out future orchestrating sub-seats.
+- [Anthropic — How the Claude Code team does code review](https://claude.dev/blog/solving-code-review-at-anthropic): ~90% agent-written code at 30,000+ merges/day; review quality from parallel review agents plus a verifier group voting findings in or out (substantive comments 16%→54%; one-round convergence 65%→78%); risk tiers set by a classifier, never the author; agent approvals never count; revert share fell >40% while volume doubled. Direct source for F-38 and the F-21 trigger weighting. Our own F-28 baseline agrees: independent review found 8 findings on the first dogfood PR, the single L2 reviewer caught 2.

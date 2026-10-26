@@ -2678,6 +2678,76 @@
       },
       "attempts": [],
       "links": {}
+    },
+    {
+      "id": "F-38",
+      "title": "Parallel review with verifier voting",
+      "source": "BUILD-ORDER.md#f-38--parallel-review-with-verifier-voting",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-09",
+        "F-23"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "The orchestrator runs N reviewer sessions (config, default 2) over the same diff in parallel, each a fresh context, then a verifier pass over the union of findings: each finding is kept with the voter's reasoning or dropped; survivors are ranked and tagged important / nit / pre-existing.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f38.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Style-only and diagnostic findings are dropped before the verdict, and at most three non-blocking findings reach the PR body — REVIEW.md's nit budget, mechanically enforced.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f38.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "Dropped findings and the drop reason land in the attempt record, so F-19 can measure the reviewer noise the verifier removed.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f38.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "Standing eval: on a seeded-diff corpus (F-16's fixtures), every known-bug diff is caught by the surviving findings and every known-clean diff draws zero blocking findings; the corpus runs in CI.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f38.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "`prompt_versions` records every reviewer and verifier prompt hash; the fan-out is inside the attempt's turn and wall-clock budget.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f38.py::test_ac_5"
+          }
+        }
+      ],
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      },
+      "attempts": [],
+      "links": {}
     }
   ]
 }
