@@ -99,6 +99,16 @@ docs_allowlist:
   - json-schema.org
   - docs.z.ai
 
+# F-11 review round (2026-10-26): the L2 reviewer ran the smell baseline
+# only — this repo's own conventions (conventional commits with the WO
+# id, branch naming, one-branch-per-work-order) never reached it, and an
+# independent review found 6 of 8 findings L2 missed, including a
+# convention violation CLAUDE.md states outright. The reviewer reads
+# these; the implementer never does (F-09 AC-5: standards live with the
+# reviewer, not under context pressure).
+standards:
+  - CLAUDE.md
+
 network_allowlist:
   - pypi.org
   - files.pythonhosted.org
