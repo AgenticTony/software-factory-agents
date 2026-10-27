@@ -7,7 +7,7 @@ and no failure marker fired, nothing explains the non-zero exit: it must
 still produce ``command_failed``, never a pass (fail-closed).
 """
 
-from test_f07 import BASE_PROFILE, _change, _repo, _run
+from test_f07 import BASE_PROFILE, _change, _git, _repo, _run
 
 from factory.gates import CommandResult
 
@@ -122,3 +122,90 @@ def test_foreign_only_with_marker_reports_one_command_failed(tmp_path):
     )
     assert report.verdict == "fail"
     assert [f.id for f in report.findings] == ["command_failed"]
+
+
+# --- Round 2: ADDED files matching paths.protected ------------------------
+#
+# Protection fired only for modified/deleted paths, so a session could
+# create a new conftest.py (or any file under a protected glob) and alter
+# how the contract tests run without tripping L0. Added files matching
+# ``paths.protected`` now FAIL too; the task's own contract test files
+# stay addable, since the implementer must create them red-first.
+
+
+def _protected_profile(*globs):
+    profile = dict(BASE_PROFILE)
+    profile["paths"] = {"risk": {}, "protected": list(globs)}
+    return profile
+
+
+def test_added_conftest_at_new_depth_fails(tmp_path):
+    repo = _repo(tmp_path, "newconf", {"tests/conftest.py": "\n", "lib/foo.py": "x = 1\n"})
+    _change(
+        repo,
+        files={"tests/sub/conftest.py": "collect_ignore_glob = ['*']\n"},
+    )
+    report = _run(repo, _protected_profile("tests/**/conftest.py"))
+    assert report.verdict == "fail"
+    assert "protected_path_touched" in report.escalations
+    hits = [f for f in report.findings if f.id == "protected_path_touched"]
+    assert [f.file for f in hits] == ["tests/sub/conftest.py"], report.findings
+    assert hits[0].text == "protected path added: tests/sub/conftest.py"
+
+
+def test_added_file_matching_protected_glob_fails(tmp_path):
+    repo = _repo(tmp_path, "newprot", {"schema/tasks.schema.json": "{}\n"})
+    _change(repo, files={"schema/override.schema.json": "{}\n"})
+    report = _run(repo, _protected_profile("schema/**"))
+    assert report.verdict == "fail"
+    assert "protected_path_touched" in report.escalations
+    assert [f.file for f in report.findings if f.id == "protected_path_touched"] == [
+        "schema/override.schema.json"
+    ]
+
+
+def test_added_copy_matching_protected_glob_fails(tmp_path):
+    """git's copy status (C) is an add of the new path."""
+    body = "".join(f"line {i}\n" for i in range(40))
+    repo = _repo(tmp_path, "copyprot", {"lib/src.txt": body})
+    _git(repo, "checkout", "-b", "feature")
+    (repo / "schema").mkdir()
+    (repo / "schema" / "src.txt").write_text(body)
+    (repo / "lib" / "src.txt").write_text(body + "more\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "copy")
+    report = _run(repo, _protected_profile("schema/**"))
+    assert report.verdict == "fail"
+    assert [f.file for f in report.findings if f.id == "protected_path_touched"] == [
+        "schema/src.txt"
+    ]
+
+
+def test_task_own_new_contract_test_file_may_be_added(tmp_path):
+    """The contract test file is created red-first by the implementer:
+    adding it is the job, even when a profile glob also covers it."""
+    repo = _repo(tmp_path, "newcontract", {"lib/foo.py": "x = 1\n"})
+    _change(
+        repo,
+        files={
+            "lib/foo.py": "x = 2\n",
+            "tests/test_thing.py": "def test_t():\n    assert 1\n",
+        },
+    )
+    task = {
+        "id": "T-9",
+        "risk": [],
+        "acceptance": [
+            {
+                "id": "AC-1",
+                "text": "it works",
+                "check": {"type": "test", "ref": "tests/test_thing.py::test_t"},
+            }
+        ],
+    }
+    report = _run(repo, _protected_profile("tests/**"), task=task)
+    assert not [f for f in report.findings if f.id == "protected_path_touched"], (
+        report.findings
+    )
+    assert "protected_path_touched" not in report.escalations
+    assert report.verdict == "pass", report.findings
