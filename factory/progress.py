@@ -68,7 +68,14 @@ class ProgressLog:
             return [], GENESIS
         entries: list[dict] = []
         prev = GENESIS
-        for number, line in enumerate(self.path.read_text().splitlines(), start=1):
+        # An undecodable byte is a rewritten log like any other: refuse it
+        # as ProgressLogError, never a raw UnicodeDecodeError past the
+        # chain check (PR #63 round 3).
+        try:
+            text = self.path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise ProgressLogError(f"{self.path}: log is not valid UTF-8: {exc}") from exc
+        for number, line in enumerate(text.splitlines(), start=1):
             try:
                 record = json.loads(line)
             except json.JSONDecodeError as exc:
@@ -145,7 +152,7 @@ class ProgressLog:
                     prev = _digest(line)
                     stored.append(record)
                     lines.append(line + "\n")
-                with self.path.open("a") as fh:
+                with self.path.open("a", encoding="utf-8") as fh:
                     fh.write("".join(lines))
                     fh.flush()
                     os.fsync(fh.fileno())

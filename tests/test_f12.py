@@ -523,13 +523,16 @@ def test_r2_missing_proposal_file_exits_1_never_traceback(tmp_path: Path, capsys
 
 def test_r2_binary_proposal_file_exits_1_never_traceback(tmp_path: Path, capsys):
     """R-2: a binary --proposal file raises UnicodeDecodeError (a
-    ValueError); contract._read turns it into a ContractError refusal."""
+    ValueError); contract.read_file turns it into a ContractError refusal."""
     repo = _repo(tmp_path)
     binary = tmp_path / "bin.md"
     binary.write_bytes(b"\xff\xfe\x00")
     rc = main(["import", "--repo", str(repo), "--proposal", str(binary)])
     assert rc == 1
-    assert "factory import:" in capsys.readouterr().err
+    # The specific refusal, not just the prefix any refusal prints
+    # (PR #63 round 3, finding 7).
+    err = capsys.readouterr().err
+    assert "bin.md" in err and "not valid UTF-8" in err
     assert not (repo / ".factory" / "tasks.json").exists()
 
 
@@ -549,3 +552,142 @@ def test_r3_eof_at_confirm_writes_nothing(tmp_path: Path, capsys, monkeypatch):
     assert rc == 1
     assert "nothing written" in capsys.readouterr().err
     assert not (repo / ".factory" / "tasks.json").exists()
+
+
+def test_r3_explicit_n_declines_with_exit_0(tmp_path: Path, capsys, monkeypatch):
+    """The documented exit contract (main()'s docstring): an explicit
+    answer other than "y" is the one exit-0 decline — distinct from
+    the EOF refusal's exit 1 (PR #63 round 3, finding 8)."""
+    repo = _repo(tmp_path)
+    proposal = tmp_path / "proposal.json"
+    proposal.write_text(_proposal(_wo("WO-1")))
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    rc = main(["import", "--repo", str(repo), "--proposal", str(proposal)])
+    assert rc == 0
+    assert "nothing written" in capsys.readouterr().out
+    assert not (repo / ".factory" / "tasks.json").exists()
+
+
+# ----------------------------------- PR #63 review round 3: read class --
+
+
+def test_eof_outside_the_prompt_is_not_reported_as_stdin(tmp_path: Path, capsys,
+                                                        monkeypatch):
+    """Only the [y/N] prompt's EOFError means "no answer on stdin" — an
+    EOFError from anywhere else is not misdiagnosed as one (finding 4)."""
+    repo = _repo(tmp_path)
+    proposal = tmp_path / "proposal.json"
+    proposal.write_text(_proposal(_wo("WO-1")))
+
+    def broken(*args, **kwargs):
+        raise EOFError("from the importer, not stdin")
+
+    monkeypatch.setattr("factory.cli.run_import", broken)
+    with pytest.raises(EOFError, match="from the importer"):
+        main(["import", "--repo", str(repo), "--proposal", str(proposal)])
+    assert "no answer on stdin" not in capsys.readouterr().err
+
+
+def test_empty_proposal_path_refuses_never_starts_a_session(tmp_path: Path,
+                                                            capsys, monkeypatch):
+    """``--proposal ""`` (an unset shell variable) is a missing file,
+    not "no --proposal given": it refuses, exit 1, and never launches
+    the model session (finding 9)."""
+    repo = _repo(tmp_path)
+
+    def no_session(*args, **kwargs):
+        raise AssertionError("the importer session was launched")
+
+    monkeypatch.setattr("factory.importer.sdk_import_session", no_session)
+    rc = main(["import", "--repo", str(repo), "--proposal", ""])
+    assert rc == 1
+    assert "--proposal is empty" in capsys.readouterr().err
+    assert not (repo / ".factory" / "tasks.json").exists()
+
+
+def test_read_file_is_public_contract_api():
+    """The refusing reader the CLI shares is public, not a private
+    import across modules (finding 6)."""
+    from factory import cli, contract
+
+    assert cli.read_file is contract.read_file
+    assert not hasattr(contract, "_read")
+
+
+@pytest.fixture
+def latin1_locale(monkeypatch):
+    """Simulate a non-UTF-8 locale (Windows cp1252, ISO-8859-1): every
+    read that leaves the encoding to the locale decodes as latin-1,
+    under which any byte string is "valid" text."""
+    import io
+
+    real = io.text_encoding
+    monkeypatch.setattr(
+        io, "text_encoding",
+        lambda encoding, stacklevel=2: "latin-1" if encoding is None
+        else real(encoding, stacklevel),
+    )
+
+
+def test_binary_reads_refuse_whatever_the_locale(tmp_path: Path, latin1_locale):
+    """The "not UTF-8 refuses" guarantee holds on any locale: each
+    refusing reader pins encoding="utf-8" instead of trusting the
+    platform default (finding 3)."""
+    from factory.config import ConfigError, load_config
+    from factory.contract import ContractError, read_file
+    from factory.progress import ProgressLog, ProgressLogError
+    from factory.replay import ReplayError, replay_lines
+
+    binary = tmp_path / "bin"
+    binary.write_bytes(b"\xff\xfe\x00")
+    with pytest.raises(ContractError, match="not valid UTF-8"):
+        read_file(binary, "bin")
+    with pytest.raises(ConfigError):
+        load_config(binary)
+    with pytest.raises(ReplayError):
+        replay_lines({"paths": {"risk": {}}}, [(binary, "bin")])
+    log = tmp_path / "log.jsonl"
+    log.write_bytes(b"\xff\n")
+    with pytest.raises(ProgressLogError):
+        ProgressLog(log).entries()
+    # ...and the writer pins it too: non-ASCII text (ensure_ascii=False)
+    # round-trips instead of being written in the locale's encoding.
+    fresh = ProgressLog(tmp_path / "fresh.jsonl")
+    fresh.append({"run_id": "r1", "note": "Malmö — klart"})
+    assert fresh.entries()[0]["note"] == "Malmö — klart"
+    repo = _repo(tmp_path)
+    register = repo / ".factory" / "out-of-scope"
+    register.mkdir(parents=True, exist_ok=True)
+    (register / "bin.md").write_bytes(b"\xff\xfe\x00")
+    with pytest.raises(ImportRefused):
+        read_out_of_scope(repo)
+
+
+def test_binary_progress_log_is_a_progress_log_error(tmp_path: Path):
+    """The tamper-evident log refuses an undecodable byte as
+    ProgressLogError — the error every caller handles — never a raw
+    UnicodeDecodeError past its chain check (finding 2)."""
+    from factory.progress import ProgressLog, ProgressLogError
+
+    log = tmp_path / "log.jsonl"
+    log.write_bytes(b'{"n": 1}\n\xff\n')
+    with pytest.raises(ProgressLogError, match="not valid UTF-8"):
+        ProgressLog(log).entries()
+
+
+def test_binary_trace_refuses_never_traceback(tmp_path: Path, capsys):
+    """``factory trace`` on a corrupted (non-UTF-8) trace — e.g. a run
+    killed mid-character — exits 1 with a message, never a raw
+    UnicodeDecodeError out of main() (finding 1)."""
+    from factory.trace import trace_path
+
+    repo = _repo(tmp_path)
+    root = tmp_path / "froot"
+    run_id = "20260101T000000Z-ab12cd"
+    path = trace_path(root, "proj", run_id)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b'{"type": "phase_start"}\n\xe2\x82\n')
+    rc = main(["trace", run_id, "--queue", str(repo / ".factory" / "tasks.json"),
+               "--factory-root", str(root)])
+    assert rc == 1
+    assert "not valid UTF-8" in capsys.readouterr().err

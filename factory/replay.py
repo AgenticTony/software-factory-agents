@@ -113,7 +113,7 @@ def replay_lines(profile: dict, entries) -> list:
         # An unreadable or binary patch refuses the replay (a ValueError
         # is not an OSError — name it, or it tracebacks past the CLI).
         try:
-            text = path.read_text()
+            text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             raise ReplayError(f"{label}: cannot read patch: {exc}") from exc
         findings = patch_findings(text, risk_globs)

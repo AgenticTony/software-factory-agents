@@ -62,6 +62,12 @@ from factory.runs import RUN_ID_RE
 from factory.sentinels import redact_credentials
 from factory.state import now_iso
 
+
+class TraceError(Exception):
+    """A trace file that cannot be read as text (corrupted, or a run
+    killed mid-character)."""
+
+
 # The event vocabulary (AC-1) plus the terminal marker AC-6's --follow
 # needs: without it, "until the attempt ends" has nothing to stop on.
 EVENT_TYPES = (
@@ -429,13 +435,20 @@ def read_trace(path: Path, *, follow: bool = False,
 
     In follow mode a line caught mid-write (readable but not yet
     newline-terminated) is pushed back and waited on, so one event never
-    prints as two fragments."""
+    prints as two fragments.
+
+    Raises:
+        TraceError: A line is not valid UTF-8 (a corrupted trace).
+    """
     path = Path(path)
     gone_polls = 0
     with path.open(encoding="utf-8") as handle:
         while True:
             position = handle.tell()
-            line = handle.readline()
+            try:
+                line = handle.readline()
+            except UnicodeDecodeError as exc:
+                raise TraceError(f"{path.name}: trace is not valid UTF-8: {exc}") from exc
             if line and line.endswith("\n"):
                 out(line.rstrip("\n"))
                 if follow and _is_run_end(line):

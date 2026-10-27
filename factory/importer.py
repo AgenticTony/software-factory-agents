@@ -166,7 +166,7 @@ def read_out_of_scope(repo: Path | str) -> list[dict[str, str]]:
     records: list[dict[str, str]] = []
     for path in sorted(register.glob("*.md")):
         try:
-            text = path.read_text()
+            text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             raise ImportRefused(
                 f"{OUT_OF_SCOPE_DIR}/{path.name}: cannot read the "

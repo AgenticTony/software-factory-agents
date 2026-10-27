@@ -148,7 +148,7 @@ def _check_semantics(tasks: Any, origin: str) -> None:
                 )
 
 
-def _read(path: Path, origin: str) -> str:
+def read_file(path: Path, origin: str) -> str:
     """Read a file, refusing unreadable/non-UTF-8 input.
 
     Args:
@@ -162,7 +162,7 @@ def _read(path: Path, origin: str) -> str:
         ContractError: If the file is missing, unreadable, or not UTF-8.
     """
     try:
-        return path.read_text()
+        return path.read_text(encoding="utf-8")
     except OSError as exc:
         raise ContractError(f"{origin}: cannot read file: {exc}") from exc
     except UnicodeDecodeError as exc:
@@ -183,7 +183,7 @@ def _validator(schema_path: Path) -> jsonschema.Draft202012Validator:
         ContractError: If the schema file is missing, unreadable, or not JSON.
     """
     try:
-        schema = json.loads(_read(schema_path, str(schema_path)))
+        schema = json.loads(read_file(schema_path, str(schema_path)))
     except json.JSONDecodeError as exc:
         raise ContractError(f"schema {schema_path} is not valid JSON: {exc}") from exc
     return jsonschema.Draft202012Validator(schema)
@@ -243,7 +243,7 @@ def load_tasks(path: Path | str, schema_path: Path | None = None) -> dict:
     path = Path(path)
     origin = str(path)
     try:
-        data = json.loads(_read(path, origin))
+        data = json.loads(read_file(path, origin))
     except json.JSONDecodeError as exc:
         raise ContractError(f"{origin}: invalid JSON: {exc}") from exc
     validate_queue(data, origin, schema_path)
@@ -290,7 +290,7 @@ def load_profile(path: Path | str, schema_path: Path | None = None) -> dict:
     path = Path(path)
     origin = str(path)
     try:
-        data = yaml.safe_load(_read(path, origin))
+        data = yaml.safe_load(read_file(path, origin))
     except yaml.YAMLError as exc:
         raise ContractError(f"{origin}: invalid YAML: {exc}") from exc
     if not isinstance(data, dict):

@@ -18,7 +18,7 @@ from factory.approve import (
     recover_task,
 )
 from factory.config import ConfigError, load_config
-from factory.contract import ContractError, _read, load_profile, load_tasks
+from factory.contract import ContractError, load_profile, load_tasks, read_file
 from factory.gates import GateError
 from factory.importer import apply_import, run_import
 from factory.orchestrator import run_loop, run_once
@@ -32,7 +32,7 @@ from factory.session import SessionConfigError
 from factory.state import TaskQueue, run_lease_held
 from factory.status import StatusError, render_status
 from factory.tick import TickError, tick_steps
-from factory.trace import read_trace, trace_path
+from factory.trace import TraceError, read_trace, trace_path
 
 # run/loop exit codes: 0 = a PR opened, nothing to do, the peak window, or
 # the F-26 open-PR limit reached (a ready task waits); 1 = an escalation
@@ -275,7 +275,7 @@ def _run_trace(args: argparse.Namespace) -> int:
 
         read_trace(path, follow=args.follow, live=live if args.follow else None)
         return 0
-    except (ContractError, OSError) as exc:
+    except (ContractError, TraceError, OSError) as exc:
         print(f"factory trace: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
@@ -305,14 +305,18 @@ def _run_import(args: argparse.Namespace) -> int:
     from the project's planning docs, shows the full diff and writes
     nothing until you confirm; a refusal exits 1, never a traceback."""
     try:
-        # The --proposal read goes through contract._read (review R-2):
-        # a missing or binary file refuses as ContractError, structurally
-        # — no widened except tuple to keep right at this callsite.
-        # OSError stays in the tuple below for the write path (TaskQueue
-        # lock, mkdir, atomic rename), not for reads.
+        # Every read under this try refuses as ContractError at its own
+        # reader (contract.read_file, the importer's register read), so
+        # the tuple below names no decode error; OSError is for the
+        # write path (TaskQueue lock, mkdir, atomic rename).
         session = None
-        if args.proposal:
-            proposal_text = _read(Path(args.proposal), args.proposal)
+        # `is not None`, not truthiness: --proposal "" (an unset shell
+        # variable) is a missing file to refuse, not a request for the
+        # model session.
+        if args.proposal is not None:
+            if not args.proposal:  # Path("") is ".", a confusing refusal
+                raise ContractError("--proposal is empty: name a proposal file")
+            proposal_text = read_file(Path(args.proposal), args.proposal)
 
             def session(prompt: str) -> str:
                 return proposal_text
@@ -324,22 +328,25 @@ def _run_import(args: argparse.Namespace) -> int:
         if not result.plan.diff:
             print("factory import: nothing to change.")
             return 0
-        answer = input(f"Apply this import to {result.queue_path}? [y/N] ")
+        try:
+            answer = input(f"Apply this import to {result.queue_path}? [y/N] ")
+        except EOFError:
+            # Closed stdin cannot answer the prompt — the same "user
+            # could not answer" class as ^C (review R-3). A refusal,
+            # exit 1: a piped caller needs the non-success signal (an
+            # explicit answer is the only decline that exits 0). Scoped
+            # to input(): an EOFError from anywhere else is not stdin.
+            print("factory import: no answer on stdin — nothing written.",
+                  file=sys.stderr)
+            return 1
         if answer.strip().lower() != "y":
             print("factory import: nothing written.")
             return 0
         apply_import(result.plan, result.queue_path, confirm=lambda: True)
         print(f"factory import: wrote {result.queue_path}")
         return 0
-    except (ContractError, OSError, UnicodeDecodeError) as exc:
+    except (ContractError, OSError) as exc:
         print(f"factory import: {exc}", file=sys.stderr)
-        return 1
-    except EOFError:
-        # Closed stdin cannot answer the [y/N] prompt — the same "user
-        # could not answer" class as ^C (review R-3). Treated as a
-        # refusal, exit 1: a piped caller needs the non-success signal
-        # (an explicit "n" answer is the only decline that exits 0).
-        print("factory import: no answer on stdin — nothing written.", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("factory import: interrupted", file=sys.stderr)
