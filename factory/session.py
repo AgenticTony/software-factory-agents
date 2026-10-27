@@ -353,9 +353,13 @@ def _seat(seat: str) -> SeatConfig:
 # process mechanics (PATH/LANG/TZ/HOME/TMPDIR, LC_*) plus the proxy names
 # — inside the sandbox those carry srt's authenticated proxy, which is the
 # session's only network route — and the seat names ride in via options.env.
+# GIT_TEMPLATE_DIR is process mechanics too (INC-006): sandbox_env points it
+# at an empty dir, and without it every `git init`/`git clone` the agent's
+# Bash runs beneath the srt cwd dies copying hook samples into the blocked
+# .git/hooks. It carries a path, never a credential.
 _RUNNER_ENV_KEEP = frozenset(
     {
-        "PATH", "LANG", "TZ", "HOME", "TMPDIR",
+        "PATH", "LANG", "TZ", "HOME", "TMPDIR", "GIT_TEMPLATE_DIR",
         "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
     }
 )
