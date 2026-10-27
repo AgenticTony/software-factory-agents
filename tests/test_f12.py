@@ -691,3 +691,336 @@ def test_binary_trace_refuses_never_traceback(tmp_path: Path, capsys):
                "--factory-root", str(root)])
     assert rc == 1
     assert "not valid UTF-8" in capsys.readouterr().err
+
+
+# ------------------------------------ PR #61 review (prs-50-62.md) --
+
+
+def _git_repo(tmp_path: Path) -> Path:
+    """The fixture project, committed: the sandboxed importer session
+    reads a disposable clone of the repo's HEAD, never the checkout."""
+    import subprocess
+
+    repo = _repo(tmp_path)
+    for args in (
+        ("init", "-q", "-b", "main"),
+        ("add", "-A"),
+        ("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+         "commit", "-q", "-m", "init"),
+    ):
+        subprocess.run(["git", "-C", str(repo), *args], check=True,
+                       capture_output=True)
+    return repo
+
+
+class _SandboxedRunnerSpy:
+    """Stands in for ``run_session_sandboxed``: records each call and
+    returns a completed record carrying ``proposal``."""
+
+    def __init__(self, proposal: str):
+        self.proposal = proposal
+        self.calls: list[dict] = []
+
+    def __call__(self, seat, prompt, run_dir, profile, **kwargs):
+        import inspect
+
+        from factory.session import SessionRecord, run_session_sandboxed
+        from factory.state import run_lease_held
+
+        # The call must bind against the real runner's signature, so the
+        # spy can never accept a call production would reject.
+        inspect.signature(run_session_sandboxed).bind(
+            seat, prompt, run_dir, profile, **kwargs)
+        run_dir = Path(run_dir)
+        self.lease_held = (
+            run_lease_held(self.queue_path) if getattr(self, "queue_path", None)
+            else None
+        )
+        self.calls.append({
+            "seat": seat, "prompt": prompt, "run_dir": run_dir,
+            "run_dir_existed": run_dir.is_dir(),
+            "has_plan": (run_dir / "docs" / "PLAN.md").is_file(),
+            "profile": profile, **kwargs,
+        })
+        return SessionRecord(seat=seat, status="completed", result=self.proposal)
+
+
+def _forbid_in_process_session(monkeypatch):
+    def in_process(*args, **kwargs):
+        raise AssertionError(
+            "the importer ran run_session in-process, outside the srt sandbox"
+        )
+
+    monkeypatch.setattr("factory.session.run_session", in_process)
+    monkeypatch.setattr("factory.importer.run_session", in_process, raising=False)
+    monkeypatch.setattr("factory.importer.seat_token", lambda: "tok")
+
+
+def test_default_import_session_runs_sandboxed_never_in_process(
+        tmp_path: Path, monkeypatch):
+    """#61 finding 1 (high): the default importer session goes through
+    ``run_session_sandboxed`` as the read-only reviewer seat, in a
+    disposable clone under the factory root — never ``run_session``
+    in-process on the live checkout (DESIGN D3)."""
+    repo = _git_repo(tmp_path)
+    factory_root = tmp_path / "factory-root"
+    spy = _SandboxedRunnerSpy(_proposal(_wo("WO-1")))
+    _forbid_in_process_session(monkeypatch)
+    monkeypatch.setattr("factory.importer.run_session_sandboxed", spy,
+                        raising=False)
+
+    result = run_import(repo, factory_root=factory_root)
+
+    assert [c.task_id for c in result.plan.changes] == ["WO-1"]
+    assert len(spy.calls) == 1
+    call = spy.calls[0]
+    assert call["seat"] == "reviewer"  # the read-only guard keys on it
+    run_dir = call["run_dir"]
+    assert run_dir.resolve() != repo.resolve()
+    assert run_dir.parent == factory_root / "runs" / "proj"
+    assert call["run_dir_existed"] and call["has_plan"]  # a clone of HEAD
+    assert call["factory_root"] == factory_root
+    assert call["settings_path"].parent == factory_root / "sandbox"
+    assert call["profile"]["name"] == "proj"
+    assert call["protected"] == []
+    # The clone and its sandbox files are disposable: gone afterwards.
+    assert not run_dir.exists()
+    assert not list((factory_root / "runs" / "proj").iterdir())
+
+
+def test_cli_default_import_goes_through_the_sandboxed_runner(
+        tmp_path: Path, monkeypatch, capsys):
+    """#61 finding 1, at the CLI: ``factory import`` with no --proposal
+    reaches the sandboxed runner (never run_session)."""
+    repo = _git_repo(tmp_path)
+    spy = _SandboxedRunnerSpy(_proposal(_wo("WO-1")))
+    _forbid_in_process_session(monkeypatch)
+    monkeypatch.setattr("factory.importer.run_session_sandboxed", spy,
+                        raising=False)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+
+    rc = main(["import", "--repo", str(repo),
+               "--factory-root", str(tmp_path / "factory-root")])
+
+    assert rc == 0
+    assert len(spy.calls) == 1 and spy.calls[0]["seat"] == "reviewer"
+    assert "nothing written" in capsys.readouterr().out
+
+
+def test_sandboxed_import_session_failure_refuses(tmp_path: Path, monkeypatch,
+                                                  capsys):
+    """A sandboxed session that did not complete (e.g. the reviewer
+    guard's mutation verdict) refuses the import, exit 1, and the clone
+    is still removed."""
+    from factory.session import SessionRecord
+
+    repo = _git_repo(tmp_path)
+    factory_root = tmp_path / "factory-root"
+    _forbid_in_process_session(monkeypatch)
+    monkeypatch.setattr(
+        "factory.importer.run_session_sandboxed",
+        lambda seat, prompt, run_dir, profile, **kw: SessionRecord(
+            seat=seat, status="failed", reason="reviewer_mutated_workspace"),
+        raising=False,
+    )
+    rc = main(["import", "--repo", str(repo), "--factory-root", str(factory_root)])
+    assert rc == 1
+    assert "reviewer_mutated_workspace" in capsys.readouterr().err
+    assert not list((factory_root / "runs" / "proj").iterdir())
+    assert not (repo / ".factory" / "tasks.json").exists()
+
+
+def _echo_proposal(doc: dict) -> dict:
+    """A proposal that echoes every task's stored spec (unchanged docs)."""
+    from factory.importer import SPEC_FIELDS
+
+    return {
+        "project": doc["project"],
+        "tasks": [
+            {"id": t["id"], **{f: t[f] for f in SPEC_FIELDS if f in t}}
+            for t in doc["tasks"]
+        ],
+    }
+
+
+def test_reimport_of_a_real_queue_proposes_no_diff():
+    """#61 finding 2: AC-3 on a queue not born from the importer's fresh
+    path — this repo's own ``.factory/tasks.json`` keeps ``updated_at``
+    before ``tasks``. Echoing every task's spec must give an empty diff,
+    not a moved ``updated_at`` line."""
+    queue_path = Path(__file__).resolve().parent.parent / ".factory" / "tasks.json"
+    doc = load_tasks(queue_path)
+    assert list(doc).index("updated_at") < list(doc).index("tasks")
+    plan = plan_import(doc, _echo_proposal(doc), [], project=doc["project"])
+    assert {c.kind for c in plan.changes} == {"unchanged"}
+    assert plan.diff == ""
+
+
+def test_reimport_preserves_the_queues_key_order(tmp_path: Path):
+    """#61 finding 2, fixture form: a queue written by TaskQueue (keys
+    version, project, updated_at, tasks) re-imports with no diff."""
+    queue_path = tmp_path / "tasks.json"
+    doc = {"version": 1, "project": "proj", "updated_at": "2026-10-01T00:00:00Z",
+           "tasks": [{**_wo("WO-1"), "status": "draft", "attempts": []}]}
+    queue_path.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+    loaded = load_tasks(queue_path)
+    plan = plan_import(loaded, _echo_proposal(loaded), [], project="proj")
+    assert plan.diff == ""
+    assert list(plan.proposed_doc) == ["version", "project", "updated_at", "tasks"]
+
+
+def test_apply_refuses_when_the_queue_changed_after_the_plan(tmp_path: Path):
+    """#61 finding 3: an approval made while the confirm prompt waits is
+    never silently reverted — apply_import refuses a stale plan."""
+    repo = _repo(tmp_path)
+    first = run_import(repo, session=lambda p: _proposal(_wo("WO-1")),
+                       confirm=lambda s: True)
+    planned = run_import(repo, session=lambda p: _proposal(_wo("WO-1"),
+                                                           _wo("WO-2")))
+    # Meanwhile, in another terminal: factory approve WO-1.
+    queue = TaskQueue(first.queue_path)
+    task = queue.get("WO-1")
+    task["status"] = "ready"
+    task["acceptance_hash"] = "a" * 64
+    task["approved_at"] = "2026-10-20T09:00:00Z"
+    task["approved_by"] = "owner"
+    queue.save()
+
+    with pytest.raises(ImportRefused, match="changed since"):
+        apply_import(planned.plan, planned.queue_path, confirm=lambda: True)
+    wo1 = next(t for t in load_tasks(first.queue_path)["tasks"]
+               if t["id"] == "WO-1")
+    assert wo1["status"] == "ready"
+    assert wo1["approved_by"] == "owner"
+
+
+def test_apply_refuses_when_a_queue_appeared_after_a_fresh_plan(tmp_path: Path):
+    """#61 finding 3, fresh arm: a plan built with no queue on disk must
+    not overwrite a queue another writer created meanwhile."""
+    repo = _repo(tmp_path)
+    planned = run_import(repo, session=lambda p: _proposal(_wo("WO-2")))
+    other = run_import(repo, session=lambda p: _proposal(_wo("WO-1")),
+                       confirm=lambda s: True)
+    with pytest.raises(ImportRefused, match="changed since"):
+        apply_import(planned.plan, planned.queue_path, confirm=lambda: True)
+    assert [t["id"] for t in load_tasks(other.queue_path)["tasks"]] == ["WO-1"]
+
+
+def test_cli_stale_plan_refuses_exit_1(tmp_path: Path, monkeypatch, capsys):
+    """#61 finding 3 at the CLI: the queue changes while [y/N] waits; y
+    refuses with exit 1 and the approval survives."""
+    repo = _repo(tmp_path)
+    run_import(repo, session=lambda p: _proposal(_wo("WO-1")),
+               confirm=lambda s: True)
+    proposal = tmp_path / "p.json"
+    proposal.write_text(_proposal(_wo("WO-1"), _wo("WO-2")))
+    queue_path = repo / ".factory" / "tasks.json"
+
+    def approve_meanwhile(prompt=""):
+        queue = TaskQueue(queue_path)
+        queue.get("WO-1")["approved_by"] = "owner"
+        queue.get("WO-1")["approved_at"] = "2026-10-20T09:00:00Z"
+        queue.get("WO-1")["acceptance_hash"] = "a" * 64
+        queue.get("WO-1")["status"] = "ready"
+        queue.save()
+        return "y"
+
+    monkeypatch.setattr("builtins.input", approve_meanwhile)
+    rc = main(["import", "--repo", str(repo), "--proposal", str(proposal)])
+    assert rc == 1
+    assert "changed since" in capsys.readouterr().err
+    assert load_tasks(queue_path)["tasks"][0]["approved_by"] == "owner"
+
+
+@pytest.mark.parametrize("omitted", ["depends_on", "risk", "gates"])
+def test_omitted_spec_field_keeps_the_existing_value(tmp_path: Path, omitted):
+    """#61 finding 4: a proposal that leaves out depends_on, risk or
+    gates keeps the stored value — a default is not a proposal."""
+    repo = _repo(tmp_path)
+    stored = {
+        "depends_on": ["WO-1"],
+        "risk": ["auth"],
+        "gates": {"spec_approval": True, "merge": "human", "deploy": "auto"},
+    }
+    first = run_import(
+        repo,
+        session=lambda p: _proposal(_wo("WO-1"), _wo("WO-2", **stored)),
+        confirm=lambda s: True,
+    )
+    bare = _wo("WO-2", **stored)
+    del bare[omitted]
+    second = run_import(repo, session=lambda p: _proposal(_wo("WO-1"), bare),
+                        confirm=lambda s: True)
+    kinds = {c.task_id: (c.kind, c.fields) for c in second.plan.changes}
+    assert kinds["WO-2"] == ("unchanged", ())
+    assert second.plan.diff == ""
+    wo2 = next(t for t in load_tasks(first.queue_path)["tasks"]
+               if t["id"] == "WO-2")
+    assert wo2[omitted] == stored[omitted]
+
+
+def test_explicit_empty_depends_on_still_clears(tmp_path: Path):
+    """#61 finding 4's other arm: an explicit ``[]`` is a proposal."""
+    repo = _repo(tmp_path)
+    run_import(repo, session=lambda p: _proposal(
+        _wo("WO-1"), _wo("WO-2", depends_on=["WO-1"])), confirm=lambda s: True)
+    second = run_import(repo, session=lambda p: _proposal(
+        _wo("WO-1"), _wo("WO-2", depends_on=[])))
+    kinds = {c.task_id: (c.kind, c.fields) for c in second.plan.changes}
+    assert kinds["WO-2"] == ("changed", ("depends_on",))
+
+
+def test_out_of_scope_register_reaches_the_session_prompt(tmp_path: Path):
+    """#61 finding 7: the register's records (path and text) are in the
+    prompt the importer session receives — AC-4's concept matching
+    depends on the session seeing them."""
+    repo = _repo(tmp_path, oos={OOS_NAME: OOS_TEXT})
+    seen: list[str] = []
+
+    def session(prompt: str) -> str:
+        seen.append(prompt)
+        return _proposal(_wo("WO-1"))
+
+    run_import(repo, session=session)
+    assert len(seen) == 1
+    assert f"### {OOS_PATH}" in seen[0]
+    assert OOS_TEXT.strip() in seen[0]
+    assert "docs/PLAN.md" in seen[0]
+
+
+def test_build_import_prompt_says_when_the_register_is_empty(tmp_path: Path):
+    """#61 finding 7: with no register the prompt says so explicitly."""
+    from factory.importer import build_import_prompt
+
+    repo = _repo(tmp_path)
+    prompt = build_import_prompt(repo, "docs", read_out_of_scope(repo))
+    assert "(the register is empty or missing)" in prompt
+    assert OOS_PATH not in prompt
+
+
+def test_sandboxed_import_holds_the_run_lease(tmp_path: Path, monkeypatch):
+    """#61 finding 1, sibling: the importer's clone lives under
+    ``runs/<project>/``, which reclaim_runs empties whenever the queue's
+    run lease is free — so the lease is held while the session runs, and
+    an import refuses (never races) while a factory run holds it."""
+    repo = _git_repo(tmp_path)
+    factory_root = tmp_path / "factory-root"
+    run_import(repo, session=lambda p: _proposal(_wo("WO-1")),
+               confirm=lambda s: True)
+    queue_path = repo / ".factory" / "tasks.json"
+    spy = _SandboxedRunnerSpy(_proposal(_wo("WO-1")))
+    spy.queue_path = queue_path
+    _forbid_in_process_session(monkeypatch)
+    monkeypatch.setattr("factory.importer.run_session_sandboxed", spy,
+                        raising=False)
+
+    run_import(repo, factory_root=factory_root)
+    assert spy.lease_held is True
+
+    from factory.state import RunInProgressError
+
+    # A live factory run holds the same lease (one exclusive lock).
+    with TaskQueue(queue_path).idle_lease():
+        with pytest.raises(RunInProgressError, match="run is in progress"):
+            run_import(repo, factory_root=factory_root)
+    assert len(spy.calls) == 1  # the refused import never started a session

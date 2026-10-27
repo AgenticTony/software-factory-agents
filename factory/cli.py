@@ -181,6 +181,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="review a prepared proposal JSON instead of running the "
              "importer session",
     )
+    import_cmd.add_argument(
+        "--factory-root", default=None,
+        help="factory root for the sandboxed importer session's disposable "
+             "clone (default: ~/factory)",
+    )
 
     for name, wo in STUBS.items():
         sub.add_parser(name, help=f"stub — implemented in {wo}")
@@ -321,8 +326,12 @@ def _run_import(args: argparse.Namespace) -> int:
             def session(prompt: str) -> str:
                 return proposal_text
 
+        # session=None: the importer session runs sandboxed (srt, the
+        # read-only reviewer guard) in a disposable clone, never
+        # in-process on the live checkout (review #61 finding 1).
         result = run_import(
-            Path(args.repo), args.queue, docs_dir=args.docs, session=session
+            Path(args.repo), args.queue, docs_dir=args.docs, session=session,
+            factory_root=Path(args.factory_root) if args.factory_root else None,
         )
         print(result.summary)
         if not result.plan.diff:
