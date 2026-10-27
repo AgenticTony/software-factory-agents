@@ -102,11 +102,21 @@ def replay_lines(profile: dict, entries) -> list:
     A hit appends ``(N finding[s])`` — the count, never the line: the
     no-echo rule of :mod:`factory.sentinels` travels with the sentinel,
     whatever prints its output.
+
+    Raises:
+        ReplayError: A patch cannot be read (missing, unreadable, or
+            not UTF-8).
     """
     risk_globs = (profile.get("paths") or {}).get("risk") or {}
     lines = []
     for path, label in entries:
-        findings = patch_findings(path.read_text(), risk_globs)
+        # An unreadable or binary patch refuses the replay (a ValueError
+        # is not an OSError — name it, or it tracebacks past the CLI).
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ReplayError(f"{label}: cannot read patch: {exc}") from exc
+        findings = patch_findings(text, risk_globs)
         counts: dict[str, int] = {}
         for finding in findings:
             counts[finding.id] = counts.get(finding.id, 0) + 1

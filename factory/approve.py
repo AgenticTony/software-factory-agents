@@ -557,7 +557,7 @@ def reconcile_bootstrap(
     """
     try:
         text = Path(ledger_path).read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         raise ApprovalError(
             f"{ledger_path}: cannot read bootstrap ledger: {exc}"
         ) from exc

@@ -18,7 +18,7 @@ from factory.approve import (
     recover_task,
 )
 from factory.config import ConfigError, load_config
-from factory.contract import ContractError, load_profile, load_tasks
+from factory.contract import ContractError, load_profile, load_tasks, read_file
 from factory.gates import GateError
 from factory.importer import apply_import, run_import
 from factory.orchestrator import run_loop, run_once
@@ -32,7 +32,7 @@ from factory.session import SessionConfigError
 from factory.state import TaskQueue, run_lease_held
 from factory.status import StatusError, render_status
 from factory.tick import TickError, tick_steps
-from factory.trace import read_trace, trace_path
+from factory.trace import TraceError, read_trace, trace_path
 
 # run/loop exit codes: 0 = a PR opened, nothing to do, the peak window, or
 # the F-26 open-PR limit reached (a ready task waits); 1 = an escalation
@@ -275,7 +275,7 @@ def _run_trace(args: argparse.Namespace) -> int:
 
         read_trace(path, follow=args.follow, live=live if args.follow else None)
         return 0
-    except (ContractError, OSError) as exc:
+    except (ContractError, TraceError, OSError) as exc:
         print(f"factory trace: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
@@ -304,14 +304,23 @@ def _run_import(args: argparse.Namespace) -> int:
     """Dispatch the import subcommand (F-12). Proposes ``tasks.json``
     from the project's planning docs, shows the full diff and writes
     nothing until you confirm; a refusal exits 1, never a traceback."""
-    session = None
-    if args.proposal:
-        proposal_text = Path(args.proposal).read_text()
-
-        def session(prompt: str) -> str:
-            return proposal_text
-
     try:
+        # Every read under this try refuses as ContractError at its own
+        # reader (contract.read_file, the importer's register read), so
+        # the tuple below names no decode error; OSError is for the
+        # write path (TaskQueue lock, mkdir, atomic rename).
+        session = None
+        # `is not None`, not truthiness: --proposal "" (an unset shell
+        # variable) is a missing file to refuse, not a request for the
+        # model session.
+        if args.proposal is not None:
+            if not args.proposal:  # Path("") is ".", a confusing refusal
+                raise ContractError("--proposal is empty: name a proposal file")
+            proposal_text = read_file(Path(args.proposal), args.proposal)
+
+            def session(prompt: str) -> str:
+                return proposal_text
+
         result = run_import(
             Path(args.repo), args.queue, docs_dir=args.docs, session=session
         )
@@ -319,7 +328,17 @@ def _run_import(args: argparse.Namespace) -> int:
         if not result.plan.diff:
             print("factory import: nothing to change.")
             return 0
-        answer = input(f"Apply this import to {result.queue_path}? [y/N] ")
+        try:
+            answer = input(f"Apply this import to {result.queue_path}? [y/N] ")
+        except EOFError:
+            # Closed stdin cannot answer the prompt — the same "user
+            # could not answer" class as ^C (review R-3). A refusal,
+            # exit 1: a piped caller needs the non-success signal (an
+            # explicit answer is the only decline that exits 0). Scoped
+            # to input(): an EOFError from anywhere else is not stdin.
+            print("factory import: no answer on stdin — nothing written.",
+                  file=sys.stderr)
+            return 1
         if answer.strip().lower() != "y":
             print("factory import: nothing written.")
             return 0
@@ -413,9 +432,11 @@ def main(argv: list | None = None) -> int:
 
     Returns:
         Process exit code. Stubs return 2 (not implemented); approve,
-        tick and import return 0 on success and 1 on any refusal or
-        decline; run/loop per ``_EXIT`` (2 when the orchestrator itself
-        failed).
+        tick and import return 0 on success and 1 on any refusal —
+        import's only exit-0 decline is an explicit answer at its
+        confirm prompt (no answer on stdin is a refusal, not a
+        decline); run/loop per ``_EXIT`` (2 when the orchestrator
+        itself failed).
     """
     parser = build_parser()
     args = parser.parse_args(argv)

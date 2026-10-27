@@ -512,6 +512,13 @@ def test_bad_config_is_refused(tmp_path: Path):
         path.write_text(yaml.safe_dump(bad))
         with pytest.raises(ConfigError):
             load_config(path)
+    # a binary config (UnicodeDecodeError, a ValueError) refuses the
+    # same way — never a raw traceback out of the CLI (PR #63 review
+    # round: the F-12 R-2 class at this read).
+    binary = tmp_path / "bin.yaml"
+    binary.write_bytes(b"\xff\xfe\x00")
+    with pytest.raises(ConfigError):
+        load_config(binary)
 
 
 def test_peak_window_reached_mid_run_stops_before_next_session(tmp_path: Path):

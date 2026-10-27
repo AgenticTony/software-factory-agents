@@ -608,6 +608,20 @@ def test_cli_reconcile_bootstrap(tmp_path, capsys, monkeypatch):
     assert code == (1 if ": failed" in out else 0)
 
 
+def test_cli_reconcile_binary_ledger_refuses_never_traceback(tmp_path, capsys):
+    """A binary bootstrap ledger (UnicodeDecodeError, a ValueError) is a
+    refusal — exit 1 with a message, never a traceback out of main()
+    (PR #63 review round: the F-12 R-2 class, reconcile's sibling)."""
+    path = _queue_file(tmp_path, [_task()])
+    ledger = tmp_path / "BOOTSTRAP.md"
+    ledger.write_bytes(b"\xff\xfe\x00")
+    code = main(["approve", "--reconcile-bootstrap", "--queue", str(path),
+                 "--ledger", str(ledger), "--approved-by", "CI"])
+    assert code == 1
+    assert "cannot read bootstrap ledger" in capsys.readouterr().err
+    assert TaskQueue(path).get("T-1")["status"] == "draft"
+
+
 def test_cli_requires_a_task_id_or_reconcile():
     with pytest.raises(SystemExit):
         main(["approve"])
