@@ -26,7 +26,10 @@ The fixture is realistic on the three axes that broke that day:
   toolchain precondition with the host's home paths baked in — refuses a
   PATH entry under the home (either spelling) or an unexpanded ``~``
   entry, so a reverted *or simplified* filter fails setup inside the
-  sandbox, deterministically on every platform.
+  sandbox, deterministically on every platform. The one exception is the
+  sandbox's own: a home entry resolving to a toolchain dir it re-allows
+  and keeps (an nvm/fnm/volta node bin), read from the same rule,
+  :func:`factory.sandbox.home_path_keep`.
 * **A remote ahead of the local clone.** The bare remote's ``main``
   carries a commit the local repo has never pulled, so a run that clones
   the local checkout without fetching the remote builds on stale code —
@@ -51,6 +54,7 @@ from pathlib import Path
 
 import yaml
 
+from factory import sandbox
 from factory.contract import acceptance_hash
 from factory.gates import git as hardened_git
 from factory.mergeorder import Protection
@@ -134,14 +138,21 @@ if __name__ == "__main__":
 # under the real home, and a leaked one of either kind always does — on
 # every platform, with no dependence on how a given execvp treats a
 # denied candidate. The home paths are baked in at fixture-build time
-# (both spellings of the home, the same set `_path_outside_home` drops).
+# (both spellings of the home, the same set `_path_outside_home` drops),
+# and so is the sandbox's keep set (`factory.sandbox.home_path_keep`, the
+# one rule both sides read): a home entry that resolves to a re-allowed
+# toolchain dir (an nvm/fnm/volta node bin) is kept by the sandbox, so
+# the guard must accept it too — otherwise an nvm-only host fails setup
+# on the entry the sandbox deliberately kept.
 _ENV_GUARD_TEMPLATE = '''#!/bin/sh
 # Refuse a PATH that leaks the owner's home (either spelling) or carries
-# an unexpanded `~` entry. Home paths are baked in by factory.rehearsal,
-# one per line in the quoted heredoc below: with a quoted delimiter the
-# body is literal, so paths with quotes, spaces or shell metacharacters
-# stay data, never syntax. (No str.format anywhere near this template —
-# the shell braces must survive verbatim.)
+# an unexpanded `~` entry. A home entry that resolves (pwd -P) to one of
+# the KEEP dirs — the toolchain dirs the sandbox re-allows and keeps on
+# PATH — is not a leak. Paths are baked in by factory.rehearsal, one per
+# line in the quoted heredocs below: with a quoted delimiter the body is
+# literal, so paths with quotes, spaces or shell metacharacters stay
+# data, never syntax. (No str.format anywhere near this template — the
+# shell braces must survive verbatim.)
 rest=$PATH:
 while [ -n "$rest" ]; do
   entry=${rest%%:*}
@@ -152,6 +163,19 @@ while [ -n "$rest" ]; do
       exit 1
       ;;
   esac
+  resolved=$(CDPATH= cd -P -- "$entry" 2>/dev/null && pwd -P)
+  kept=
+  if [ -n "$resolved" ]; then
+    while IFS= read -r keep; do
+      [ -n "$keep" ] || continue
+      if [ "$resolved" = "$keep" ]; then
+        kept=1
+      fi
+    done <<'KEEP'
+__KEEP__
+KEEP
+  fi
+  [ -z "$kept" ] || continue
   while IFS= read -r home; do
     [ -n "$home" ] || continue
     case $entry in
@@ -239,8 +263,14 @@ def _env_guard_source() -> str:
             raise ValueError(
                 f"cannot bake a home path containing a newline into env-guard.sh: {home!r}"
             )
-    lines = "\n".join(sorted(homes))
-    return _ENV_GUARD_TEMPLATE.replace("__HOMES__", lines)
+    # The sandbox's own keep rule, not a copy of it. A kept dir with a
+    # newline cannot be baked; leaving it out only makes the guard refuse
+    # it (loud), never accept a leak.
+    keep = sorted(str(path) for path in sandbox.home_path_keep() if "\n" not in str(path))
+    return (
+        _ENV_GUARD_TEMPLATE.replace("__HOMES__", "\n".join(sorted(homes)))
+        .replace("__KEEP__", "\n".join(keep))
+    )
 
 
 def _write(path: Path, text: str, executable: bool = False) -> None:

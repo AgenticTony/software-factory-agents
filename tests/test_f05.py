@@ -509,19 +509,27 @@ def test_process_is_sandboxed_tracks_a_real_seatbelt(tmp_path: Path):
         assert child.stdout.strip() == "True", child.stdout + child.stderr
 
 
-def _conftest_harness(tmp_path: Path, probe: bool) -> subprocess.CompletedProcess:
+def _conftest_harness(
+    tmp_path: Path, probe: "bool | str"
+) -> subprocess.CompletedProcess:
     """Run a throwaway pytest against a copy of this repo's conftest and
     factory package, with the seatbelt probe forced to ``probe`` before
-    conftest loads. The probe test inside reports what run_sandboxed is."""
+    conftest loads (``"raise"``: the probe raises SandboxError, a broken
+    host stack). The probe test inside reports what run_sandboxed is."""
     root = tmp_path / f"harness-{probe}"
     shutil.copytree(REPO_ROOT / "factory", root / "factory",
                     ignore=shutil.ignore_patterns("__pycache__"))
     (root / "tests").mkdir(parents=True)
     shutil.copy2(REPO_ROOT / "tests" / "conftest.py", root / "tests" / "conftest.py")
-    (root / "force_probe.py").write_text(
-        "import factory.sandbox as s\n"
-        f"s.can_apply_seatbelt = lambda: {probe!r}\n"
-    )
+    if probe == "raise":
+        forced = (
+            "def _broken():\n"
+            "    raise s.SandboxError('seatbelt probe failed: forced by harness')\n"
+            "s.can_apply_seatbelt = _broken\n"
+        )
+    else:
+        forced = f"s.can_apply_seatbelt = lambda: {probe!r}\n"
+    (root / "force_probe.py").write_text("import factory.sandbox as s\n" + forced)
     (root / "tests" / "test_probe.py").write_text(textwrap.dedent(
         """
         import factory.sandbox as s
@@ -562,6 +570,21 @@ def test_conftest_guards_sandbox_spawning_tests_when_nested(tmp_path: Path):
     assert "1 passed" in host.stdout and "skipped" not in host.stdout, (
         host.stdout + host.stderr
     )
+
+
+def test_conftest_probe_failure_stops_the_suite(tmp_path: Path):
+    """INC-007's standing rule, end to end through conftest: a seatbelt
+    probe that fails on a host (SandboxError — anything but the kernel's
+    nested refusal) stops the run with a pytest usage error naming
+    INC-007. It never answers "nested", so the sandbox tests are never
+    quietly skipped and no test runs at all (review of #56/#57)."""
+    broken = _conftest_harness(tmp_path, probe="raise")
+    out = broken.stdout + broken.stderr
+    assert broken.returncode == pytest.ExitCode.USAGE_ERROR, out
+    assert "INC-007 seatbelt probe failed on this host" in out, out
+    assert "forced by harness" in out, out
+    assert "REAL" not in out and "PATCHED" not in out, out
+    assert "skipped" not in out and "passed" not in out, out
 
 
 def test_nested_suite_skips_instead_of_failing(tmp_path: Path):

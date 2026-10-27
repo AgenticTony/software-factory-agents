@@ -269,8 +269,10 @@ def _path_outside_home(path: str, keep: "Sequence[Path] | None" = None) -> str:
     ``build_settings``.
 
     An entry under home that is itself in ``keep`` (compared resolved) is
-    kept. ``keep`` defaults to the reads :func:`build_settings` re-allows
-    for :func:`default_toolchain` (every caller's toolchain includes it),
+    kept. ``keep`` defaults to :func:`home_path_keep` — the reads
+    :func:`build_settings` re-allows for :func:`default_toolchain` (every
+    caller's toolchain includes it), the same set the F-24 env-guard
+    accepts,
     so a node/npm installed by nvm, fnm or volta
     (``~/.nvm/versions/node/vX/bin``) stays findable — the dir is readable,
     so a lookup there cannot EPERM — and the L0 setup's ``npm ci`` does not
@@ -278,11 +280,9 @@ def _path_outside_home(path: str, keep: "Sequence[Path] | None" = None) -> str:
     (``~/.local/bin/claude``) is not in ``keep`` and is still dropped.
     """
     if keep is None:
-        keep = _toolchain_allowread(Path("~").expanduser(), default_toolchain())
-    keep_resolved = set()
-    for entry in keep:
-        with suppress(OSError):
-            keep_resolved.add(Path(entry).resolve())
+        keep_resolved = home_path_keep()
+    else:
+        keep_resolved = _resolved(keep)
 
     def kept(entry: str) -> bool:
         try:
@@ -303,6 +303,32 @@ def _path_outside_home(path: str, keep: "Sequence[Path] | None" = None) -> str:
         entry for entry in path.split(":")
         if entry and (not under_home(entry) or kept(entry))
     )
+
+
+def home_path_keep() -> frozenset[Path]:
+    """The one rule for which PATH entries under the owner's home survive
+    into a sandboxed child: the (resolved) reads :func:`build_settings`
+    re-allows for :func:`default_toolchain`. A home entry is kept iff it
+    resolves to one of these — an nvm/fnm/volta ``bin/`` that holds the
+    session's node, say.
+
+    :func:`_path_outside_home` filters by it, and the F-24 rehearsal's
+    env-guard bakes it in (``factory.rehearsal._env_guard_source``), so the
+    guard refuses exactly the home entries the sandbox would have dropped
+    — never the ones it deliberately keeps.
+    """
+    return _resolved(
+        _toolchain_allowread(Path("~").expanduser(), default_toolchain())
+    )
+
+
+def _resolved(paths: "Sequence[Path] | set[Path]") -> frozenset[Path]:
+    """``paths`` resolved, skipping any that cannot be."""
+    found = set()
+    for entry in paths:
+        with suppress(OSError):
+            found.add(Path(entry).resolve())
+    return frozenset(found)
 
 
 def default_toolchain(extra: "Sequence[Path] | None" = None) -> list[Path]:
