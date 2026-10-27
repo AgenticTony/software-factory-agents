@@ -311,6 +311,8 @@ Owner steps:
 
 Step 5 record note (2026-10-27): the step was ticked 2026-10-26T13:29:01Z with evidence that carries rounds, L2-missed findings and later fixes, but no owner review time; tick evidence is immutable, so the gap is recorded here instead. The PR #62 body, the only other place a review time was written, labels CET local times as `Z` and has the weekdays off by one. GitHub's UTC record: PR #58 (F-11) created 2026-10-25T20:25:35Z (Sunday), merged 2026-10-26T07:27:39Z (Monday); PR #61 (F-12) created 2026-10-26T11:04:13Z, merged 2026-10-26T13:21:41Z. Owner attention time for either PR was never measured, so the F-28 baseline has no review-time figure. F-11 does not fill the gap: it reports time from approval to merge (F-11 AC-3), which includes overnight waits, not your attention time.
 
+Protected-path note (2026-10-28): step 1's list is the set protected when F-28 ran. The PR #50–#62 review extends it in PR #70 (judging and gating modules such as `factory/sentinels.py`, `factory/replay.py`, `factory/mergeorder.py`, `factory/contract.py`, `factory/state.py`, `factory/approve.py`, `factory/tick.py`, `factory/prbody.py`, plus `conftest.py` and the pytest/ruff config files). The current `paths.protected` in `.factory/project.yaml` is the source of truth; this list is not kept in step with it. Step text and tick evidence are unchanged (immutable).
+
 ### F-31 — Read-only dashboard (`factory dashboard`)
 One local page that shows the queue and any run, live, instead of reading `tasks.json`, progress logs and traces by hand. Read-only by construction, so it can never become a second writer of `tasks.json`, and it needs no web framework. One event transport for everything live: server-sent events over the F-30 trace; no WebSocket (token-gated POSTs from F-34/F-35 plus server events cover every need, and a bidirectional transport would add a dependency for nothing).
 - AC-1 `factory dashboard [--port N]` serves on `127.0.0.1` only (a test asserts the bound address), using the standard library's `http.server.ThreadingHTTPServer` and static files shipped in the package. No new dependency. A test holds one event stream open and asserts a second request is still answered.
@@ -351,7 +353,7 @@ A second chat seat for discovery, architecture and risky decisions: it reads eve
 ### F-38 — Parallel review with verifier voting
 L2 is one reviewer. Anthropic's code-review record ([solving code review at Anthropic](https://claude.dev/blog/solving-code-review-at-anthropic), Oct 2026) attributes their review-quality jump to multiple review agents hunting the same diff in parallel, with a separate verifier group voting findings in or out before a human sees them. Our own measured baseline (F-28 step 5) says the single reviewer is the weak layer: independent review found 8 findings, L2 caught 2, including two real bugs and a convention violation the reviewer had the docs to catch.
 - AC-1 The orchestrator runs N reviewer sessions (config, default 2) over the same diff in parallel, each a fresh context, then a verifier pass over the union of findings: each finding is kept with the voter's reasoning or dropped; survivors are ranked and tagged important / nit / pre-existing.
-- AC-2 Style-only and diagnostic findings are dropped before the verdict, and at most three non-blocking findings reach the PR body — REVIEW.md's nit budget, mechanically enforced.
+- AC-2 Style-only and diagnostic findings are dropped before the verdict, and at most three nits (severity `minor` or `note`) reach the PR body — REVIEW.md's nit budget, mechanically enforced; `blocking` and `major` findings are never capped.
 - AC-3 Dropped findings and the drop reason land in the attempt record, so F-19 can measure the reviewer noise the verifier removed.
 - AC-4 The fan-out and the vote are tested with scripted reviewer and verifier sessions, no real model: findings two reviewers both report merge into one entry of the union, and a finding the verifier drops never reaches the verdict or the PR body (one test per case). Measuring catch quality on seeded-bug and known-clean diffs is F-16's job (F-16 AC-3), run against this reviewer after it lands; that eval needs real model sessions, so it never runs in routine CI.
 - AC-5 `prompt_versions` records every reviewer and verifier prompt hash; the fan-out is inside the attempt's turn and wall-clock budget.
@@ -404,6 +406,10 @@ A monthly job: seed 5–10 known bugs on a branch, run the validator, record the
 - AC-1 The report shows the catch rate per layer for a fixture set of seeded bugs.
 - AC-2 The phantom-table seed is caught by L0 or L2 on the SoloAdventurer fixture.
 - AC-3 The eval runs L2 as F-38's parallel reviewer and verifier, over the seeded-bug diffs plus known-clean diffs, and reports per diff whether the surviving findings caught the seeded bug, and how many blocking findings each known-clean diff drew. It runs on demand and monthly, never in routine CI: it drives real model sessions.
+
+AC-3 is checked `manual`, not `test` or `command`: an L1 red/green run would drive real model sessions, and so would a `command` check, whose exit code is evidence the validator collects on every attempt (VALIDATOR-SPEC L1 step 3). `manual` becomes an owner step (TASK-CONTRACT §2), and the one below is its evidence.
+
+Owner steps: Run the AC-3 eval once on demand after F-16 merges and record its per-diff report (seeded bug caught or not; blocking findings per known-clean diff) as the tick evidence.
 
 ## Phase 3 — Second project and watchers
 

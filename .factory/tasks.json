@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-27T18:06:27Z",
+  "updated_at": "2026-10-27T23:05:15Z",
   "tasks": [
     {
       "id": "F-00",
@@ -1293,8 +1293,8 @@
           "id": "AC-3",
           "text": "The eval runs L2 as F-38's parallel reviewer and verifier, over the seeded-bug diffs plus known-clean diffs, and reports per diff whether the surviving findings caught the seeded bug, and how many blocking findings each known-clean diff drew. It runs on demand and monthly, never in routine CI: it drives real model sessions.",
           "check": {
-            "type": "test",
-            "ref": "tests/test_f16.py::test_ac_3"
+            "type": "manual",
+            "expect": "owner step 1: the per-diff report of one on-demand eval run, recorded as tick evidence"
           }
         }
       ],
@@ -1305,7 +1305,13 @@
         "wall_clock_min": 150
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "owner_steps": [
+        {
+          "text": "Run the AC-3 eval once on demand after F-16 merges and record its per-diff report (seeded bug caught or not; blocking findings per known-clean diff) as the tick evidence.",
+          "done": false
+        }
+      ]
     },
     {
       "id": "F-17",
@@ -2719,7 +2725,7 @@
         },
         {
           "id": "AC-2",
-          "text": "Style-only and diagnostic findings are dropped before the verdict, and at most three non-blocking findings reach the PR body — REVIEW.md's nit budget, mechanically enforced.",
+          "text": "Style-only and diagnostic findings are dropped before the verdict, and at most three nits (severity `minor` or `note`) reach the PR body — REVIEW.md's nit budget, mechanically enforced; `blocking` and `major` findings are never capped.",
           "check": {
             "type": "test",
             "ref": "tests/test_f38.py::test_ac_2"
