@@ -18,7 +18,7 @@ from factory.approve import (
     recover_task,
 )
 from factory.config import ConfigError, load_config
-from factory.contract import ContractError, load_profile, load_tasks
+from factory.contract import ContractError, _read, load_profile, load_tasks
 from factory.gates import GateError
 from factory.importer import apply_import, run_import
 from factory.orchestrator import run_loop, run_once
@@ -305,13 +305,14 @@ def _run_import(args: argparse.Namespace) -> int:
     from the project's planning docs, shows the full diff and writes
     nothing until you confirm; a refusal exits 1, never a traceback."""
     try:
-        # The --proposal read sits inside the guarded region (review
-        # R-2): a typo'd or binary file is a refusal, never a traceback.
-        # UnicodeDecodeError is a ValueError, so it is named in the
-        # except tuple below alongside OSError.
+        # The --proposal read goes through contract._read (review R-2):
+        # a missing or binary file refuses as ContractError, structurally
+        # — no widened except tuple to keep right at this callsite.
+        # OSError stays in the tuple below for the write path (TaskQueue
+        # lock, mkdir, atomic rename), not for reads.
         session = None
         if args.proposal:
-            proposal_text = Path(args.proposal).read_text()
+            proposal_text = _read(Path(args.proposal), args.proposal)
 
             def session(prompt: str) -> str:
                 return proposal_text
@@ -424,9 +425,11 @@ def main(argv: list | None = None) -> int:
 
     Returns:
         Process exit code. Stubs return 2 (not implemented); approve,
-        tick and import return 0 on success and 1 on any refusal or
-        decline; run/loop per ``_EXIT`` (2 when the orchestrator itself
-        failed).
+        tick and import return 0 on success and 1 on any refusal —
+        import's only exit-0 decline is an explicit answer at its
+        confirm prompt (no answer on stdin is a refusal, not a
+        decline); run/loop per ``_EXIT`` (2 when the orchestrator
+        itself failed).
     """
     parser = build_parser()
     args = parser.parse_args(argv)

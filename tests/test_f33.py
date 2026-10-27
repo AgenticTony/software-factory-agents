@@ -280,6 +280,14 @@ def test_replay_refuses_misuse(tmp_path, capsys):
                      "--queue", str(queue)])
     assert code == 1
     assert "missing.patch" in capsys.readouterr().err
+    # a patch that exists but is binary (UnicodeDecodeError): a refusal
+    # with a message, never a traceback out of main() (PR #63 review
+    # round — the F-12 R-2 class at this read).
+    binary = tmp_path / "bin.patch"
+    binary.write_bytes(b"\xff\xfe\x00")
+    code = cli_main(["sentinels", "replay", str(binary), "--queue", str(queue)])
+    assert code == 1
+    assert "cannot read patch" in capsys.readouterr().err
 
 
 # --- AC-5: the corpus directory is a protected path -------------------------

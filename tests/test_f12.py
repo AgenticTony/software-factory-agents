@@ -17,13 +17,12 @@ What is real and what is stubbed:
   seam the real session result enters at.
 """
 
-import argparse
 import json
 from pathlib import Path
 
 import pytest
 
-from factory.cli import _run_import
+from factory.cli import main
 from factory.contract import load_tasks
 from factory.importer import (
     ImportRefused,
@@ -509,35 +508,27 @@ def test_defaults_risk_depends_on_and_gates(tmp_path: Path):
 # ------------------------------------------- L2 review round: R-2/R-3 --
 
 
-def _args(repo: Path, proposal: str) -> argparse.Namespace:
-    """The import subcommand's parsed arguments, as the parser builds
-    them for ``factory import --proposal <file>``."""
-    return argparse.Namespace(
-        repo=str(repo), queue=None, docs="docs", proposal=proposal
-    )
-
-
-def test_r2_missing_proposal_file_exits_1_never_traceback(
-    tmp_path: Path, capsys
-):
+def test_r2_missing_proposal_file_exits_1_never_traceback(tmp_path: Path, capsys):
     """R-2: a typo'd --proposal path is a refusal (exit 1, stderr
     message), not a FileNotFoundError traceback from outside the try
-    block."""
+    block. Driven through the real parser (main), the repo's CLI-test
+    convention."""
     repo = _repo(tmp_path)
-    assert _run_import(_args(repo, str(tmp_path / "nope.md"))) == 1
+    rc = main(["import", "--repo", str(repo),
+               "--proposal", str(tmp_path / "nope.md")])
+    assert rc == 1
     assert "nope.md" in capsys.readouterr().err
     assert not (repo / ".factory" / "tasks.json").exists()
 
 
-def test_r2_binary_proposal_file_exits_1_never_traceback(
-    tmp_path: Path, capsys
-):
+def test_r2_binary_proposal_file_exits_1_never_traceback(tmp_path: Path, capsys):
     """R-2: a binary --proposal file raises UnicodeDecodeError (a
-    ValueError), so the except tuple must name it — not just OSError."""
+    ValueError); contract._read turns it into a ContractError refusal."""
     repo = _repo(tmp_path)
     binary = tmp_path / "bin.md"
     binary.write_bytes(b"\xff\xfe\x00")
-    assert _run_import(_args(repo, str(binary))) == 1
+    rc = main(["import", "--repo", str(repo), "--proposal", str(binary)])
+    assert rc == 1
     assert "factory import:" in capsys.readouterr().err
     assert not (repo / ".factory" / "tasks.json").exists()
 
@@ -554,6 +545,7 @@ def test_r3_eof_at_confirm_writes_nothing(tmp_path: Path, capsys, monkeypatch):
         raise EOFError
 
     monkeypatch.setattr("builtins.input", eof)
-    assert _run_import(_args(repo, str(proposal))) == 1
+    rc = main(["import", "--repo", str(repo), "--proposal", str(proposal)])
+    assert rc == 1
     assert "nothing written" in capsys.readouterr().err
     assert not (repo / ".factory" / "tasks.json").exists()

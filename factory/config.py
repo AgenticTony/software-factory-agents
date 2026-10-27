@@ -110,7 +110,7 @@ def load_config(path: Path | str | None) -> FactoryConfig:
         return FactoryConfig()
     try:
         raw = yaml.safe_load(Path(path).read_text())
-    except (OSError, yaml.YAMLError) as exc:
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
         raise ConfigError(f"cannot read factory config {path}: {exc}") from exc
     if raw is None:
         return FactoryConfig()
