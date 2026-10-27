@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-26T13:29:01Z",
+  "updated_at": "2026-10-27T18:06:27Z",
   "tasks": [
     {
       "id": "F-00",
@@ -1263,7 +1263,8 @@
       "depends_on": [
         "F-07",
         "F-08",
-        "F-09"
+        "F-09",
+        "F-38"
       ],
       "risk": [],
       "gates": {
@@ -1286,6 +1287,14 @@
           "check": {
             "type": "test",
             "ref": "tests/test_f16.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "The eval runs L2 as F-38's parallel reviewer and verifier, over the seeded-bug diffs plus known-clean diffs, and reports per diff whether the surviving findings caught the seeded bug, and how many blocking findings each known-clean diff drew. It runs on demand and monthly, never in routine CI: it drives real model sessions.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f16.py::test_ac_3"
           }
         }
       ],
@@ -1513,7 +1522,8 @@
         "F-11",
         "F-14",
         "F-16",
-        "F-20"
+        "F-20",
+        "F-38"
       ],
       "risk": [
         "deploy"
@@ -2464,7 +2474,7 @@
       "acceptance": [
         {
           "id": "AC-1",
-          "text": "`factory dashboard --operator` adds a chat panel and exactly one `POST /operator/chat` route. Without `--operator`, F-31 AC-2 holds unchanged (GET only, everything else 405); a test runs F-31's route sweep both ways.",
+          "text": "`factory dashboard --operator` adds a chat panel and one POST route, `POST /operator/chat`. Every operator POST route is listed in one declared set in the dashboard module, which later work orders extend in their own code (F-35's `/operator/confirm`, F-37's inbox upload), never by editing `tests/test_f34.py`; every route in the set enforces AC-2. Without `--operator`, F-31 AC-2 holds unchanged (GET only, everything else 405); a test runs F-31's route sweep both ways and asserts, with `--operator`, that the routes accepting POST are exactly the declared set.",
           "check": {
             "type": "test",
             "ref": "tests/test_f34.py::test_ac_1"
@@ -2480,7 +2490,7 @@
         },
         {
           "id": "AC-3",
-          "text": "A new `operator` seat: read-only sandbox (`build_settings(read_only=True)`), no Write/Edit/NotebookEdit/Bash, no GitHub token, no network except the model provider. Reads are limited to the queue, traces, progress logs, reports and the repo. Its prompt `prompts/operator.md` is pinned like the other seats (F-09 AC-2).",
+          "text": "A new `operator` seat: read-only sandbox (`build_settings(read_only=True)`) with its network narrowed to the model provider's host — the profile's `docs_allowlist` and `network_allowlist`, which `build_settings` adds for the build seats today, are left out (a new `build_settings` option; a test asserts the seat's `allowedDomains` is exactly the model host). No GitHub token. Its tools are denied explicitly in `disallowed_tools`, because `allowed_tools` grants without restricting: Write, Edit, NotebookEdit, Bash, WebFetch, WebSearch and Task (sub-agents) — WebSearch runs on the provider's side, outside srt's network confinement, so the sandbox alone cannot stop it. A test asserts the seat denies each of those tools. Reads are limited to the queue, traces, progress logs, reports and the repo. Its prompt `prompts/operator.md` is pinned like the other seats (F-09 AC-2).",
           "check": {
             "type": "test",
             "ref": "tests/test_f34.py::test_ac_3"
@@ -2623,7 +2633,7 @@
       "acceptance": [
         {
           "id": "AC-1",
-          "text": "The F-34 panel offers a `planner` seat (`POST /operator/chat` with `seat: planner`) in the same read-only sandbox as the operator: no network beyond the model provider. Documentation lookups go through an in-process `fetch_doc(url)` tool that accepts only `https` URLs whose host is an exact member of the project's `docs_allowlist`; a URL carrying a query string or fragment is refused, not stripped, a redirect response is refused rather than followed, and the fetched body honors the same size cap and text types as an inbox upload with a timeout from config (one test per refusal: non-https scheme, query string, fragment, non-allowlisted host, redirect; plus the planner's own sandbox reaching no host). Files you attach (a client brief, say) upload through a token-gated POST (F-34 AC-2) into `<factory_root>/plans/<project>/inbox/` (0600 files in 0700 directories), with a size cap from config and text types only — anything else is refused at upload. Inbox files and saved plans are pruned by the same retention window as operator transcripts (F-34 AC-5), and `factory plans purge <project>` deletes them on demand.",
+          "text": "The F-34 panel offers a `planner` seat (`POST /operator/chat` with `seat: planner`) with the operator's read-only sandbox and tool denials (F-34 AC-3). In-process tools run inside the sandboxed runner, so the planner's sandbox allows exactly the model host plus the project's `docs_allowlist` hosts (never `network_allowlist`), and with Bash, WebFetch, WebSearch and Task denied, `fetch_doc` is the planner's only path to those hosts. Documentation lookups go through that in-process `fetch_doc(url)` tool, which accepts only `https` URLs whose host is an exact member of the project's `docs_allowlist`, on the default port only (no explicit port other than 443), with a path of at most 256 bytes drawn from `A-Z a-z 0-9 - . _ ~ /`; a URL carrying a query string or fragment is refused, not stripped, a redirect response is refused rather than followed, a session's fetch count is capped from config, every fetched URL is recorded in the trace, and the fetched body honors the same size cap and text types as an inbox upload with a timeout from config (one test per refusal: non-https scheme, query string, fragment, non-allowlisted host, explicit non-443 port, over-long path, disallowed path character, fetch cap reached, redirect; plus a test that the planner's sandbox `allowedDomains` is exactly the model host plus `docs_allowlist`). The path rules bound, not close, an outbound channel to allowlisted hosts, so `docs_allowlist` lists only documentation hosts whose access logs no third party reads — never a user-content or shared-hosting domain. Files you attach (a client brief, say) upload through a token-gated POST (F-34 AC-2) into `<factory_root>/plans/<project>/inbox/` (0600 files in 0700 directories), with a size cap from config and text types only — anything else is refused at upload. Inbox files and saved plans are pruned by the same retention window as operator transcripts (F-34 AC-5), and `factory plans purge <project>` deletes them on demand.",
           "check": {
             "type": "test",
             "ref": "tests/test_f37.py::test_ac_1"
@@ -2631,7 +2641,7 @@
         },
         {
           "id": "AC-2",
-          "text": "The planner's only write is an in-process `save_plan(name, markdown)` tool into `<factory_root>/plans/<project>/`, with `name` matched against `[a-z0-9-]+\\.md` minus the reserved `decisions` and `index` names: `decisions.md` is yours alone, and `index.md` is regenerated by the factory after each save, so neither is planner-writable. A test asserts `save_plan` cannot write outside that directory (`..`, absolute paths, symlinks) or under either reserved name, and that the repo, `tasks.json`, every trace other than the session's own and every plans file other than the session's own saves are byte-identical after a scripted planning session.",
+          "text": "The planner's only write is an in-process `save_plan(name, markdown)` tool into `<factory_root>/plans/<project>/`, with `name` matched against `[a-z0-9-]+\\.md` minus the reserved `decisions` and `index` names: `decisions.md` is yours alone, and `index.md` is regenerated by the factory after each save, so neither is planner-writable. `index.md` lists only each plan's file name, size and save time, never text from inside a plan, so planner-authored content cannot ride the index into every resumed prompt (AC-4); a test saves a plan whose first line is an instruction and asserts `index.md` does not contain it. A test asserts `save_plan` cannot write outside that directory (`..`, absolute paths, symlinks) or under either reserved name, and that after a scripted planning session the repo, `tasks.json`, every trace other than the session's own and every plans file other than the session's own saves and the regenerated `index.md` are byte-identical, and `index.md` equals the generator's output for the directory.",
           "check": {
             "type": "test",
             "ref": "tests/test_f37.py::test_ac_2"
@@ -2639,7 +2649,7 @@
         },
         {
           "id": "AC-3",
-          "text": "`propose_work_orders(tasks)` validates the proposed tasks against `schema/tasks.schema.json` and shows them in the panel as the same diff `factory import` (F-12) shows; your confirm writes them through F-12's write path as `draft` only. A proposal carrying any other status, approval fields or attempts is refused, and nothing reaches `tasks.json` without the click (test).",
+          "text": "`propose_work_orders(tasks)` validates the proposed tasks against `schema/tasks.schema.json` and shows them in the panel as the same diff `factory import` (F-12) shows; your confirm writes them through F-12's write path as `draft` only. A proposal carrying any other status, approval fields or attempts is refused, and so is one naming a task id already in `tasks.json` (F-12 merges spec fields into existing ids; a planner proposal only adds). Confirming is F-35's `POST /operator/confirm` with one added kind, `work_orders` (F-35 AC-1's `propose_action` kinds are unchanged): its one-time nonce is bound to the hash of the proposed tasks and the hash of `tasks.json` when the card was shown, and a reused nonce, or a queue that changed since, gets 409 and writes nothing (one test per case), with F-35 AC-3's token, `Host` and `Origin` checks. Nothing reaches `tasks.json` without the click (test).",
           "check": {
             "type": "test",
             "ref": "tests/test_f37.py::test_ac_3"
@@ -2725,7 +2735,7 @@
         },
         {
           "id": "AC-4",
-          "text": "Standing eval: on a seeded-diff corpus (F-16's fixtures), every known-bug diff is caught by the surviving findings and every known-clean diff draws zero blocking findings; the corpus runs in CI.",
+          "text": "The fan-out and the vote are tested with scripted reviewer and verifier sessions, no real model: findings two reviewers both report merge into one entry of the union, and a finding the verifier drops never reaches the verdict or the PR body (one test per case). Measuring catch quality on seeded-bug and known-clean diffs is F-16's job (F-16 AC-3), run against this reviewer after it lands; that eval needs real model sessions, so it never runs in routine CI.",
           "check": {
             "type": "test",
             "ref": "tests/test_f38.py::test_ac_4"
