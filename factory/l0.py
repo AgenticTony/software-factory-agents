@@ -60,7 +60,9 @@ flips it, per the verifier's standing rule):
   ``sentinels.<risk flag>`` commands after setup and records one result
   per sentinel on the report.
 - Command output is scanned for ``file:line`` errors (gcc/ruff and tsc
-  styles). A failing command whose output yields no parseable location —
+  styles). A failing command whose output yields no parseable location,
+  or only locations outside the repo (framework/site-packages frames,
+  which never become ``new_error``) —
   or that reports a failure no baseline entry can cover (a failed test, a
   traceback, a tool crash) — is a FAIL with the raw output attached: an
   error we cannot attribute is not pre-existing.
@@ -631,9 +633,8 @@ def run_l0(
                     for f, n, msg in errors
                 }
             )
-            for file, line, message in errors:
-                if not repo_owned(file):
-                    continue  # a framework frame: never baselineable noise
+            owned = [e for e in errors if repo_owned(e[0])]
+            for file, line, message in owned:
                 if line in known_errors.get(file, set()):
                     preexisting.append(f"{file}:{line} pre-existing (baselined), not a failure")
                 else:
@@ -653,6 +654,18 @@ def run_l0(
                         "command_failed",
                         f"{name} exited {result.exit_code} reporting a failure no "
                         f"baseline entry covers: {marker}",
+                    )
+                )
+            elif not owned:
+                # Every parsed location was a framework/foreign frame
+                # (dropped from new_error, INC-005) and no marker fired:
+                # nothing in the repo or its baseline explains the
+                # non-zero exit, so it fails like an unparsable one.
+                findings.append(
+                    Finding(
+                        "command_failed",
+                        f"{name} exited {result.exit_code} with no repo-owned error "
+                        f"location: {result.output.strip()[:500]}",
                     )
                 )
 
