@@ -304,14 +304,18 @@ def _run_import(args: argparse.Namespace) -> int:
     """Dispatch the import subcommand (F-12). Proposes ``tasks.json``
     from the project's planning docs, shows the full diff and writes
     nothing until you confirm; a refusal exits 1, never a traceback."""
-    session = None
-    if args.proposal:
-        proposal_text = Path(args.proposal).read_text()
-
-        def session(prompt: str) -> str:
-            return proposal_text
-
     try:
+        # The --proposal read sits inside the guarded region (review
+        # R-2): a typo'd or binary file is a refusal, never a traceback.
+        # UnicodeDecodeError is a ValueError, so it is named in the
+        # except tuple below alongside OSError.
+        session = None
+        if args.proposal:
+            proposal_text = Path(args.proposal).read_text()
+
+            def session(prompt: str) -> str:
+                return proposal_text
+
         result = run_import(
             Path(args.repo), args.queue, docs_dir=args.docs, session=session
         )
@@ -326,8 +330,15 @@ def _run_import(args: argparse.Namespace) -> int:
         apply_import(result.plan, result.queue_path, confirm=lambda: True)
         print(f"factory import: wrote {result.queue_path}")
         return 0
-    except (ContractError, OSError) as exc:
+    except (ContractError, OSError, UnicodeDecodeError) as exc:
         print(f"factory import: {exc}", file=sys.stderr)
+        return 1
+    except EOFError:
+        # Closed stdin cannot answer the [y/N] prompt — the same "user
+        # could not answer" class as ^C (review R-3). Treated as a
+        # refusal, exit 1: a piped caller needs the non-success signal
+        # (an explicit "n" answer is the only decline that exits 0).
+        print("factory import: no answer on stdin — nothing written.", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("factory import: interrupted", file=sys.stderr)

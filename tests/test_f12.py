@@ -17,11 +17,13 @@ What is real and what is stubbed:
   seam the real session result enters at.
 """
 
+import argparse
 import json
 from pathlib import Path
 
 import pytest
 
+from factory.cli import _run_import
 from factory.contract import load_tasks
 from factory.importer import (
     ImportRefused,
@@ -502,3 +504,56 @@ def test_defaults_risk_depends_on_and_gates(tmp_path: Path):
         "merge": "human",
         "deploy": "human",
     }
+
+
+# ------------------------------------------- L2 review round: R-2/R-3 --
+
+
+def _args(repo: Path, proposal: str) -> argparse.Namespace:
+    """The import subcommand's parsed arguments, as the parser builds
+    them for ``factory import --proposal <file>``."""
+    return argparse.Namespace(
+        repo=str(repo), queue=None, docs="docs", proposal=proposal
+    )
+
+
+def test_r2_missing_proposal_file_exits_1_never_traceback(
+    tmp_path: Path, capsys
+):
+    """R-2: a typo'd --proposal path is a refusal (exit 1, stderr
+    message), not a FileNotFoundError traceback from outside the try
+    block."""
+    repo = _repo(tmp_path)
+    assert _run_import(_args(repo, str(tmp_path / "nope.md"))) == 1
+    assert "nope.md" in capsys.readouterr().err
+    assert not (repo / ".factory" / "tasks.json").exists()
+
+
+def test_r2_binary_proposal_file_exits_1_never_traceback(
+    tmp_path: Path, capsys
+):
+    """R-2: a binary --proposal file raises UnicodeDecodeError (a
+    ValueError), so the except tuple must name it — not just OSError."""
+    repo = _repo(tmp_path)
+    binary = tmp_path / "bin.md"
+    binary.write_bytes(b"\xff\xfe\x00")
+    assert _run_import(_args(repo, str(binary))) == 1
+    assert "factory import:" in capsys.readouterr().err
+    assert not (repo / ".factory" / "tasks.json").exists()
+
+
+def test_r3_eof_at_confirm_writes_nothing(tmp_path: Path, capsys, monkeypatch):
+    """R-3: EOF at the [y/N] prompt (closed or piped stdin) prints to
+    stderr, writes nothing, and exits 1 — the same "user could not
+    answer" class KeyboardInterrupt already had."""
+    repo = _repo(tmp_path)
+    proposal = tmp_path / "proposal.json"
+    proposal.write_text(_proposal(_wo("WO-1")))
+
+    def eof(prompt: str = "") -> str:
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", eof)
+    assert _run_import(_args(repo, str(proposal))) == 1
+    assert "nothing written" in capsys.readouterr().err
+    assert not (repo / ".factory" / "tasks.json").exists()
