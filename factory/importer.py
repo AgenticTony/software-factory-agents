@@ -66,6 +66,7 @@ from factory.contract import (
     validate_queue,
 )
 from factory.runs import FACTORY_ROOT_DEFAULT, RunError, cleanup_run, create_run
+from factory.sandbox import SandboxError
 from factory.session import SessionConfigError, run_session_sandboxed, seat_token
 from factory.state import TaskQueue, _atomic_write_json, now_iso
 
@@ -372,7 +373,7 @@ def _merge_task(existing: dict, proposed: dict) -> tuple[dict, list[str]]:
     merged = copy.deepcopy(existing)
     for spec_field in changed:
         merged[spec_field] = copy.deepcopy(proposed[spec_field])
-    # Same normalisation as a fresh task (_task_from_proposal): a queue
+    # Same normalisation as a fresh task (_new_task): a queue
     # written before the key existed (or by hand) still merges out with a
     # list, not a missing key.
     merged.setdefault("attempts", [])
@@ -773,7 +774,11 @@ def sdk_import_session(
                 protected=list((profile.get("paths") or {}).get("protected") or []),
                 token=token, run_id=run.run_id,
             )
-        except SessionConfigError as exc:
+        except (SessionConfigError, SandboxError, RunError) as exc:
+            # Runner setup errors: no bundled CLI / token (SessionConfigError),
+            # srt missing or not at the pin (SandboxError, from ensure_srt
+            # before anything spawns), a run-dir fault (RunError). Each is
+            # a refusal (exit 1 at the CLI), never a traceback.
             raise ImportRefused(f"the importer session could not run: {exc}") from exc
         except subprocess.TimeoutExpired as exc:
             raise ImportRefused(

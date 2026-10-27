@@ -1024,3 +1024,54 @@ def test_sandboxed_import_holds_the_run_lease(tmp_path: Path, monkeypatch):
         with pytest.raises(RunInProgressError, match="run is in progress"):
             run_import(repo, factory_root=factory_root)
     assert len(spy.calls) == 1  # the refused import never started a session
+
+
+def test_cli_import_srt_unusable_refuses_exit_1_never_traceback(
+        tmp_path: Path, monkeypatch, capsys):
+    """Round 2: srt missing or at the wrong version surfaces from the real
+    sandboxed runner as ``SandboxError`` (``ensure_srt``, before anything
+    spawns). ``factory import`` refuses — exit 1 with the message, never a
+    traceback — and the clone is still removed."""
+    from factory.sandbox import SandboxError
+
+    def srt_missing(srt_bin_path=None):
+        raise SandboxError("srt not found at node_modules/.bin/srt")
+
+    repo = _git_repo(tmp_path)
+    factory_root = tmp_path / "factory-root"
+    _forbid_in_process_session(monkeypatch)
+    monkeypatch.setattr("factory.sandbox.ensure_srt", srt_missing)
+
+    rc = main(["import", "--repo", str(repo), "--factory-root", str(factory_root)])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "srt not found" in err and "Traceback" not in err
+    assert not list((factory_root / "runs" / "proj").iterdir())
+    assert not (repo / ".factory" / "tasks.json").exists()
+
+
+@pytest.mark.parametrize("error", ["SandboxError", "RunError"])
+def test_cli_import_runner_setup_error_refuses_exit_1(
+        tmp_path: Path, monkeypatch, capsys, error):
+    """Round 2: any runner setup error raised from the sandboxed runner
+    (``SandboxError``, ``RunError``) is an ImportRefused at the CLI."""
+    from factory.runs import RunError
+    from factory.sandbox import SandboxError
+
+    exc_type = {"SandboxError": SandboxError, "RunError": RunError}[error]
+
+    def broken(seat, prompt, run_dir, profile, **kw):
+        raise exc_type(f"{error}: runner could not be set up")
+
+    repo = _git_repo(tmp_path)
+    factory_root = tmp_path / "factory-root"
+    _forbid_in_process_session(monkeypatch)
+    monkeypatch.setattr("factory.importer.run_session_sandboxed", broken,
+                        raising=False)
+
+    rc = main(["import", "--repo", str(repo), "--factory-root", str(factory_root)])
+
+    assert rc == 1
+    assert "runner could not be set up" in capsys.readouterr().err
+    assert not list((factory_root / "runs" / "proj").iterdir())
