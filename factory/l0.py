@@ -51,7 +51,10 @@ flips it, per the verifier's standing rule):
   ``gates.TEST_GLOBS`` (nested test dirs and ``conftest.py`` at any depth
   included — conftest is test infrastructure); the exact test files named
   in the task's approved contract are additionally treated as protected
-  paths, locked at approval.
+  paths, locked at approval. Adding a file under ``paths.protected`` is a
+  touch (a new ``conftest.py`` can disable the contract tests); only the
+  task's own contract test files may be added, since they are written
+  red-first by the implementer.
 - Skip markers and removed assertions are line heuristics over the diff's
   added/removed lines in test files. A moved assertion trips the rule; a
   human reviews the FAIL. All four built-in sentinels (F-25) scan in
@@ -60,7 +63,9 @@ flips it, per the verifier's standing rule):
   ``sentinels.<risk flag>`` commands after setup and records one result
   per sentinel on the report.
 - Command output is scanned for ``file:line`` errors (gcc/ruff and tsc
-  styles). A failing command whose output yields no parseable location —
+  styles). A failing command whose output yields no parseable location,
+  or only locations outside the repo (framework/site-packages frames,
+  which never become ``new_error``) —
   or that reports a failure no baseline entry can cover (a failed test, a
   traceback, a tool crash) — is a FAIL with the raw output attached: an
   error we cannot attribute is not pre-existing.
@@ -235,7 +240,8 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
                       matched_flags: set | None = None):
     """Apply the L0 diff policy to a set of changed paths.
 
-    FAIL classes (findings): protected path touched (modified or deleted),
+    FAIL classes (findings): protected path touched (added, modified or
+    deleted — adding one of the task's own contract test files is allowed),
     test file deleted. Escalation classes (no FAIL by themselves):
     undeclared risk path touched (flag added; forces a human merge),
     dependency manifest changed. The skip-marker, assertion, credential
@@ -257,7 +263,8 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
     """
     task = task or {}
     paths = profile.get("paths") or {}
-    protected = list(paths.get("protected") or []) + sorted(contract_test_files(task))
+    contract_files = contract_test_files(task)
+    protected = list(paths.get("protected") or []) + sorted(contract_files)
     manifests = profile.get("dependency_manifests") or []
 
     findings: list[Finding] = []
@@ -273,7 +280,14 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
 
     for change in changes:
         for path, verb in events(change):
-            if verb in ("modified", "deleted") and _matches(path, protected):
+            # Adding counts too: a new conftest.py or a new file under a
+            # protected glob changes how the contract tests run. The task's
+            # own contract test files are the exception — the implementer
+            # must create them (red-first); once they exist, edits are locked.
+            touched = verb in ("modified", "deleted") or (
+                verb == "added" and path not in contract_files
+            )
+            if touched and _matches(path, protected):
                 findings.append(
                     Finding(
                         "protected_path_touched",
@@ -631,9 +645,8 @@ def run_l0(
                     for f, n, msg in errors
                 }
             )
-            for file, line, message in errors:
-                if not repo_owned(file):
-                    continue  # a framework frame: never baselineable noise
+            owned = [e for e in errors if repo_owned(e[0])]
+            for file, line, message in owned:
                 if line in known_errors.get(file, set()):
                     preexisting.append(f"{file}:{line} pre-existing (baselined), not a failure")
                 else:
@@ -653,6 +666,18 @@ def run_l0(
                         "command_failed",
                         f"{name} exited {result.exit_code} reporting a failure no "
                         f"baseline entry covers: {marker}",
+                    )
+                )
+            elif not owned:
+                # Every parsed location was a framework/foreign frame
+                # (dropped from new_error, INC-005) and no marker fired:
+                # nothing in the repo or its baseline explains the
+                # non-zero exit, so it fails like an unparsable one.
+                findings.append(
+                    Finding(
+                        "command_failed",
+                        f"{name} exited {result.exit_code} with no repo-owned error "
+                        f"location: {result.output.strip()[:500]}",
                     )
                 )
 
