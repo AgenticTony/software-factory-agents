@@ -26,12 +26,15 @@ record the orchestrator writes):
   merged tasks, divided by the number of merged tasks (``links.merged``
   equals ``links.pr``; orchestrator-stamped, F-26).
 * **time from approval to merge** — per merged task, ``approved_at`` to
-  the merge commit's time (from git history, or a caller-supplied
-  ``merge_times`` map); reported as the median.
-* **merged PRs later reverted** — of the merged PRs, the share whose
-  merge commit is named by a later revert commit's
-  ``This reverts commit <sha>`` body (the canonical ``git revert``
-  message: the revert names the PR's merge commit).
+  the time of its merge commit on the default branch (a squash merge's
+  ``<title> (#N)`` or a merge commit's ``Merge pull request #N from ...``
+  subject); reported as the median.
+* **merged PRs later reverted** — of the merged PRs whose merge commit
+  was found, the share named by a revert commit's
+  ``This reverts commit <sha>`` body on the default branch (the canonical
+  ``git revert`` message, for either merge style). Merged PRs with no
+  merge commit found are not counted as unreverted: when none is found
+  the share is unknown, and a partial gap is said on the page.
 
 Everything here reads; nothing writes.
 """
@@ -57,10 +60,11 @@ class StatusError(Exception):
 # A GitHub PR url's number: .../pull/7, .../pull-requests/7, or a
 # gitlab-style .../-/merge_requests/7 (the same idea).
 _PR_NUMBER = re.compile(r"/(?:pull|pull-requests|merge_requests)/(\d+)")
-# A squash-merge commit names its PR: "<title> (#7)". The number varies,
-# so the subject pattern is compiled per lookup in _merge_commit_for.
-# The canonical git revert body names the commit it reverts — for a
-# squash merge, that commit IS the PR's merge commit.
+# A merge names its PR: a squash merge's "<title> (#7)" subject or a
+# merge commit's "Merge pull request #7 from ..." subject. The number
+# varies, so the patterns are compiled per lookup in _merge_commit_for.
+# The canonical git revert body names the commit it reverts — the PR's
+# squash commit or its merge commit (``git revert -m 1`` keeps the line).
 _REVERTS = "This reverts commit "
 
 
@@ -93,26 +97,76 @@ def pr_number(url: str) -> str | None:
     return match.group(1) if match else None
 
 
-def git_commits(repo: Path | str) -> list[dict[str, str]]:
-    """The repo's commit history as ``{sha, subject, body, at}`` dicts.
+def _git_out(repo: Path | str, *args: str) -> str | None:
+    """A git query's stdout, stripped; None when git refuses it."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True, text=True, check=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    return proc.stdout.strip()
 
-    One subprocess, read-only. ``at`` is the committer date in ISO-8601 —
-    the time a merge (or its revert) actually landed on the branch.
-    ``--all`` spans every ref: the caller may sit on a feature branch
-    (the orchestrator's clones always do) while the merges live on the
-    default branch, and the measures must not silently degrade to zero
-    there.
+
+def _default_branch_refs(repo: Path | str) -> list[str]:
+    """The refs that hold the repo's default branch, never other branches.
+
+    The default branch is the one ``origin/HEAD`` names (``git clone``
+    sets it), else a local ``main`` or ``master``. Both its local branch
+    and its ``origin/`` tracking ref are read — the caller may sit on a
+    feature branch with no local default branch (an orchestrator clone),
+    or on a checkout whose local default is ahead of the remote. With no
+    default branch found, ``HEAD`` is the only honest choice left.
+
+    Stashes, unmerged branches (GitHub's ``revert-N``) and backport
+    branches are deliberately excluded: a stash subject ends in the
+    stashed commit's ``(#N)`` and a revert that never landed is no revert.
+    """
+    name: str | None = None
+    origin_head = _git_out(
+        repo, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"
+    )
+    if origin_head and origin_head.startswith("origin/"):
+        name = origin_head.removeprefix("origin/")
+    else:
+        for candidate in ("main", "master"):
+            if _git_out(repo, "rev-parse", "-q", "--verify",
+                        f"refs/heads/{candidate}^{{commit}}") is not None:
+                name = candidate
+                break
+    if name is None:
+        return ["HEAD"]
+    refs = [
+        ref for ref in (f"refs/heads/{name}", f"refs/remotes/origin/{name}")
+        if _git_out(repo, "rev-parse", "-q", "--verify", f"{ref}^{{commit}}")
+        is not None
+    ]
+    return refs or ["HEAD"]
+
+
+def git_commits(repo: Path | str) -> list[dict[str, str]]:
+    """The default branch's commit history as ``{sha, subject, body, at}``.
+
+    Read-only. ``at`` is the committer date in ISO-8601 — the time a
+    merge (or its revert) actually landed on the branch. The history is
+    the default branch's (:func:`_default_branch_refs`), not the checked
+    out one: the caller may sit on a feature branch (the orchestrator's
+    clones always do) while the merges live on the default branch — and
+    not every ref either, since a stash or an unmerged revert branch
+    would date merges wrongly and count reverts that never landed.
 
     Raises:
         StatusError: ``repo`` is not a git repository (or has no commits,
             or git is missing) — the merge measures degrade to a note on
             the page instead of guessing.
     """
+    refs = _default_branch_refs(repo)
     try:
         proc = subprocess.run(
             [
-                "git", "-C", str(repo), "log", "--all",
-                "--pretty=format:%H%x1f%s%x1f%b%x1f%cI%x1e",
+                "git", "-C", str(repo), "log", *refs,
+                "--pretty=format:%H%x1f%s%x1f%b%x1f%cI%x1e", "--",
             ],
             capture_output=True,
             text=True,
@@ -137,7 +191,8 @@ def git_commits(repo: Path | str) -> list[dict[str, str]]:
 def _merge_commit_for(
     commits: list[dict[str, str]], number: str
 ) -> dict[str, str] | None:
-    """The newest commit whose subject names the PR.
+    """The newest commit whose subject names the PR (in ``commits``,
+    which :func:`git_commits` limits to the default branch).
 
     Both GitHub merge styles: a squash merge ends its subject with
     ``(#N)``; a merge commit reads ``Merge pull request #N from ...``.
@@ -179,13 +234,18 @@ def compute_metrics(
         commits: Optional commit history (:func:`git_commits` shape) used
             both to date merges (squash ``(#N)`` and merge-commit
             ``Merge pull request #N`` subjects) and to detect reverts.
+            None means no history was read; an empty list means history
+            was read and holds nothing.
 
     Returns:
         A dict with, per the module docstring: ``interventions_per_task``,
         ``review_rounds_per_attempt``, ``tokens_per_merged_pr``,
         ``approval_to_merge_days`` (median), ``approval_to_merge_detail``
-        (per-task ``(id, days)``), ``revert_share`` plus ``reverted`` /
-        ``merged`` counts, the raw ``interventions`` / ``attempted_tasks``
+        (per-task ``(id, days)``), ``revert_share`` (over the merges
+        whose commit was found; None when none was, or with no history)
+        plus ``reverted`` / ``merged`` counts and ``merges_unresolved``
+        (merged tasks with no merge commit found; None with no history),
+        the raw ``interventions`` / ``attempted_tasks``
         / ``attempts`` / ``rounds`` counts, ``merges_undated`` (merged
         tasks whose merge time could not be established) and
         ``merges_anomalous`` (a merge stamp older than the approval —
@@ -220,6 +280,9 @@ def compute_metrics(
         durations.append((task.get("id", "?"), (merged_at - approved).total_seconds() / 86400))
 
     reverted = sum(1 for sha in merge_shas if _is_reverted(commits or [], sha))
+    # The share is over the merges actually checked: a merged PR whose
+    # merge commit was never found is unknown, not "not reverted".
+    unresolved = len(merged) - len(merge_shas) if commits is not None else None
     return {
         "interventions_per_task": (
             len(interventions) / len(attempted_tasks) if attempted_tasks else None
@@ -234,9 +297,10 @@ def compute_metrics(
             statistics.median(days for _, days in durations) if durations else None
         ),
         "approval_to_merge_detail": durations,
-        "revert_share": reverted / len(merged) if merged and commits is not None else None,
+        "revert_share": reverted / len(merge_shas) if merge_shas else None,
         "reverted": reverted,
         "merged": len(merged),
+        "merges_unresolved": unresolved,
         "interventions": len(interventions),
         "attempted_tasks": len(attempted_tasks),
         "attempts": len(attempts),
@@ -327,7 +391,8 @@ def _render_metrics(metrics: dict[str, Any], notes: list[str]) -> list[str]:
     if metrics["merges_undated"]:
         notes.append(
             f"{metrics['merges_undated']} merged PR(s) without a merge time "
-            "(no git history for the repo, or no (#N) merge commit)"
+            "(no git history for the repo, no '(#N)' or 'Merge pull "
+            "request #N' commit on its default branch, or no approved_at)"
         )
     if metrics["merges_anomalous"]:
         notes.append(
@@ -338,9 +403,22 @@ def _render_metrics(metrics: dict[str, Any], notes: list[str]) -> list[str]:
 
     if metrics["merged"] == 0:
         lines.append("- merged PRs later reverted: no merged PRs yet")
-    elif metrics["revert_share"] is None:
+    elif metrics["merges_unresolved"] is None:
         lines.append(
             "- merged PRs later reverted: needs the repo's git history"
+        )
+    elif metrics["revert_share"] is None:
+        lines.append(
+            "- merged PRs later reverted: unknown — no merge commit found "
+            f"for any of the {metrics['merged']} merged PRs"
+        )
+    elif metrics["merges_unresolved"]:
+        checked = metrics["merged"] - metrics["merges_unresolved"]
+        lines.append(
+            f"- merged PRs later reverted: {metrics['reverted']} of "
+            f"{checked} checked ({metrics['revert_share']:.0%}); "
+            f"{metrics['merges_unresolved']} merged PR(s) with no merge "
+            "commit found, not counted"
         )
     else:
         lines.append(

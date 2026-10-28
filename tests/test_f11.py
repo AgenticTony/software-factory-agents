@@ -451,7 +451,8 @@ def test_review_f1_history_spans_all_branches(tmp_path: Path):
     """F1: git_commits read HEAD only, so a clone checked out on a
     feature branch (the orchestrator's clones always are) missed every
     merge on main — approval-to-merge and reverts silently degraded to
-    nothing. History must span all refs."""
+    nothing. History must reach the default branch from any checkout
+    (since review round 2: the default branch only, not every ref)."""
     repo = _review_repo(tmp_path)
     subjects = [c["subject"] for c in git_commits(repo)]
     assert "Task T-A (#7)" in subjects, (
@@ -568,3 +569,153 @@ def test_review_f7_render_uses_the_group_it_already_has(tmp_path):
     finally:
         status_module.needs_human_tasks = original
     assert "T-G" in page and "attempts_exhausted" in page
+
+
+# ------------------- review round 2 (PRs #58/#59 findings, 2026-10-27) -------
+
+
+def _commit(repo: Path, message: str, at: str, *extra: str) -> str:
+    """A pinned-date commit in a fixture repo; returns its sha."""
+    (repo / "f.txt").write_text(message + "\n")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.email=s@x", "-c", "user.name=s",
+         "commit", "-q", "--allow-empty", "-m", message, *extra, at=at)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def test_review2_58_f1_revert_share_is_unknown_without_merge_commits(
+    tmp_path: Path,
+):
+    """#58 F1: with history present but no merge commit found for any
+    merged PR, revert_share divided by the merged count and the page
+    claimed '0 of 2 (0%)' — a confident figure for an unchecked measure."""
+    commits = [
+        {"sha": "e" * 40, "subject": "rebase-merged work, no PR number",
+         "body": "", "at": "2026-10-02T09:00:00Z"},
+        {"sha": "f" * 40, "subject": "Revert something",
+         "body": f"This reverts commit {'e' * 40}.",
+         "at": "2026-10-03T09:00:00Z"},
+    ]
+    metrics = compute_metrics(_doc(), commits=commits)
+    assert metrics["revert_share"] is None, metrics["revert_share"]
+    assert metrics["merges_unresolved"] == 2
+
+    repo = tmp_path / "norepo-match"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _commit(repo, "unrelated work", "2026-10-02T09:00:00Z")
+    page = render_status(_doc(), project="fixture", factory_root=tmp_path,
+                         now=NOW, repo=repo)
+    assert "0 of 2" not in page, page
+    assert ("- merged PRs later reverted: unknown — no merge commit found "
+            "for any of the 2 merged PRs") in page, page
+
+
+def test_review2_58_f1_revert_share_counts_only_resolved_merges():
+    """#58 F1 (partial): an unresolved merge must not dilute the share —
+    the denominator is the merges actually checked, and the gap is said."""
+    commits = [c for c in COMMIT_FIXTURE if c["subject"] != "Task T-C (#9)"]
+    metrics = compute_metrics(_doc(), commits=commits)
+    assert metrics["revert_share"] == pytest.approx(1.0)
+    assert (metrics["reverted"], metrics["merges_unresolved"]) == (1, 1)
+    notes: list[str] = []
+    from factory.status import _render_metrics
+
+    lines = _render_metrics(metrics, notes)
+    assert ("- merged PRs later reverted: 1 of 1 checked (100%); 1 merged "
+            "PR(s) with no merge commit found, not counted") in lines, lines
+
+
+def test_review2_58_f2_stash_is_not_taken_as_the_merge_commit(tmp_path: Path):
+    """#58 F2 / #59 F1(a): `git log --all` read refs/stash, whose subject
+    'WIP on main: <sha> Task T-A (#7)' ends in (#7) and is newest, so the
+    stash became PR #7's merge commit — wrong merge date, and a real
+    revert of the merge was missed."""
+    from factory.status import _merge_commit_for
+
+    repo = tmp_path / "stashed"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    merge = _commit(repo, "Task T-A (#7)", "2026-10-02T09:00:00Z")
+    # Stash while HEAD is the squash merge: subject 'WIP on main: <short>
+    # Task T-A (#7)', newer than the merge.
+    (repo / "f.txt").write_text("dirty\n")
+    _git(repo, "-c", "user.email=s@x", "-c", "user.name=s", "stash",
+         at="2026-10-06T09:00:00Z")
+    _commit(repo, 'Revert "Task T-A (#7)"', "2026-10-07T09:00:00Z",
+            "-m", f"This reverts commit {merge}.")
+    commits = git_commits(repo)
+    found = _merge_commit_for(commits, "7")
+    assert found is not None and found["sha"] == merge, found
+    doc = {"version": 1, "tasks": [
+        _task("T-A", "done", links={"pr": PR_A, "merged": PR_A}),
+    ]}
+    metrics = compute_metrics(doc, commits=commits)
+    assert metrics["reverted"] == 1, metrics
+    assert dict(metrics["approval_to_merge_detail"]) == {"T-A": 1.0}
+
+
+def test_review2_59_f1_unmerged_revert_branch_is_not_a_revert(tmp_path: Path):
+    """#59 F1(b): a revert that lives only on an unmerged branch (GitHub's
+    Revert button pushes revert-N) was counted, so the PR showed reverted
+    while the revert PR was still open. Only the default branch counts."""
+    repo = tmp_path / "revert-branch"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    merge = _commit(repo, "Task T-A (#7)", "2026-10-02T09:00:00Z")
+    _git(repo, "checkout", "-q", "-b", "revert-7")
+    _commit(repo, 'Revert "Task T-A (#7)"', "2026-10-05T09:00:00Z",
+            "-m", f"This reverts commit {merge}.")
+    # A cherry-picked backport elsewhere must not outrank the real merge.
+    _git(repo, "checkout", "-q", "-b", "release", "main")
+    backport = _commit(repo, "Task T-A (#7)", "2026-10-06T09:00:00Z")
+    _git(repo, "checkout", "-q", "main")
+    commits = git_commits(repo)
+    shas = {c["sha"] for c in commits}
+    assert backport not in shas
+    doc = {"version": 1, "tasks": [
+        _task("T-A", "done", links={"pr": PR_A, "merged": PR_A}),
+    ]}
+    metrics = compute_metrics(doc, commits=commits)
+    assert metrics["reverted"] == 0, "revert on an unmerged branch counted"
+    assert metrics["revert_share"] == 0
+
+
+def test_review2_59_f1_clone_on_feature_branch_reads_origin_default(
+    tmp_path: Path,
+):
+    """#59 F1 keeps the #59 F1 guarantee: a clone checked out on a feature
+    branch, with no local default branch, still reads the merges from
+    origin's default branch (origin/HEAD) — and not the feature's own
+    unmerged revert."""
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    _git(upstream, "init", "-q", "-b", "main")
+    merge = _commit(upstream, "Task T-A (#7)", "2026-10-02T09:00:00Z")
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", "-q", str(upstream), str(clone))
+    _git(clone, "checkout", "-q", "-b", "feature")
+    _git(clone, "branch", "-q", "-D", "main")
+    _commit(clone, "feature revert", "2026-10-05T09:00:00Z",
+            "-m", f"This reverts commit {merge}.")
+    doc = {"version": 1, "tasks": [
+        _task("T-A", "done", links={"pr": PR_A, "merged": PR_A}),
+    ]}
+    metrics = compute_metrics(doc, commits=git_commits(clone))
+    assert dict(metrics["approval_to_merge_detail"]) == {"T-A": 1.0}
+    assert metrics["reverted"] == 0
+
+
+def test_review2_59_f2_texts_describe_current_behaviour():
+    """#59 F2: the module docstring still cited the removed merge_times
+    map, and the undated note named only '(#N)' squash commits although
+    'Merge pull request #N' subjects are matched too."""
+    import factory.status as status_module
+    from factory.status import _render_metrics
+
+    assert "merge_times" not in (status_module.__doc__ or "")
+    metrics = compute_metrics(_doc(), commits=[])
+    notes: list[str] = []
+    _render_metrics(metrics, notes)
+    undated = [n for n in notes if "without a merge time" in n]
+    assert undated and "Merge pull request #N" in undated[0], notes
