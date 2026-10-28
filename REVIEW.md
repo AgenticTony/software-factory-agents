@@ -32,10 +32,17 @@ done, say that — never "no steps recorded".
 
 ## Nit budget
 
-At most three non-blocking findings per review. Style-only findings are
-dropped (the linter owns style). If everything you found is a nit, the
-verdict is PASS with the nits listed — do not manufacture a blocking
-finding to be thorough.
+A nit is a finding of severity `minor` or `note`. Report every
+`blocking` and `major` finding you have evidence for — the budget never
+caps them, and never drop a real defect to stay within it. At most three
+nits per review: keep the three that matter most. Style-only findings
+are dropped (the linter owns style).
+
+The budget limits noise, not the verdict. The verdict follows the
+reviewer prompt's rules: default FAIL, a `blocking` finding fails, and
+FAIL stands without one when the evidence for an acceptance item isn't
+there. Nits alone never turn a pass into a fail — do not manufacture a
+blocking finding to be thorough, and do not inflate a nit to `major`.
 
 ## The bug class beats the bug instance
 
