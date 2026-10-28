@@ -15,12 +15,18 @@ documents and proposes a queue. Four rules shape everything here:
   proposes; it writes only through :func:`apply_import`, on an explicit
   confirm, and then via :class:`~factory.state.TaskQueue` — so the
   writer lock and the append-only attempts rule hold on this path too.
+  The plan remembers the queue it was built from: if the queue changed
+  while the confirm prompt waited (an approval, a status move), the
+  write is refused instead of reverting that change.
 * **Re-running with unchanged documents proposes no diff for existing
   tasks** (AC-3): the merge compares the proposed spec fields with the
   stored ones and touches nothing else — status, attempts, approval
-  fields and links are preserved as they are. A task the proposal does
-  not mention is carried over and *listed* (kind ``missing``), so a
-  silently dropped work order is visible instead of quiet.
+  fields and links are preserved as they are, and so is the queue's own
+  key order. A spec field the proposal leaves out keeps its stored value
+  (defaults apply to new tasks only; an explicit value, ``[]`` included,
+  is a proposal). A task the proposal does not mention is carried over
+  and *listed* (kind ``missing``), so a silently dropped work order is
+  visible instead of quiet.
 
 The out-of-scope register (TASK-CONTRACT §5, ``.factory/out-of-scope/``)
 is read and shown to the importer session. A proposed task that resembles
@@ -33,17 +39,21 @@ still ``draft``, never dropped or rejected on its own.
 The session sits behind one injected callable (the F-06 pattern):
 ``session(prompt) -> text``. Tests pass a stub returning a fixed
 proposal; the default, :func:`sdk_import_session`, runs the reviewer
-seat — read-only: no Write/Edit — through
-:func:`factory.session.run_session` and returns its final message.
+seat through :func:`factory.session.run_session_sandboxed` — inside srt,
+in a disposable clone of the repo's committed HEAD, with the read-only
+reviewer guard (read-only sandbox, no Write/Edit, workspace integrity
+check) — and returns its final message. It never runs in-process on the
+live checkout (DESIGN D3).
 """
 
 from __future__ import annotations
 
-import asyncio
+import contextlib
 import copy
 import difflib
 import json
 import re
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -55,7 +65,9 @@ from factory.contract import (
     load_tasks,
     validate_queue,
 )
-from factory.session import run_session, seat_token
+from factory.runs import FACTORY_ROOT_DEFAULT, RunError, cleanup_run, create_run
+from factory.sandbox import SandboxError
+from factory.session import SessionConfigError, run_session_sandboxed, seat_token
 from factory.state import TaskQueue, _atomic_write_json, now_iso
 
 OUT_OF_SCOPE_DIR = ".factory/out-of-scope"
@@ -272,13 +284,19 @@ class ImportPlan:
     changes: list[TaskChange] = field(default_factory=list)
     matches: list[OutOfScopeMatch] = field(default_factory=list)
     diff: str = ""
+    # The queue the plan was built from (None: no queue existed). The
+    # write refuses if the disk queue no longer matches it, so a change
+    # made while the confirm prompt waits is never silently reverted.
+    base_doc: dict | None = None
 
 
 def _task_from_proposal(raw: Any, index: int, record_paths: set[str]) -> tuple[dict, str | None]:
     """Build one proposed task from a raw proposal entry.
 
-    Returns the task (with ``status: draft`` and the spec defaults
-    applied) and the out-of-scope record it claims to resemble, if any.
+    Returns the task (``id``, ``status: draft`` and exactly the spec
+    fields the entry carries — no defaults: a default here would read as
+    a proposal to an existing task's merge; see :func:`_new_task`) and
+    the out-of-scope record it claims to resemble, if any.
 
     Raises:
         ImportRefused: The entry is not an object, carries a forbidden
@@ -318,6 +336,15 @@ def _task_from_proposal(raw: Any, index: int, record_paths: set[str]) -> tuple[d
     for spec_field in SPEC_FIELDS:
         if spec_field in raw:
             task[spec_field] = raw[spec_field]
+    return task, match
+
+
+def _new_task(proposed: dict) -> dict:
+    """A task the queue does not hold yet: the proposal plus the spec
+    defaults (no dependencies, no risk flags, every gate human). Only a
+    new task gets defaults — for an existing one an omitted field keeps
+    its stored value (:func:`_merge_task`)."""
+    task = copy.deepcopy(proposed)
     task.setdefault("depends_on", [])
     task.setdefault("risk", [])
     task.setdefault(
@@ -328,13 +355,14 @@ def _task_from_proposal(raw: Any, index: int, record_paths: set[str]) -> tuple[d
     # key so every reader of an imported task sees a list, never a
     # KeyError on a field the schema leaves optional.
     task.setdefault("attempts", [])
-    return task, match
+    return task
 
 
 def _merge_task(existing: dict, proposed: dict) -> tuple[dict, list[str]]:
     """Merge a proposal into an existing task: only the spec fields the
-    proposal actually changes are updated, so status, attempts, approval
-    fields and links survive untouched (AC-3)."""
+    proposal carries *and* changes are updated, so status, attempts,
+    approval fields, links and every spec field the proposal leaves out
+    survive untouched (AC-3)."""
     changed = [
         spec_field
         for spec_field in SPEC_FIELDS
@@ -345,7 +373,7 @@ def _merge_task(existing: dict, proposed: dict) -> tuple[dict, list[str]]:
     merged = copy.deepcopy(existing)
     for spec_field in changed:
         merged[spec_field] = copy.deepcopy(proposed[spec_field])
-    # Same normalisation as a fresh task (_task_from_proposal): a queue
+    # Same normalisation as a fresh task (_new_task): a queue
     # written before the key existed (or by hand) still merges out with a
     # list, not a missing key.
     merged.setdefault("attempts", [])
@@ -426,18 +454,19 @@ def plan_import(
     for task in proposed_tasks:
         if task["id"] in by_id:
             continue
-        merged.append(copy.deepcopy(task))
+        merged.append(_new_task(task))
         changes.append(TaskChange(task_id=task["id"], kind="new"))
 
-    proposed_doc: dict[str, Any] = {
-        "version": 1,
-        "project": project,
-        "tasks": merged,
-    }
-    if existing_doc is not None and existing_doc.get("updated_at"):
-        # Inherited so the diff shows the tasks, not a fresh stamp (the
-        # write path stamps its own).
-        proposed_doc["updated_at"] = existing_doc["updated_at"]
+    if existing_doc is not None:
+        # The existing document, tasks swapped in place: its key order
+        # (this repo's queues keep updated_at before tasks) and its
+        # updated_at stamp are inherited, so an unchanged re-import
+        # renders byte-identical and the diff is empty (AC-3). The write
+        # path stamps its own updated_at.
+        proposed_doc: dict[str, Any] = copy.deepcopy(existing_doc)
+        proposed_doc["tasks"] = merged
+    else:
+        proposed_doc = {"version": 1, "project": project, "tasks": merged}
     try:
         validate_queue(proposed_doc, f"proposed tasks.json for {project}")
     except ContractError as exc:
@@ -458,6 +487,7 @@ def plan_import(
         changes=changes,
         matches=matches,
         diff=diff,
+        base_doc=copy.deepcopy(existing_doc),
     )
 
 
@@ -533,7 +563,11 @@ def apply_import(
 
     An existing queue is written through :class:`TaskQueue.save`
     (validation, the writer lock, the append-only attempts check); a
-    fresh queue is validated once more and written atomically.
+    fresh queue is validated once more and written atomically. Either
+    way the queue on disk must still be the one the plan was built from
+    (``plan.base_doc``): a change made in between — an approval, a
+    status move, a queue created by another writer — refuses the write
+    rather than being overwritten with the stale plan.
 
     Args:
         plan: The plan to apply.
@@ -542,18 +576,36 @@ def apply_import(
 
     Returns:
         True if the queue was written, False if the confirm declined.
+
+    Raises:
+        ImportRefused: The queue changed since the plan was built.
     """
     if not confirm():
         return False
     path = Path(queue_path)
+    stale = ImportRefused(
+        f"{path}: the queue changed since this import was planned (an "
+        "approval, a status move or another writer); nothing written — "
+        "re-run factory import to plan against the current queue"
+    )
     if path.is_file():
+        if plan.base_doc is None:
+            raise stale
         queue = TaskQueue(path)
+        # The baseline check: the queue this instance loaded must be the
+        # one the plan was built from. From here on save()'s own
+        # concurrent-write check (against this load) covers the rest of
+        # the window up to the locked write.
+        if canonical_json(queue.doc) != canonical_json(plan.base_doc):
+            raise stale
         queue.doc["tasks"] = copy.deepcopy(plan.proposed_doc["tasks"])
         # save() validates the whole document, takes the writer lock,
         # re-reads the disk queue and enforces the append-only attempts
         # rule — the same guarantees every other writer goes through.
         queue.save()
     else:
+        if plan.base_doc is not None:
+            raise stale  # the queue the plan merged into is gone
         doc = copy.deepcopy(plan.proposed_doc)
         doc["updated_at"] = now_iso()
         validate_queue(doc, str(path))
@@ -586,6 +638,7 @@ def run_import(
     docs_dir: str = DEFAULT_DOCS_DIR,
     session: Callable[[str], str] | None = None,
     confirm: Callable[[str], bool] | None = None,
+    factory_root: Path | str | None = None,
 ) -> ImportResult:
     """Propose a queue from the project's planning documents.
 
@@ -601,8 +654,10 @@ def run_import(
         queue_path: The queue file; default ``<repo>/.factory/tasks.json``.
         docs_dir: Repo-relative planning-docs directory for the prompt.
         session: Injected importer session (``prompt -> text``); default
-            :func:`sdk_import_session`.
+            :func:`sdk_import_session` (sandboxed, in a disposable clone).
         confirm: ``summary -> bool``; asked before the one and only write.
+        factory_root: Factory root for the default session's run dir and
+            sandbox settings (default ``~/factory``).
 
     Returns:
         The :class:`ImportResult` — plan, summary, resolved queue path,
@@ -618,15 +673,24 @@ def run_import(
     queue_path = Path(queue_path)
     records = read_out_of_scope(repo)
     existing_doc = load_tasks(queue_path) if queue_path.is_file() else None
+    profile: dict | None = None
     if existing_doc is not None:
         project = existing_doc["project"]
     else:
-        project = load_profile(repo / ".factory" / "project.yaml")["name"]
+        profile = load_profile(repo / ".factory" / "project.yaml")
+        project = profile["name"]
     prompt = build_import_prompt(repo, docs_dir, records)
     if session is not None:
         text = session(prompt)
     else:
-        text = sdk_import_session(prompt, repo)
+        if profile is None:
+            # The sandbox settings (docs/network allowlists, protected
+            # paths) come from the profile; no profile, no session.
+            profile = load_profile(repo / ".factory" / "project.yaml")
+        text = sdk_import_session(
+            prompt, repo, profile=profile, queue_path=queue_path,
+            factory_root=factory_root,
+        )
     plan = plan_import(existing_doc, parse_proposal(text), records, project=project)
     summary = render_summary(plan)
     applied = False
@@ -643,17 +707,46 @@ def sdk_import_session(
     prompt: str,
     repo: Path | str,
     *,
+    profile: dict,
+    queue_path: Path | str | None = None,
+    factory_root: Path | str | None = None,
     max_turns: int = DEFAULT_MAX_TURNS,
     timeout_min: float = DEFAULT_TIMEOUT_MIN,
 ) -> str:
-    """The default importer session: the reviewer seat (read-only — no
-    Write/Edit) over the project repo, returning its final message.
+    """The default importer session: the reviewer seat, sandboxed.
 
-    The in-process call is the library seam; an unattended run wraps the
-    same seat through the sandboxed runner
-    (``factory.session.run_session_sandboxed``). A machine with no model
-    credential refuses here — review a prepared proposal with
-    ``factory import --proposal`` instead.
+    Runs through :func:`factory.session.run_session_sandboxed` exactly as
+    the orchestrator runs its reviewer — the whole runner inside srt with
+    the read-only reviewer guard (read-only sandbox settings, no
+    Write/Edit/NotebookEdit, the workspace-integrity check that fails a
+    session which changed anything) — in a disposable clone of the repo's
+    committed HEAD under ``<factory_root>/runs/<project>/``. The live
+    checkout is never the session's cwd and nothing runs in-process
+    (DESIGN D3): the session reads committed planning docs, so commit
+    them before importing. The clone and its sandbox files are removed on
+    every exit path.
+
+    While the clone exists the queue's run lease is held (when the queue
+    exists): every run dir of a project is created under that lease, so
+    the orchestrator's reclaim never deletes the clone mid-session, and
+    an import refuses instead of racing a live run.
+
+    Args:
+        prompt: The importer prompt (:func:`build_import_prompt`).
+        repo: The project repo root (cloned, never used as the cwd).
+        profile: The project profile — the sandbox's docs/network
+            allowlists and ``paths.protected``.
+        queue_path: The queue whose run lease to hold; None or a missing
+            file holds none (a fresh project has no orchestrator).
+        factory_root: Factory root (default ``~/factory``).
+        max_turns/timeout_min: The session's budget.
+
+    Raises:
+        ImportRefused: No model credential (review a prepared proposal
+            with ``factory import --proposal`` instead), the clone or the
+            sandbox could not be set up, the session timed out, or it
+            ended other than ``completed`` (a reviewer that mutated its
+            clone ends ``failed``).
     """
     token = seat_token()
     if not token:
@@ -662,11 +755,37 @@ def sdk_import_session(
             "importer session cannot run; prepare a proposal elsewhere and "
             "review it with `factory import --proposal <file>`"
         )
-    record = asyncio.run(
-        run_session(
-            "reviewer", prompt, Path(repo), max_turns, timeout_min, token=token
-        )
+    root = Path(factory_root) if factory_root else FACTORY_ROOT_DEFAULT
+    queue = (
+        TaskQueue(queue_path)
+        if queue_path is not None and Path(queue_path).is_file() else None
     )
+    lease = queue.idle_lease() if queue is not None else contextlib.nullcontext()
+    with lease:
+        try:
+            run = create_run(profile["name"], Path(repo), factory_root=root)
+        except RunError as exc:
+            raise ImportRefused(f"cannot clone the repo for the importer session: {exc}") from exc
+        try:
+            record = run_session_sandboxed(
+                "reviewer", prompt, run.root, profile,
+                factory_root=root, settings_path=run.settings_path,
+                max_turns=max_turns, timeout_min=timeout_min,
+                protected=list((profile.get("paths") or {}).get("protected") or []),
+                token=token, run_id=run.run_id,
+            )
+        except (SessionConfigError, SandboxError, RunError) as exc:
+            # Runner setup errors: no bundled CLI / token (SessionConfigError),
+            # srt missing or not at the pin (SandboxError, from ensure_srt
+            # before anything spawns), a run-dir fault (RunError). Each is
+            # a refusal (exit 1 at the CLI), never a traceback.
+            raise ImportRefused(f"the importer session could not run: {exc}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise ImportRefused(
+                f"the importer session timed out after {exc.timeout:.0f}s"
+            ) from exc
+        finally:
+            cleanup_run(run)
     if record.status != "completed":
         raise ImportRefused(
             f"the importer session ended {record.status}: {record.reason}"
