@@ -193,3 +193,17 @@ docstring-contract test. Full-suite nested validation: **83 passed,
 37 skipped, 0 failed** for the two affected files; the whole suite
 nested matches the L0 shape. CI and hosts are unchanged: every gated
 test runs for real wherever a seatbelt can be applied.
+
+*Standing rule (review of #56/#57, PR #69):* "nested" is a narrow answer,
+not a fallback. `can_apply_seatbelt()` answers False only when the probe
+gets the kernel's `sandbox_apply` refusal **and** `process_is_sandboxed()`
+(libSystem `sandbox_check`) independently confirms this process already
+runs under a seatbelt. Any other probe failure on a host — `sandbox-exec`
+missing, a timeout, another nonzero exit, the refusal text on an
+unsandboxed process — raises `SandboxError`, and `tests/conftest.py`
+turns that into a pytest usage error naming INC-007: the run stops before
+any test executes. A broken host sandbox stack fails loudly; the F-05
+sandbox tests fail, never skip. The tests that enforce it:
+  - `tests/test_f05.py::test_seatbelt_probe_failure_is_loud_not_nested`
+  - `tests/test_f05.py::test_seatbelt_probe_answers_nested_only_on_the_kernel_refusal`
+  - `tests/test_f05.py::test_conftest_probe_failure_stops_the_suite`

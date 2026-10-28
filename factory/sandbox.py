@@ -22,6 +22,7 @@ keychain-derived names — a prefixed secret that appears only *after* the
 settings were built is caught by the scrub alone.
 """
 
+import ctypes
 import json
 import os
 import select
@@ -253,8 +254,9 @@ def sandbox_env(
     return scrub_env(env, forbidden)
 
 
-def _path_outside_home(path: str) -> str:
-    """The inherited PATH minus every entry under the owner's home.
+def _path_outside_home(path: str, keep: "Sequence[Path] | None" = None) -> str:
+    """The inherited PATH minus every entry under the owner's home, except
+    the toolchain install dirs the sandbox re-allows.
 
     The sandbox denies reads under ``$HOME``, but an interactive PATH
     starts with home dirs (``~/.local/bin``, ``~/.pyenv/shims``, ...). A
@@ -265,7 +267,29 @@ def _path_outside_home(path: str) -> str:
     kept. A caller's explicit ``env={"PATH": ...}`` is left as given:
     it's a deliberate choice, e.g. a symlinked toolchain re-allowed by
     ``build_settings``.
+
+    An entry under home that is itself in ``keep`` (compared resolved) is
+    kept. ``keep`` defaults to :func:`home_path_keep` — the reads
+    :func:`build_settings` re-allows for :func:`default_toolchain` (every
+    caller's toolchain includes it), the same set the F-24 env-guard
+    accepts,
+    so a node/npm installed by nvm, fnm or volta
+    (``~/.nvm/versions/node/vX/bin``) stays findable — the dir is readable,
+    so a lookup there cannot EPERM — and the L0 setup's ``npm ci`` does not
+    exit 127 (review of #53). A dir that only holds a re-allowed *link*
+    (``~/.local/bin/claude``) is not in ``keep`` and is still dropped.
     """
+    if keep is None:
+        keep_resolved = home_path_keep()
+    else:
+        keep_resolved = _resolved(keep)
+
+    def kept(entry: str) -> bool:
+        try:
+            return Path(entry).resolve() in keep_resolved
+        except OSError:
+            return False
+
     homes = {str(Path.home())}
     with suppress(OSError):
         homes.add(str(Path.home().resolve()))
@@ -275,7 +299,36 @@ def _path_outside_home(path: str) -> str:
             entry == home or entry.startswith(home.rstrip("/") + "/") for home in homes
         )
 
-    return ":".join(entry for entry in path.split(":") if entry and not under_home(entry))
+    return ":".join(
+        entry for entry in path.split(":")
+        if entry and (not under_home(entry) or kept(entry))
+    )
+
+
+def home_path_keep() -> frozenset[Path]:
+    """The one rule for which PATH entries under the owner's home survive
+    into a sandboxed child: the (resolved) reads :func:`build_settings`
+    re-allows for :func:`default_toolchain`. A home entry is kept iff it
+    resolves to one of these — an nvm/fnm/volta ``bin/`` that holds the
+    session's node, say.
+
+    :func:`_path_outside_home` filters by it, and the F-24 rehearsal's
+    env-guard bakes it in (``factory.rehearsal._env_guard_source``), so the
+    guard refuses exactly the home entries the sandbox would have dropped
+    — never the ones it deliberately keeps.
+    """
+    return _resolved(
+        _toolchain_allowread(Path("~").expanduser(), default_toolchain())
+    )
+
+
+def _resolved(paths: "Sequence[Path] | set[Path]") -> frozenset[Path]:
+    """``paths`` resolved, skipping any that cannot be."""
+    found = set()
+    for entry in paths:
+        with suppress(OSError):
+            found.add(Path(entry).resolve())
+    return frozenset(found)
 
 
 def default_toolchain(extra: "Sequence[Path] | None" = None) -> list[Path]:
@@ -293,42 +346,6 @@ def default_toolchain(extra: "Sequence[Path] | None" = None) -> list[Path]:
         if path and Path(path) not in toolchain:
             toolchain.append(Path(path))
     return toolchain
-
-
-def git_template_dir(git_bin: "str | Path | None" = None) -> Path | None:
-    """The share dir git copies repo templates (hook samples) from at
-    init/clone, for the git on PATH.
-
-    Diagnostics for INC-006: the sandbox cannot let ``git init`` read the
-    installation's real templates, because srt blocks writes into every
-    ``.git/hooks/**`` beneath the child's cwd and init copies hook
-    samples there — the empty-``GIT_TEMPLATE_DIR`` fix in
-    :func:`sandbox_env` sidesteps the whole copy. This helper stays for
-    tests and incident forensics: it names the dir the blocked copy
-    would have read.
-
-    Args:
-        git_bin: The git binary to ask (default: PATH's git).
-
-    Returns:
-        The templates dir, or None where git is missing or its templates
-        cannot be located.
-    """
-    binary = str(git_bin) if git_bin else (shutil.which("git") or "git")
-    try:
-        proc = subprocess.run(
-            [binary, "--exec-path"], capture_output=True, text=True, timeout=10
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if proc.returncode != 0 or not proc.stdout.strip():
-        return None
-    exec_path = Path(proc.stdout.strip().rstrip("/"))
-    candidates = (
-        exec_path.parent.parent / "share" / "git-core" / "templates",  # prefix/libexec
-        exec_path.parent / "share" / "git-core" / "templates",  # <prefix>/libexec sibling
-    )
-    return next((c.resolve() for c in candidates if c.is_dir()), None)
 
 
 def build_settings(
@@ -496,6 +513,37 @@ def write_settings(settings: dict, path: Path) -> Path:
     return path
 
 
+def process_is_sandboxed() -> bool:
+    """Whether the kernel reports this process as already running under a
+    macOS sandbox — the independent nesting signal (INC-007 review).
+
+    Asked through libSystem's ``sandbox_check(pid, NULL, 0)``, which
+    answers nonzero for a sandboxed process. Unlike the seatbelt probe it
+    does not try (and fail) to apply anything, so a broken or slow
+    ``sandbox-exec`` cannot make it lie.
+
+    Returns:
+        True inside a macOS sandbox; False otherwise, and always False
+        off darwin.
+
+    Raises:
+        SandboxError: on darwin, when libSystem's ``sandbox_check`` cannot
+            be called — the nesting answer is unknown, and an unknown must
+            fail loudly rather than pass for "not nested" or "nested".
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        check = ctypes.CDLL("/usr/lib/libSystem.dylib").sandbox_check
+    except (OSError, AttributeError) as exc:
+        raise SandboxError(
+            f"cannot ask the kernel whether this process is sandboxed: {exc}"
+        ) from exc
+    check.restype = ctypes.c_int
+    check.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    return check(os.getpid(), None, 0) != 0
+
+
 @lru_cache(maxsize=1)
 def can_apply_seatbelt() -> bool:
     """Whether this process may apply a macOS seatbelt profile.
@@ -515,10 +563,23 @@ def can_apply_seatbelt() -> bool:
     inside its sandbox can make applying a second profile succeed, so
     the skip cannot be forged from within.
 
+    "Nested" is answered only for the one shape nesting has: the probe
+    refused with ``sandbox_apply`` AND :func:`process_is_sandboxed`
+    confirming this process already runs under a sandbox. Every other
+    failure — sandbox-exec missing (OSError), a timeout under load, a
+    different refusal, or the refusal text on an unsandboxed process —
+    is a broken host stack and raises: answering False there would turn
+    the whole sandbox suite into silent skips (review of #56/#57; the
+    F-05 tests fail, never skip). Only answers are cached; a raise is
+    re-probed on the next call.
+
     Returns:
         True where a seatbelt profile can be applied (or the platform
         has no seatbelt — non-darwin answers True and lets srt's own
         Linux path decide), False inside a macOS sandbox.
+
+    Raises:
+        SandboxError: the probe failed and this is not nesting.
     """
     if sys.platform != "darwin":
         return True
@@ -528,9 +589,22 @@ def can_apply_seatbelt() -> bool:
              "/usr/bin/true"],
             capture_output=True, text=True, timeout=15,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SandboxError(
+            f"seatbelt probe could not run ({exc!r}): the macOS sandbox stack "
+            "is unusable on this host — refusing to report it as nesting"
+        ) from exc
+    if proc.returncode == 0:
+        return True
+    refused = "sandbox_apply" in proc.stderr
+    if refused and process_is_sandboxed():
         return False
-    return proc.returncode == 0
+    raise SandboxError(
+        f"seatbelt probe failed (rc={proc.returncode}, stderr="
+        f"{proc.stderr.strip()!r}, process sandboxed="
+        f"{process_is_sandboxed()}): not the nested refusal — the macOS "
+        "sandbox stack is broken on this host"
+    )
 
 
 def run_sandboxed(
@@ -772,9 +846,16 @@ def _toolchain_allowread(home: Path, toolchain: "Sequence[Path]") -> set[Path]:
     ``$HOME`` would re-open whole subtrees like ``~/.local``.
     """
     entries: set[Path] = set()
+    # Both spellings of home: link paths come in as given (under the
+    # unresolved home), binaries are .resolve()d (under the real one). A
+    # HOME with a symlink component (/tmp, /var -> /private on macOS) would
+    # otherwise put nothing "below home" and emit no reads at all.
+    homes = {home}
+    with suppress(OSError):
+        homes.add(home.resolve())
 
     def below_home(path: Path) -> bool:
-        return path != home and home in path.parents
+        return any(path != h and h in path.parents for h in homes)
 
     for raw in toolchain:
         link = Path(raw).expanduser()
@@ -794,7 +875,7 @@ def _toolchain_allowread(home: Path, toolchain: "Sequence[Path]") -> set[Path]:
         if not below_home(directory):
             continue
         entries.add(directory)
-        if directory.name == "bin" and directory.parent != home:
+        if directory.name == "bin" and directory.parent not in homes:
             entries.add(directory.parent / "lib")
     return entries
 

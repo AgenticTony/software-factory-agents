@@ -1,5 +1,6 @@
 """Suite-wide guards for the environment the tests run in."""
 
+import functools
 from pathlib import Path
 
 import pytest
@@ -28,25 +29,46 @@ def pytest_configure(config: pytest.Config) -> None:
             "or with PYTHONPATH=., or give this checkout its own "
             "environment."
         )
+    _guard_nested_sandbox()
 
 
-# INC-007: macOS cannot apply a seatbelt profile from inside one, so a
-# sandboxed run of this suite (the L0 gate runs it inside the F-05
-# sandbox, F-10 AC-11) can never spawn a second srt. Tests that reach
-# for run_sandboxed would fail on the kernel's refusal, not on the code
-# under test; they skip instead — the probe is the environment's truth
-# (an agent inside its sandbox cannot forge it, nothing it does makes
-# applying a second profile succeed), and the skipped tests run for
-# real in CI's unsandboxed run of the same PR. functools.wraps carries
-# the real function's identity onto the wrapper, so introspection tests
-# (docstring contracts) still see the truth.
-import functools  # noqa: E402
+def _guard_nested_sandbox() -> None:
+    """INC-007: skip sandbox-spawning tests only when the suite runs nested.
 
-from factory import sandbox as _sandbox_module  # noqa: E402
+    macOS cannot apply a seatbelt profile from inside one, so a sandboxed
+    run of this suite (the L0 gate runs it inside the F-05 sandbox, F-10
+    AC-11) can never spawn a second srt. Tests that reach for
+    run_sandboxed would fail on the kernel's refusal, not on the code
+    under test; they skip instead. The probe is the environment's truth:
+    an agent inside its sandbox cannot forge it — nothing it does makes
+    applying a second profile succeed — and "nested" needs both the
+    kernel's refusal and the kernel reporting this process sandboxed.
 
-if not _sandbox_module.can_apply_seatbelt():
+    A probe that fails any other way on a host raises SandboxError, and
+    the run stops here with a usage error: a broken seatbelt stack must
+    fail the suite, never quietly skip the sandbox tests (README /
+    CLAUDE.md: F-05 tests fail, never skip; review of #56/#57).
+
+    functools.wraps carries the real function's identity onto the
+    wrapper, so introspection tests (docstring contracts) still see the
+    truth.
+    """
+    from factory import sandbox as sandbox_module
+
+    try:
+        can_apply = sandbox_module.can_apply_seatbelt()
+    except sandbox_module.SandboxError as exc:
+        raise pytest.UsageError(
+            f"INC-007 seatbelt probe failed on this host: {exc}. The F-05 "
+            "sandbox tests fail, never skip — fix the host's sandbox stack "
+            "(README, Setup)."
+        ) from exc
+    if can_apply:
+        return
+
     def _nested_unavailable(*args, **kwargs):
         pytest.skip("nested seatbelt cannot apply a profile (INC-007)")
-    _sandbox_module.run_sandboxed = functools.wraps(
-        _sandbox_module.run_sandboxed
+
+    sandbox_module.run_sandboxed = functools.wraps(
+        sandbox_module.run_sandboxed
     )(_nested_unavailable)

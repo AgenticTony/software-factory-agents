@@ -533,3 +533,77 @@ def test_review10_env_guard_rejects_newline_home_paths(monkeypatch):
     monkeypatch.setenv("HOME", "/tmp/bad\nhome")
     with pytest.raises(ValueError, match=r"newline.*bad"):
         _env_guard_source()
+
+
+def test_review11_env_guard_accepts_the_toolchain_dirs_sandbox_env_keeps(
+    tmp_path, monkeypatch
+):
+    """Round-2 review of #69: ``sandbox_env`` keeps a home PATH entry that
+    is a re-allowed toolchain install dir (nvm/fnm/volta node), but the
+    env-guard refused every home entry — on an nvm-only host the rehearsal
+    setup tripped on the very entry the sandbox deliberately keeps. Both
+    now read one rule (:func:`factory.sandbox.home_path_keep`): a fake home
+    with an nvm-style node passes the guard with the sanitised PATH, while
+    a home entry the sandbox drops is still refused."""
+    home = tmp_path / "home"
+    nvm_bin = home / ".nvm" / "versions" / "node" / "v22.0.0" / "bin"
+    nvm_bin.mkdir(parents=True)
+    for name in ("node", "npm", "npx"):
+        tool = nvm_bin / name
+        tool.write_text("#!/bin/sh\nexit 0\n")
+        tool.chmod(0o755)
+    leaked = home / ".local" / "bin"
+    leaked.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", f"{nvm_bin}:{leaked}:/usr/bin:/bin")
+
+    child_path = sandbox_module.sandbox_env(tmp_path / "run")["PATH"]
+    assert child_path.split(":") == [str(nvm_bin), "/usr/bin", "/bin"], child_path
+
+    guard = tmp_path / "env-guard.sh"
+    guard.write_text(_env_guard_source())
+    guard.chmod(0o755)
+
+    kept = subprocess.run(
+        ["/bin/sh", str(guard)], env={"PATH": child_path},
+        capture_output=True, text=True,
+    )
+    assert kept.returncode == 0, kept.stderr
+
+    leak = subprocess.run(
+        ["/bin/sh", str(guard)], env={"PATH": f"{leaked}:{child_path}"},
+        capture_output=True, text=True,
+    )
+    assert leak.returncode == 1, leak.stderr
+    assert "env-guard: PATH leaks a home-dir entry" in leak.stderr, leak.stderr
+
+    # One rule, not two copies: empty the shared keep set and BOTH sides
+    # drop the nvm entry — the sandbox filters it out and the guard
+    # refuses it.
+    monkeypatch.setattr(sandbox_module, "home_path_keep", lambda: frozenset())
+    assert sandbox_module.sandbox_env(tmp_path / "run2")["PATH"] == "/usr/bin:/bin"
+    guard.write_text(_env_guard_source())
+    refused = subprocess.run(
+        ["/bin/sh", str(guard)], env={"PATH": f"{nvm_bin}:/usr/bin:/bin"},
+        capture_output=True, text=True,
+    )
+    assert refused.returncode == 1, refused.stderr
+    assert str(nvm_bin) in refused.stderr, refused.stderr
+
+
+def test_review12_inc007_records_the_loud_probe_rule():
+    """Round-2 review of #69: INC-007 must record the rule that a seatbelt
+    probe failing on a host raises (a pytest usage error via conftest)
+    instead of answering "nested" and skipping the sandbox suite — and
+    cite the tests that enforce it."""
+    doc = (REPO_ROOT / "docs" / "incidents.md").read_text()
+    entry = next(
+        section for section in re.split(r"(?m)^## ", doc)[1:]
+        if section.startswith("INC-007")
+    )
+    for ref in (
+        "tests/test_f05.py::test_seatbelt_probe_failure_is_loud_not_nested",
+        "tests/test_f05.py::test_conftest_probe_failure_stops_the_suite",
+    ):
+        assert f"`{ref}`" in entry, f"INC-007 does not cite {ref}"
+    assert "SandboxError" in entry and "never skip" in entry, entry[-600:]

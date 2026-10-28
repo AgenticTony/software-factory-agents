@@ -230,6 +230,40 @@ def test_sandbox_env_sets_empty_git_templates(tmp_path: Path):
     assert not any(templates.iterdir()), "template dir must start empty"
 
 
+def test_sandbox_path_keeps_a_home_toolchain_dir_the_sandbox_reallows(
+    tmp_path: Path, monkeypatch
+):
+    """Node from nvm/fnm/volta lives under $HOME. The PATH filter drops
+    home entries (a denied dir probed first can EPERM a lookup), but a
+    home bin dir that build_settings re-allows for reading — the install
+    dir of a toolchain binary — must stay on PATH, or the L0 setup's
+    ``npm ci`` exits 127 ("npm: command not found"). Unrelated home
+    entries are still dropped."""
+    home = tmp_path / "home"
+    node_bin = home / ".nvm" / "versions" / "node" / "v22.12.0" / "bin"
+    node_bin.mkdir(parents=True)
+    for name in ("node", "npm"):
+        tool = node_bin / name
+        tool.write_text("#!/bin/sh\n")
+        tool.chmod(0o755)
+    other = home / ".local" / "bin"
+    other.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", f"{other}:{node_bin}:/usr/bin:/bin")
+    run, _root, _settings = _make_run(tmp_path)
+    path = sandbox_env(run.root)["PATH"].split(":")
+    assert str(node_bin) in path or str(node_bin.resolve()) in path, path
+    assert str(other) not in path and str(other.resolve()) not in path, path
+    assert path[-2:] == ["/usr/bin", "/bin"], path
+    # consistency: what PATH keeps, the sandbox can read
+    settings = build_settings(
+        {"docs_allowlist": [], "network_allowlist": []},
+        run.root,
+        model_endpoint=MODEL_ENDPOINT,
+    )
+    assert str(node_bin.resolve()) in settings["filesystem"]["allowRead"]
+
+
 def test_build_settings_relaxes_git_config_but_not_the_run_clone(tmp_path):
     """init/clone must write .git/config, so the built-in .git/config
     block is relaxed (allowGitConfig) — while the run clone's own
@@ -283,7 +317,60 @@ def test_git_clone_succeeds_inside_the_sandbox(tmp_path: Path):
         timeout=60,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert (run.root / ".tmp" / "work" / ".git" / "HEAD").is_file()
+    clone_git = run.root / ".tmp" / "work" / ".git"
+    assert (clone_git / "HEAD").is_file()
+    hooks = clone_git / "hooks"
+    assert not hooks.exists() or not any(hooks.iterdir()), (
+        f"clone wrote into the blocked hooks path: {sorted(hooks.iterdir())}"
+    )
+
+
+def test_session_env_window_keeps_git_template_dir(monkeypatch):
+    """INC-006 must hold for the agent too, not just L0's children: the
+    in-sandbox session runner windows os.environ down to an allowlist
+    before Claude Code starts, and the agent's Bash inherits that. A
+    window that drops GIT_TEMPLATE_DIR puts every ``git init`` the
+    agent's red-first pytest runs back on the hooks-copy denial."""
+    import factory.session as session_module
+
+    monkeypatch.setenv("GIT_TEMPLATE_DIR", "/run/.home/.git-templates")
+    saved = session_module._window_environ({})
+    try:
+        assert os.environ.get("GIT_TEMPLATE_DIR") == "/run/.home/.git-templates"
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+def test_git_init_succeeds_inside_the_sandbox_after_the_session_window(
+    tmp_path: Path, monkeypatch
+):
+    """The same, end to end: the environment the session runner leaves
+    for Claude Code (the child's sandbox env, then the window) must
+    still let ``git init`` under TMPDIR succeed confined. The window is
+    applied to the exact env the sandboxed child gets, and the git runs
+    with only that env (``env -i``), as the agent's Bash would."""
+    import factory.session as session_module
+
+    run, _root, _settings = _make_run(tmp_path)
+    child_env = sandbox_env(run.root)
+    saved = dict(os.environ)
+    try:
+        os.environ.clear()
+        os.environ.update(child_env)
+        session_module._window_environ({})
+        windowed = dict(os.environ)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+    target = Path(windowed["TMPDIR"]) / "after-window"
+    proc = run_sandboxed(
+        ["/usr/bin/env", "-i", *[f"{k}={v}" for k, v in windowed.items()],
+         "git", "init", "-q", str(target)],
+        run.root, run.settings_path, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (target / ".git" / "HEAD").is_file()
 
 
 # --- INC-007: nesting is detected, not fought -------------------------------
@@ -297,25 +384,207 @@ pytestmark_nested = pytest.mark.skipif(
 )
 
 
-@pytestmark_nested
 def test_can_apply_seatbelt_is_true_where_tests_run():
     """On a host (and CI) the probe answers True: the sandbox tests
     below run for real. Inside a macOS sandbox it answers False and
     conftest turns run_sandboxed into a skip — macOS cannot apply a
     seatbelt profile from inside one, so a nested srt is refused by the
-    kernel whatever the settings allow."""
-    from factory.sandbox import can_apply_seatbelt
+    kernel whatever the settings allow.
 
-    assert can_apply_seatbelt() is True
+    Deliberately NOT gated on the probe (review of #57): the skip
+    condition would be the negation of the assertion and the test could
+    never fail. "Am I nested?" is answered independently, by asking the
+    kernel whether this process already runs under a sandbox — so a
+    host where the probe wrongly answers False goes red here instead of
+    silently skipping the whole sandbox suite."""
+    from factory.sandbox import can_apply_seatbelt, process_is_sandboxed
+
+    if sys.platform != "darwin" or not process_is_sandboxed():
+        assert can_apply_seatbelt() is True
+    else:
+        assert can_apply_seatbelt() is False
 
 
-def test_conftest_guards_sandbox_spawning_tests_when_nested():
+class _ProbeResult:
+    def __init__(self, returncode: int, stderr: str = ""):
+        self.returncode = returncode
+        self.stdout = ""
+        self.stderr = stderr
+
+
+_NESTED_REFUSAL = "sandbox-exec: sandbox_apply: Operation not permitted\n"
+
+
+@pytest.mark.parametrize(
+    "outcome, sandboxed",
+    [
+        (OSError("No such file or directory: /usr/bin/sandbox-exec"), False),
+        (subprocess.TimeoutExpired(["/usr/bin/sandbox-exec"], 15), False),
+        (_ProbeResult(1, "sandbox-exec: some other failure\n"), False),
+        # the nested refusal text, but the kernel says this process is
+        # NOT sandboxed: not nesting — a broken host stack
+        (_ProbeResult(71, _NESTED_REFUSAL), False),
+        # sandboxed, but the probe failed for another reason
+        (_ProbeResult(1, "sandbox-exec: some other failure\n"), True),
+        (subprocess.TimeoutExpired(["/usr/bin/sandbox-exec"], 15), True),
+    ],
+    ids=["oserror", "timeout", "other-rc", "refusal-unsandboxed",
+         "other-rc-sandboxed", "timeout-sandboxed"],
+)
+def test_seatbelt_probe_failure_is_loud_not_nested(monkeypatch, outcome, sandboxed):
+    """A probe that fails for any reason other than the kernel's nested
+    refusal must raise, never answer "nested": False turns every sandbox
+    test into a skip and the suite stays green on a host whose sandbox
+    stack is broken (README/CLAUDE.md: the F-05 tests fail, never skip)."""
+    import factory.sandbox as sandbox_module
+
+    def fake_run(*args, **kwargs):
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(sandbox_module.sys, "platform", "darwin")
+    monkeypatch.setattr(sandbox_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(sandbox_module, "process_is_sandboxed", lambda: sandboxed)
+    sandbox_module.can_apply_seatbelt.cache_clear()
+    try:
+        with pytest.raises(SandboxError, match="seatbelt probe"):
+            sandbox_module.can_apply_seatbelt()
+    finally:
+        sandbox_module.can_apply_seatbelt.cache_clear()
+
+
+def test_seatbelt_probe_answers_nested_only_on_the_kernel_refusal(monkeypatch):
+    """The one False: the probe was refused with sandbox_apply EPERM AND
+    the kernel reports this process already sandboxed. A clean probe is
+    True. Both answers are cached for the session."""
+    import factory.sandbox as sandbox_module
+
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args)
+        return outcome
+
+    monkeypatch.setattr(sandbox_module.sys, "platform", "darwin")
+    monkeypatch.setattr(sandbox_module.subprocess, "run", fake_run)
+    try:
+        outcome = _ProbeResult(71, _NESTED_REFUSAL)
+        monkeypatch.setattr(sandbox_module, "process_is_sandboxed", lambda: True)
+        sandbox_module.can_apply_seatbelt.cache_clear()
+        assert sandbox_module.can_apply_seatbelt() is False
+        assert sandbox_module.can_apply_seatbelt() is False
+        assert len(calls) == 1, "the nested answer is cached"
+
+        outcome = _ProbeResult(0)
+        monkeypatch.setattr(sandbox_module, "process_is_sandboxed", lambda: False)
+        sandbox_module.can_apply_seatbelt.cache_clear()
+        assert sandbox_module.can_apply_seatbelt() is True
+    finally:
+        sandbox_module.can_apply_seatbelt.cache_clear()
+
+
+def test_process_is_sandboxed_tracks_a_real_seatbelt(tmp_path: Path):
+    """The independent nesting signal is the kernel's own answer: False
+    for this (unsandboxed) process, True for a child started under a
+    seatbelt profile. On a host where the suite itself runs nested, the
+    first half flips and the second still holds."""
+    from factory.sandbox import process_is_sandboxed
+
+    if sys.platform != "darwin":
+        assert process_is_sandboxed() is False
+        return
+    script = (
+        f"import sys; sys.path.insert(0, {str(REPO_ROOT)!r}); "
+        "from factory.sandbox import process_is_sandboxed; "
+        "print(process_is_sandboxed())"
+    )
+    if not process_is_sandboxed():
+        child = subprocess.run(
+            ["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)",
+             sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert child.returncode == 0, child.stderr
+        assert child.stdout.strip() == "True", child.stdout + child.stderr
+
+
+def _conftest_harness(
+    tmp_path: Path, probe: "bool | str"
+) -> subprocess.CompletedProcess:
+    """Run a throwaway pytest against a copy of this repo's conftest and
+    factory package, with the seatbelt probe forced to ``probe`` before
+    conftest loads (``"raise"``: the probe raises SandboxError, a broken
+    host stack). The probe test inside reports what run_sandboxed is."""
+    root = tmp_path / f"harness-{probe}"
+    shutil.copytree(REPO_ROOT / "factory", root / "factory",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    (root / "tests").mkdir(parents=True)
+    shutil.copy2(REPO_ROOT / "tests" / "conftest.py", root / "tests" / "conftest.py")
+    if probe == "raise":
+        forced = (
+            "def _broken():\n"
+            "    raise s.SandboxError('seatbelt probe failed: forced by harness')\n"
+            "s.can_apply_seatbelt = _broken\n"
+        )
+    else:
+        forced = f"s.can_apply_seatbelt = lambda: {probe!r}\n"
+    (root / "force_probe.py").write_text("import factory.sandbox as s\n" + forced)
+    (root / "tests" / "test_probe.py").write_text(textwrap.dedent(
+        """
+        import factory.sandbox as s
+
+        def test_spawn(tmp_path):
+            real = s.run_sandboxed.__code__.co_name == "run_sandboxed"
+            print("REAL" if real else "PATCHED")
+            if not real:
+                s.run_sandboxed(["true"], tmp_path, tmp_path / "settings.json")
+        """
+    ))
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST")}
+    env["PYTHONPATH"] = str(root)
+    return subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "force_probe", "-rs", "-s",
+         "-p", "no:cacheprovider", "--no-header", "tests/test_probe.py"],
+        cwd=root, env=env, capture_output=True, text=True, timeout=300,
+    )
+
+
+def test_conftest_guards_sandbox_spawning_tests_when_nested(tmp_path: Path):
     """The skip lives in tests/conftest.py, one point for every test
     that spawns a sandbox (INC-007): patched only when the seatbelt
-    probe says nesting is impossible, never on a host."""
-    conftest = (REPO_ROOT / "tests" / "conftest.py").read_text()
-    assert "can_apply_seatbelt" in conftest
-    assert "INC-007" in conftest
+    probe says nesting is impossible, never on a host. Asserted by
+    behaviour, not by grepping the file (review of #56): with the probe
+    forced False a run_sandboxed call skips with the INC-007 reason from
+    conftest; with it forced True run_sandboxed is the real function and
+    nothing is skipped."""
+    nested = _conftest_harness(tmp_path, probe=False)
+    assert "PATCHED" in nested.stdout, nested.stdout + nested.stderr
+    assert "1 skipped" in nested.stdout, nested.stdout + nested.stderr
+    assert "conftest.py" in nested.stdout and "(INC-007)" in nested.stdout, (
+        nested.stdout
+    )
+
+    host = _conftest_harness(tmp_path, probe=True)
+    assert "REAL" in host.stdout, host.stdout + host.stderr
+    assert "1 passed" in host.stdout and "skipped" not in host.stdout, (
+        host.stdout + host.stderr
+    )
+
+
+def test_conftest_probe_failure_stops_the_suite(tmp_path: Path):
+    """INC-007's standing rule, end to end through conftest: a seatbelt
+    probe that fails on a host (SandboxError — anything but the kernel's
+    nested refusal) stops the run with a pytest usage error naming
+    INC-007. It never answers "nested", so the sandbox tests are never
+    quietly skipped and no test runs at all (review of #56/#57)."""
+    broken = _conftest_harness(tmp_path, probe="raise")
+    out = broken.stdout + broken.stderr
+    assert broken.returncode == pytest.ExitCode.USAGE_ERROR, out
+    assert "INC-007 seatbelt probe failed on this host" in out, out
+    assert "forced by harness" in out, out
+    assert "REAL" not in out and "PATCHED" not in out, out
+    assert "skipped" not in out and "passed" not in out, out
 
 
 def test_nested_suite_skips_instead_of_failing(tmp_path: Path):
@@ -340,15 +609,20 @@ def test_nested_suite_skips_instead_of_failing(tmp_path: Path):
                     ignore=shutil.ignore_patterns("__pycache__"))
     proc = run_sandboxed(
         [sys.executable, "-m", "pytest",
-         "tests/test_f05.py::test_conftest_guards_sandbox_spawning_tests_when_nested",
-         "tests/test_f05.py::test_ac_1", "-q", "--no-header"],
+         "tests/test_f05.py::test_run_sandboxed_docstring_matches_the_select_pump",
+         "tests/test_f05.py::test_can_apply_seatbelt_is_true_where_tests_run",
+         "tests/test_f05.py::test_ac_1", "-q", "-rs", "--no-header"],
         run.root, run.settings_path, timeout=300,
     )
     out = proc.stdout
-    # the seatbelt-independent test passed inside; the spawning test
-    # skipped inside (the reason itself is asserted by the conftest
-    # content test — -q does not print skip reasons)
-    assert "1 passed, 1 skipped" in out, f"nested suite run:\n{out[-2000:]}"
+    # the seatbelt-independent tests passed inside (including the probe's
+    # own truth test: nested, it must answer False); the spawning test
+    # skipped inside, and the skip came from the conftest guard with the
+    # INC-007 reason — not from anything else that happens to skip
+    assert "2 passed, 1 skipped" in out, f"nested suite run:\n{out[-2000:]}"
+    skips = [line for line in out.splitlines() if line.startswith("SKIPPED")]
+    assert len(skips) == 1, f"nested suite run:\n{out[-2000:]}"
+    assert "conftest.py" in skips[0] and "(INC-007)" in skips[0], skips
 
 
 # --- F-05 AC-4: no GitHub/keychain credentials inside the sandbox ----------
@@ -1211,23 +1485,56 @@ def test_ambient_seat_and_git_config_names_do_not_cross(tmp_path: Path, monkeypa
     )
 
 
-@pytestmark_nested
 def test_toolchain_allowread_is_install_dir_only():
     """Only the resolved install dir is re-allowed (plus the sibling lib/
     when the binary sits in a bin/), never the ancestors: re-allowing the
     chain re-opens ~/.local and ~/.local/share — uv's credential store,
-    cursor-agent, Copilot shims and friends live there."""
+    cursor-agent, Copilot shims and friends live there.
+
+    A pure function of its arguments: no seatbelt involved, so not gated
+    on the nesting probe (review of #57). Entries come back resolved, so
+    the expectation is spelled against the resolved home."""
     home = Path.home()
     base = home / ".factory-sandbox-tc-r4"
+    real = home.resolve() / ".factory-sandbox-tc-r4"
     claude = base / "share" / "claude" / "versions" / "X" / "claude"
     assert _toolchain_allowread(home, [claude]) == {
-        base / "share" / "claude" / "versions" / "X"
+        real / "share" / "claude" / "versions" / "X"
     }
     python = base / "pyenv" / "versions" / "3.12" / "bin" / "python"
     assert _toolchain_allowread(home, [python]) == {
-        base / "pyenv" / "versions" / "3.12" / "bin",
-        base / "pyenv" / "versions" / "3.12" / "lib",  # stdlib + site-packages
+        real / "pyenv" / "versions" / "3.12" / "bin",
+        real / "pyenv" / "versions" / "3.12" / "lib",  # stdlib + site-packages
     }
+
+
+def test_toolchain_allowread_survives_a_symlinked_home(tmp_path: Path, monkeypatch):
+    """HOME with a symlink component (macOS /tmp and /var -> /private, a
+    nested HOME, /home on another volume): the binary path is resolved,
+    so the home it is compared against must be too — otherwise nothing
+    is "below home", no toolchain read is emitted, and the home-wide
+    denyRead leaves the session's own toolchain unexecutable."""
+    real_home = tmp_path / "real-home"
+    (real_home / ".local" / "bin").mkdir(parents=True)
+    link_home = tmp_path / "link-home"
+    link_home.symlink_to(real_home)
+    tool = link_home / ".local" / "bin" / "sometool"
+    tool.write_text("#!/bin/sh\n")
+    real = real_home.resolve()
+    assert _toolchain_allowread(link_home, [tool]) == {
+        real / ".local" / "bin", real / ".local" / "lib"
+    }
+
+    run, _root, _settings = _make_run(tmp_path)
+    monkeypatch.setenv("HOME", str(link_home))
+    settings = build_settings(
+        {"docs_allowlist": [], "network_allowlist": []},
+        run.root,
+        model_endpoint=MODEL_ENDPOINT,
+        toolchain=[tool],
+    )
+    allow = settings["filesystem"]["allowRead"]
+    assert str(real / ".local" / "bin") in allow, allow
 
 
 def test_toolchain_bin_dir_under_home_still_executes(tmp_path: Path):
@@ -1346,16 +1653,16 @@ def test_toolchain_symlink_under_home_executes(tmp_path: Path):
         shutil.rmtree(base, ignore_errors=True)
 
 
-@pytestmark_nested
 def test_bin_dir_parent_never_reopens_a_shared_prefix():
     """A binary living in ~/.local/bin must not re-allow all of ~/.local
     (uv credentials, cursor-agent, ... under ~/.local/share). For a bin/ dir
     only its sibling lib/ (where an interpreter's stdlib and site-packages
     live) joins the reads, never the whole parent."""
     home = Path.home()
+    real = home.resolve()
     reads = _toolchain_allowread(home, [home / ".local" / "bin" / "sometool"])
-    assert home / ".local" not in reads, reads
-    assert reads == {home / ".local" / "bin", home / ".local" / "lib"}
+    assert home / ".local" not in reads and real / ".local" not in reads, reads
+    assert reads == {real / ".local" / "bin", real / ".local" / "lib"}
 
 
 def test_run_sandboxed_docstring_matches_the_select_pump():
