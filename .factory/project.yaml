@@ -28,6 +28,12 @@ paths:
     # Control files: touching these changes how work is chosen or judged.
     factory_control: ["schema/**", "TASK-CONTRACT.md", "VALIDATOR-SPEC.md", ".factory/**"]
     deploy: [".github/workflows/**"]
+  # #53 finding 1: setup's npm ci installs node_modules/.bin/srt; L1's
+  # between-phase git clean -fdx keeps only declared setup outputs, so
+  # without this the sandbox runtime is gone for the red/green runs.
+  # (pip install -e leaves only *.egg-info in-tree, which nothing needs
+  # after install.)
+  setup_outputs: ["node_modules"]
   protected:
     - ".factory/**"
     - ".github/workflows/**"
@@ -56,6 +62,37 @@ paths:
     - "factory/prompts.py"
     - "factory/trace.py"
     - "prompts/**"
+    # PR #50-#62 review (#52 finding 1): the step-1 list above matched the
+    # BUILD-ORDER text, and the text missed modules that also judge or
+    # gate agents. l0 hands its skip/assertion/credential scans to
+    # sentinels; replay is the corpus gate over them; mergeorder is the
+    # self-enforced up-to-date check branch_protection: unavailable relies
+    # on; contract is the validating loader and acceptance_hash; approve
+    # and tick are the human gates; state is the transition table; prbody
+    # builds the PR evidence a human merges on.
+    - "factory/sentinels.py"
+    - "factory/replay.py"
+    - "factory/mergeorder.py"
+    - "factory/contract.py"
+    - "factory/approve.py"
+    - "factory/tick.py"
+    - "factory/state.py"
+    - "factory/prbody.py"
+    # #52 finding 2 / #56 finding 3: a conftest.py (existing or new, any
+    # depth) can deselect or skip the protected contract tests without
+    # touching a test file or adding a skip marker, and these config
+    # files override pyproject's pytest/ruff settings when created.
+    # (fnmatch's * crosses "/", so **/conftest.py covers every depth;
+    # the bare entry covers the repo root.)
+    - "conftest.py"
+    - "**/conftest.py"
+    - "pytest.ini"
+    - "tox.ini"
+    - "setup.cfg"
+    - "ruff.toml"
+    - ".ruff.toml"
+    # The profile invariants above, pinned by test.
+    - "tests/test_profile_review.py"
     # Existing contract tests, enumerated file by file and NOT as a
     # tests/test_f*.py glob: the session hook denies file creation too,
     # and the dogfood implementers must write tests/test_f11.py and
@@ -72,6 +109,12 @@ paths:
     - "tests/test_f08.py"
     - "tests/test_f09.py"
     - "tests/test_f10.py"
+    # #52 finding 3: merged by #58/#59 and #61/#63 after the list froze.
+    # tests/test_profile_review.py fails when a done task's contract test
+    # is missing here: the (human-reviewed) PR that marks a task done adds
+    # its file in the same change.
+    - "tests/test_f11.py"
+    - "tests/test_f12.py"
     - "tests/test_f23.py"
     - "tests/test_f24.py"
     - "tests/test_f25.py"
