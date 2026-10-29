@@ -1225,7 +1225,10 @@ def _bundled_cli() -> Path | None:
 
 
 def probe_session_interpreter(
-    *, srt_bin_path: Path | None = None, timeout_sec: float = 60.0,
+    profile: dict,
+    *,
+    srt_bin_path: Path | None = None,
+    timeout_sec: float = 60.0,
 ) -> None:
     """One sandboxed proof that the session interpreter can import the SDK.
 
@@ -1235,15 +1238,25 @@ def probe_session_interpreter(
     ``ModuleNotFoundError: No module named 'claude_agent_sdk'`` one full
     session too late — after the attempt is spent (run
     20261029T130912Z-1e4eb9: F-31 lost 1 of 3 attempts to exactly
-    that). This probe runs the same import under the same
-    settings-builder BEFORE anything is picked or recorded: a failure
-    raises :class:`~factory.runs.RunError` naming the interpreter and
-    the fix — a clean environment refusal that spends no attempt, the
-    same class the orchestrator already uses for environment failures
-    (network git timeouts, merge pathologies), caught and printed by
-    the CLI.
+    that). This probe runs the same import, through the same
+    settings-builder a real session uses — the project profile (its
+    docs/network allowlists) and a toolchain that includes the bundled
+    CLI — BEFORE anything is recorded: a failure raises
+    :class:`~factory.runs.RunError` naming the interpreter and the fix —
+    a clean environment refusal that spends no attempt, the same class
+    the orchestrator already uses for environment failures (network git
+    timeouts, merge pathologies), caught and printed by the CLI.
+
+    What the probe deliberately does NOT replicate: the staged runner
+    dir (the entry bootstrap's ``allow_read``) — the SDK lives in the
+    interpreter's own site-packages, not the runner, and that was the
+    failing import; and the seat token/base URL, which reach the child
+    as env and select no filesystem surface. The endpoint in the
+    settings is :data:`DEFAULT_BASE_URL`, the same default a session
+    gets when no override is passed.
 
     Args:
+        profile: The loaded ``project.yaml`` mapping (allowlists).
         srt_bin_path: srt override for tests (still pin-checked).
         timeout_sec: Wall-clock cap for the probe.
 
@@ -1261,8 +1274,8 @@ def probe_session_interpreter(
         run_dir = root / "runs" / "probe" / "sdk-import"
         run_dir.mkdir(parents=True)
         settings = build_settings(
-            {}, run_dir, model_endpoint=DEFAULT_BASE_URL,
-            toolchain=default_toolchain(),
+            profile, run_dir, model_endpoint=DEFAULT_BASE_URL,
+            toolchain=default_toolchain(extra=[_bundled_cli()]),
         )
         settings_path = run_dir / "probe-settings.json"
         write_settings(settings, settings_path)

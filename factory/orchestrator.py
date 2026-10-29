@@ -691,8 +691,9 @@ def run_once(
         sdk_probe: Session-interpreter probe seam (default: auto —
             :func:`factory.session.probe_session_interpreter` when real
             sessions would run, i.e. the session runner is the default;
-            None when tests inject stub seats). A raising probe refuses
-            the run before anything is picked or recorded.
+            None when tests inject stub seats). Called with the profile
+            once a task is picked, just before the session starts; a
+            raising probe refuses the run before anything is recorded.
 
     Returns:
         The :class:`RunResult`.
@@ -730,20 +731,6 @@ def run_once(
         # no gh lookups, no re-validation escalations inside it.
         return RunResult("idle" if pick is None else "peak_window",
                          task_id=pick.task["id"] if pick else None)
-    # The F-31 incident (run 20261029T130912Z-1e4eb9): a venv interpreter
-    # whose own files the sandbox denied started as its bare base, and
-    # the session entry died on ModuleNotFoundError one full session too
-    # late — after the attempt was spent. One sandboxed import probe
-    # before anything is picked or recorded: an unrunnable interpreter
-    # refuses the run as a clean environment error and spends no
-    # attempt. Automatic only when real sessions would run (tests inject
-    # stub seats and no probe); an explicit probe seam always runs.
-    probe = sdk_probe or (
-        probe_session_interpreter
-        if session_runner in (None, run_session_sandboxed) else None
-    )
-    if probe is not None:
-        probe(srt_bin_path=srt_bin_path)
     # Round-3 findings 1+7: the sweep runs on EVERY off-peak run, with or
     # without pickable work (AC-3's "every run" — F-27 waiting on F-26's
     # open PR must still see it go stale or closed), and an idle tick
@@ -791,6 +778,24 @@ def run_once(
         return RunResult("concurrency_wait", task_id=task_id,
                          open_prs=open_urls, unresolved_prs=unresolved_urls,
                          ready_prs=ready)
+
+    # The F-31 incident (run 20261029T130912Z-1e4eb9): a venv interpreter
+    # whose own files the sandbox denied started as its bare base, and
+    # the session entry died on ModuleNotFoundError one full session too
+    # late — after the attempt was spent. One sandboxed import probe,
+    # here and only here — a picked task is about to spawn a session, so
+    # only a picked run pays the probe: idle ticks spawn no sandbox, and
+    # a broken interpreter never blocks the sweep or the no-deploy close
+    # pass. Still before anything is recorded or leased: an unrunnable
+    # interpreter refuses the run as a clean environment error and spends
+    # no attempt. Automatic only when real sessions would run (tests
+    # inject stub seats and no probe); an explicit probe seam always runs.
+    probe = sdk_probe or (
+        probe_session_interpreter
+        if session_runner in (None, run_session_sandboxed) else None
+    )
+    if probe is not None:
+        probe(profile, srt_bin_path=srt_bin_path)
 
     ctx = _Ctx(
         queue=queue, task_id=task_id, profile=profile, factory_root=factory_root,
