@@ -13,6 +13,7 @@ of skipping: a credential that must never leave the Mac is not a broken
 stack, and the refusal is real, tested behaviour.
 """
 
+import ast
 import asyncio
 import json
 import os
@@ -201,8 +202,10 @@ def test_ac_3(tmp_path: Path):
         assert _decision(guard, "Bash", {"command": command}) is None, command
 
     # --- real half -----------------------------------------------------------
-    token = seat_token()
-    if token is None:
+    # A bool, never the token: a local holding it would print under
+    # `pytest -l` (showlocals) on any failure below.
+    have_token = seat_token() is not None
+    if not have_token:
         # The CI shape: no credential exists here by design. The runner must
         # refuse loudly rather than spawn a session that cannot authenticate.
         with pytest.raises(SessionConfigError, match="factory-zai"):
@@ -619,8 +622,10 @@ def test_ac_4(tmp_path: Path):
     model name comes from model_usage. Token-gated like AC-3's real half:
     without a credential the runner's refusal is the assertion (CI shape).
     """
-    token = seat_token()
-    if token is None:
+    # A bool, never the token: a local holding it would print under
+    # `pytest -l` (showlocals) on any failure below.
+    have_token = seat_token() is not None
+    if not have_token:
         with pytest.raises(SessionConfigError, match="factory-zai"):
             run_session_sandboxed(
                 seat="implementer",
@@ -1280,17 +1285,97 @@ def test_review6_spec_never_lands_in_the_clone(tmp_path: Path):
 def test_review7_ambient_token_requires_the_zai_base_url(monkeypatch):
     """The ambient token is only used when the ambient base URL names the
     Z.ai endpoint — a token exported for a different provider (or with no
-    base URL at all, i.e. api.anthropic.com) is not ours to send."""
-    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    base URL at all, i.e. api.anthropic.com) is not ours to send.
+
+    Hermetic: the keychain step is stubbed to "not found" so the owner's
+    real factory-zai item cannot answer first. Each result is reduced to a
+    bool before asserting, so a failure never prints a credential.
+    """
+    from factory import session as session_mod
+
+    monkeypatch.setattr(session_mod, "_keychain_token", lambda: None)
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "an-anthropic-key")
-    assert seat_token() is None
+    got_none = seat_token() is None
+    assert got_none, "foreign base URL: returned a value (redacted)"
 
     monkeypatch.setenv("ANTHROPIC_BASE_URL", DEFAULT_BASE_URL)
-    assert seat_token() == "an-anthropic-key"
+    got_ambient = seat_token() == "an-anthropic-key"
+    assert got_ambient, "Z.ai base URL: did not return the ambient token (redacted)"
 
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
-    assert seat_token() is None
+    got_none = seat_token() is None
+    assert got_none, "no base URL: returned a value (redacted)"
+
+
+# --- Secret hygiene: no test may surface a real credential. -------------- --
+
+# Calls whose return value is (or may be) the owner's real Z.ai credential.
+_CREDENTIAL_CALLS = frozenset({"seat_token", "_keychain_token"})
+
+
+def _credential_leaks(source: str) -> list[int]:
+    """Line numbers where a credential call's value can reach test output.
+
+    Flags a credential call — or a name bound directly to one — inside an
+    ``assert`` (pytest's rewrite prints its operands on failure), a
+    ``print(...)`` or an f-string. Reducing to a bool first
+    (``ok = seat_token() is None``) is the sanctioned shape and passes.
+    """
+    tree = ast.parse(source)
+
+    def is_credential_call(node: ast.AST) -> bool:
+        if not isinstance(node, ast.Call):
+            return False
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        return name in _CREDENTIAL_CALLS
+
+    tainted: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and is_credential_call(node.value):
+            tainted.update(t.id for t in node.targets if isinstance(t, ast.Name))
+
+    def exposes(node: ast.AST) -> bool:
+        return any(
+            is_credential_call(sub)
+            or (isinstance(sub, ast.Name) and sub.id in tainted)
+            for sub in ast.walk(node)
+        )
+
+    hits = []
+    for node in ast.walk(tree):
+        sink = (
+            isinstance(node, (ast.Assert, ast.JoinedStr))
+            or (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "print")
+        )
+        if sink and exposes(node):
+            hits.append(node.lineno)
+    return sorted(set(hits))
+
+
+def test_no_test_can_print_a_real_credential():
+    """Guard: no test file asserts on, prints or formats the output of
+    seat_token()/_keychain_token() (or a name bound to it). A failing
+    ``assert seat_token() is None`` once printed the owner's real token."""
+    offenders = {
+        str(path.relative_to(REPO)): lines
+        for path in sorted((REPO / "tests").rglob("*.py"))
+        if "fixtures" not in path.parts
+        and (lines := _credential_leaks(path.read_text()))
+    }
+    assert not offenders, f"credential-exposing test lines: {offenders}"
+
+
+def test_credential_guard_catches_the_known_shapes():
+    """The guard's own positive controls: each historical/obvious leak
+    shape is flagged, the bool-first shape is not."""
+    assert _credential_leaks("assert seat_token() is None\n") == [1]
+    assert _credential_leaks("assert x == session.seat_token()\n") == [1]
+    assert _credential_leaks("t = seat_token()\nassert t, t\n") == [2]
+    assert _credential_leaks("t = _keychain_token()\nprint(t)\n") == [2]
+    assert _credential_leaks("msg = f'{seat_token()}'\n") == [1]
+    assert _credential_leaks("ok = seat_token() is None\nassert ok, 'redacted'\n") == []
 
 
 # --- Finding 8: a wall-clock abort never closed the SDK stream. ----------- --
