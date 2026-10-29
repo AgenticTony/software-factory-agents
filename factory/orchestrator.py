@@ -1071,16 +1071,21 @@ def _no_deploy_target(profile: dict) -> bool:
     """Whether the profile declares nothing to deploy or verify live.
 
     ``deploy.mechanism`` is free text in the schema (project.schema.json),
-    so the none-form is a convention: ``none`` or ``none (…)``. Any other
-    mechanism means a deployment follows the merge. An empty
-    ``live_checks`` means no L4 exists to wait for. Both must hold —
-    either one alone leaves post-merge work for F-14 (``verify-live``),
-    and until F-14 exists a merged task on such a profile stays
-    ``in_review``: the close fails closed toward the status quo.
+    so the none-form is matched exactly: ``none``, or ``none`` followed
+    by optional whitespace and an opening parenthesis (``none (…)``).
+    Anything else — ``nonexistent-host``, ``nonetheless (vercel)`` — is
+    a deploy target, so a merged task there keeps waiting for F-14: the
+    close fails closed, never open on prose that merely starts with
+    "none". An empty ``live_checks`` means no L4 exists to wait for.
+    Both must hold — either one alone leaves post-merge work for F-14
+    (``verify-live``), and until F-14 exists a merged task on such a
+    profile stays ``in_review``.
     """
     deploy = profile.get("deploy") or {}
     mechanism = str(deploy.get("mechanism") or "").strip().lower()
-    return mechanism.startswith("none") and not (profile.get("live_checks") or {})
+    return (
+        mechanism == "none" or re.match(r"none\s*\(", mechanism) is not None
+    ) and not (profile.get("live_checks") or {})
 
 
 def _close_merged_tasks(
@@ -1212,14 +1217,16 @@ def _sweep_stale_prs(
             # terminal: later runs never gh-poll the link, count it, or
             # re-validate it. On a no-deploy profile the close pass
             # below takes it on to done/awaiting_owner in this same
-            # run — there is no gate to wait for.
+            # run — when no slice remains unmerged; a sliced task with
+            # unmerged slices stays in_review for its next slice. The
+            # note claims only the recovery: whatever the close pass
+            # then does, its own "closed" entry is the record.
             new_status = "in_review"
             task["links"]["merged"] = task["links"]["pr"]
             note = (f"GitHub shows {task['links']['pr']} merged: "
                     f"{escalation} recovery — back to in_review"
-                    + (" for the F-14 deploy gate"
-                       if not _no_deploy_target(profile) else
-                       " and closed (no deploy target)"))
+                    + ("" if _no_deploy_target(profile)
+                       else " for the F-14 deploy gate"))
         elif state == "open" and escalation == "pr_closed":
             new_status = "in_review"
             note = (f"GitHub shows {task['links']['pr']} open again: "

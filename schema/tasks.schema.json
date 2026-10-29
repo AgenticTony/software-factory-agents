@@ -163,7 +163,7 @@
             "step": { "type": "string", "description": "e.g. SoloAdventurer execution-order step number" },
             "merged": {
               "type": "string",
-              "description": "F-26: the URL of the PR GitHub reported merged. Terminal for that PR only — while links.pr equals it, the link is never gh-polled, counted open, or re-validated again and the task waits in in_review for the F-14 deploy gate; a later PR on the task (links.pr changes) is not covered."
+              "description": "F-26: the URL of the PR GitHub reported merged. Terminal for that PR only — while links.pr equals it, the link is never gh-polled, counted open, or re-validated again and the task waits in in_review for the F-14 deploy gate (a no-deploy profile — deploy.mechanism none-form with empty live_checks — closes it to done/awaiting_owner instead, the merge the evidence); a later PR on the task (links.pr changes) is not covered."
             },
             "revalidated": {
               "type": "object",

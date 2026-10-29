@@ -1764,3 +1764,84 @@ def test_a_merged_recovery_escalation_closes_too(tmp_path: Path):
     notes = [e.get("note", "") for e in env.log().entries()]
     assert any(e.get("outcome") == "recovered" for e in env.log().entries())
     assert any(task["links"]["pr"] in note and "done" in note for note in notes)
+
+
+# --------------------------- review fixes on the no-deploy close (PR #72) ---
+
+
+@pytest.mark.parametrize("mechanism,expected", [
+    ("none", True),
+    ("None", True),
+    ("NONE (local CLI; nothing ships)", True),
+    ("none (local CLI; nothing ships)", True),
+    ("none(x)", True),
+    ("", False),
+    ("vercel", False),
+    ("nonexistent-host", False),          # fails open under startswith("none")
+    ("nonetheless (vercel)", False),      # same
+    ("none-but-actually-vercel", False),  # hyphenated prose is not the form
+])
+def test_no_deploy_target_matches_only_the_none_form(mechanism, expected):
+    """Review finding 2: the none-form is exactly ``none``, or ``none``
+    followed by optional whitespace and an opening paren — anything else
+    (``nonexistent-host``, ``nonetheless (vercel)``) is a deploy target,
+    so a merged task there must keep waiting for F-14, never close."""
+    from factory.orchestrator import _no_deploy_target
+
+    assert _no_deploy_target({
+        "deploy": {"mechanism": mechanism},
+        "live_checks": {},
+    }) is expected
+
+
+@pytest.mark.parametrize("mechanism", ["nonexistent-host", "nonetheless (vercel)"])
+def test_fail_open_mechanism_text_keeps_the_task_in_review(tmp_path: Path,
+                                                            mechanism):
+    """Review finding 2, behaviorally: a stamped-merged task on a profile
+    whose mechanism merely starts with "none" stays in_review — the
+    classifier may not fail open into closing it."""
+    env = Env(tmp_path / mechanism.replace(" ", "-").replace("(", "").replace(")", ""))
+    _stamped_in_review(env, branch="factory/t-1-merged")
+    env.profile["deploy"]["mechanism"] = mechanism
+    env.profile_path.write_text(yaml.safe_dump(env.profile))
+
+    assert env.run(Seats()).outcome == "idle"
+    assert env.task("T-1")["status"] == "in_review"
+    assert not any(e.get("outcome") == "closed" for e in env.log().entries())
+
+
+def test_a_merged_recovery_with_an_unmerged_slice_is_not_claimed_closed(
+        tmp_path: Path):
+    """Review finding 3: the recovery note may only say what happened.
+    A no-deploy profile whose recovered task still has an unmerged
+    slice: the close pass skips it (slice continuation), so the task
+    stays in_review and no log entry claims a close."""
+    env = Env(tmp_path, tasks=[_task("T-1", status="ready", slices=[
+        {"id": "S-1", "text": "first slice", "status": "todo"},
+        {"id": "S-2", "text": "second slice", "status": "todo"},
+    ])])
+    q = TaskQueue(env.queue_path)
+    q.transition("T-1", "in_progress")
+    q.transition("T-1", "in_review")
+    q.get("T-1")["links"] = {
+        "pr": "https://github.com/fixture/fixture/pull/9",
+        "branch": "factory/t-1-merged",
+    }
+    q.append_attempt("T-1", {
+        "run_id": "run-t1-r1-at1", "slice_id": "S-1",
+        "started": "2026-10-18T10:00:00Z", "outcome": "escalated",
+        "prompt_versions": {}, "skills": [],
+        "escalation": "stale_base", "note": "fixture escalation",
+    })
+    q.transition("T-1", "needs_human")
+
+    result = env.run(Seats(), pr_state=lambda url: "merged")
+
+    assert result.outcome == "idle"
+    task = env.task("T-1")
+    assert task["status"] == "in_review"        # close skipped: S-2 unmerged
+    assert task["links"]["merged"] == task["links"]["pr"]  # stamp happened
+    recovered = [e.get("note") or "" for e in env.log().entries()
+                 if e.get("outcome") == "recovered"]
+    assert recovered and "closed" not in recovered[-1]
+    assert not any(e.get("outcome") == "closed" for e in env.log().entries())
