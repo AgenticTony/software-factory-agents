@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-27T23:05:15Z",
+  "updated_at": "2026-10-29T09:40:47Z",
   "tasks": [
     {
       "id": "F-00",
@@ -835,7 +835,7 @@
       "source": "BUILD-ORDER.md#f-11--factory-status-daily-summary--metrics",
       "kind": "build",
       "priority": "P1",
-      "status": "in_review",
+      "status": "done",
       "depends_on": [
         "F-03",
         "F-23",
@@ -948,7 +948,7 @@
       "source": "BUILD-ORDER.md#f-12--importer-factory-import",
       "kind": "build",
       "priority": "P1",
-      "status": "in_review",
+      "status": "done",
       "depends_on": [
         "F-06",
         "F-02",
@@ -2234,7 +2234,7 @@
       "source": "BUILD-ORDER.md#f-31--read-only-dashboard-factory-dashboard",
       "kind": "build",
       "priority": "P2",
-      "status": "draft",
+      "status": "ready",
       "depends_on": [
         "F-11",
         "F-30"
@@ -2312,7 +2312,10 @@
         "wall_clock_min": 150
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "acceptance_hash": "e656d126458f306bde9c876b6dc8ec179f369b7aa62caacc5c4352a1b4a24084",
+      "approved_at": "2026-10-29T09:09:09Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-32",
