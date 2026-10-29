@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-29T09:40:47Z",
+  "updated_at": "2026-10-29T13:09:13Z",
   "tasks": [
     {
       "id": "F-00",
@@ -2311,7 +2311,27 @@
         "max_turns": 200,
         "wall_clock_min": 150
       },
-      "attempts": [],
+      "attempts": [
+        {
+          "run_id": "20261029T130912Z-1e4eb9",
+          "slice_id": "F-31",
+          "started": "2026-10-29T13:09:13Z",
+          "ended": "2026-10-29T13:09:13Z",
+          "outcome": "escalated",
+          "rounds": 1,
+          "turns": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "prompt_versions": {
+            "implementer": "05c3dbdd637cb9e74a7ded51310f036bdb0ac6afc0a0bc09425c58bfaa55cca1",
+            "reviewer": "c6d9f701b82dc9d79e90786f62b21f1dde6a0f8476835232efae32bb48f423c1"
+          },
+          "skills": [],
+          "validator_report": "/Users/anthonyforan/factory/reports/software-factory/F-31/20261029T130912Z-1e4eb9-a1.json",
+          "escalation": "orchestrator_error",
+          "note": "SessionConfigError: the sandboxed session entry produced no record (exit 1): Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n  File \"/Users/anthonyforan/factory/sandbox/software-factory-20261029T130912Z-1e4eb9.json-runner/factory/session.py\", line 79, in <module>\n    from claude_agent_sdk import (\nModuleNotFoundError: No module named 'claude_agent_sdk'"
+        }
+      ],
       "links": {},
       "acceptance_hash": "e656d126458f306bde9c876b6dc8ec179f369b7aa62caacc5c4352a1b4a24084",
       "approved_at": "2026-10-29T09:09:09Z",

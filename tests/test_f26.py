@@ -39,6 +39,7 @@ from factory.mergeorder import (
 from factory.orchestrator import run_loop, run_once
 from factory.progress import ProgressLog
 from factory.publish import PullRequest
+from factory.runs import RunError
 from factory.session import SessionRecord
 from factory.state import ALLOWED_TRANSITIONS, TaskQueue
 
@@ -1845,3 +1846,22 @@ def test_a_merged_recovery_with_an_unmerged_slice_is_not_claimed_closed(
                  if e.get("outcome") == "recovered"]
     assert recovered and "closed" not in recovered[-1]
     assert not any(e.get("outcome") == "closed" for e in env.log().entries())
+
+
+def test_an_idle_run_with_a_failing_probe_still_sweeps_and_closes(tmp_path: Path):
+    """Review fix on PR #73: the interpreter probe runs only when a task
+    was picked. An idle tick with a broken interpreter still sweeps — a
+    merged no-deploy task still closes — and returns idle; the probe
+    must not sit in front of the sweep or the close pass."""
+    env = Env(tmp_path)
+    _stamped_in_review(env, branch="factory/t-1-merged")
+
+    def broken(*args, **kwargs):
+        raise RunError(
+            "the sandboxed session interpreter cannot import "
+            "claude_agent_sdk (.venv/bin/python, exit 1)")
+
+    result = env.run(Seats(), sdk_probe=broken)
+
+    assert result.outcome == "idle"
+    assert env.task("T-1")["status"] == "done"   # the close pass still ran

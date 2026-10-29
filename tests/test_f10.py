@@ -55,7 +55,7 @@ from factory.prbody import (
 from factory.progress import ProgressLog, ProgressLogError
 from factory.prompts import prompt_versions
 from factory.publish import PushRefused, gh_pr_create, push_branch
-from factory.runs import GIT_HARDENING, create_run
+from factory.runs import GIT_HARDENING, RunError, create_run
 from factory.session import SessionRecord
 from factory.state import TaskQueue
 
@@ -1497,3 +1497,71 @@ def test_rehearsal_run_refuses_when_the_remote_is_unreachable(tmp_path):
         env.run(seats)
     assert seats.calls == []
     assert env.task()["status"] == "ready"
+
+
+# --- an unrunnable session interpreter refuses before anything is spent -----
+
+
+def test_an_unimportable_sdk_refuses_the_run_before_any_attempt(tmp_path: Path):
+    """The F-31 incident: a venv interpreter the sandbox silently degraded
+    to its base died on ModuleNotFoundError one full session too late,
+    and the orchestrator_error attempt it recorded spent 1 of 3. The
+    interpreter probe refuses the run as a clean environment error
+    BEFORE anything is picked or recorded: no attempt, no lease, the
+    task stays ready, no session ever starts."""
+    env = Env(tmp_path)
+    seats = Seats()
+    probe_calls: list[tuple] = []
+
+    def broken(*args, **kwargs):
+        probe_calls.append((args, kwargs))
+        raise RunError(
+            "the sandboxed session interpreter cannot import "
+            "claude_agent_sdk (.venv/bin/python, exit 1): "
+            "ModuleNotFoundError — the sandbox denies $HOME, so a venv "
+            "interpreter needs its own pyvenv.cfg and site-packages "
+            "re-allowed")
+
+    with pytest.raises(RunError, match="claude_agent_sdk"):
+        env.run(seats, sdk_probe=broken)
+
+    assert probe_calls, "the probe never ran"
+    assert len(probe_calls[0][0]) == 1  # the profile, positionally
+    task = TaskQueue(env.queue_path).get("T-1")
+    assert task["attempts"] == []
+    assert task["status"] == "ready"
+    assert seats.calls == []
+    assert env.prs == []
+
+
+def test_the_probe_matches_real_session_settings(monkeypatch):
+    """Review fix on PR #73: the probe builds its settings from the
+    project profile and a toolchain that includes the bundled CLI — the
+    same surfaces a real session gets — not from an empty profile."""
+    import factory.session as session_module
+
+    seen: dict = {}
+    real_build = session_module.build_settings
+
+    def spy_build(profile, run_dir, **kwargs):
+        seen["profile"] = profile
+        seen["toolchain"] = kwargs.get("toolchain")
+        return real_build(profile, run_dir, **kwargs)
+
+    def spy_toolchain(extra=None):
+        seen["extra"] = list(extra or [])
+        return [sys.executable, *[p for p in (extra or []) if p]]
+
+    monkeypatch.setattr(session_module, "build_settings", spy_build)
+    monkeypatch.setattr(session_module, "default_toolchain", spy_toolchain)
+    monkeypatch.setattr(
+        session_module, "run_sandboxed",
+        lambda *a, **k: subprocess.CompletedProcess(["srt"], 0, "", ""),
+    )
+
+    probe_profile = {"docs_allowlist": ["docs.example"]}
+    session_module.probe_session_interpreter(probe_profile)
+
+    assert seen["profile"] is probe_profile
+    assert seen["extra"] == [session_module._bundled_cli()]
+    assert seen["toolchain"][0] == sys.executable

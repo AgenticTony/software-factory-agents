@@ -1783,14 +1783,136 @@ def test_rehearsal_ambient_path_drops_home_entries(tmp_path, monkeypatch):
 
 
 def test_rehearsal_sandboxed_child_sees_no_home_path_entries(tmp_path, monkeypatch):
-    """End to end: the PATH a real sandboxed child sees has no home dir."""
+    """End to end: the PATH a real sandboxed child sees has no DENIED home
+    dir. A home entry survives the filter only as a dir build_settings
+    re-allows for reading — the repo venv's bin, since the venv
+    interpreter is toolchain (the F-31 fix); the planted ~/.local/bin
+    (not re-allowed) must be dropped."""
     home = str(Path.home())
     monkeypatch.setenv("PATH", f"{home}/.local/bin:{os.environ['PATH']}")
-    run, _, _ = _make_run(tmp_path)
+    run, _, settings = _make_run(tmp_path)
     proc = run_sandboxed(
         _child("import os; print('PATH=' + os.environ['PATH'])", []),
         run.root, run.settings_path, timeout=60,
     )
     line = next(ln for ln in proc.stdout.splitlines() if ln.startswith("PATH="))
     entries = line[len("PATH="):].split(":")
-    assert entries and not [e for e in entries if e.startswith(home) or e.startswith("~")], line
+    assert entries, line
+    assert f"{home}/.local/bin" not in entries, line
+    allowed = {Path(p) for p in settings["filesystem"]["allowRead"]}
+    survivors = [e for e in entries if e.startswith(home) or e.startswith("~")]
+    assert all(
+        Path(e) in allowed or Path(e).resolve() in allowed for e in survivors
+    ), f"PATH kept a home entry the sandbox denies reading: {line}"
+
+
+# --- the F-31 venv incident: a home venv interpreter must stay a venv -------
+
+
+def test_toolchain_allowread_covers_a_home_venv_exactly(tmp_path: Path):
+    """Run 20261029T130912Z-1e4eb9: a venv python under the denied home
+    resolves to its base install, so the toolchain allowread covered only
+    the base — inside the sandbox Python started WITHOUT the venv
+    (pyvenv.cfg unreadable, sys.prefix collapsed to the base) and the
+    session entry died on ModuleNotFoundError. The venv's own
+    pyvenv.cfg, bin/ and lib*/python*/site-packages must be re-allowed;
+    the venv directory itself, its parent (the repo it lives in) and
+    everything else in the home must not be."""
+    home = tmp_path / "home"
+    venv = home / "proj" / ".venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("home = /usr/local/bin\n")
+    site = venv / "lib" / "python3.11" / "site-packages"
+    site.mkdir(parents=True)
+    python = venv / "bin" / "python"
+    python.symlink_to(sys.executable)  # the base interpreter, outside this home
+
+    allowed = _toolchain_allowread(home, [python])
+
+    assert venv / "pyvenv.cfg" in allowed
+    assert venv / "bin" in allowed
+    assert site in allowed
+    assert venv not in allowed             # never the venv dir itself
+    assert venv.parent not in allowed      # never the repo around it
+    assert home / "proj" not in allowed
+    assert all(entry != home for entry in allowed)
+
+
+def test_a_venv_interpreter_imports_from_its_own_site_packages(
+        tmp_path: Path, monkeypatch):
+    """End to end under the real sandbox: the venv lives under a denied
+    home, its interpreter must still start as the venv (pyvenv.cfg
+    readable) and import a package from its own site-packages — while
+    the venv's parent directory and a sibling secret in that home stay
+    unreadable. Never touches the real SDK or a real token: the package
+    is a dummy planted in the throwaway venv."""
+    import venv as venv_module
+
+    home = tmp_path / "home"
+    proj = home / "proj"
+    venv_dir = proj / ".venv"
+    venv_module.create(venv_dir, with_pip=False)
+    site = (
+        venv_dir / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    dummy = site / "dummy_pkg"
+    dummy.mkdir(parents=True)
+    (dummy / "__init__.py").write_text("MARKER = 'venv-site'\n")
+    (proj / "repo-secret.txt").write_text("checkout secret\n")
+    (home / "home-secret.txt").write_text("home secret\n")
+    monkeypatch.setenv("HOME", str(home))
+
+    # Canonical runs layout so build_settings derives the factory root.
+    run_dir = tmp_path / "factory-root" / "runs" / "fixture" / "probe-run"
+    run_dir.mkdir(parents=True)
+    settings = build_settings(
+        {"docs_allowlist": [], "network_allowlist": []},
+        run_dir,
+        model_endpoint=MODEL_ENDPOINT,
+        toolchain=[venv_dir / "bin" / "python"],
+    )
+    settings_path = run_dir / "settings.json"
+    write_settings(settings, settings_path)
+
+    script = textwrap.dedent(
+        """
+        import sys
+
+        def attempt(label, fn):
+            try:
+                fn()
+                print(f"{label}:ok", flush=True)
+            except Exception as exc:
+                print(f"{label}:denied {type(exc).__name__}", flush=True)
+
+        import dummy_pkg
+        print("import:" + dummy_pkg.MARKER, flush=True)
+        print("is_venv:" + str(sys.prefix != sys.base_prefix), flush=True)
+        attempt("parent", lambda: open(sys.argv[1]).read())
+        attempt("home_sibling", lambda: open(sys.argv[2]).read())
+        """
+    )
+    proc = run_sandboxed(
+        [str(venv_dir / "bin" / "python"), "-c", script,
+         str(proj / "repo-secret.txt"), str(home / "home-secret.txt")],
+        run_dir,
+        settings_path,
+        timeout=120,
+    )
+    outcomes = dict(
+        line.split(":", 1) for line in proc.stdout.splitlines() if ":" in line
+    )
+    assert outcomes.get("import") == "venv-site", proc.stdout + proc.stderr
+    assert outcomes.get("is_venv") == "True", (
+        "the interpreter started as its base, not the venv — pyvenv.cfg "
+        f"unreadable\n{proc.stdout}{proc.stderr}"
+    )
+    assert outcomes.get("parent", "missing").startswith("denied"), (
+        f"the venv's parent (the repo) was readable\n{proc.stdout}{proc.stderr}"
+    )
+    assert outcomes.get("home_sibling", "missing").startswith("denied"), (
+        f"a sibling file in the denied home was readable\n"
+        f"{proc.stdout}{proc.stderr}"
+    )
