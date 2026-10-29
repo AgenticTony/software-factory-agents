@@ -27,7 +27,8 @@ mismatch. System dependencies (per srt's own README):
 | Linux | `sudo apt-get install -y bubblewrap socat ripgrep` |
 | Ubuntu 24.04+ | also `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (AppArmor otherwise blocks bubblewrap's user namespaces) |
 
-Then `ruff check . && pytest -q`. The sandbox tests attempt the forbidden
+Then `ruff check . && pytest -q -n auto` (parallel via pytest-xdist; plain
+`pytest -q` works too and is what CI runs). The sandbox tests attempt the forbidden
 actions for real and are never skipped: a missing `srt` or system dependency
 fails them, by design. CI (`.github/workflows/ci.yml`) runs the same steps.
 
