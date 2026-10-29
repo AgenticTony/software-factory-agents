@@ -86,6 +86,28 @@ def _child(script: str, args: list[str]) -> list[str]:
     return [sys.executable, "-c", script, *args]
 
 
+def _env_probe(planted: set[str]) -> str:
+    """A child script printing ``NAME=<value>`` per argv name — but only
+    values the test planted itself; anything else (a real ambient
+    credential that crossed) prints as redacted, so a failing assert or
+    its ``proc.stdout`` message can never show a real secret."""
+    return textwrap.dedent(
+        f"""
+        import os, sys
+        planted = {sorted(planted)!r}
+        for name in sys.argv[1:]:
+            value = os.environ.get(name)
+            if value is None:
+                shown = 'absent'
+            elif value in planted:
+                shown = value
+            else:
+                shown = '<set, redacted>'
+            print(f"{{name}}={{shown}}", flush=True)
+        """
+    )
+
+
 # --- F-05 AC-1: a sandboxed process can't write outside the run dir -------
 
 
@@ -632,15 +654,7 @@ def test_ac_4(tmp_path: Path):
     run, _, settings = _make_run(tmp_path)
     keychain_derived = "JFO_PROBE_PASS"
     names = ["GH_TOKEN", "GITHUB_TOKEN", "GH_HOST", keychain_derived]
-    script = textwrap.dedent(
-        """
-        import os, sys
-        for name in sys.argv[1:]:
-            value = os.environ.get(name)
-            print(f"{name}={'<set:' + value + '>' if value is not None else 'absent'}", flush=True)
-        print(f"API_TIMEOUT_MS={os.environ.get('API_TIMEOUT_MS')}", flush=True)
-        """
-    )
+    script = _env_probe({"gh-leak", "github-leak", "github.com", "keychain-leak", "3000000"})
     env = sandbox_env(
         run.root,
         extra={
@@ -653,7 +667,8 @@ def test_ac_4(tmp_path: Path):
         forbidden=[keychain_derived],
     )
     proc = run_sandboxed(
-        _child(script, names), run.root, run.settings_path, env=env, timeout=60
+        _child(script, [*names, "API_TIMEOUT_MS"]), run.root, run.settings_path,
+        env=env, timeout=60,
     )
     seen = dict(line.split("=", 1) for line in proc.stdout.splitlines())
     for name in names:
@@ -1199,14 +1214,9 @@ def test_env_dict_of_os_environ_is_allowlisted(tmp_path: Path, monkeypatch):
     os.environ IS a dict the caller can pass."""
     run, _, _ = _make_run(tmp_path)
     monkeypatch.setenv("FAKE_AWS_SECRET", "leak123")
-    script = textwrap.dedent(
-        """
-        import os, sys
-        for name in sys.argv[1:]:
-            value = os.environ.get(name)
-            print(f"{name}={value if value is not None else 'absent'}", flush=True)
-        """
-    )
+    # AWS_SECRET_ACCESS_KEY may be the host's real key: the probe redacts
+    # every value this test did not plant.
+    script = _env_probe({"leak123", "zai-token", "3000000"})
     names = ["FAKE_AWS_SECRET", "AWS_SECRET_ACCESS_KEY", "ANTHROPIC_AUTH_TOKEN",
              "API_TIMEOUT_MS"]
     proc = run_sandboxed(

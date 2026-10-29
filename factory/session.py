@@ -424,6 +424,21 @@ def seat_token() -> str | None:
     Z.ai. On the Linux CI runner neither exists and this returns None,
     which callers must treat as "no session can authenticate here".
     """
+    keychain = _keychain_token()
+    if keychain is not None:
+        return keychain
+    ambient_url = os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/")
+    if ambient_url != DEFAULT_BASE_URL:
+        return None
+    return os.environ.get("ANTHROPIC_AUTH_TOKEN") or None
+
+
+def _keychain_token() -> str | None:
+    """The ``factory-zai`` keychain item's secret, or None where absent.
+
+    Its own function so tests can stub the keychain step and exercise the
+    env-fallback rules hermetically on a Mac that has the item.
+    """
     try:
         proc = subprocess.run(
             ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
@@ -432,13 +447,10 @@ def seat_token() -> str | None:
             timeout=15,
         )
     except (OSError, subprocess.TimeoutExpired):
-        proc = None  # no macOS keychain here (or it hung) — try the env
-    if proc is not None and proc.returncode == 0 and proc.stdout.strip():
+        return None  # no macOS keychain here (or it hung) — try the env
+    if proc.returncode == 0 and proc.stdout.strip():
         return proc.stdout.strip()
-    ambient_url = os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/")
-    if ambient_url != DEFAULT_BASE_URL:
-        return None
-    return os.environ.get("ANTHROPIC_AUTH_TOKEN") or None
+    return None
 
 
 # ----------------------------------------------------------------- hooks --
