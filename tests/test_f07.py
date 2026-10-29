@@ -178,6 +178,50 @@ def test_pyproject_dependency_surface_changes_escalate(tmp_path):
         assert "new_dependency" in _run(repo, profile).escalations, label
 
 
+def test_pyproject_dependency_surfaces_outside_the_named_tables_escalate(tmp_path):
+    """Review round on #74: comparing only the three named tables was
+    fail-open — PEP 735 ``[dependency-groups]``, ``dynamic =
+    ["dependencies"]`` + ``[tool.setuptools.dynamic]``, ``[tool.uv.sources]``
+    and ``[tool.poetry.*]`` all add or redirect dependencies without
+    touching them. The comparison is inverted: the WHOLE parsed document
+    compares, minus an explicit inert allowlist — anything else that
+    differs escalates."""
+    variants = {
+        "dep-groups": _PYPROJECT_BASE + "\n[dependency-groups]\nlint = ['ruff']\n",
+        "dynamic": _PYPROJECT_BASE.replace(
+            'name = "fixture"\n',
+            'name = "fixture"\ndynamic = ["dependencies"]\n',
+        ).replace(
+            'dependencies = ["a"]\n', ""
+        ) + "\n[tool.setuptools.dynamic]\ndependencies = {file = 'reqs.txt'}\n",
+        "uv-sources": _PYPROJECT_BASE + "\n[tool.uv.sources]\na = { git = 'https://evil/x' }\n",
+        "unknown-tool": _PYPROJECT_BASE + "\n[tool.somethingnew]\nkey = 1\n",
+        "poetry": _PYPROJECT_BASE + "\n[tool.poetry.dependencies]\na = '*'\n",
+    }
+    profile = dict(BASE_PROFILE)
+    profile["dependency_manifests"] = ["pyproject.toml"]
+    for label, head in variants.items():
+        repo = _repo(tmp_path, f"opensurface-{label}",
+                     {"pyproject.toml": _PYPROJECT_BASE})
+        _change(repo, files={"pyproject.toml": head})
+        assert "new_dependency" in _run(repo, profile).escalations, label
+
+
+def test_pyproject_inert_metadata_edit_does_not_escalate(tmp_path):
+    """The allowlist side: project metadata that describes the artifact
+    (description/readme/version/urls/scripts) and dev-tool config tables
+    may differ without a dependency escalation."""
+    head = (_PYPROJECT_BASE
+            .replace('name = "fixture"', 'name = "fixture"\nversion = "2.0"\ndescription = "d"')
+            + "\n[project.urls]\nhome = 'https://x'\n"
+            + "\n[tool.ruff]\nline-length = 100\n")
+    repo = _repo(tmp_path, "inertmeta", {"pyproject.toml": _PYPROJECT_BASE})
+    _change(repo, files={"pyproject.toml": head})
+    profile = dict(BASE_PROFILE)
+    profile["dependency_manifests"] = ["pyproject.toml"]
+    assert "new_dependency" not in _run(repo, profile).escalations
+
+
 def test_malformed_pyproject_escalates(tmp_path):
     """Fail closed: a pyproject either side can't be parsed structurally
     escalates exactly as the pre-diff-aware rule did."""

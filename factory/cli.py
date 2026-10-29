@@ -100,6 +100,15 @@ def build_parser() -> argparse.ArgumentParser:
              "'test fixture, not a real credential' or 'rotated')",
     )
     recover.add_argument(
+        "--done-by", default=None,
+        help="your name for the credential-recovery log entry "
+             "(default: git user.name)",
+    )
+    recover.add_argument(
+        "--factory-root", default=None,
+        help="factory root for the progress log (default: ~/factory)",
+    )
+    recover.add_argument(
         "--queue", default=".factory/tasks.json",
         help="queue file (default: %(default)s)",
     )
@@ -230,7 +239,9 @@ def _run_recover(args: argparse.Namespace) -> int:
     try:
         status = recover_task(
             TaskQueue(args.queue), args.task_id, assume_yes=args.yes,
-            evidence=args.evidence,
+            evidence=args.evidence, done_by=args.done_by,
+            factory_root=(Path(args.factory_root) if args.factory_root
+                          else None),
         )
         print(f"{args.task_id}: needs_human -> {status} (fix round queued)")
         return 0

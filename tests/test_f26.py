@@ -1467,6 +1467,77 @@ def test_credential_added_recover_cli_confirm_and_f26_path_unchanged(
     assert env.task("T-2")["status"] == "ready"
 
 
+def test_credential_recover_persists_evidence_in_the_progress_log(
+        tmp_path: Path):
+    """Review round on #74: the evidence was only echoed to the terminal —
+    the audit trail lost the one thing the whole gate exists to capture.
+    A completed recover appends a progress-log entry (outcome
+    ``recovered``, the escalation, the evidence, who, when); a declined
+    or refused recover writes nothing."""
+    from factory.approve import ApprovalDeclined, recover_task
+
+    env = Env(tmp_path, tasks=[_task("T-1")])
+    _park_escalated(env, "T-1", "credential_added")
+    queue = lambda: TaskQueue(env.queue_path)  # noqa: E731
+
+    before = len(env.log("T-1").entries())
+    with pytest.raises(ApprovalDeclined):
+        recover_task(queue(), "T-1", evidence="rotated",
+                     confirm=lambda question: False, done_by="owner",
+                     factory_root=env.root)
+    assert len(env.log("T-1").entries()) == before, "a decline wrote a log entry"
+
+    assert recover_task(queue(), "T-1",
+                        evidence="test fixture, not a real credential",
+                        confirm=lambda question: True, done_by="owner",
+                        factory_root=env.root) == "ready"
+    entries = env.log("T-1").entries()
+    recovered = [e for e in entries if e.get("outcome") == "recovered"]
+    assert len(recovered) == 1, entries
+    entry = recovered[0]
+    assert entry["escalation"] == "credential_added"
+    assert entry["evidence"] == "test fixture, not a real credential"
+    assert entry["done_by"] == "owner"
+    assert entry["recovered_at"]
+
+
+def test_credential_edge_is_state_gated_not_command_gated(tmp_path: Path):
+    """Review round on #74: the credential exit was enforced only inside
+    the recover command — any other writer of ``transition`` could move a
+    credential task. The generic edge now refuses credential_added tasks;
+    the dedicated state method is the only writer, and it refuses blank
+    evidence at the state layer too."""
+    from factory.state import TransitionError
+
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2", depends_on=["T-3"]),
+                               _task("T-3")])
+    for task_id in ("T-1", "T-2"):
+        _park_escalated(env, task_id, "credential_added")
+
+    with pytest.raises(TransitionError):
+        TaskQueue(env.queue_path).transition("T-1", "ready")
+
+    queue = TaskQueue(env.queue_path)
+    with pytest.raises(Exception, match="evidence"):
+        queue.recover_credential("T-1", "   ")
+    assert env.task("T-1")["status"] == "needs_human", "blank evidence wrote"
+
+    assert TaskQueue(env.queue_path).recover_credential(
+        "T-1", "test fixture, not a real credential") == "ready"
+    assert env.task("T-1")["status"] == "ready"
+    # open dependency routes blocked, same rule as every recovery writer
+    assert TaskQueue(env.queue_path).recover_credential(
+        "T-2", "rotated") == "blocked"
+    assert env.task("T-2")["status"] == "blocked"
+
+    # the command still works through the new state method
+    from factory.approve import recover_task
+    _park_escalated(env, "T-1", "credential_added")
+    assert recover_task(TaskQueue(env.queue_path), "T-1", evidence="rotated",
+                        confirm=lambda question: True,
+                        factory_root=env.root) == "ready"
+
+
 def test_review35_a_merged_escalated_pr_returns_to_review(tmp_path: Path):
     """Round-5 finding 4: an owner who resolves a stale_base conflict on
     GitHub and merges leaves the task parked needs_human with shipped

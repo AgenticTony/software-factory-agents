@@ -43,7 +43,9 @@ from pathlib import Path
 
 from factory.contract import NON_EXECUTABLE_KINDS, ContractError, acceptance_hash
 from factory.mergeorder import gh_pr_state
+from factory.progress import ProgressLog, ProgressLogError
 from factory.publish import PublishError
+from factory.runs import FACTORY_ROOT_DEFAULT
 from factory.state import (
     TaskQueue,
     credential_recovery_eligible,
@@ -265,6 +267,8 @@ def recover_task(
     *,
     assume_yes: bool = False,
     evidence: str | None = None,
+    done_by: str | None = None,
+    factory_root: Path | None = None,
     pr_state: Callable[[str], str] | None = None,
     confirm: Callable[[str], bool] = input_confirm,
     echo: Callable[[str], None] = print,
@@ -286,7 +290,10 @@ def recover_task(
     (e.g. "test fixture, not a real credential" or "rotated"), an
     interactive y/N with NO ``--yes`` — the point is that a human looked
     — and no attempt reset: the remaining budget is spent with the
-    finding in hand.
+    finding in hand. The confirmation is PERSISTED: the task's progress
+    log gains an entry (outcome ``recovered``, the escalation, the
+    evidence, ``done_by``, a timestamp) written after the state move —
+    the audit trail, not just the terminal echo (review round on #74).
 
     Refused — :class:`ApprovalError`, nothing written — when the task
     isn't parked on a recoverable escalation (the same gates the
@@ -303,7 +310,11 @@ def recover_task(
         assume_yes: Skip the confirmation prompt (never allowed for a
             credential_added task).
         evidence: Required for a credential_added task: what the owner
-            checked; recorded in the command's summary.
+            checked; persisted in the task's progress log.
+        done_by: Who confirmed a credential recovery (default: the git
+            user, like ``factory tick``); recorded in the log entry.
+        factory_root: Factory root for the progress log (default
+            ``~/factory``).
         pr_state: GitHub PR-state seam (default
             :func:`factory.mergeorder.gh_pr_state`); injected in tests.
         confirm: Interactive confirmation callable; injected in tests.
@@ -322,6 +333,7 @@ def recover_task(
     if credential_recovery_eligible(task):
         return _recover_credential_task(
             queue, task_id, task, evidence=evidence, assume_yes=assume_yes,
+            done_by=done_by, factory_root=factory_root,
             confirm=confirm, echo=echo,
         )
     if not recovery_task_eligible(task):
@@ -374,15 +386,19 @@ def _recover_credential_task(
     *,
     evidence: str | None,
     assume_yes: bool,
+    done_by: str | None,
+    factory_root: Path | None,
     confirm: Callable[[str], bool],
     echo: Callable[[str], None],
 ) -> str:
-    """The credential_added re-queue: evidence + interactive y/N, then the
-    gated ``needs_human → ready/blocked`` edge. Session-less, no attempt
-    reset (the remaining budget is the owner's call, made with the
-    finding named in ``evidence``). Refuses before any write on a missing
-    or empty evidence, on ``--yes`` (the confirmation IS the gate), and on
-    a declined prompt."""
+    """The credential_added re-queue: evidence + interactive y/N, the
+    state layer's dedicated edge (:meth:`TaskQueue.recover_credential`),
+    and the confirmation persisted to the task's progress log (outcome
+    ``recovered``, escalation, evidence, ``done_by``, timestamp).
+    Session-less, no attempt reset (the remaining budget is the owner's
+    call, made with the finding named in ``evidence``). Refuses before
+    any write on a missing or empty evidence, on ``--yes`` (the
+    confirmation IS the gate), and on a declined prompt."""
     if not (evidence or "").strip():
         raise ApprovalError(
             f"{task_id}: credential_added recovery requires --evidence — "
@@ -406,11 +422,31 @@ def _recover_credential_task(
     )
     if not confirm(f"Re-queue {task_id} (credential confirmed handled)?"):
         raise ApprovalDeclined(f"{task_id}: credential recovery declined")
-    new_status = (
-        "blocked" if unmet_dependencies(task, queue.doc.get("tasks", []))
-        else "ready"
-    )
-    queue.transition(task_id, new_status)  # the gated edge (state enforces)
+    new_status = queue.recover_credential(task_id, evidence)
+    who = done_by or default_approver()
+    # The audit trail: the state has moved, so a log failure is loud —
+    # the operator must know the one durable record of the confirmation
+    # is missing, not discover it in an incident review.
+    try:
+        entry = ProgressLog.for_task(
+            factory_root or FACTORY_ROOT_DEFAULT,
+            queue.doc.get("project") or "unknown",
+            task_id,
+        ).append({
+            "outcome": "recovered",
+            "escalation": "credential_added",
+            "evidence": evidence.strip(),
+            "done_by": who,
+            "recovered_at": now_iso(),
+            "note": f"credential_added re-queued ({new_status}) by "
+                    f"{who}: {evidence.strip()}",
+        })
+    except ProgressLogError as exc:
+        raise ApprovalError(
+            f"{task_id}: moved to {new_status}, but the progress log could "
+            f"not be written — the confirmation is NOT durably recorded: {exc}"
+        ) from exc
+    assert entry.get("outcome") == "recovered"
     return new_status
 
 

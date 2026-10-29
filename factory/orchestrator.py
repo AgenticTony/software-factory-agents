@@ -218,17 +218,33 @@ def _create_gate_venv(run_dir: Path) -> Path:
     (the interpreter behind the orchestrator's own venv, if any), so a
     venv-of-venv never chains through the owner's checkout.
 
-    The venv is anchored in ``.git/info/exclude``: the gates diff refs,
-    but they run commands on the checkout, and L0 refuses a tree that
-    isn't exactly ``head_ref`` — an untracked ``.venv`` would read as
-    dirty. ``.git/info`` is sandbox-denyWritten, so the session can't
+    The venv is anchored in ``.git/info/exclude`` (idempotently — one
+    ``/.venv/`` line however often creation re-runs): the gates diff
+    refs, but they run commands on the checkout, and L0 refuses a tree
+    that isn't exactly ``head_ref`` — an untracked ``.venv`` would read
+    as dirty. ``.git/info`` is sandbox-denyWritten, so the session can't
     undo it (same anchoring ``create_run`` seeds for ``.home``/``.tmp``).
 
+    A ``.venv`` that already exists in the clone is REFUSED (review
+    round on #74): an implementer can ``git add -f .venv/…``, and
+    ``python -m venv`` over an existing directory keeps its
+    site-packages — the gates would run planted code. The refusal fires
+    at construction, before a single gate command executes; L0 flags the
+    tracked paths one layer below.
+
     Raises:
-        RunError: venv creation failed (no partial dir is kept); the run
-            cannot gate hermetically, so it refuses to gate at all.
+        RunError: venv creation failed (no partial dir is kept), or a
+            ``.venv`` already exists in the clone (planted environment);
+            the run cannot gate hermetically, so it refuses to gate.
     """
     venv = run_dir / ".venv"
+    if venv.exists():
+        raise RunError(
+            f"refusing to create the gate venv: {venv} already exists in "
+            "the clone — a committed .venv is planted environment "
+            "(git add -f), never factory state; the run is refused before "
+            "any gate command executes"
+        )
     base = Path(getattr(sys, "_base_executable", sys.executable))
     try:
         proc = subprocess.run(
@@ -246,8 +262,10 @@ def _create_gate_venv(run_dir: Path) -> Path:
         )
     exclude = run_dir / ".git" / "info" / "exclude"
     exclude.parent.mkdir(parents=True, exist_ok=True)
-    with exclude.open("a") as fh:
-        fh.write("/.venv/\n")
+    lines = exclude.read_text().splitlines() if exclude.exists() else []
+    if "/.venv/" not in lines:
+        with exclude.open("a") as fh:
+            fh.write("/.venv/\n")
     return venv
 
 

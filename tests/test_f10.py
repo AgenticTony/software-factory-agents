@@ -898,6 +898,82 @@ def test_gate_runner_uses_a_run_local_venv_not_ambient_pip(
     assert status.stdout.strip() == "", status.stdout
 
 
+def test_committed_venv_is_refused_and_flagged(tmp_path: Path):
+    """Review round on #74: an implementer can ``git add -f .venv/…``; the
+    clean clone would carry it, ``python -m venv`` keeps existing
+    site-packages, and the gates would run planted code. Two layers: L0
+    flags any tracked path under ``.venv/`` as protected_path_touched
+    (factory infrastructure inside the clone is never agent-writable),
+    and the gate venv creation refuses outright when ``<run>/.venv``
+    already exists — before a single gate command can run through it."""
+    import factory.orchestrator as orch
+    from factory.runs import RunError
+
+    planted = ".venv/lib/python3.11/site-packages/evil.pth"
+    repo = tmp_path / "source-repo"
+    repo.mkdir()
+    (repo / "README.md").write_text("# fixture\n")
+    subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"],
+                   check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=f@x", "-c", "user.name=f",
+         "commit", "-q", "-m", "base"], check=True)
+    target = repo / planted
+    target.parent.mkdir(parents=True)
+    target.write_text("import evil\n")
+    subprocess.run(["git", "-C", str(repo), "add", "-f", ".venv"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=f@x", "-c", "user.name=f",
+         "commit", "-q", "-m", "plant"], check=True)
+    base = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD~1"],
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+    # L0 layer: the planted path is a protected-path finding + escalation
+    from factory.l0 import run_l0
+    report = run_l0({"commands": {"setup": "true"}, "paths": {}},
+                    repo, base, "HEAD")
+    assert "protected_path_touched" in report.escalations, report.escalations
+    assert any(f.file == planted for f in report.findings), \
+        [f.id for f in report.findings]
+
+    # runner layer: the venv creation refuses, so no command ever runs
+    root = tmp_path / "factory-root"
+    (root / "holdouts").mkdir(parents=True)
+    run = create_run("fixture", repo, factory_root=root, ref="HEAD")
+    assert (run.root / ".venv").is_dir(), "fixture setup error: no planted venv"
+    with pytest.raises(RunError, match="already exists"):
+        orch.sandboxed_runner(run.root, run.settings_path)
+
+
+def test_gate_venv_exclude_line_is_written_once(tmp_path: Path):
+    """Review round on #74: the exclude anchor is appended idempotently —
+    a recreated venv (the only way creation runs twice: an existing
+    ``.venv`` refuses) must not stack duplicate ``/.venv/`` lines in
+    ``.git/info/exclude``."""
+    import shutil as _shutil
+
+    import factory.orchestrator as orch
+
+    repo = tmp_path / "source-repo"
+    repo.mkdir()
+    (repo / "README.md").write_text("# fixture\n")
+    subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"],
+                   check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=f@x", "-c", "user.name=f",
+         "commit", "-q", "--allow-empty", "-m", "base"], check=True)
+    root = tmp_path / "factory-root"
+    (root / "holdouts").mkdir(parents=True)
+    run = create_run("fixture", repo, factory_root=root)
+
+    orch._create_gate_venv(run.root)
+    _shutil.rmtree(run.root / ".venv")  # the one way creation can re-run
+    orch._create_gate_venv(run.root)
+    exclude = (run.root / ".git" / "info" / "exclude").read_text()
+    assert exclude.count("/.venv/\n") == 1, exclude
+
+
 # --- AC-12: every run dir is cleaned up; loop reclaims orphans --------------
 
 

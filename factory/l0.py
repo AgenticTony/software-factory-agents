@@ -76,13 +76,14 @@ not a near-miss of a popular name). L0 records the escalation; the checks
 run when there is a sandbox to run them in.
 """
 
+import copy
 import json
 import posixpath
 import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from factory.gates import (
     CommandResult,
@@ -237,31 +238,77 @@ def _failure_marker(output: str) -> str | None:
     return None
 
 
-def _dependency_surface(doc: dict) -> tuple:
-    """The comparable dependency surface of a parsed pyproject.toml:
-    ``[project].dependencies``, ``[project].optional-dependencies`` and
-    ``[build-system].requires`` — the three tables a human must review as
-    a dependency change. Optional-dependency extras compare sorted: extra
-    order carries no meaning; dependency order is kept as written (it is
-    resolution order to a reader). A wrong-typed table raises, and the
-    caller escalates: fail closed.
-    """
-    project = doc.get("project") or {}
-    build = doc.get("build-system") or {}
-    deps = project.get("dependencies") or []
-    optional = project.get("optional-dependencies") or {}
-    requires = build.get("requires") or []
-    if not isinstance(deps, list) or not isinstance(requires, list):
-        raise TypeError("dependencies/requires must be arrays")
-    if not isinstance(optional, dict) or any(
-        not isinstance(values, list) for values in optional.values()
-    ):
-        raise TypeError("optional-dependencies must be a table of arrays")
-    return (
-        tuple(deps),
-        tuple(sorted((key, tuple(values)) for key, values in optional.items())),
-        tuple(requires),
-    )
+# Dotted paths inside a parsed pyproject.toml that are INERT for the
+# dependency surface: they may differ between merge-base and head without
+# escalating ``new_dependency``. The comparison is inverted on purpose
+# (review round on #74: enumerating the dependency-carrying tables was
+# fail-open — [dependency-groups], dynamic dependencies, [tool.uv.sources]
+# and [tool.poetry.*] all slipped past a three-table allowlist), so every
+# entry here must earn its place:
+#
+# * ``project.name/description/readme/version/urls/scripts`` — artifact
+#   metadata and console entry points: describe the thing built, never
+#   what is imported to build or run it. (``scripts`` executes the
+#   project's own code, which the diff already reviews; it cannot pull
+#   a new package in.)
+# * ``tool.ruff`` / ``tool.pytest`` / ``tool.coverage`` / ``tool.mypy`` —
+#   dev-tool configuration for tools the factory itself pins and runs;
+#   none of them can name an import that enters the built environment.
+# * ``tool.setuptools.package-data`` — which existing files ship in the
+#   wheel; the F-31 case (a py.typed line), and a file that exists in
+#   the diff either way.
+#
+# Anything else — an unknown ``tool.*`` table included — compares, and a
+# difference escalates: a new table class that can carry dependencies
+# fails closed until a human allowlists it here.
+_INERT_PYPROJECT_PATHS = (
+    "project.name",
+    "project.description",
+    "project.readme",
+    "project.version",
+    "project.urls",
+    "project.scripts",
+    "tool.ruff",
+    "tool.pytest",
+    "tool.coverage",
+    "tool.mypy",
+    "tool.setuptools.package-data",
+)
+
+
+def _strip_inert(doc: dict) -> dict:
+    """A deep copy of a parsed pyproject with every :data:`_INERT_PYPROJECT_PATHS`
+    entry removed, for whole-document comparison. Tables the stripping
+    empties are pruned (``[tool.ruff]`` alone leaves ``tool: {}`` on one
+    side and no ``tool`` key on the other — equal in meaning, unequal as
+    dicts); an empty table carries no dependency, so pruning it is not a
+    hole."""
+    stripped = copy.deepcopy(doc)
+    for dotted in _INERT_PYPROJECT_PATHS:
+        parts = dotted.split(".")
+        node: Any = stripped
+        for part in parts[:-1]:
+            if not isinstance(node, dict) or part not in node:
+                node = None
+                break
+            node = node[part]
+        if isinstance(node, dict):
+            node.pop(parts[-1], None)
+    return _prune_empty(stripped)
+
+
+def _prune_empty(node: Any) -> Any:
+    """Recursively drop dict entries whose value is (or prunes to) an
+    empty dict; scalars, lists and empty lists pass through untouched."""
+    if not isinstance(node, dict):
+        return node
+    pruned = {}
+    for key, value in node.items():
+        value = _prune_empty(value)
+        if isinstance(value, dict) and not value:
+            continue
+        pruned[key] = value
+    return pruned
 
 
 def _pyproject_surface_unchanged(change, path: str, *, repo, base_ref, head_ref) -> bool:
@@ -269,6 +316,11 @@ def _pyproject_surface_unchanged(change, path: str, *, repo, base_ref, head_ref)
     untouched — the one structurally parsed manifest (F-31 run blocker:
     a ``[tool.setuptools.package-data]``-only edit falsely escalated
     ``new_dependency`` and skipped every remaining gate).
+
+    The WHOLE parsed document compares, minus the inert allowlist
+    (:data:`_INERT_PYPROJECT_PATHS`) — dependency-bearing tables outside
+    the obvious three (PEP 735 dependency-groups, dynamic dependencies,
+    tool.uv.sources, tool.poetry.*) escalate rather than slipping through.
 
     True ONLY for a plain modification (status M) of a root
     ``pyproject.toml`` with refs supplied, whose merge-base and head
@@ -285,7 +337,7 @@ def _pyproject_surface_unchanged(change, path: str, *, repo, base_ref, head_ref)
         merge_base = _git(Path(repo), "merge-base", base_ref, head_ref).strip()
         before = tomllib.loads(_git(Path(repo), "show", f"{merge_base}:pyproject.toml"))
         after = tomllib.loads(_git(Path(repo), "show", f"{head_ref}:pyproject.toml"))
-        return _dependency_surface(before) == _dependency_surface(after)
+        return _strip_inert(before) == _strip_inert(after)
     except (GateError, tomllib.TOMLDecodeError, TypeError, UnicodeDecodeError):
         return False
 
@@ -348,6 +400,24 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
 
     for change in changes:
         for path, verb in events(change):
+            # The gate runner's venv (factory/orchestrator._create_gate_venv)
+            # is factory infrastructure inside the clone: a tracked path
+            # under .venv/ means an implementer `git add -f`-ed planted
+            # environment (a .pth is imported code) into the tree the gates
+            # would run through. protected_path_touched — the standing
+            # class for paths an agent must never write — independently of
+            # the profile's list, like the venv-creation refusal one layer
+            # up (review round on #74).
+            if path == ".venv" or path.startswith(".venv/"):
+                findings.append(
+                    Finding(
+                        "protected_path_touched",
+                        f"tracked gate-venv path {verb}: {path} — a committed "
+                        ".venv is planted environment, never project source",
+                        file=path,
+                    )
+                )
+                escalations.add("protected_path_touched")
             # Adding counts too: a new conftest.py or a new file under a
             # protected glob changes how the contract tests run. The task's
             # own contract test files are the exception — the implementer

@@ -114,10 +114,13 @@ ALLOWED_TRANSITIONS: dict[tuple[str, str], str] = {
 # escalation, so GitHub has no signal left to distinguish re-open from
 # reject. The one exception to "no other escalation": credential_added
 # (F-31 run blocker) may exit through the needs_human → ready/blocked
-# edge ONLY via `factory recover --evidence …` with an interactive y/N
-# (no --yes) — TASK-CONTRACT's "a human confirms and re-queues". The
-# sweep never writes it, and no other needs_human task
-# (protected_path_touched, attempts_exhausted, …) may exit through them.
+# edge ONLY via TaskQueue.recover_credential — the dedicated state-layer
+# writer `factory recover --evidence …` drives with an interactive y/N
+# (no --yes), TASK-CONTRACT's "a human confirms and re-queues". The
+# generic transition refuses credential tasks (check_recovery_transition
+# is stale_base/pr_closed only), the sweep never writes the edge, and no
+# other needs_human task (protected_path_touched, attempts_exhausted, …)
+# may exit through them.
 RECOVERY_ESCALATIONS = ("stale_base", "pr_closed")
 CREDENTIAL_RECOVERY_ESCALATIONS = ("credential_added",)
 RECOVERY_TRANSITIONS: dict[tuple[str, str], str] = {
@@ -227,30 +230,26 @@ def credential_recovery_eligible(task: dict) -> bool:
 
 
 def check_recovery_transition(task: dict, new: str) -> str:
-    """Validate one recovery transition for this specific task.
+    """Validate one F-26 recovery transition for this specific task.
 
-    Two gated writer paths share these edges: the F-26 stale-PR recovery
-    (sweep or ``factory recover``, needs the PR link), and the
-    ``credential_added`` re-queue (``factory recover --evidence`` only —
-    no PR exists to gate on; the command enforces the human's evidence
-    and confirmation, this table only the escalation).
+    The stale_base/pr_closed edges only (sweep or ``factory recover``).
+    The ``credential_added`` re-queue is NOT one of them: it refuses
+    here and moves only through :meth:`TaskQueue.recover_credential`,
+    the dedicated state-layer writer that demands the owner's evidence
+    (review round on #74: a gate that lived only in the command left
+    every other ``transition`` caller able to move a credential task).
 
     Raises:
         TransitionError: If the edge isn't a recovery edge, or the task
-            is neither a stale_base/pr_closed escalation holding a PR
-            link nor a credential_added escalation.
+            isn't a stale_base/pr_closed escalation holding a PR link.
     """
     reason = RECOVERY_TRANSITIONS.get((task.get("status"), new))
-    eligible = (
-        recovery_task_eligible(task)
-        or (new in ("ready", "blocked") and credential_recovery_eligible(task))
-    )
-    if reason is None or not eligible:
+    if reason is None or not recovery_task_eligible(task):
         raise TransitionError(
             f"recovery transition {task.get('status')} -> {new} needs a "
-            "stale_base/pr_closed escalation and a PR link, or a "
-            "credential_added escalation (F-26; credential via "
-            "`factory recover --evidence`)"
+            "stale_base/pr_closed escalation and a PR link (F-26; a "
+            "credential_added task moves only through "
+            "TaskQueue.recover_credential)"
         )
     return reason
 
@@ -680,7 +679,9 @@ class TaskQueue:
         Raises:
             StateError: If the task doesn't exist.
             TransitionError: If the edge isn't in the table, or the slice
-                or owner-step state contradicts it.
+                or owner-step state contradicts it — including a
+                credential_added task asked to leave ``needs_human``
+                (that edge is :meth:`recover_credential`'s alone).
             ContractError: If the resulting queue wouldn't validate.
             ConcurrentWriteError: If another writer changed the file.
         """
@@ -698,6 +699,55 @@ class TaskQueue:
         _check_owner_step_rules(task, new_status)
         task["status"] = new_status
         self.save()
+
+    def recover_credential(self, task_id: str, evidence: str) -> str:
+        """Re-queue a ``credential_added`` task: the one writer of the
+        ``needs_human → ready/blocked`` edge for that escalation.
+
+        The credential exit is gated HERE, not in the command (review
+        round on #74): the generic :meth:`transition` refuses a
+        credential task, so no other writer can move it. Evidence is
+        demanded again at this layer — the command already required it,
+        and the state layer must hold on its own. Routing matches every
+        recovery writer: ``blocked`` when a dependency is open, else
+        ``ready``; attempts are never reset (the remaining budget is the
+        owner's call, made with the finding named in the evidence).
+
+        Args:
+            task_id: Task parked on a ``credential_added`` escalation.
+            evidence: What the owner checked; must not be blank.
+
+        Returns:
+            The new status: ``ready`` or ``blocked``.
+
+        Raises:
+            StateError: Unknown task, or blank evidence.
+            TransitionError: The task isn't parked on a
+                ``credential_added`` escalation (including via the
+                generic transition, which never moves one).
+            ContractError: If the resulting queue wouldn't validate.
+            ConcurrentWriteError: If another writer changed the file.
+        """
+        if not (evidence or "").strip():
+            raise StateError(f"{task_id}: credential recovery requires evidence")
+        task = self.get(task_id)
+        if not credential_recovery_eligible(task):
+            raise TransitionError(
+                f"{task_id}: credential recovery needs a needs_human task "
+                "whose last attempt escalated credential_added"
+            )
+        new_status = (
+            "blocked" if unmet_dependencies(task, self.doc.get("tasks", []))
+            else "ready"
+        )
+        reason = RECOVERY_TRANSITIONS.get((task.get("status"), new_status))
+        assert reason is not None  # needs_human → ready/blocked is in the table
+        _check_kind_rules(task, task.get("status"), new_status)
+        _check_slice_rules(task, new_status)
+        _check_owner_step_rules(task, new_status)
+        task["status"] = new_status
+        self.save()
+        return new_status
 
     def transition_path(self, task_id: str, statuses: list) -> None:
         """Move a task through a sequence of legal transitions in one save.
