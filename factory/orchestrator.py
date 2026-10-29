@@ -100,6 +100,7 @@ from factory.sandbox import build_settings, run_sandboxed, write_settings
 from factory.session import (
     DEFAULT_BASE_URL,
     SessionRecord,
+    probe_session_interpreter,
     run_session_sandboxed,
     seat_token,
 )
@@ -662,6 +663,7 @@ def run_once(
     gate_timeout_sec: int = 600,
     protection: Callable | None = None,
     pr_state: Callable | None = None,
+    sdk_probe: Callable | None = None,
 ) -> RunResult:
     """Pick the next task and take it to a PR, an escalation or a stop.
 
@@ -686,6 +688,11 @@ def run_once(
         pr_state: Open-PR seam (default
             :func:`factory.mergeorder.gh_pr_state`); the stale-base sweep
             and the open-PR limit follow GitHub's truth, not the queue's.
+        sdk_probe: Session-interpreter probe seam (default: auto —
+            :func:`factory.session.probe_session_interpreter` when real
+            sessions would run, i.e. the session runner is the default;
+            None when tests inject stub seats). A raising probe refuses
+            the run before anything is picked or recorded.
 
     Returns:
         The :class:`RunResult`.
@@ -723,6 +730,20 @@ def run_once(
         # no gh lookups, no re-validation escalations inside it.
         return RunResult("idle" if pick is None else "peak_window",
                          task_id=pick.task["id"] if pick else None)
+    # The F-31 incident (run 20261029T130912Z-1e4eb9): a venv interpreter
+    # whose own files the sandbox denied started as its bare base, and
+    # the session entry died on ModuleNotFoundError one full session too
+    # late — after the attempt was spent. One sandboxed import probe
+    # before anything is picked or recorded: an unrunnable interpreter
+    # refuses the run as a clean environment error and spends no
+    # attempt. Automatic only when real sessions would run (tests inject
+    # stub seats and no probe); an explicit probe seam always runs.
+    probe = sdk_probe or (
+        probe_session_interpreter
+        if session_runner in (None, run_session_sandboxed) else None
+    )
+    if probe is not None:
+        probe(srt_bin_path=srt_bin_path)
     # Round-3 findings 1+7: the sweep runs on EVERY off-peak run, with or
     # without pickable work (AC-3's "every run" — F-27 waiting on F-26's
     # open PR must still see it go stale or closed), and an idle tick

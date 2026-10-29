@@ -71,6 +71,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -85,7 +86,7 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk import query as sdk_query
 
-from factory.runs import GIT_HARDENING
+from factory.runs import GIT_HARDENING, RunError
 from factory.sandbox import (
     build_settings,
     default_toolchain,
@@ -1221,6 +1222,67 @@ def _bundled_cli() -> Path | None:
     name = "claude.exe" if sys.platform == "win32" else "claude"
     bundled = Path(claude_agent_sdk.__file__).parent / "_bundled" / name
     return bundled if bundled.exists() else None
+
+
+def probe_session_interpreter(
+    *, srt_bin_path: Path | None = None, timeout_sec: float = 60.0,
+) -> None:
+    """One sandboxed proof that the session interpreter can import the SDK.
+
+    The session entry runs ``sys.executable -c`` inside srt with the home
+    denied. A venv interpreter whose own files the settings don't
+    re-allow starts as its bare base interpreter and dies on
+    ``ModuleNotFoundError: No module named 'claude_agent_sdk'`` one full
+    session too late — after the attempt is spent (run
+    20261029T130912Z-1e4eb9: F-31 lost 1 of 3 attempts to exactly
+    that). This probe runs the same import under the same
+    settings-builder BEFORE anything is picked or recorded: a failure
+    raises :class:`~factory.runs.RunError` naming the interpreter and
+    the fix — a clean environment refusal that spends no attempt, the
+    same class the orchestrator already uses for environment failures
+    (network git timeouts, merge pathologies), caught and printed by
+    the CLI.
+
+    Args:
+        srt_bin_path: srt override for tests (still pin-checked).
+        timeout_sec: Wall-clock cap for the probe.
+
+    Raises:
+        RunError: The sandboxed interpreter cannot import
+            ``claude_agent_sdk`` — the message names the interpreter and
+            the fix.
+        SandboxError: srt is missing or unpinned (from :func:`ensure_srt`
+            inside :func:`run_sandboxed`).
+    """
+    with tempfile.TemporaryDirectory(prefix="factory-sdk-probe-") as tmp:
+        root = Path(tmp)
+        # Canonical runs layout so build_settings derives the factory
+        # root (its holdouts deny must name a real path shape).
+        run_dir = root / "runs" / "probe" / "sdk-import"
+        run_dir.mkdir(parents=True)
+        settings = build_settings(
+            {}, run_dir, model_endpoint=DEFAULT_BASE_URL,
+            toolchain=default_toolchain(),
+        )
+        settings_path = run_dir / "probe-settings.json"
+        write_settings(settings, settings_path)
+        proc = run_sandboxed(
+            [sys.executable, "-c", "import claude_agent_sdk"],
+            run_dir,
+            settings_path,
+            timeout=timeout_sec,
+            srt_bin_path=srt_bin_path,
+        )
+    if proc.returncode != 0:
+        raise RunError(
+            f"the sandboxed session interpreter cannot import "
+            f"claude_agent_sdk ({sys.executable}, exit {proc.returncode}): "
+            f"{proc.stderr.strip()[:800] or proc.stdout.strip()[:800]} — "
+            "the sandbox denies $HOME, so a venv interpreter needs its own "
+            "pyvenv.cfg and site-packages re-allowed "
+            "(factory.sandbox._toolchain_allowread); run factory from the "
+            "venv with the SDK installed, or reinstall it there"
+        )
 
 
 def run_session_sandboxed(

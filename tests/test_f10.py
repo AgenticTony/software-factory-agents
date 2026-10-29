@@ -55,7 +55,7 @@ from factory.prbody import (
 from factory.progress import ProgressLog, ProgressLogError
 from factory.prompts import prompt_versions
 from factory.publish import PushRefused, gh_pr_create, push_branch
-from factory.runs import GIT_HARDENING, create_run
+from factory.runs import GIT_HARDENING, RunError, create_run
 from factory.session import SessionRecord
 from factory.state import TaskQueue
 
@@ -1497,3 +1497,37 @@ def test_rehearsal_run_refuses_when_the_remote_is_unreachable(tmp_path):
         env.run(seats)
     assert seats.calls == []
     assert env.task()["status"] == "ready"
+
+
+# --- an unrunnable session interpreter refuses before anything is spent -----
+
+
+def test_an_unimportable_sdk_refuses_the_run_before_any_attempt(tmp_path: Path):
+    """The F-31 incident: a venv interpreter the sandbox silently degraded
+    to its base died on ModuleNotFoundError one full session too late,
+    and the orchestrator_error attempt it recorded spent 1 of 3. The
+    interpreter probe refuses the run as a clean environment error
+    BEFORE anything is picked or recorded: no attempt, no lease, the
+    task stays ready, no session ever starts."""
+    env = Env(tmp_path)
+    seats = Seats()
+    probe_calls: list[dict] = []
+
+    def broken(**kwargs):
+        probe_calls.append(kwargs)
+        raise RunError(
+            "the sandboxed session interpreter cannot import "
+            "claude_agent_sdk (.venv/bin/python, exit 1): "
+            "ModuleNotFoundError — the sandbox denies $HOME, so a venv "
+            "interpreter needs its own pyvenv.cfg and site-packages "
+            "re-allowed")
+
+    with pytest.raises(RunError, match="claude_agent_sdk"):
+        env.run(seats, sdk_probe=broken)
+
+    assert probe_calls, "the probe never ran"
+    task = TaskQueue(env.queue_path).get("T-1")
+    assert task["attempts"] == []
+    assert task["status"] == "ready"
+    assert seats.calls == []
+    assert env.prs == []

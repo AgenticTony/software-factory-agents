@@ -836,6 +836,16 @@ def _toolchain_allowread(home: Path, toolchain: "Sequence[Path]") -> set[Path]:
       whole parent: for ``~/.local/bin`` that would re-open all of
       ``~/.local`` (``~/.local/share`` holds uv's credential store,
       cursor-agent, Copilot shims);
+    * when the binary is a venv interpreter (PEP 405: a ``pyvenv.cfg``
+      sits beside its ``bin/``), the venv's own ``pyvenv.cfg``, ``bin/``
+      and ``lib*/python*/site-packages``. ``.resolve()`` follows past
+      the venv to the base install (covered by the rules above), but
+      without the venv's own files Python silently starts as the bare
+      base interpreter — ``sys.prefix`` collapses, the venv's
+      site-packages (claude_agent_sdk, …) vanish from ``sys.path``
+      (run 20261029T130912Z-1e4eb9). Exactly the venv's subpaths, never
+      the venv directory's parent: that is the repo the venv lives in,
+      with the checkout and any secrets in it;
     * every symlink on the way to the binary, as the literal link *file*
       (never its directory). The native Claude Code install is
       ``~/.local/bin/claude -> ~/.local/share/claude/versions/X``; without
@@ -857,10 +867,22 @@ def _toolchain_allowread(home: Path, toolchain: "Sequence[Path]") -> set[Path]:
     def below_home(path: Path) -> bool:
         return any(path != h and h in path.parents for h in homes)
 
+    def venv_reads(prefix: Path) -> None:
+        """A PEP 405 venv rooted at ``prefix``: its own files, read-only."""
+        entries.add(prefix / "pyvenv.cfg")
+        entries.add(prefix / "bin")
+        entries.update(
+            site
+            for lib in prefix.glob("lib*")
+            if lib.is_dir()
+            for site in lib.glob("python*/site-packages")
+        )
+
     for raw in toolchain:
         link = Path(raw).expanduser()
         if not link.is_absolute():
             continue
+        given = link
         for _ in range(40):  # same hop limit as the kernel's ELOOP
             if not link.is_symlink():
                 break
@@ -871,6 +893,12 @@ def _toolchain_allowread(home: Path, toolchain: "Sequence[Path]") -> set[Path]:
             binary = Path(raw).expanduser().resolve()
         except OSError:
             continue
+        # The venv check runs on BOTH the given path's prefix and the
+        # resolved binary's: a venv python is itself a symlink to the
+        # base install, so only the given spelling names the venv.
+        for prefix in {given.parent.parent, binary.parent.parent}:
+            if below_home(prefix) and (prefix / "pyvenv.cfg").is_file():
+                venv_reads(prefix)
         directory = binary.parent
         if not below_home(directory):
             continue
