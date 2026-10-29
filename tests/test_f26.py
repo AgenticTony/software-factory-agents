@@ -508,9 +508,11 @@ def _push_remote_branch(env: Env, branch: str, impl_body: str) -> None:
 
 
 def test_review1_a_merged_pr_is_never_revalidated(tmp_path: Path):
-    """Finding 1: a squash-merged PR (task still in_review until reconcile)
-    must be skipped by the sweep, not escalated stale_base — the contract
-    tests already pass on the new main, so re-validation would fail."""
+    """Finding 1: a squash-merged PR must be stamped and skipped by the
+    sweep, never escalated stale_base — the contract tests already pass
+    on the new main, so re-validation would fail. On this no-deploy
+    fixture profile the stamp also closes the task (the fix): done in
+    the same run, still with no attempt spent."""
     env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
     assert env.run(Seats()).outcome == "pr_opened"
     env.advance_remote_main("def answer():\n    return 99\n",
@@ -523,14 +525,16 @@ def test_review1_a_merged_pr_is_never_revalidated(tmp_path: Path):
     # The merged PR is skipped AND frees its slot: the next task runs.
     assert result.outcome == "pr_opened"
     task = env.task("T-1")
-    assert task["status"] == "in_review"          # reconcile's story, not ours
-    assert len(task["attempts"]) == before        # no stale_base attempt
-    assert len(env.log().entries()) == entries    # no re-validation ran
+    assert task["status"] == "done"        # stamped, then closed (no deploy)
+    assert len(task["attempts"]) == before          # no stale_base attempt
+    assert len(env.log().entries()) == entries + 1  # only the close evidence
 
 
 def test_review2_a_deleted_branch_after_merge_does_not_wedge(tmp_path: Path):
     """Finding 2: with auto-delete head branches, the PR's branch is gone
-    from the remote while the task sits in_review — run must not raise."""
+    from the remote while the task sits in_review — run must not raise.
+    The merged stamp (and the close it triggers) happens before any
+    branch fetch, so the missing branch is never fetched."""
     env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
     _force_in_review(env, branch="factory/t-1-gone")
     # The branch is deliberately never pushed: fetching it would fail.
@@ -538,7 +542,7 @@ def test_review2_a_deleted_branch_after_merge_does_not_wedge(tmp_path: Path):
     result = env.run(Seats(), pr_state=lambda url: "merged")
 
     assert result.outcome == "pr_opened"          # the next task is not wedged
-    assert env.task("T-1")["status"] == "in_review"
+    assert env.task("T-1")["status"] == "done"    # stamped + closed, no fetch
 
 
 def test_review3_the_open_pr_limit_counts_open_prs(tmp_path: Path):
@@ -1340,9 +1344,10 @@ def test_review34_a_pr_closed_task_can_be_recovered_for_a_fix_round(
 def test_review35_a_merged_escalated_pr_returns_to_review(tmp_path: Path):
     """Round-5 finding 4: an owner who resolves a stale_base conflict on
     GitHub and merges leaves the task parked needs_human with shipped
-    code — the merged recovery moves it back in_review (the standard
-    merged story: reconcile owns it from there) instead of stranding it
-    and every task depending on it."""
+    code — the merged recovery moves it back in_review, and on this
+    no-deploy fixture profile the close pass finishes the job to done
+    in the same run, instead of stranding it and every task depending
+    on it."""
     env = Env(tmp_path, tasks=[_task("T-1")])
     assert env.run(Seats()).outcome == "pr_opened"
     env.advance_remote_main("def answer():\n    return 99\n",
@@ -1353,7 +1358,7 @@ def test_review35_a_merged_escalated_pr_returns_to_review(tmp_path: Path):
     result = env.run(Seats(), pr_state=lambda url: "merged")
 
     assert result.outcome == "idle"  # nothing to pick; recovery is the story
-    assert env.task("T-1")["status"] == "in_review"
+    assert env.task("T-1")["status"] == "done"  # recovered, then closed
     entries = env.log().entries()
     assert any("merged" in (e.get("note") or "") for e in entries)
 
@@ -1413,11 +1418,14 @@ def test_review37_the_recovery_scan_runs_once_per_run(tmp_path, monkeypatch):
 
 
 def test_review38_a_merged_park_names_its_real_wait(tmp_path: Path):
-    """Round-6 finding 1: nothing advances a merged task from in_review
-    (reconcile skips non-draft tasks; in_review → deploying is F-14,
-    unbuilt) — the docs and the recovery note must say so instead of
-    promising a reconcile that never comes."""
+    """Round-6 finding 1, narrowed by the no-deploy close: on a profile
+    WITH a deploy target nothing advances a merged task from in_review
+    (in_review → deploying is F-14, unbuilt) — the docs and the recovery
+    note must say so. On a no-deploy profile there is no wait to name:
+    the close pass takes the merged task to done in the same run."""
     env = Env(tmp_path, tasks=[_task("T-1")])
+    env.profile["deploy"]["mechanism"] = "vercel"  # a real deploy target
+    env.profile_path.write_text(yaml.safe_dump(env.profile))
     assert env.run(Seats()).outcome == "pr_opened"
     env.advance_remote_main("def answer():\n    return 99\n",
                             message="conflicting remote change")
@@ -1620,3 +1628,220 @@ def test_review44_cli_prints_the_ready_lines(tmp_path: Path, monkeypatch, capsys
         "queue_empty", results=[RunResult("idle", ready_prs=[line])]))
     assert cli.main(["loop", "--queue", str(tmp_path / "tasks.json")]) == 0
     assert f"    ready: {line}" in capsys.readouterr().out.splitlines()
+
+
+# ------------------------------- no-deploy merged close (fix, F-26 surface) ---
+
+# The bug this fixes (2026-10-29): F-11/#58 and F-12/#61 merged, the sweep
+# stamped links.merged, and both tasks then waited in in_review forever —
+# only F-14 (L4 live checks, not built) would have advanced them, so the
+# queue drained: F-31 stayed blocked on F-11 and `factory run` went idle.
+# On a profile with NO deploy target (deploy.mechanism none-form AND
+# live_checks empty) the merge is the whole story: nothing will ever
+# deploy or be verified live, so the task closes through the state
+# machine — in_review -> deploying -> done (awaiting_owner with open
+# owner steps), the merged PR recorded as the evidence.
+
+
+def _stamped_in_review(env: Env, task_id: str = "T-1", *, branch: str,
+                       pr_url: str = "https://github.com/fixture/fixture/pull/9"):
+    """Hand-craft a task in_review whose PR the sweep stamped merged."""
+    _force_in_review(env, task_id, branch=branch, pr_url=pr_url)
+    q = TaskQueue(env.queue_path)
+    q.get(task_id)["links"]["merged"] = q.get(task_id)["links"]["pr"]
+    q.save()
+
+
+def test_merged_closes_done_on_a_no_deploy_project(tmp_path: Path):
+    """No deploy target: a stamped-merged in_review task reaches done
+    through the F-03 path in one run, the merge the evidence — no gh
+    round-trip (merged links are terminal), no attempt spent."""
+    env = Env(tmp_path)
+    _stamped_in_review(env, branch="factory/t-1-merged")
+    attempts = len(env.task()["attempts"])
+    pr = env.task("T-1")["links"]["pr"]
+
+    result = env.run(Seats())  # pr_state default "open" is never asked
+
+    assert result.outcome == "idle"              # nothing else to pick
+    task = env.task("T-1")
+    assert task["status"] == "done"              # in_review -> deploying -> done
+    assert len(task["attempts"]) == attempts     # session-less close
+    notes = [e.get("note", "") for e in env.log().entries()]
+    assert any(pr in note and "done" in note for note in notes)  # evidence
+
+
+def test_merged_stays_in_review_with_a_deploy_target(tmp_path: Path):
+    """A deploy target (a real mechanism, or live checks to run) keeps
+    the merged task in in_review: merged and deployed are separate
+    facts, and until F-14 exists nothing may close it."""
+    for slug, mechanism, checks in (
+        ("mechanism", "vercel", {}),
+        ("live-checks", "none",
+         {"probe": {"command": "curl -fsS https://example.com/health",
+                    "when": "every_deploy"}}),
+    ):
+        env = Env(tmp_path / slug)
+        _stamped_in_review(env, branch="factory/t-1-merged")
+        env.profile["deploy"]["mechanism"] = mechanism
+        env.profile["live_checks"] = checks
+        env.profile_path.write_text(yaml.safe_dump(env.profile))
+
+        result = env.run(Seats())
+
+        assert result.outcome == "idle"
+        assert env.task("T-1")["status"] == "in_review"
+        assert not any("closed" in e.get("note", "")
+                       for e in env.log().entries())
+
+
+def test_merged_with_open_owner_steps_awaits_owner(tmp_path: Path):
+    """Owner steps still gate done (F-03): a merged no-deploy task with
+    an open step parks in awaiting_owner, and ticking it closes the task."""
+    env = Env(tmp_path, tasks=[_task(
+        "T-1", owner_steps=[{"text": "check the merged dashboard", "done": False}])])
+    _stamped_in_review(env, branch="factory/t-1-merged")
+
+    assert env.run(Seats()).outcome == "idle"
+    assert env.task("T-1")["status"] == "awaiting_owner"
+
+    status = TaskQueue(env.queue_path).tick_owner_steps(
+        "T-1", [1], evidence="rendered the dashboard by hand", done_by="owner")
+    assert status == "done"
+
+
+def test_an_open_pr_is_unchanged_by_the_close_pass(tmp_path: Path):
+    """A PR GitHub still reports open is not merged: the task stays
+    in_review, no stamp, no close."""
+    env = Env(tmp_path)
+    _force_in_review(env, branch="factory/t-1-open")
+    _push_remote_branch(env, "factory/t-1-open", "def answer():\n    return 42\n")
+
+    result = env.run(Seats())  # pr_state "open", branch up to date
+
+    assert result.outcome == "idle"
+    task = env.task("T-1")
+    assert task["status"] == "in_review"
+    assert "merged" not in task["links"]
+    assert not any("closed" in e.get("note", "")
+                   for e in env.log().entries())
+
+
+def test_the_close_pass_unblocks_a_dependent_in_the_same_run(tmp_path: Path):
+    """The F-31 story end to end: closing the merged task and syncing
+    readiness happen BEFORE the pick, so one run closes the dependency
+    and starts the dependent that was blocked on it."""
+    env = Env(tmp_path, tasks=[
+        _task("T-1"),
+        _task("T-2", depends_on=["T-1"], status="blocked"),
+    ])
+    _stamped_in_review(env, branch="factory/t-1-merged")
+
+    result = env.run(Seats())
+
+    assert env.task("T-1")["status"] == "done"
+    assert result.outcome == "pr_opened"          # T-2 picked this run
+    assert env.task("T-2")["status"] == "in_review"
+
+
+def test_a_merged_recovery_escalation_closes_too(tmp_path: Path):
+    """A stale_base task whose PR you merged on GitHub: the recovery
+    edge returns it to in_review stamped, and the close pass takes it
+    to done in the same run — no extra attempt, no re-validation."""
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
+    assert env.run(Seats()).outcome == "pr_opened"
+    env.advance_remote_main("def answer():\n    return 99\n",
+                            message="conflicting remote change")
+    assert env.run(Seats()).outcome == "needs_human"       # stale_base
+    attempts = len(env.task("T-1")["attempts"])
+
+    result = env.run(Seats(), pr_state=lambda url: "merged")
+
+    assert result.outcome == "pr_opened"          # T-2: the slot freed
+    task = env.task("T-1")
+    assert task["status"] == "done"
+    assert len(task["attempts"]) == attempts      # no re-validation ran
+    notes = [e.get("note", "") for e in env.log().entries()]
+    assert any(e.get("outcome") == "recovered" for e in env.log().entries())
+    assert any(task["links"]["pr"] in note and "done" in note for note in notes)
+
+
+# --------------------------- review fixes on the no-deploy close (PR #72) ---
+
+
+@pytest.mark.parametrize("mechanism,expected", [
+    ("none", True),
+    ("None", True),
+    ("NONE (local CLI; nothing ships)", True),
+    ("none (local CLI; nothing ships)", True),
+    ("none(x)", True),
+    ("", False),
+    ("vercel", False),
+    ("nonexistent-host", False),          # fails open under startswith("none")
+    ("nonetheless (vercel)", False),      # same
+    ("none-but-actually-vercel", False),  # hyphenated prose is not the form
+])
+def test_no_deploy_target_matches_only_the_none_form(mechanism, expected):
+    """Review finding 2: the none-form is exactly ``none``, or ``none``
+    followed by optional whitespace and an opening paren — anything else
+    (``nonexistent-host``, ``nonetheless (vercel)``) is a deploy target,
+    so a merged task there must keep waiting for F-14, never close."""
+    from factory.orchestrator import _no_deploy_target
+
+    assert _no_deploy_target({
+        "deploy": {"mechanism": mechanism},
+        "live_checks": {},
+    }) is expected
+
+
+@pytest.mark.parametrize("mechanism", ["nonexistent-host", "nonetheless (vercel)"])
+def test_fail_open_mechanism_text_keeps_the_task_in_review(tmp_path: Path,
+                                                            mechanism):
+    """Review finding 2, behaviorally: a stamped-merged task on a profile
+    whose mechanism merely starts with "none" stays in_review — the
+    classifier may not fail open into closing it."""
+    env = Env(tmp_path / mechanism.replace(" ", "-").replace("(", "").replace(")", ""))
+    _stamped_in_review(env, branch="factory/t-1-merged")
+    env.profile["deploy"]["mechanism"] = mechanism
+    env.profile_path.write_text(yaml.safe_dump(env.profile))
+
+    assert env.run(Seats()).outcome == "idle"
+    assert env.task("T-1")["status"] == "in_review"
+    assert not any(e.get("outcome") == "closed" for e in env.log().entries())
+
+
+def test_a_merged_recovery_with_an_unmerged_slice_is_not_claimed_closed(
+        tmp_path: Path):
+    """Review finding 3: the recovery note may only say what happened.
+    A no-deploy profile whose recovered task still has an unmerged
+    slice: the close pass skips it (slice continuation), so the task
+    stays in_review and no log entry claims a close."""
+    env = Env(tmp_path, tasks=[_task("T-1", status="ready", slices=[
+        {"id": "S-1", "text": "first slice", "status": "todo"},
+        {"id": "S-2", "text": "second slice", "status": "todo"},
+    ])])
+    q = TaskQueue(env.queue_path)
+    q.transition("T-1", "in_progress")
+    q.transition("T-1", "in_review")
+    q.get("T-1")["links"] = {
+        "pr": "https://github.com/fixture/fixture/pull/9",
+        "branch": "factory/t-1-merged",
+    }
+    q.append_attempt("T-1", {
+        "run_id": "run-t1-r1-at1", "slice_id": "S-1",
+        "started": "2026-10-18T10:00:00Z", "outcome": "escalated",
+        "prompt_versions": {}, "skills": [],
+        "escalation": "stale_base", "note": "fixture escalation",
+    })
+    q.transition("T-1", "needs_human")
+
+    result = env.run(Seats(), pr_state=lambda url: "merged")
+
+    assert result.outcome == "idle"
+    task = env.task("T-1")
+    assert task["status"] == "in_review"        # close skipped: S-2 unmerged
+    assert task["links"]["merged"] == task["links"]["pr"]  # stamp happened
+    recovered = [e.get("note") or "" for e in env.log().entries()
+                 if e.get("outcome") == "recovered"]
+    assert recovered and "closed" not in recovered[-1]
+    assert not any(e.get("outcome") == "closed" for e in env.log().entries())

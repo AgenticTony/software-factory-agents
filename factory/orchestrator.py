@@ -108,6 +108,7 @@ from factory.state import (
     RunInProgressError,
     TaskQueue,
     now_iso,
+    open_owner_steps,
     recovery_task_eligible,
     unmet_dependencies,
 )
@@ -706,6 +707,14 @@ def run_once(
     reclaim_runs(queue, profile["name"], factory_root)
     queue.reclaim_abandoned()
     queue.demote_changed_contracts()
+    # Before the pick, and needing no gh round-trip: close merged tasks
+    # on a no-deploy profile (links.merged is stamped terminal, so this
+    # also unstucks tasks merged before the fix), then re-route
+    # ready/blocked against the dependencies those closes just met —
+    # sync_readiness is F-03's own reconciliation, wired here so a run
+    # sees the post-merge queue instead of idling on it.
+    _close_merged_tasks(queue, profile, factory_root)
+    queue.sync_readiness()
     pick = queue.pick()
     if in_peak_window(now(), config.peak_window):
         # Round-2 finding 8: a drained queue is done whatever the clock
@@ -1058,6 +1067,86 @@ def _sweep_escalation(
     return RunResult("needs_human", task_id, escalation=escalation, reports=reports)
 
 
+def _no_deploy_target(profile: dict) -> bool:
+    """Whether the profile declares nothing to deploy or verify live.
+
+    ``deploy.mechanism`` is free text in the schema (project.schema.json),
+    so the none-form is matched exactly: ``none``, or ``none`` followed
+    by optional whitespace and an opening parenthesis (``none (…)``).
+    Anything else — ``nonexistent-host``, ``nonetheless (vercel)`` — is
+    a deploy target, so a merged task there keeps waiting for F-14: the
+    close fails closed, never open on prose that merely starts with
+    "none". An empty ``live_checks`` means no L4 exists to wait for.
+    Both must hold — either one alone leaves post-merge work for F-14
+    (``verify-live``), and until F-14 exists a merged task on such a
+    profile stays ``in_review``.
+    """
+    deploy = profile.get("deploy") or {}
+    mechanism = str(deploy.get("mechanism") or "").strip().lower()
+    return (
+        mechanism == "none" or re.match(r"none\s*\(", mechanism) is not None
+    ) and not (profile.get("live_checks") or {})
+
+
+def _close_merged_tasks(
+    queue: TaskQueue, profile: dict, factory_root: Path,
+) -> list[tuple[str, str]]:
+    """Close merged ``in_review`` tasks on a no-deploy profile (the fix).
+
+    A merged PR on a profile with no deploy target has nothing left to
+    wait for: nothing will ever deploy, and no L4 live check exists to
+    pass — so the task advances through the F-03 state machine
+    (``in_review -> deploying -> done``, or ``awaiting_owner`` while
+    owner steps are open, exactly as F-03 requires) via
+    :meth:`TaskQueue.transition_path`, never a hand edit, and the
+    progress log records the merged PR as the evidence. Session-less,
+    like every sweep transition: no attempt is spent.
+
+    Called before the pick in :func:`run_once` — where it needs no gh
+    round-trip at all, because ``links.merged`` is stamped terminal and
+    never re-polled, which is how tasks merged before this fix
+    (F-11/#58, F-12/#61) unstuck — and again from the sweep after a
+    fresh merge stamp (recovery loop or open-PR loop), so the run that
+    observes the merge also closes it. Every call is the same
+    idempotent scan. A task with unmerged slices is left alone: slice
+    continuation is the slice loop's edge (``deploying -> ready``),
+    not this close.
+
+    Args:
+        queue: The loaded queue (its only writer).
+        profile: The loaded ``project.yaml`` mapping.
+        factory_root: Progress logs live under it.
+
+    Returns:
+        ``[(task_id, final_status)]`` for every task closed, in queue
+        order; empty when the profile has a deploy target or nothing
+        was stuck.
+    """
+    if not _no_deploy_target(profile):
+        return []
+    closed: list = []
+    for task in queue.doc.get("tasks", []):
+        links = task.get("links") or {}
+        if task.get("status") != "in_review" or not _is_merged(links):
+            continue
+        if any(s.get("status") != "merged" for s in (task.get("slices") or [])):
+            continue
+        target = "awaiting_owner" if open_owner_steps(task) else "done"
+        queue.transition_path(task["id"], ["deploying", target])
+        ProgressLog.for_task(factory_root, profile["name"], task["id"]).append({
+            "run_id": new_run_id(),
+            "outcome": "closed",
+            "note": (
+                f"{links['merged']} is merged and the profile has no deploy "
+                f"target (deploy.mechanism none, live_checks empty): nothing "
+                f"to deploy or verify live — {task['id']} in_review → "
+                f"deploying → {target}, the merge itself the evidence"
+            ),
+        })
+        closed.append((task["id"], target))
+    return closed
+
+
 def _sweep_stale_prs(
     queue: TaskQueue, profile: dict, *, factory_root: Path,
     srt_bin_path: Path | None, gate_timeout_sec: int, states: dict,
@@ -1084,8 +1173,10 @@ def _sweep_stale_prs(
     they have (reconcile skips non-draft tasks; tasks.json is never
     hand-edited; the other is `factory recover`). A re-opened or merged
     escalated PR goes back to ``in_review`` (a merged one waits there
-    for the F-14 deploy gate like every merged factory PR, stamped
-    terminal — round-5 finding 4 + round-6 findings 1+2); a closed
+    for the F-14 deploy gate like every merged factory PR on a
+    deploy-target profile, stamped terminal — round-5 finding 4 +
+    round-6 findings 1+2; on a no-deploy profile the close pass takes
+    it on to done/awaiting_owner in this same run); a closed
     stale_base PR was your rejection — the task goes straight to
     ``ready`` (or ``blocked`` when a dependency is open — round-6
     finding 4) for its fix round (round-5 finding 3: no lease-less
@@ -1119,17 +1210,23 @@ def _sweep_stale_prs(
         if state == "merged":
             # Round-5 finding 4 + round-6 findings 1+2: you resolved the
             # conflict on GitHub and merged — the task returns to
-            # in_review, exactly where every merged factory PR waits for
-            # the F-14 deploy gate (nothing in F-26 advances a merged
-            # task; reconcile skips non-draft tasks by design). The
-            # stamp makes merged terminal: later runs never gh-poll the
-            # link, count it, or re-validate it.
+            # in_review, exactly where every merged factory PR on a
+            # deploy-target profile waits for the F-14 deploy gate
+            # (nothing in F-26 advances a merged task there; reconcile
+            # skips non-draft tasks by design). The stamp makes merged
+            # terminal: later runs never gh-poll the link, count it, or
+            # re-validate it. On a no-deploy profile the close pass
+            # below takes it on to done/awaiting_owner in this same
+            # run — when no slice remains unmerged; a sliced task with
+            # unmerged slices stays in_review for its next slice. The
+            # note claims only the recovery: whatever the close pass
+            # then does, its own "closed" entry is the record.
             new_status = "in_review"
             task["links"]["merged"] = task["links"]["pr"]
             note = (f"GitHub shows {task['links']['pr']} merged: "
-                    f"{escalation} recovery — back to in_review, where "
-                    f"every merged PR waits in in_review for the F-14 "
-                    f"deploy gate")
+                    f"{escalation} recovery — back to in_review"
+                    + ("" if _no_deploy_target(profile)
+                       else " for the F-14 deploy gate"))
         elif state == "open" and escalation == "pr_closed":
             new_status = "in_review"
             note = (f"GitHub shows {task['links']['pr']} open again: "
@@ -1153,6 +1250,9 @@ def _sweep_stale_prs(
             "outcome": "recovered",
             "note": note,
         })
+    # Recovery stamps are merged-terminal: on a no-deploy profile the
+    # tasks they returned to in_review close now, in this run.
+    _close_merged_tasks(queue, profile, factory_root)
     open_prs = [
         task for task in queue.doc.get("tasks", [])
         if task.get("status") == "in_review"
@@ -1169,12 +1269,14 @@ def _sweep_stale_prs(
         if state == "merged":
             # A shipped PR: re-validating it would fail L1's red-first
             # proof on code that already landed, and its head branch may
-            # be auto-deleted. Round-6 findings 1+2: the task waits in
-            # in_review for the F-14 deploy gate (nothing here advances
-            # it), and the stamp makes merged terminal — later runs
-            # never gh-poll this link again.
+            # be auto-deleted. Round-6 findings 1+2: the stamp makes
+            # merged terminal — later runs never gh-poll this link
+            # again. The task waits in in_review for the F-14 deploy
+            # gate, except on a no-deploy profile, where the close pass
+            # takes it to done/awaiting_owner in this same run.
             links["merged"] = links["pr"]
             queue.save()
+            _close_merged_tasks(queue, profile, factory_root)
             continue
         if state == "closed":
             # Round-2 finding 5: closed without merging — surface the

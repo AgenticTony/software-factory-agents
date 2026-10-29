@@ -25,9 +25,10 @@ changed (TASK-CONTRACT §2 — the recomputed acceptance hash no longer
 matches ``acceptance_hash``). :meth:`TaskQueue.demote_changed_contracts`
 is their intended caller; the task then needs human re-approval (F-04)
 before it can run again, so a demotion can never auto-retry work. A
-``done`` task is never auto-demoted — merged, live-verified work is
-flagged for your review instead, and reopening it (``done -> draft``)
-stays a human decision.
+``done`` task is never auto-demoted — merged work (live-verified where
+the profile has a deploy target; the merge is the evidence on a
+no-deploy profile) is flagged for your review instead, and reopening
+it (``done -> draft``) stays a human decision.
 
 ``not_buildable`` is set by the importer at task-creation time (§3), not
 by an orchestrator transition, so it has no outgoing edges here.
@@ -783,9 +784,11 @@ class TaskQueue:
         hash no longer matches its stored ``acceptance_hash`` goes back to
         ``draft`` through the contract-changed edge, and the demotion is
         persisted; the task then needs human re-approval (F-04) before it
-        can run again. A ``done`` task is never demoted — merged,
-        live-verified work is returned in ``flagged_done`` for your
-        review, and reopening it stays your decision. The stale hash and
+        can run again. A ``done`` task is never demoted — merged work
+        (live-verified where the profile has a deploy target; the merge
+        is the evidence on a no-deploy profile) is returned in
+        ``flagged_done`` for your review, and reopening it stays your
+        decision. The stale hash and
         approval fields are left in place as history; re-approval
         overwrites them.
 
