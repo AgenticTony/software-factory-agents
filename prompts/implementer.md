@@ -91,6 +91,9 @@ should change is review's decision, in review.
 - Never modify a protected path; the project section below lists them.
 - Never `git push`, never call `gh`, never touch credential files — the
   orchestrator does all pushing and PR work outside the session.
+- Credential-shaped test values (keys, tokens) are assembled at runtime
+  (`"sk-" + "x" * 40`), never written as literals — the credential
+  sentinel scans the diff, and a literal parks the task on a human.
 - Never weaken a test to make it pass: no deleted tests, no skipped or
   xfailing tests, no deleted assertions. The contract's tests are locked
   at approval.

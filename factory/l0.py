@@ -79,6 +79,7 @@ run when there is a sandbox to run them in.
 import json
 import posixpath
 import re
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar
@@ -236,8 +237,64 @@ def _failure_marker(output: str) -> str | None:
     return None
 
 
+def _dependency_surface(doc: dict) -> tuple:
+    """The comparable dependency surface of a parsed pyproject.toml:
+    ``[project].dependencies``, ``[project].optional-dependencies`` and
+    ``[build-system].requires`` — the three tables a human must review as
+    a dependency change. Optional-dependency extras compare sorted: extra
+    order carries no meaning; dependency order is kept as written (it is
+    resolution order to a reader). A wrong-typed table raises, and the
+    caller escalates: fail closed.
+    """
+    project = doc.get("project") or {}
+    build = doc.get("build-system") or {}
+    deps = project.get("dependencies") or []
+    optional = project.get("optional-dependencies") or {}
+    requires = build.get("requires") or []
+    if not isinstance(deps, list) or not isinstance(requires, list):
+        raise TypeError("dependencies/requires must be arrays")
+    if not isinstance(optional, dict) or any(
+        not isinstance(values, list) for values in optional.values()
+    ):
+        raise TypeError("optional-dependencies must be a table of arrays")
+    return (
+        tuple(deps),
+        tuple(sorted((key, tuple(values)) for key, values in optional.items())),
+        tuple(requires),
+    )
+
+
+def _pyproject_surface_unchanged(change, path: str, *, repo, base_ref, head_ref) -> bool:
+    """Whether a manifest touch leaves pyproject.toml's dependency surface
+    untouched — the one structurally parsed manifest (F-31 run blocker:
+    a ``[tool.setuptools.package-data]``-only edit falsely escalated
+    ``new_dependency`` and skipped every remaining gate).
+
+    True ONLY for a plain modification (status M) of a root
+    ``pyproject.toml`` with refs supplied, whose merge-base and head
+    sides both parse and compare equal. Every doubt — another manifest
+    path, an added/deleted/renamed pyproject, missing refs, a git or
+    TOML failure — answers False, and the caller escalates exactly as
+    the path-match rule always did.
+    """
+    if path != "pyproject.toml" or change.status != "M":
+        return False
+    if repo is None or not base_ref or not head_ref:
+        return False
+    try:
+        merge_base = _git(Path(repo), "merge-base", base_ref, head_ref).strip()
+        before = tomllib.loads(_git(Path(repo), "show", f"{merge_base}:pyproject.toml"))
+        after = tomllib.loads(_git(Path(repo), "show", f"{head_ref}:pyproject.toml"))
+        return _dependency_surface(before) == _dependency_surface(after)
+    except (GateError, tomllib.TOMLDecodeError, TypeError, UnicodeDecodeError):
+        return False
+
+
 def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
-                      matched_flags: set | None = None):
+                      matched_flags: set | None = None, *,
+                      repo: Path | str | None = None,
+                      base_ref: str | None = None,
+                      head_ref: str | None = None):
     """Apply the L0 diff policy to a set of changed paths.
 
     FAIL classes (findings): protected path touched (added, modified or
@@ -248,6 +305,17 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
     and lint-suppression sentinels (F-25) scan in
     :func:`factory.sentinels.builtin_sentinel_findings`, not here — one
     home for the standing set.
+
+    A modified ``pyproject.toml`` is diff-aware when refs are supplied:
+    the escalation fires only if the dependency surface —
+    ``[project].dependencies``, ``[project].optional-dependencies``,
+    ``[build-system].requires`` — actually changed between the
+    merge-base and head (F-31 run blocker: a bare
+    ``[tool.setuptools.package-data]`` table falsely escalated and
+    skipped every remaining gate). Everything else fails closed: any
+    other manifest, an added/deleted/renamed pyproject, a parse error
+    on either side, or a direct call without refs, escalates exactly as
+    the path-match rule always did.
 
     Args:
         profile: The loaded ``project.yaml`` mapping.
@@ -296,7 +364,9 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
                     )
                 )
                 escalations.add("protected_path_touched")
-            if _matches(path, manifests):
+            if _matches(path, manifests) and not _pyproject_surface_unchanged(
+                change, path, repo=repo, base_ref=base_ref, head_ref=head_ref,
+            ):
                 escalations.add("new_dependency")
 
         if change.status == "D" and _is_test_file(change.path):
@@ -549,7 +619,8 @@ def run_l0(
     risk_globs = (profile.get("paths") or {}).get("risk") or {}
     matched = matched_risk_flags(risk_globs, changes)
     findings, escalations, risk_flags_added, _matched = check_diff_policy(
-        profile, changes, task, matched_flags=matched
+        profile, changes, task, matched_flags=matched,
+        repo=repo, base_ref=base_ref, head_ref=head_ref,
     )
     # F-25: the built-in sentinel pass — pure diff scans; a credential hit
     # escalates immediately (nothing is pushed before a passing round, but

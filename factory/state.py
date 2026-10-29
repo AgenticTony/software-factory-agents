@@ -112,15 +112,21 @@ ALLOWED_TRANSITIONS: dict[tuple[str, str], str] = {
 # 3) — and `factory recover`, the owner's explicit fix-round word for a
 # pr_closed task (round-5 finding 2): its PR was already closed at
 # escalation, so GitHub has no signal left to distinguish re-open from
-# reject. No other needs_human task (credential_added,
-# protected_path_touched, attempts_exhausted, …) may exit through them.
+# reject. The one exception to "no other escalation": credential_added
+# (F-31 run blocker) may exit through the needs_human → ready/blocked
+# edge ONLY via `factory recover --evidence …` with an interactive y/N
+# (no --yes) — TASK-CONTRACT's "a human confirms and re-queues". The
+# sweep never writes it, and no other needs_human task
+# (protected_path_touched, attempts_exhausted, …) may exit through them.
 RECOVERY_ESCALATIONS = ("stale_base", "pr_closed")
+CREDENTIAL_RECOVERY_ESCALATIONS = ("credential_added",)
 RECOVERY_TRANSITIONS: dict[tuple[str, str], str] = {
     ("needs_human", "in_review"):
         "owner re-opened (or merged) the escalated PR (F-26 recovery, "
         "sweep-applied)",
     ("needs_human", "ready"):
-        "owner rejected the escalated PR; fix round (F-26 recovery, "
+        "owner rejected the escalated PR, or confirmed a credential "
+        "escalation was a false positive / rotated (F-26 recovery, "
         "sweep- or recover-applied)",
     ("needs_human", "blocked"):
         "the recovery fix round queued, but a dependency is open — same "
@@ -205,18 +211,46 @@ def recovery_task_eligible(task: dict) -> bool:
             and bool((task.get("links") or {}).get("pr")))
 
 
+def credential_recovery_eligible(task: dict) -> bool:
+    """Whether the owner's credential re-queue word may move this task.
+
+    True only for a ``needs_human`` task whose last attempt escalated
+    ``credential_added`` — the F-25 sentinel's false-positive/false-negative
+    trap has no GitHub signal (nothing was pushed), so the only honest
+    exit is a human confirming with evidence. The sweep never consults
+    this predicate: it is `factory recover`'s gate alone.
+    """
+    attempts = task.get("attempts") or []
+    return (task.get("status") == "needs_human"
+            and bool(attempts)
+            and attempts[-1].get("escalation") in CREDENTIAL_RECOVERY_ESCALATIONS)
+
+
 def check_recovery_transition(task: dict, new: str) -> str:
-    """Validate one F-26 recovery transition for this specific task.
+    """Validate one recovery transition for this specific task.
+
+    Two gated writer paths share these edges: the F-26 stale-PR recovery
+    (sweep or ``factory recover``, needs the PR link), and the
+    ``credential_added`` re-queue (``factory recover --evidence`` only —
+    no PR exists to gate on; the command enforces the human's evidence
+    and confirmation, this table only the escalation).
 
     Raises:
         TransitionError: If the edge isn't a recovery edge, or the task
-            isn't a stale_base/pr_closed escalation holding a PR link.
+            is neither a stale_base/pr_closed escalation holding a PR
+            link nor a credential_added escalation.
     """
     reason = RECOVERY_TRANSITIONS.get((task.get("status"), new))
-    if reason is None or not recovery_task_eligible(task):
+    eligible = (
+        recovery_task_eligible(task)
+        or (new in ("ready", "blocked") and credential_recovery_eligible(task))
+    )
+    if reason is None or not eligible:
         raise TransitionError(
             f"recovery transition {task.get('status')} -> {new} needs a "
-            "stale_base/pr_closed escalation and a PR link (F-26)"
+            "stale_base/pr_closed escalation and a PR link, or a "
+            "credential_added escalation (F-26; credential via "
+            "`factory recover --evidence`)"
         )
     return reason
 

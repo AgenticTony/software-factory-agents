@@ -17,6 +17,7 @@ What is real and what is stubbed:
 """
 
 import json
+import os
 import re
 import shlex
 import signal
@@ -829,6 +830,72 @@ def test_ac_11(tmp_path: Path, monkeypatch):
         assert "PROBE WRITE-DENIED READ-DENIED" in commands[name], (name, commands[name])
     assert all("HOLDOUT-SECRET-CANARY" not in out for out in commands.values())
     assert not outside.exists()
+
+
+# --- F-31 run blocker: gate commands run on a run-local venv ----------------
+
+
+def test_gate_runner_uses_a_run_local_venv_not_ambient_pip(
+        tmp_path: Path, monkeypatch):
+    """Run 20261029T145356Z-b1875d: L0's setup resolved the OWNER's
+    terminal venv (its pip "satisfied" requirements from the main
+    checkout's site-packages and tried to uninstall the owner's
+    ``bin/factory`` until the sandbox blocked it), setup failed, every
+    remaining gate was skipped. The gate runner must instead create a
+    venv inside the run clone and run every command with its ``bin/``
+    first on PATH plus VIRTUAL_ENV — a decoy venv planted first on the
+    ambient PATH is then never resolved, and ``pip``/``python`` land in
+    the run's venv. The venv is git-excluded, so the clean-tree gate
+    still sees a clean checkout."""
+    import factory.orchestrator as orch
+    from factory.sandbox import build_settings, write_settings
+
+    repo = tmp_path / "source-repo"
+    repo.mkdir()
+    (repo / "README.md").write_text("# fixture\n")
+    subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"],
+                   check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.email=f@x", "-c", "user.name=f",
+         "commit", "-q", "--allow-empty", "-m", "base"], check=True)
+
+    # A decoy venv sitting FIRST on the ambient PATH, outside $HOME so
+    # the home-entry filter would keep it: its pip/python record the hit
+    # and fail — proof the gate commands never resolved them.
+    decoy = tmp_path / "decoy-venv" / "bin"
+    decoy.mkdir(parents=True)
+    marker = tmp_path / "decoy-hit"
+    for name in ("pip", "python", "python3"):
+        (decoy / name).write_text(
+            f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\nexit 1\n")
+        (decoy / name).chmod(0o755)
+    monkeypatch.setenv("PATH", f"{decoy}:{os.environ.get('PATH', '')}")
+
+    root = tmp_path / "factory-root"
+    (root / "holdouts").mkdir(parents=True)
+    run = create_run("fixture", repo, factory_root=root)
+    settings = build_settings(
+        {"docs_allowlist": [], "network_allowlist": []},
+        run.root, model_endpoint="api.z.ai",
+    )
+    write_settings(settings, run.settings_path)
+
+    runner = orch.sandboxed_runner(run.root, run.settings_path)
+    result = runner(
+        "probe",
+        'pip --version && python -c "import sys; print(\'prefix:\' + sys.prefix)"',
+        run.root, 120,
+    )
+    assert result.exit_code == 0, result.output
+    assert not marker.exists(), "a decoy venv binary executed — the gate resolved an ambient venv"
+    assert f"{run.root}/.venv" in result.output, result.output  # pip + prefix
+    assert (run.root / ".venv" / "pyvenv.cfg").is_file()
+    # the venv is excluded, not invisible to the gate's clean-tree check
+    status = subprocess.run(
+        ["git", "-C", str(run.root), "status", "--porcelain"],
+        capture_output=True, text=True,
+    )
+    assert status.stdout.strip() == "", status.stdout
 
 
 # --- AC-12: every run dir is cleaned up; loop reclaims orphans --------------

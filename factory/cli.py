@@ -86,10 +86,18 @@ def build_parser() -> argparse.ArgumentParser:
     recover = sub.add_parser(
         "recover", help="queue a fix round for a parked F-26 escalation")
     recover.add_argument(
-        "task_id", help="task id to recover (stale_base/pr_closed only)")
+        "task_id",
+        help="task id to recover (stale_base/pr_closed, or "
+             "credential_added with --evidence)")
     recover.add_argument(
         "--yes", action="store_true",
-        help="non-interactive confirmation",
+        help="non-interactive confirmation (never allowed for "
+             "credential_added)",
+    )
+    recover.add_argument(
+        "--evidence", default=None,
+        help="required for credential_added: what you checked (e.g. "
+             "'test fixture, not a real credential' or 'rotated')",
     )
     recover.add_argument(
         "--queue", default=".factory/tasks.json",
@@ -221,7 +229,8 @@ def _run_recover(args: argparse.Namespace) -> int:
     """Dispatch the recover subcommand; refusals exit 1, never a traceback."""
     try:
         status = recover_task(
-            TaskQueue(args.queue), args.task_id, assume_yes=args.yes
+            TaskQueue(args.queue), args.task_id, assume_yes=args.yes,
+            evidence=args.evidence,
         )
         print(f"{args.task_id}: needs_human -> {status} (fix round queued)")
         return 0

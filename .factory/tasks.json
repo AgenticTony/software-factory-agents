@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-29T13:09:13Z",
+  "updated_at": "2026-10-29T15:25:42Z",
   "tasks": [
     {
       "id": "F-00",
@@ -2234,7 +2234,7 @@
       "source": "BUILD-ORDER.md#f-31--read-only-dashboard-factory-dashboard",
       "kind": "build",
       "priority": "P2",
-      "status": "ready",
+      "status": "needs_human",
       "depends_on": [
         "F-11",
         "F-30"
@@ -2330,6 +2330,49 @@
           "validator_report": "/Users/anthonyforan/factory/reports/software-factory/F-31/20261029T130912Z-1e4eb9-a1.json",
           "escalation": "orchestrator_error",
           "note": "SessionConfigError: the sandboxed session entry produced no record (exit 1): Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n  File \"/Users/anthonyforan/factory/sandbox/software-factory-20261029T130912Z-1e4eb9.json-runner/factory/session.py\", line 79, in <module>\n    from claude_agent_sdk import (\nModuleNotFoundError: No module named 'claude_agent_sdk'"
+        },
+        {
+          "run_id": "20261029T145356Z-b1875d",
+          "slice_id": "F-31",
+          "started": "2026-10-29T14:53:57Z",
+          "ended": "2026-10-29T15:25:42Z",
+          "outcome": "escalated",
+          "rounds": 2,
+          "turns": 94,
+          "input_tokens": 168452,
+          "output_tokens": 68833,
+          "prompt_versions": {
+            "implementer": "05c3dbdd637cb9e74a7ded51310f036bdb0ac6afc0a0bc09425c58bfaa55cca1",
+            "reviewer": "c6d9f701b82dc9d79e90786f62b21f1dde6a0f8476835232efae32bb48f423c1"
+          },
+          "skills": [],
+          "model": "implementer=claude-opus-5-5",
+          "validator_report": "/Users/anthonyforan/factory/reports/software-factory/F-31/20261029T145356Z-b1875d-a2.json",
+          "escalation": "credential_added",
+          "note": "L0 escalations: credential_added, new_dependency",
+          "sentinels": [
+            {
+              "name": "assertion_removed",
+              "kind": "builtin",
+              "verdict": "pass"
+            },
+            {
+              "name": "credential_added",
+              "kind": "builtin",
+              "verdict": "fail"
+            },
+            {
+              "name": "lint_suppression_added",
+              "kind": "builtin",
+              "verdict": "pass",
+              "detail": "no risk path touched"
+            },
+            {
+              "name": "skip_marker_added",
+              "kind": "builtin",
+              "verdict": "pass"
+            }
+          ]
         }
       ],
       "links": {},

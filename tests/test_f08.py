@@ -569,3 +569,26 @@ def test_rehearsal_clean_keeps_declared_setup_outputs(tmp_path):
     assert green.exit_code == 0, green.output[-500:]
     assert report.verdict == "pass", [f.id for f in report.findings]
     assert shim.exists(), "a declared setup output was cleaned away"
+
+
+def test_inter_phase_clean_keeps_the_gate_run_venv(tmp_path):
+    """F-31 run blocker: the gate runner's run-local ``/.venv`` is
+    git-ignored (L0 refuses a dirty tree), so the inter-phase
+    ``git clean -fdx`` would remove it between red and green — and the
+    green phase would resolve pip/python back against an ambient env,
+    the leak the venv exists to close. It survives without being
+    declared in setup_outputs (it is the runner's, not the profile's);
+    other untracked files are still cleaned."""
+    repo = _red_first_repo(tmp_path, "gate-venv")
+    venv_bin = repo / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "pip").write_text("#!/bin/sh\nexit 0\n")
+    junk = repo / "__pycache__"
+    junk.mkdir()
+    (junk / "mod.cpython-311.pyc").write_bytes(b"\x00")
+    report = _run(repo, _task("tests/test_feature.py::test_answer"))
+    assert report.verdict == "pass", [f.id for f in report.findings]
+    assert (venv_bin / "pip").exists(), (
+        "the gate runner's .venv was cleaned away between phases"
+    )
+    assert not junk.exists(), "untracked junk survived the clean"

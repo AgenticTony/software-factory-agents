@@ -220,8 +220,15 @@ def _clean(repo: Path, keep: tuple[str, ...] = ()) -> None:
     not found" in both phases, and a healthy test reads as red-and-not-
     green. Each is excluded as an anchored path, so only that directory
     survives; its contents came from setup, not from either phase.
+
+    The gate runner's ``/.venv`` is always excluded too (F-31 run
+    blocker): it is git-ignored, so ``-x`` would remove it, and the
+    green phase would resolve ``pip``/``python`` back against whatever
+    ambient environment PATH carries — the owner's terminal venv, the
+    very leak the run-local venv exists to close.
     """
     excludes = [arg for path in keep for arg in ("-e", "/" + path.strip("/"))]
+    excludes += ["-e", "/.venv"]
     git(repo, "clean", "-fdx", *excludes)
 
 

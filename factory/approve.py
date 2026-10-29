@@ -46,6 +46,7 @@ from factory.mergeorder import gh_pr_state
 from factory.publish import PublishError
 from factory.state import (
     TaskQueue,
+    credential_recovery_eligible,
     now_iso,
     open_owner_steps,
     recovery_task_eligible,
@@ -263,11 +264,13 @@ def recover_task(
     task_id: str,
     *,
     assume_yes: bool = False,
+    evidence: str | None = None,
     pr_state: Callable[[str], str] | None = None,
     confirm: Callable[[str], bool] = input_confirm,
     echo: Callable[[str], None] = print,
 ) -> str:
-    """Queue a fix round for a parked escalation (F-26 round-5 finding 2).
+    """Queue a fix round for a parked escalation (F-26 round-5 finding 2;
+    credential_added re-queue per TASK-CONTRACT §credential_added).
 
     ``factory recover`` is the owner's explicit fix-round word — the one
     recovery intent GitHub cannot express for a ``pr_closed`` task: its
@@ -277,20 +280,30 @@ def recover_task(
     a closed ``stale_base`` PR re-queues ``ready`` on its own); this
     command writes the gated ``needs_human → ready`` edge directly.
 
+    A task parked on ``credential_added`` (nothing was pushed, so GitHub
+    has no signal at all) takes the same edge through the owner's
+    confirmation instead: required ``evidence`` saying what was checked
+    (e.g. "test fixture, not a real credential" or "rotated"), an
+    interactive y/N with NO ``--yes`` — the point is that a human looked
+    — and no attempt reset: the remaining budget is spent with the
+    finding in hand.
+
     Refused — :class:`ApprovalError`, nothing written — when the task
-    isn't parked on a ``stale_base``/``pr_closed`` escalation holding a
-    PR link (the same gate the sweep's transitions enforce), or when
-    GitHub does not report the PR **closed** (round-6 finding 3): an
-    open PR holds the concurrency slot, so queueing a fix round under
-    it would park the task in an endless named ``concurrency_wait``.
-    A dependency that regressed while the task was parked routes the
-    move to ``blocked`` instead (round-6 finding 4), exactly as
-    approval would.
+    isn't parked on a recoverable escalation (the same gates the
+    transitions enforce), or when GitHub does not report the PR
+    **closed** (round-6 finding 3): an open PR holds the concurrency
+    slot, so queueing a fix round under it would park the task in an
+    endless named ``concurrency_wait``. A dependency that regressed
+    while the task was parked routes the move to ``blocked`` instead
+    (round-6 finding 4), exactly as approval would.
 
     Args:
         queue: The queue to write through (its only writer path).
         task_id: Task to recover.
-        assume_yes: Skip the confirmation prompt.
+        assume_yes: Skip the confirmation prompt (never allowed for a
+            credential_added task).
+        evidence: Required for a credential_added task: what the owner
+            checked; recorded in the command's summary.
         pr_state: GitHub PR-state seam (default
             :func:`factory.mergeorder.gh_pr_state`); injected in tests.
         confirm: Interactive confirmation callable; injected in tests.
@@ -306,12 +319,19 @@ def recover_task(
         ContractError: If the resulting queue wouldn't validate.
     """
     task = queue.get(task_id)  # StateError (a ContractError) if unknown
+    if credential_recovery_eligible(task):
+        return _recover_credential_task(
+            queue, task_id, task, evidence=evidence, assume_yes=assume_yes,
+            confirm=confirm, echo=echo,
+        )
     if not recovery_task_eligible(task):
         raise ApprovalError(
             f"{task_id}: not recoverable — only a stale_base/pr_closed "
-            "escalation holding a PR link can take the fix-round edge. "
+            "escalation holding a PR link, or a credential_added "
+            "escalation with --evidence, can take the fix-round edge. "
             "Re-open the PR on GitHub (the sweep returns it to in_review), "
-            "or change the contract and re-approve."
+            "confirm the credential finding, or change the contract and "
+            "re-approve."
         )
     url = task["links"]["pr"]
     state: str | None
@@ -339,6 +359,53 @@ def recover_task(
     )
     if not assume_yes and not confirm(f"Queue fix round for {task_id}?"):
         raise ApprovalDeclined(f"{task_id}: recovery declined")
+    new_status = (
+        "blocked" if unmet_dependencies(task, queue.doc.get("tasks", []))
+        else "ready"
+    )
+    queue.transition(task_id, new_status)  # the gated edge (state enforces)
+    return new_status
+
+
+def _recover_credential_task(
+    queue: TaskQueue,
+    task_id: str,
+    task: dict,
+    *,
+    evidence: str | None,
+    assume_yes: bool,
+    confirm: Callable[[str], bool],
+    echo: Callable[[str], None],
+) -> str:
+    """The credential_added re-queue: evidence + interactive y/N, then the
+    gated ``needs_human → ready/blocked`` edge. Session-less, no attempt
+    reset (the remaining budget is the owner's call, made with the
+    finding named in ``evidence``). Refuses before any write on a missing
+    or empty evidence, on ``--yes`` (the confirmation IS the gate), and on
+    a declined prompt."""
+    if not (evidence or "").strip():
+        raise ApprovalError(
+            f"{task_id}: credential_added recovery requires --evidence — "
+            "what you checked (e.g. 'test fixture, not a real credential' "
+            "or 'rotated')"
+        )
+    if assume_yes:
+        raise ApprovalError(
+            f"{task_id}: credential_added recovery is interactive only — "
+            "--yes is not accepted; the point is that a human looked at "
+            "the finding"
+        )
+    attempts = task.get("attempts") or []
+    echo(
+        f"{task_id}: {task.get('title')}\n"
+        f"  escalation: {attempts[-1].get('escalation')} "
+        "(nothing was pushed; the finding is local to the run branch)\n"
+        f"  evidence: {evidence.strip()}\n"
+        "  recover re-queues the task on a fresh run (the old run branch "
+        "is discarded); attempts are NOT reset."
+    )
+    if not confirm(f"Re-queue {task_id} (credential confirmed handled)?"):
+        raise ApprovalDeclined(f"{task_id}: credential recovery declined")
     new_status = (
         "blocked" if unmet_dependencies(task, queue.doc.get("tasks", []))
         else "ready"
