@@ -203,6 +203,72 @@ class LoopResult:
 # ------------------------------------------------------------ the sandbox --
 
 
+def _create_gate_venv(run_dir: Path) -> Path:
+    """Create ``<run_dir>/.venv`` from the orchestrator's base interpreter.
+
+    Gate commands (setup, lint, test) must resolve ``pip``/``python``
+    inside the run clone, never an ambient environment: run
+    20261029T145356Z-b1875d's setup resolved the owner's terminal venv,
+    "satisfied" its requirements from the main checkout's site-packages,
+    tried to uninstall its ``bin/factory`` until the sandbox blocked it,
+    and the failed setup skipped every remaining gate. The venv uses the
+    PEP 405 shape ``runs._relocate_venv`` expects of a run-local venv
+    (``pyvenv.cfg`` at the root, ``bin/`` beside it) — created in place,
+    so no cache relocation applies — and from ``sys._base_executable``
+    (the interpreter behind the orchestrator's own venv, if any), so a
+    venv-of-venv never chains through the owner's checkout.
+
+    The venv is anchored in ``.git/info/exclude`` (idempotently — one
+    ``/.venv/`` line however often creation re-runs): the gates diff
+    refs, but they run commands on the checkout, and L0 refuses a tree
+    that isn't exactly ``head_ref`` — an untracked ``.venv`` would read
+    as dirty. ``.git/info`` is sandbox-denyWritten, so the session can't
+    undo it (same anchoring ``create_run`` seeds for ``.home``/``.tmp``).
+
+    A ``.venv`` that already exists in the clone is REFUSED (review
+    round on #74): an implementer can ``git add -f .venv/…``, and
+    ``python -m venv`` over an existing directory keeps its
+    site-packages — the gates would run planted code. The refusal fires
+    at construction, before a single gate command executes; L0 flags the
+    tracked paths one layer below.
+
+    Raises:
+        RunError: venv creation failed (no partial dir is kept), or a
+            ``.venv`` already exists in the clone (planted environment);
+            the run cannot gate hermetically, so it refuses to gate.
+    """
+    venv = run_dir / ".venv"
+    if venv.exists():
+        raise RunError(
+            f"refusing to create the gate venv: {venv} already exists in "
+            "the clone — a committed .venv is planted environment "
+            "(git add -f), never factory state; the run is refused before "
+            "any gate command executes"
+        )
+    base = Path(getattr(sys, "_base_executable", sys.executable))
+    try:
+        proc = subprocess.run(
+            [str(base), "-m", "venv", str(venv)],
+            capture_output=True, text=True, timeout=180,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        shutil.rmtree(venv, ignore_errors=True)
+        raise RunError(f"gate venv creation in {venv} failed: {exc}") from exc
+    if proc.returncode != 0:
+        shutil.rmtree(venv, ignore_errors=True)
+        raise RunError(
+            f"gate venv creation in {venv} failed (exit {proc.returncode}): "
+            f"{(proc.stdout + proc.stderr).strip()[:300]}"
+        )
+    exclude = run_dir / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    lines = exclude.read_text().splitlines() if exclude.exists() else []
+    if "/.venv/" not in lines:
+        with exclude.open("a") as fh:
+            fh.write("/.venv/\n")
+    return venv
+
+
 def sandboxed_runner(
     run_dir: Path, settings_path: Path, *, srt_bin_path: Path | None = None
 ):
@@ -210,9 +276,13 @@ def sandboxed_runner(
 
     The returned callable has :func:`factory.gates.run_command`'s signature
     and refuses to run anywhere but ``run_dir`` — the clean clone the
-    settings at ``settings_path`` confine.
+    settings at ``settings_path`` confine. Every command runs with a
+    run-local venv (``<run_dir>/.venv``, :func:`_create_gate_venv`) first
+    on PATH and ``VIRTUAL_ENV`` set, so the profile's ``pip install``
+    lands in the run — never the owner's venv or a host env.
     """
     run_dir = Path(run_dir)
+    venv = _create_gate_venv(run_dir)
 
     def run(name: str, command: str, repo: Path, timeout_sec: int) -> CommandResult:
         if Path(repo).resolve() != run_dir.resolve():
@@ -222,7 +292,7 @@ def sandboxed_runner(
         try:
             proc = run_sandboxed(
                 ["/bin/sh", "-c", command], run_dir, settings_path,
-                timeout=timeout_sec, srt_bin_path=srt_bin_path,
+                timeout=timeout_sec, srt_bin_path=srt_bin_path, venv=venv,
             )
         except subprocess.TimeoutExpired as exc:
             output = (exc.output or "") + (exc.stderr or "")

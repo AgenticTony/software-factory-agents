@@ -252,6 +252,96 @@ def test_sandbox_env_sets_empty_git_templates(tmp_path: Path):
     assert not any(templates.iterdir()), "template dir must start empty"
 
 
+def test_sandbox_env_sets_claude_code_tmpdir_inside_the_run(tmp_path: Path):
+    """The child env points CLAUDE_CODE_TMPDIR at the run's scratch.
+
+    The pinned Claude CLI (claude-agent-sdk 0.2.168's bundled binary)
+    builds its per-uid scratch root — ``<root>/claude-<uid>/<cwd-slug>``,
+    where the Bash tool's shell snapshots live — from
+    ``CLAUDE_CODE_TMPDIR`` or a HARDCODED ``/tmp`` (the binary's ``sm()``:
+    ``let e=a.CLAUDE_CODE_TMPDIR;if(e)return e;return "/tmp"``). TMPDIR
+    is never consulted for that root, so run 20261029T145356Z-b1875d
+    lost all 21 Bash calls to ``EPERM mkdir /private/tmp/claude-501/…``
+    while Read/Write/Edit worked. The env must redirect the CLI's root
+    into the run's writable scratch — never widen the sandbox to /tmp."""
+    run, _root, _settings = _make_run(tmp_path)
+    env = sandbox_env(run.root)
+    assert env["CLAUDE_CODE_TMPDIR"] == str(run.root / ".tmp")
+
+
+def test_claude_cli_temp_root_mkdir_lands_in_run_scratch(tmp_path: Path):
+    """The exact mkdir the CLI performs, run confined: resolve the root
+    the way ``sm()`` does (CLAUDE_CODE_TMPDIR, else /tmp), then
+    ``mkdir -p <root>/claude-<uid>/<slug>`` mode 0700. Without the env
+    redirect the mkdir lands on /private/tmp and the sandbox denies it
+    — the dead-Bash signature of run 20261029T145356Z-b1875d; with it,
+    the dir lands inside the run. The control re-proves /tmp itself
+    stays write-denied: the fix redirects, it does not widen."""
+    run, _root, _settings = _make_run(tmp_path)
+    script = textwrap.dedent(
+        """
+        import os
+
+        def probe(label, root):
+            target = os.path.join(root, f"claude-{os.getuid()}", "probe-slug")
+            try:
+                os.makedirs(target, mode=0o700, exist_ok=True)
+                print(f"{label}:{os.path.isdir(target)}", flush=True)
+            except OSError as exc:
+                print(f"{label}:denied {type(exc).__name__}", flush=True)
+
+        probe("default", os.environ.get("CLAUDE_CODE_TMPDIR") or "/tmp")
+        probe("tmpctl", "/tmp")
+        """
+    )
+    proc = run_sandboxed(
+        _child(script, []), run.root, run.settings_path, timeout=60,
+    )
+    outcomes = dict(line.split(":", 1) for line in proc.stdout.splitlines())
+    assert outcomes.get("default") == "True", (
+        "the CLI-equivalent temp-root mkdir failed — a sandboxed session's "
+        "Bash tool is dead exactly as in run 20261029T145356Z-b1875d\n"
+        f"{proc.stdout}{proc.stderr}"
+    )
+    assert outcomes.get("tmpctl", "missing").startswith("denied"), (
+        "/tmp became writable inside the sandbox — the fix must redirect "
+        f"the CLI's temp root, never widen allowWrite\n{proc.stdout}{proc.stderr}"
+    )
+    assert (run.root / ".tmp" / f"claude-{os.getuid()}" / "probe-slug").is_dir()
+
+
+def test_session_env_window_keeps_claude_code_tmpdir(monkeypatch):
+    """The env window must not strip CLAUDE_CODE_TMPDIR before the SDK
+    spawns the CLI: the redirect only reaches the CLI if it survives
+    ``_window_environ`` — process mechanics like GIT_TEMPLATE_DIR, a path
+    and never a credential."""
+    import factory.session as session_module
+
+    monkeypatch.setenv("CLAUDE_CODE_TMPDIR", "/run/.tmp")
+    saved = session_module._window_environ({})
+    try:
+        assert os.environ.get("CLAUDE_CODE_TMPDIR") == "/run/.tmp"
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+def test_sandbox_env_prepends_the_run_venv_to_path(tmp_path: Path):
+    """A caller-provided run-local venv reaches the child as PATH
+    precedence plus VIRTUAL_ENV: ``pip``/``python`` resolve into
+    ``<run>/.venv`` before anything ambient. The ambient PATH survives
+    after the prefix (npm and the re-allowed toolchain stay findable)."""
+    run, _root, _settings = _make_run(tmp_path)
+    venv = run.root / ".venv"
+    (venv / "bin").mkdir(parents=True)
+    env = sandbox_env(run.root, venv=venv)
+    path = env["PATH"].split(":")
+    assert path[0] == str(venv / "bin"), env["PATH"]
+    assert env["VIRTUAL_ENV"] == str(venv)
+    without = sandbox_env(run.root)["PATH"].split(":")
+    assert path[1:] == without, "the ambient PATH must survive after the prefix"
+
+
 def test_sandbox_path_keeps_a_home_toolchain_dir_the_sandbox_reallows(
     tmp_path: Path, monkeypatch
 ):

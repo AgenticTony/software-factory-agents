@@ -357,10 +357,14 @@ def _seat(seat: str) -> SeatConfig:
 # GIT_TEMPLATE_DIR is process mechanics too (INC-006): sandbox_env points it
 # at an empty dir, and without it every `git init`/`git clone` the agent's
 # Bash runs beneath the srt cwd dies copying hook samples into the blocked
-# .git/hooks. It carries a path, never a credential.
+# .git/hooks. It carries a path, never a credential. CLAUDE_CODE_TMPDIR is
+# the same class (F-31 run blocker): the CLI builds its per-uid Bash-tool
+# scratch root from it or a hardcoded /tmp — sandbox_env points it into the
+# run, and a window that strips it kills every Bash call again.
 _RUNNER_ENV_KEEP = frozenset(
     {
         "PATH", "LANG", "TZ", "HOME", "TMPDIR", "GIT_TEMPLATE_DIR",
+        "CLAUDE_CODE_TMPDIR",
         "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
     }
 )

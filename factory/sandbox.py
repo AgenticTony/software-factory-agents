@@ -201,6 +201,7 @@ def sandbox_env(
     *,
     extra: dict[str, str] | None = None,
     forbidden: tuple[str, ...] = (),
+    venv: Path | None = None,
 ) -> dict[str, str]:
     """Build the child env: ambient base + allowlisted extras, HOME inside
     the run.
@@ -220,6 +221,16 @@ def sandbox_env(
     writable scratch (the real home is denyRead; writes are allowed nowhere
     outside the run). Both are git-excluded by ``create_run``.
 
+    CLAUDE_CODE_TMPDIR points at the same scratch. The pinned Claude CLI
+    builds its per-uid scratch root — ``<root>/claude-<uid>/<cwd-slug>``,
+    home of the Bash tool's shell snapshots — from CLAUDE_CODE_TMPDIR or
+    a hardcoded ``/tmp`` (the bundled binary's ``sm()``; TMPDIR is never
+    consulted for that root). Unset, every sandboxed session's Bash call
+    died on ``EPERM mkdir /private/tmp/claude-<uid>/…`` (run
+    20261029T145356Z-b1875d: 0/21 Bash calls, Read/Write/Edit fine). The
+    redirect keeps the root inside the run — allowWrite never widens to
+    /tmp.
+
     GIT_TEMPLATE_DIR points at an empty dir under that scratch (INC-006):
     ``git init``/``git clone`` copy hook samples from git's installation
     templates into ``.git/hooks/`` of the new repo, and srt blocks writes
@@ -229,6 +240,19 @@ def sandbox_env(
     into the blocked path and init is a config write (allowed by
     ``allowGitConfig`` in :func:`build_settings`). Hook samples are dead
     weight here anyway: this factory's git runs hardened, hooks off.
+
+    Args:
+        run_dir: The run the child is confined to.
+        extra: Caller extras, filtered by :data:`SESSION_ENV_ALLOWLIST`.
+        forbidden: Secret names to scrub on top of the structural ones.
+        venv: A run-local venv (``<run_dir>/.venv``, PEP 405). When given,
+            its ``bin/`` is prepended to PATH and VIRTUAL_ENV is set, so
+            ``pip``/``python`` resolve into the run's venv — never the
+            owner's terminal venv or a host conda env (run
+            20261029T145356Z-b1875d: setup resolved the owner's venv,
+            tried to uninstall its ``bin/factory``, failed, and every
+            remaining gate was skipped). The rest of PATH survives after
+            the prefix.
     """
     run_dir = Path(run_dir)
     home = run_dir / ".home"
@@ -248,8 +272,12 @@ def sandbox_env(
         for key, value in extra.items():
             if key in SESSION_ENV_ALLOWLIST or key.startswith(SESSION_ENV_PREFIXES):
                 env[key] = value
+    if venv is not None:
+        env["PATH"] = f"{Path(venv) / 'bin'}:{env.get('PATH', '')}"
+        env["VIRTUAL_ENV"] = str(venv)
     env["HOME"] = str(home)
     env["TMPDIR"] = str(tmp)
+    env["CLAUDE_CODE_TMPDIR"] = str(tmp)
     env["GIT_TEMPLATE_DIR"] = str(git_templates)
     return scrub_env(env, forbidden)
 
@@ -616,6 +644,7 @@ def run_sandboxed(
     timeout: float | None = None,
     cwd: Path | None = None,
     srt_bin_path: Path | None = None,
+    venv: Path | None = None,
     on_stdout_line=None,
 ) -> subprocess.CompletedProcess:
     """Run ``cmd`` under srt confined to ``run_dir``.
@@ -632,6 +661,9 @@ def run_sandboxed(
             token}`` cannot smuggle an unlisted secret across. Scrub
             keychain-derived names yourself (via :func:`sandbox_env`) — the
             settings file denies them as the backstop layer.
+        venv: A run-local venv prepended to the child's PATH with
+            VIRTUAL_ENV set (see :func:`sandbox_env`) — the gate commands'
+            ``pip``/``python`` resolve into the run, never an ambient env.
         timeout: Wall-clock seconds for the leader. While it runs, the
             pipes are pumped by a single-threaded ``select`` loop over
             non-blocking fds (``proc.wait`` on PIPEd output would deadlock
@@ -671,7 +703,7 @@ def run_sandboxed(
     run_dir = Path(run_dir)
     tmp = run_dir / ".tmp"
     tmp.mkdir(parents=True, exist_ok=True)
-    child_env = sandbox_env(run_dir, extra=env)
+    child_env = sandbox_env(run_dir, extra=env, venv=venv)
     # srt's Linux network bridges create unix sockets in node's tmpdir().
     # A TMPDIR deep inside the run dir overflows the kernel's ~108-byte
     # sun_path limit and the bridges silently never come up ("Failed to

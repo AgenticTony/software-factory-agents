@@ -110,14 +110,163 @@ def test_ac_1(tmp_path):
 
 
 def test_ac_2(tmp_path):
+    # The manifest edit is a REAL dependency change ([project].dependencies):
+    # since the pyproject diff-awareness (F-31 run blocker: a bare
+    # [tool.setuptools.package-data] table falsely escalated) only
+    # dependency-surface changes escalate, and this AC holds the line that
+    # they still do.
     repo = _repo(tmp_path, "ac2", {"pyproject.toml": "[project]\n"})
-    _change(repo, files={"pyproject.toml": "[project]\ndep = 'x'\n"})
+    _change(repo, files={
+        "pyproject.toml": '[project]\ndependencies = ["requests"]\n',
+    })
     profile = dict(BASE_PROFILE)
     profile["dependency_manifests"] = ["pyproject.toml"]
     report = _run(repo, profile)
     assert "new_dependency" in report.escalations
     assert report.verdict == "pass"
     assert not report.findings
+
+
+# --- F-31 run blocker: pyproject diff-awareness for new_dependency ----------
+
+_PYPROJECT_BASE = (
+    "[project]\n"
+    'name = "fixture"\n'
+    'dependencies = ["a"]\n'
+    "\n"
+    "[project.optional-dependencies]\n"
+    'dev = ["b"]\n'
+    "\n"
+    "[build-system]\n"
+    'requires = ["setuptools"]\n'
+)
+
+
+def test_pyproject_edit_outside_dependency_surface_does_not_escalate(tmp_path):
+    """Run 20261029T145356Z-b1875d added only a [tool.setuptools.package-data]
+    table and still escalated new_dependency, skipping every remaining
+    gate. A pyproject.toml modification escalates only when the dependency
+    surface — [project].dependencies, [project].optional-dependencies,
+    [build-system].requires — actually changed."""
+    repo = _repo(tmp_path, "pkgdata", {"pyproject.toml": _PYPROJECT_BASE})
+    _change(repo, files={
+        "pyproject.toml": _PYPROJECT_BASE
+        + "\n[tool.setuptools.package-data]\nfactory = ['py.typed']\n",
+    })
+    profile = dict(BASE_PROFILE)
+    profile["dependency_manifests"] = ["pyproject.toml"]
+    report = _run(repo, profile)
+    assert "new_dependency" not in report.escalations
+
+
+def test_pyproject_dependency_surface_changes_escalate(tmp_path):
+    """Each real surface change — an added dependency, an added optional
+    extra, an added build requirement, a removed dependency — escalates."""
+    variants = {
+        "dependency": _PYPROJECT_BASE.replace('["a"]', '["a", "c"]'),
+        "optional": _PYPROJECT_BASE.replace('dev = ["b"]', 'dev = ["b", "c"]'),
+        "build": _PYPROJECT_BASE.replace(
+            'requires = ["setuptools"]', 'requires = ["setuptools", "wheel"]'),
+        "removed": _PYPROJECT_BASE.replace('dependencies = ["a"]\n', ""),
+    }
+    profile = dict(BASE_PROFILE)
+    profile["dependency_manifests"] = ["pyproject.toml"]
+    for label, head in variants.items():
+        repo = _repo(tmp_path, f"depsurface-{label}",
+                     {"pyproject.toml": _PYPROJECT_BASE})
+        _change(repo, files={"pyproject.toml": head})
+        assert "new_dependency" in _run(repo, profile).escalations, label
+
+
+def test_pyproject_dependency_surfaces_outside_the_named_tables_escalate(tmp_path):
+    """Review round on #74: comparing only the three named tables was
+    fail-open — PEP 735 ``[dependency-groups]``, ``dynamic =
+    ["dependencies"]`` + ``[tool.setuptools.dynamic]``, ``[tool.uv.sources]``
+    and ``[tool.poetry.*]`` all add or redirect dependencies without
+    touching them. The comparison is inverted: the WHOLE parsed document
+    compares, minus an explicit inert allowlist — anything else that
+    differs escalates."""
+    variants = {
+        "dep-groups": _PYPROJECT_BASE + "\n[dependency-groups]\nlint = ['ruff']\n",
+        "dynamic": _PYPROJECT_BASE.replace(
+            'name = "fixture"\n',
+            'name = "fixture"\ndynamic = ["dependencies"]\n',
+        ).replace(
+            'dependencies = ["a"]\n', ""
+        ) + "\n[tool.setuptools.dynamic]\ndependencies = {file = 'reqs.txt'}\n",
+        "uv-sources": _PYPROJECT_BASE + "\n[tool.uv.sources]\na = { git = 'https://evil/x' }\n",
+        "unknown-tool": _PYPROJECT_BASE + "\n[tool.somethingnew]\nkey = 1\n",
+        "poetry": _PYPROJECT_BASE + "\n[tool.poetry.dependencies]\na = '*'\n",
+    }
+    profile = dict(BASE_PROFILE)
+    profile["dependency_manifests"] = ["pyproject.toml"]
+    for label, head in variants.items():
+        repo = _repo(tmp_path, f"opensurface-{label}",
+                     {"pyproject.toml": _PYPROJECT_BASE})
+        _change(repo, files={"pyproject.toml": head})
+        assert "new_dependency" in _run(repo, profile).escalations, label
+
+
+def test_pyproject_inert_metadata_edit_does_not_escalate(tmp_path):
+    """The allowlist side: project metadata that describes the artifact
+    (description/readme/version/urls/scripts) and dev-tool config tables
+    may differ without a dependency escalation."""
+    head = (_PYPROJECT_BASE
+            .replace('name = "fixture"', 'name = "fixture"\nversion = "2.0"\ndescription = "d"')
+            + "\n[project.urls]\nhome = 'https://x'\n"
+            + "\n[tool.ruff]\nline-length = 100\n")
+    repo = _repo(tmp_path, "inertmeta", {"pyproject.toml": _PYPROJECT_BASE})
+    _change(repo, files={"pyproject.toml": head})
+    profile = dict(BASE_PROFILE)
+    profile["dependency_manifests"] = ["pyproject.toml"]
+    assert "new_dependency" not in _run(repo, profile).escalations
+
+
+def test_malformed_pyproject_escalates(tmp_path):
+    """Fail closed: a pyproject either side can't be parsed structurally
+    escalates exactly as the pre-diff-aware rule did."""
+    repo = _repo(tmp_path, "badtoml", {"pyproject.toml": _PYPROJECT_BASE})
+    _change(repo, files={
+        "pyproject.toml": _PYPROJECT_BASE + "\nthis is not = toml\n",
+    })
+    profile = dict(BASE_PROFILE)
+    profile["dependency_manifests"] = ["pyproject.toml"]
+    report = _run(repo, profile)
+    assert "new_dependency" in report.escalations
+
+
+def test_other_manifests_and_structural_changes_still_escalate(tmp_path):
+    """Manifests the rule can't parse structurally (requirements.txt), a
+    renamed or deleted pyproject, and direct check_diff_policy calls
+    without refs (fail closed) all escalate as before."""
+    from factory.gates import FileChange
+    from factory.l0 import check_diff_policy
+
+    repo = _repo(tmp_path, "otherman", {
+        "pyproject.toml": _PYPROJECT_BASE,
+        "requirements.txt": "a==1\n",
+    })
+    _change(repo, files={"requirements.txt": "a==1\nc==2\n"})
+    profile = dict(BASE_PROFILE)
+    profile["dependency_manifests"] = ["pyproject.toml", "requirements.txt"]
+    assert "new_dependency" in _run(repo, profile).escalations
+
+    repo = _repo(tmp_path, "renamed", {"pyproject.toml": _PYPROJECT_BASE})
+    _change(repo, rename=[("pyproject.toml", "pyproject.prod.toml")])
+    profile2 = dict(BASE_PROFILE)
+    profile2["dependency_manifests"] = ["pyproject.toml"]
+    assert "new_dependency" in _run(repo, profile2).escalations
+
+    repo = _repo(tmp_path, "deleted", {"pyproject.toml": _PYPROJECT_BASE})
+    _change(repo, delete=("pyproject.toml",))
+    assert "new_dependency" in _run(repo, profile2).escalations
+
+    findings, escalations, _added, _matched = check_diff_policy(
+        {"paths": {}, "dependency_manifests": ["pyproject.toml"]},
+        [FileChange("pyproject.toml", "M")],
+        dict(TASK),
+    )
+    assert "new_dependency" in escalations  # no refs: cannot diff, fail closed
 
 
 # --- AC-3: undeclared touched risk path -> flag added + escalation ---------

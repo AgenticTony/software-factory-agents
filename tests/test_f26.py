@@ -1342,6 +1342,202 @@ def test_review34_a_pr_closed_task_can_be_recovered_for_a_fix_round(
     assert "factory recover" in doc  # the remedy is documented
 
 
+# --- F-31 run blocker: credential_added re-queues through recover ----------
+
+
+def _park_escalated(env, task_id: str, escalation: str) -> None:
+    """Move a fixture task to needs_human with one escalated attempt."""
+    q = TaskQueue(env.queue_path)
+    task = q.get(task_id)
+    task["status"] = "needs_human"
+    task["attempts"] = [{
+        "run_id": "r1", "slice_id": task_id, "started": "2026-10-29T10:00:00Z",
+        "ended": "2026-10-29T11:00:00Z", "outcome": "escalated",
+        "escalation": escalation, "prompt_versions": {}, "skills": [],
+    }]
+    q.save()
+
+
+def test_credential_added_requeues_with_evidence(tmp_path: Path):
+    """TASK-CONTRACT §credential_added says "a human confirms and
+    re-queues" — but recover was gated to stale_base/pr_closed, so F-31
+    sat in needs_human with no exit. The owner's word is
+    ``factory recover <id> --evidence …`` + an interactive y/N: it writes
+    the gated needs_human → ready edge, resets nothing (the remaining
+    attempt budget is the human's call, made with the evidence in hand),
+    and an open dependency routes to blocked exactly like approval."""
+    from factory.approve import recover_task
+
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2", depends_on=["T-3"]),
+                               _task("T-3")])
+    for task_id in ("T-1", "T-2"):
+        _park_escalated(env, task_id, "credential_added")
+
+    said = {}
+
+    def echo(text: str) -> None:
+        said["summary"] = said.get("summary", "") + text + "\n"
+
+    confirm = lambda question: said.update(prompt=question) or True  # noqa: E731
+    assert recover_task(TaskQueue(env.queue_path), "T-1",
+                        evidence="test fixture, not a real credential",
+                        confirm=confirm, echo=echo) == "ready"
+    assert env.task("T-1")["status"] == "ready"
+    assert len(env.task("T-1")["attempts"]) == 1, "recover must not reset attempts"
+    assert "credential_added" in said["summary"]
+    assert "test fixture, not a real credential" in said["summary"]
+    # a dependency that is open routes to blocked, same as approval
+    assert recover_task(TaskQueue(env.queue_path), "T-2",
+                        evidence="rotated",
+                        confirm=lambda question: True) == "blocked"
+    assert env.task("T-2")["status"] == "blocked"
+
+
+def test_credential_added_recover_refusals(tmp_path: Path):
+    """The credential edge is deliberately human-paced: no --yes (the
+    point is that a human looked), evidence is required and must say
+    something, a declined prompt writes nothing — and every other
+    needs_human reason (attempts budget, protected paths, risk paths)
+    still refuses: only credential_added has an owner word."""
+    from factory.approve import ApprovalDeclined, ApprovalError, recover_task
+    from factory.cli import main
+
+    others = [("T-4", "attempts_exhausted"),
+              ("T-5", "protected_path_touched"),
+              ("T-6", "risk_path_touched")]
+    # fresh tasks per escalation: attempts are append-only, so each
+    # refusal parks its own task
+    env = Env(tmp_path, tasks=[_task("T-1")] + [_task(tid) for tid, _ in others])
+    _park_escalated(env, "T-1", "credential_added")
+    queue = lambda: TaskQueue(env.queue_path)  # noqa: E731
+
+    with pytest.raises(ApprovalError, match="evidence"):
+        recover_task(queue(), "T-1", confirm=lambda question: True)
+    with pytest.raises(ApprovalError, match="evidence"):
+        recover_task(queue(), "T-1", evidence="   ",
+                     confirm=lambda question: True)
+    with pytest.raises(ApprovalError, match="interactive"):
+        recover_task(queue(), "T-1", assume_yes=True,
+                     evidence="test fixture, not a real credential")
+    assert main(["recover", "T-1", "--queue", str(env.queue_path), "--yes",
+                 "--evidence", "test fixture"]) == 1
+    assert main(["recover", "T-1", "--queue", str(env.queue_path)]) == 1
+    with pytest.raises(ApprovalDeclined):
+        recover_task(queue(), "T-1", evidence="rotated",
+                     confirm=lambda question: False)
+    assert env.task("T-1")["status"] == "needs_human"
+
+    for task_id, escalation in others:
+        _park_escalated(env, task_id, escalation)
+        with pytest.raises(ApprovalError, match="not recoverable"):
+            recover_task(queue(), task_id, evidence="looks fine",
+                         confirm=lambda question: True)
+        assert env.task(task_id)["status"] == "needs_human", task_id
+
+
+def test_credential_added_recover_cli_confirm_and_f26_path_unchanged(
+        tmp_path: Path, monkeypatch):
+    """End to end at the CLI: the y/N prompt is answered through stdin
+    (EOF declines), and the pre-existing stale_base/pr_closed flow —
+    closed-PR check, --yes allowed there — is untouched by the new
+    credential branch."""
+    import io
+
+    import factory.approve as approve_mod
+    from factory.cli import main
+
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
+    _park_escalated(env, "T-1", "credential_added")
+    monkeypatch.setattr("sys.stdin", io.StringIO("y\n"))
+    assert main(["recover", "T-1", "--queue", str(env.queue_path),
+                 "--evidence", "test fixture, not a real credential"]) == 0
+    assert env.task("T-1")["status"] == "ready"
+
+    # the F-26 path still checks GitHub for a closed PR and takes --yes
+    _park_escalated(env, "T-2", "pr_closed")
+    q = TaskQueue(env.queue_path)
+    q.get("T-2")["links"] = {"pr": "https://github.com/fixture/fixture/pull/9"}
+    q.save()
+    monkeypatch.setattr(approve_mod, "gh_pr_state", lambda url: "open")
+    assert main(["recover", "T-2", "--queue", str(env.queue_path),
+                 "--yes"]) == 1  # open PR: refused
+    monkeypatch.setattr(approve_mod, "gh_pr_state", lambda url: "closed")
+    assert main(["recover", "T-2", "--queue", str(env.queue_path),
+                 "--yes"]) == 0
+    assert env.task("T-2")["status"] == "ready"
+
+
+def test_credential_recover_persists_evidence_in_the_progress_log(
+        tmp_path: Path):
+    """Review round on #74: the evidence was only echoed to the terminal —
+    the audit trail lost the one thing the whole gate exists to capture.
+    A completed recover appends a progress-log entry (outcome
+    ``recovered``, the escalation, the evidence, who, when); a declined
+    or refused recover writes nothing."""
+    from factory.approve import ApprovalDeclined, recover_task
+
+    env = Env(tmp_path, tasks=[_task("T-1")])
+    _park_escalated(env, "T-1", "credential_added")
+    queue = lambda: TaskQueue(env.queue_path)  # noqa: E731
+
+    before = len(env.log("T-1").entries())
+    with pytest.raises(ApprovalDeclined):
+        recover_task(queue(), "T-1", evidence="rotated",
+                     confirm=lambda question: False, done_by="owner",
+                     factory_root=env.root)
+    assert len(env.log("T-1").entries()) == before, "a decline wrote a log entry"
+
+    assert recover_task(queue(), "T-1",
+                        evidence="test fixture, not a real credential",
+                        confirm=lambda question: True, done_by="owner",
+                        factory_root=env.root) == "ready"
+    entries = env.log("T-1").entries()
+    recovered = [e for e in entries if e.get("outcome") == "recovered"]
+    assert len(recovered) == 1, entries
+    entry = recovered[0]
+    assert entry["escalation"] == "credential_added"
+    assert entry["evidence"] == "test fixture, not a real credential"
+    assert entry["done_by"] == "owner"
+    assert entry["recovered_at"]
+
+
+def test_credential_edge_is_state_gated_not_command_gated(tmp_path: Path):
+    """Review round on #74: the credential exit was enforced only inside
+    the recover command — any other writer of ``transition`` could move a
+    credential task. The generic edge now refuses credential_added tasks;
+    the dedicated state method is the only writer, and it refuses blank
+    evidence at the state layer too."""
+    from factory.state import TransitionError
+
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2", depends_on=["T-3"]),
+                               _task("T-3")])
+    for task_id in ("T-1", "T-2"):
+        _park_escalated(env, task_id, "credential_added")
+
+    with pytest.raises(TransitionError):
+        TaskQueue(env.queue_path).transition("T-1", "ready")
+
+    queue = TaskQueue(env.queue_path)
+    with pytest.raises(Exception, match="evidence"):
+        queue.recover_credential("T-1", "   ")
+    assert env.task("T-1")["status"] == "needs_human", "blank evidence wrote"
+
+    assert TaskQueue(env.queue_path).recover_credential(
+        "T-1", "test fixture, not a real credential") == "ready"
+    assert env.task("T-1")["status"] == "ready"
+    # open dependency routes blocked, same rule as every recovery writer
+    assert TaskQueue(env.queue_path).recover_credential(
+        "T-2", "rotated") == "blocked"
+    assert env.task("T-2")["status"] == "blocked"
+
+    # the command still works through the new state method
+    from factory.approve import recover_task
+    _park_escalated(env, "T-1", "credential_added")
+    assert recover_task(TaskQueue(env.queue_path), "T-1", evidence="rotated",
+                        confirm=lambda question: True,
+                        factory_root=env.root) == "ready"
+
+
 def test_review35_a_merged_escalated_pr_returns_to_review(tmp_path: Path):
     """Round-5 finding 4: an owner who resolves a stale_base conflict on
     GitHub and merges leaves the task parked needs_human with shipped

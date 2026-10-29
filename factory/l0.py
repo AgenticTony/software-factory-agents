@@ -76,12 +76,14 @@ not a near-miss of a popular name). L0 records the escalation; the checks
 run when there is a sandbox to run them in.
 """
 
+import copy
 import json
 import posixpath
 import re
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from factory.gates import (
     CommandResult,
@@ -236,8 +238,115 @@ def _failure_marker(output: str) -> str | None:
     return None
 
 
+# Dotted paths inside a parsed pyproject.toml that are INERT for the
+# dependency surface: they may differ between merge-base and head without
+# escalating ``new_dependency``. The comparison is inverted on purpose
+# (review round on #74: enumerating the dependency-carrying tables was
+# fail-open — [dependency-groups], dynamic dependencies, [tool.uv.sources]
+# and [tool.poetry.*] all slipped past a three-table allowlist), so every
+# entry here must earn its place:
+#
+# * ``project.name/description/readme/version/urls/scripts`` — artifact
+#   metadata and console entry points: describe the thing built, never
+#   what is imported to build or run it. (``scripts`` executes the
+#   project's own code, which the diff already reviews; it cannot pull
+#   a new package in.)
+# * ``tool.ruff`` / ``tool.pytest`` / ``tool.coverage`` / ``tool.mypy`` —
+#   dev-tool configuration for tools the factory itself pins and runs;
+#   none of them can name an import that enters the built environment.
+# * ``tool.setuptools.package-data`` — which existing files ship in the
+#   wheel; the F-31 case (a py.typed line), and a file that exists in
+#   the diff either way.
+#
+# Anything else — an unknown ``tool.*`` table included — compares, and a
+# difference escalates: a new table class that can carry dependencies
+# fails closed until a human allowlists it here.
+_INERT_PYPROJECT_PATHS = (
+    "project.name",
+    "project.description",
+    "project.readme",
+    "project.version",
+    "project.urls",
+    "project.scripts",
+    "tool.ruff",
+    "tool.pytest",
+    "tool.coverage",
+    "tool.mypy",
+    "tool.setuptools.package-data",
+)
+
+
+def _strip_inert(doc: dict) -> dict:
+    """A deep copy of a parsed pyproject with every :data:`_INERT_PYPROJECT_PATHS`
+    entry removed, for whole-document comparison. Tables the stripping
+    empties are pruned (``[tool.ruff]`` alone leaves ``tool: {}`` on one
+    side and no ``tool`` key on the other — equal in meaning, unequal as
+    dicts); an empty table carries no dependency, so pruning it is not a
+    hole."""
+    stripped = copy.deepcopy(doc)
+    for dotted in _INERT_PYPROJECT_PATHS:
+        parts = dotted.split(".")
+        node: Any = stripped
+        for part in parts[:-1]:
+            if not isinstance(node, dict) or part not in node:
+                node = None
+                break
+            node = node[part]
+        if isinstance(node, dict):
+            node.pop(parts[-1], None)
+    return _prune_empty(stripped)
+
+
+def _prune_empty(node: Any) -> Any:
+    """Recursively drop dict entries whose value is (or prunes to) an
+    empty dict; scalars, lists and empty lists pass through untouched."""
+    if not isinstance(node, dict):
+        return node
+    pruned = {}
+    for key, value in node.items():
+        value = _prune_empty(value)
+        if isinstance(value, dict) and not value:
+            continue
+        pruned[key] = value
+    return pruned
+
+
+def _pyproject_surface_unchanged(change, path: str, *, repo, base_ref, head_ref) -> bool:
+    """Whether a manifest touch leaves pyproject.toml's dependency surface
+    untouched — the one structurally parsed manifest (F-31 run blocker:
+    a ``[tool.setuptools.package-data]``-only edit falsely escalated
+    ``new_dependency`` and skipped every remaining gate).
+
+    The WHOLE parsed document compares, minus the inert allowlist
+    (:data:`_INERT_PYPROJECT_PATHS`) — dependency-bearing tables outside
+    the obvious three (PEP 735 dependency-groups, dynamic dependencies,
+    tool.uv.sources, tool.poetry.*) escalate rather than slipping through.
+
+    True ONLY for a plain modification (status M) of a root
+    ``pyproject.toml`` with refs supplied, whose merge-base and head
+    sides both parse and compare equal. Every doubt — another manifest
+    path, an added/deleted/renamed pyproject, missing refs, a git or
+    TOML failure — answers False, and the caller escalates exactly as
+    the path-match rule always did.
+    """
+    if path != "pyproject.toml" or change.status != "M":
+        return False
+    if repo is None or not base_ref or not head_ref:
+        return False
+    try:
+        merge_base = _git(Path(repo), "merge-base", base_ref, head_ref).strip()
+        before = tomllib.loads(_git(Path(repo), "show", f"{merge_base}:pyproject.toml"))
+        after = tomllib.loads(_git(Path(repo), "show", f"{head_ref}:pyproject.toml"))
+        return _strip_inert(before) == _strip_inert(after)
+    except (GateError, tomllib.TOMLDecodeError, TypeError, UnicodeDecodeError):
+        return False
+
+
 def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
-                      matched_flags: set | None = None):
+                      matched_flags: set | None = None, *,
+                      repo: Path | str | None = None,
+                      base_ref: str | None = None,
+                      head_ref: str | None = None):
     """Apply the L0 diff policy to a set of changed paths.
 
     FAIL classes (findings): protected path touched (added, modified or
@@ -248,6 +357,17 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
     and lint-suppression sentinels (F-25) scan in
     :func:`factory.sentinels.builtin_sentinel_findings`, not here — one
     home for the standing set.
+
+    A modified ``pyproject.toml`` is diff-aware when refs are supplied:
+    the escalation fires only if the dependency surface —
+    ``[project].dependencies``, ``[project].optional-dependencies``,
+    ``[build-system].requires`` — actually changed between the
+    merge-base and head (F-31 run blocker: a bare
+    ``[tool.setuptools.package-data]`` table falsely escalated and
+    skipped every remaining gate). Everything else fails closed: any
+    other manifest, an added/deleted/renamed pyproject, a parse error
+    on either side, or a direct call without refs, escalates exactly as
+    the path-match rule always did.
 
     Args:
         profile: The loaded ``project.yaml`` mapping.
@@ -280,6 +400,24 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
 
     for change in changes:
         for path, verb in events(change):
+            # The gate runner's venv (factory/orchestrator._create_gate_venv)
+            # is factory infrastructure inside the clone: a tracked path
+            # under .venv/ means an implementer `git add -f`-ed planted
+            # environment (a .pth is imported code) into the tree the gates
+            # would run through. protected_path_touched — the standing
+            # class for paths an agent must never write — independently of
+            # the profile's list, like the venv-creation refusal one layer
+            # up (review round on #74).
+            if path == ".venv" or path.startswith(".venv/"):
+                findings.append(
+                    Finding(
+                        "protected_path_touched",
+                        f"tracked gate-venv path {verb}: {path} — a committed "
+                        ".venv is planted environment, never project source",
+                        file=path,
+                    )
+                )
+                escalations.add("protected_path_touched")
             # Adding counts too: a new conftest.py or a new file under a
             # protected glob changes how the contract tests run. The task's
             # own contract test files are the exception — the implementer
@@ -296,7 +434,9 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
                     )
                 )
                 escalations.add("protected_path_touched")
-            if _matches(path, manifests):
+            if _matches(path, manifests) and not _pyproject_surface_unchanged(
+                change, path, repo=repo, base_ref=base_ref, head_ref=head_ref,
+            ):
                 escalations.add("new_dependency")
 
         if change.status == "D" and _is_test_file(change.path):
@@ -549,7 +689,8 @@ def run_l0(
     risk_globs = (profile.get("paths") or {}).get("risk") or {}
     matched = matched_risk_flags(risk_globs, changes)
     findings, escalations, risk_flags_added, _matched = check_diff_policy(
-        profile, changes, task, matched_flags=matched
+        profile, changes, task, matched_flags=matched,
+        repo=repo, base_ref=base_ref, head_ref=head_ref,
     )
     # F-25: the built-in sentinel pass — pure diff scans; a credential hit
     # escalates immediately (nothing is pushed before a passing round, but
