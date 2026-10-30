@@ -105,7 +105,11 @@ from factory.sandbox import (
     write_settings,
 )
 from factory.state import now_iso
-from factory.toolkit import TOOLKIT_PLUGIN_NAME, stage_toolkit
+from factory.toolkit import (
+    STAGED_PLACEHOLDER,
+    TOOLKIT_PLUGIN_NAME,
+    stage_toolkit,
+)
 from factory.trace import STREAM_PREFIX, scrub_literal, snippet
 from factory.vent import VENT_QUALIFIED_NAME, VENT_TOOL_NAME, VentCollector, vent_server
 
@@ -749,6 +753,44 @@ def bash_guard_hook(protected: "Sequence[str]" = ()) -> HookMatcher:
 
 # ----------------------------------------------------------- options/record --
 
+
+def mcp_guard_hook(granted: "frozenset[tuple[str, str]]") -> HookMatcher:
+    """PreToolUse hook over MCP tools: the enforcement under
+    ``bypassPermissions`` (F-22 review, PR #77 finding 2).
+
+    Both seats run prompt-bypassed (nobody can answer a permission
+    prompt), and under bypass the CLI's ``allowed_tools`` only
+    *pre-approves* — it restricts nothing: a live turn proved it (a
+    stub server's UNLISTED write tool ran unchallenged, empty
+    ``permission_denials``). A deny hook still blocks under
+    ``bypassPermissions`` (F-06's established fact), so THIS hook is
+    what makes AC-5's "tools enabled one by one" real: every
+    ``mcp__<server>__<tool>`` call whose pair the seat's toolkit never
+    granted — an unlisted tool of a listed server, or any tool of a
+    server that is not in the toolkit at all — is denied. Built-in
+    tools never match the hook's matcher and pass untouched; the vent
+    tool is granted like any other in-process server. Fail closed: a
+    malformed ``mcp__`` name matches no grant.
+    """
+
+    async def _hook(
+        input: dict[str, Any], tool_use_id: str | None, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        name = str(input.get("tool_name") or "")
+        if not name.startswith("mcp__"):
+            return {}  # the matcher routes only mcp__ names; defence anyway
+        parts = name.split("__")
+        if len(parts) != 3 or (parts[1], parts[2]) not in granted:
+            return _deny(
+                f"MCP tool {name} is not granted to this seat's toolkit — "
+                "admitted servers expose their tools one by one; an "
+                "unlisted tool is never callable"
+            )
+        return {}
+
+    return HookMatcher(matcher="mcp__.*", hooks=[_hook])
+
+
 def _apply_toolkit(options: ClaudeAgentOptions, toolkit: dict) -> None:
     """Wire a resolved, staged toolkit into the options (F-22).
 
@@ -757,18 +799,27 @@ def _apply_toolkit(options: ClaudeAgentOptions, toolkit: dict) -> None:
     ``--plugin-dir`` while ``setting_sources`` stays ``[]``: nothing is
     loaded from the owner's personal setup or from the clone (AC-7).
     Plugin items keep their own manifests (their own ``--plugin-dir``).
-    MCP servers spawn from the staged descriptor's exact command/args/
-    env — a child of this sandboxed runner, so srt confines them too
-    (AC-5) — and each tool is enabled one by one through
-    ``allowed_tools``. ``strict_mcp_config`` shuts the CLI's config-file
-    MCP discovery off whenever a toolkit server is attached (defence in
-    depth under ``setting_sources=[]``).
+    MCP servers spawn from the staged descriptor's command/args/env
+    with the ``{staged}`` placeholder substituted by the staged root —
+    they run the vendored, hash-verified copy (PR #77 finding 3), as
+    children of this sandboxed runner, so srt confines them too (AC-5).
+    Each tool is granted in ``allowed_tools`` one by one, and
+    :func:`mcp_guard_hook` enforces exactly that set — under
+    ``bypassPermissions`` the grant list alone pre-approves and
+    restricts nothing (finding 2). ``strict_mcp_config`` shuts the
+    CLI's config-file MCP discovery off whenever a toolkit server is
+    attached (defence in depth under ``setting_sources=[]``).
     """
     staged = Path(toolkit["staged"])
     plugin_dirs: list[dict] = []
     skills: list[str] = []
     mcp_servers: dict[str, dict] = {}
+    granted: set[tuple[str, str]] = set()
     allowed = list(options.allowed_tools)
+
+    def staged_path(token: str) -> str:
+        return token.replace(STAGED_PLACEHOLDER, str(staged))
+
     for item in toolkit.get("items") or []:
         if item["kind"] == "skill":
             skills.append(f"{TOOLKIT_PLUGIN_NAME}:{item['name']}")
@@ -778,12 +829,14 @@ def _apply_toolkit(options: ClaudeAgentOptions, toolkit: dict) -> None:
             descriptor = item["mcp"]
             mcp_servers[item["name"]] = {
                 "type": "stdio",
-                "command": descriptor["command"],
-                "args": list(descriptor.get("args") or []),
+                "command": staged_path(str(descriptor["command"])),
+                "args": [staged_path(str(arg))
+                         for arg in descriptor.get("args") or []],
                 "env": dict(descriptor.get("env") or {}),
             }
             for tool in descriptor.get("tools") or []:
                 allowed.append(f"mcp__{item['name']}__{tool['name']}")
+                granted.add((item["name"], tool["name"]))
     if skills:
         # The wrapper plugin (skills' on-disk home) rides first; plugin
         # items keep their own manifests.
@@ -795,6 +848,10 @@ def _apply_toolkit(options: ClaudeAgentOptions, toolkit: dict) -> None:
         options.mcp_servers = {**(options.mcp_servers or {}), **mcp_servers}
         options.strict_mcp_config = True
     options.allowed_tools = allowed
+    # Finding 2: the granted pairs are the enforced set, not a wish.
+    if VENT_TOOL_NAME in (options.mcp_servers or {}):
+        granted.add((VENT_TOOL_NAME, VENT_TOOL_NAME))
+    options.hooks["PreToolUse"].append(mcp_guard_hook(frozenset(granted)))
 
 
 def build_options(

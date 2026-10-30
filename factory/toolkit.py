@@ -42,8 +42,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
@@ -64,7 +66,9 @@ TOOLKIT_PLUGIN_NAME = "factory-toolkit"
 # mirrors this list exactly (test_ac_2 pins the pair).
 ALLOWED_LICENCES = ("MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC")
 
-# AC-3: the vet's failure classes, in the contract's order.
+# AC-3: the vet's failure classes, in the contract's order — plus the
+# review round's ninth: a vendored symlink (or any non-regular file) is
+# an exfiltration channel, not a style problem (PR #77 finding 1).
 VET_CLASSES = (
     "network",
     "shell",
@@ -74,6 +78,7 @@ VET_CLASSES = (
     "hidden_chars",
     "prompt_injection",
     "self_modify",
+    "symlink",
 )
 
 # Encoded-blob threshold: a run of base64/hex charset longer than this
@@ -109,18 +114,58 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _scan_tree(root: Path) -> tuple[dict[str, Path], list[str]]:
+    """The tree under ``root`` as (regular files by posix relpath,
+    irregular names).
+
+    The walker never follows anything: a symlink (file or directory), a
+    fifo, a socket or a device is *irregular* by name, and recursion
+    happens only through real directories (PR #77 finding 1: rglob +
+    is_file + copytree all FOLLOW symlinks — a vendored link to
+    ``~/.ssh/id_ed25519`` would hand the private key to the model
+    provider, and git stores symlinks, so an admission PR can carry one
+    past a skim). Every caller that hashes, vets, loads or stages
+    toolkit content goes through here, so irregular content is refused
+    or flagged everywhere at once — and with symlinks refused, no path
+    can escape the item dir.
+    """
+    files: dict[str, Path] = {}
+    irregular: list[str] = []
+
+    def walk(directory: Path, prefix: str) -> None:
+        for entry in sorted(os.scandir(directory), key=lambda e: e.name):
+            rel = prefix + entry.name
+            if entry.is_symlink():
+                irregular.append(rel)
+                continue
+            mode = entry.stat(follow_symlinks=False).st_mode
+            if stat.S_ISDIR(mode):
+                walk(Path(entry.path), rel + "/")
+            elif stat.S_ISREG(mode):
+                files[rel] = Path(entry.path)
+            else:
+                irregular.append(rel)
+
+    walk(Path(root), "")
+    return files, irregular
+
+
+def irregular_paths(root: Path) -> list[str]:
+    """Symlinks and other non-regular files under ``root``, by name."""
+    return _scan_tree(root)[1]
+
+
 def file_hashes(root: Path) -> dict[str, str]:
-    """``{posix relpath: sha256}`` over every file under ``root``.
+    """``{posix relpath: sha256}`` over every REGULAR file under
+    ``root`` — symlinked and other irregular entries are excluded, never
+    hashed through (their targets' content must never enter a toolkit
+    hash).
 
     The walk is sorted and path-based, so the result is independent of
     directory iteration order and inode numbers.
     """
-    root = Path(root)
-    files: dict[str, str] = {}
-    for path in sorted(root.rglob("*")):
-        if path.is_file():
-            files[path.relative_to(root).as_posix()] = _sha256(path.read_bytes())
-    return files
+    files, _ = _scan_tree(root)
+    return {rel: _sha256(path.read_bytes()) for rel, path in files.items()}
 
 
 def _aggregate(files: dict[str, str]) -> str:
@@ -372,10 +417,16 @@ def vet_candidate(path: Path | str, *, allowlists: Sequence[str]) -> VetResult:
     if not root.is_dir():
         raise ToolkitError(f"candidate {root} is not a directory")
     findings: list[Finding] = []
-    files = sorted(p for p in root.rglob("*") if p.is_file())
-    for path_ in files:
-        _scan_file(path_, path_.relative_to(root).as_posix(), findings,
-                   allowlists)
+    files, irregular = _scan_tree(root)
+    # Review finding 1: a symlink (or fifo/device) is a finding of its
+    # own class — never hashed through, never staged.
+    for rel in irregular:
+        findings.append(Finding(
+            "symlink", rel, None,
+            "symlink or non-regular file: a vendored link is an "
+            "exfiltration channel (its target is read through it)"))
+    for rel in sorted(files):
+        _scan_file(files[rel], rel, findings, allowlists)
     licence_path = _licence_file(root)
     licence: str | None = None
     reason: str | None = None
@@ -438,6 +489,15 @@ _CRED_ENV_KEY = re.compile(
     r"TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|PRIVATE_?KEY|CREDENTIAL", re.I
 )
 
+# Commands that fetch (or reach out) at spawn: what actually runs is
+# whatever the network returned, so an index pin beside them is
+# declarative only (PR #77 finding 3). The placeholder an admitted
+# descriptor MUST reference: the vendored, hash-verified copy inside
+# the staged toolkit.
+_FETCH_COMMANDS = frozenset({"npx", "uvx", "bunx", "pipx", "curl", "wget",
+                             "ssh"})
+STAGED_PLACEHOLDER = "{staged}"
+
 
 def _credential_shaped(value: str) -> bool:
     """Whether an env value looks like a credential: any F-25 shape, or
@@ -449,11 +509,51 @@ def _credential_shaped(value: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9_\-]{32,}", value))
 
 
+def _spawn_reasons(mcp: dict) -> list[str]:
+    """Why a descriptor's spawn refuses admission (PR #77 finding 3).
+
+    The pin must describe what actually executes: the command runs from
+    the vendored, hash-verified copy inside the staged toolkit — the
+    ``{staged}`` placeholder, substituted with the staged root at option
+    build time — and never fetches at spawn (npx/uvx/bunx/pipx, pip
+    install, curl/wget/ssh): a runtime fetch executes whatever the
+    network returned, which no index pin can vouch for.
+    """
+    command = str(mcp.get("command") or "")
+    args = [str(arg) for arg in mcp.get("args") or []]
+    argv0 = Path(command).name
+    reasons: list[str] = []
+    if argv0 in _FETCH_COMMANDS:
+        reasons.append(
+            f"command {command!r} fetches or reaches out at spawn: an MCP "
+            "server must run from the vendored, hash-verified copy inside "
+            f"the staged toolkit ({STAGED_PLACEHOLDER}), never a runtime "
+            "fetch — an index pin beside a fetch is declarative only"
+        )
+    elif (argv0 in {"pip", "pip3"} and "install" in args) or (
+        argv0 in {"python", "python3"} and args[:2] == ["-m", "pip"]
+        and "install" in args
+    ):
+        reasons.append(
+            f"command {command!r} installs at spawn ({' '.join([command, *args])}): "
+            "an MCP server must run from the vendored, hash-verified copy "
+            f"inside the staged toolkit ({STAGED_PLACEHOLDER})"
+        )
+    if not any(STAGED_PLACEHOLDER in token for token in [command, *args]):
+        reasons.append(
+            f"descriptor never references {STAGED_PLACEHOLDER}: the server "
+            "must run from the vendored copy inside the staged toolkit, so "
+            "the index pin describes what actually executes"
+        )
+    return reasons
+
+
 def _descriptor_reasons(mcp: dict, allowlists: Sequence[str]) -> list[str]:
     """Why an MCP descriptor refuses admission (AC-5); empty = admitted.
 
     Read-only tools, no credentials in the environment, every domain
-    inside the allowlists. The pinned version + integrity hash are
+    inside the allowlists, and a spawn that runs the vendored content
+    (no runtime fetch). The pinned version + integrity hash are
     schema-checked on the index entry, not here.
     """
     reasons: list[str] = []
@@ -479,6 +579,7 @@ def _descriptor_reasons(mcp: dict, allowlists: Sequence[str]) -> list[str]:
             reasons.append(
                 f"domain {domain!r} is outside the project's allowlists"
             )
+    reasons.extend(_spawn_reasons(mcp))
     if not reasons and not (mcp.get("tools") or []):
         reasons.append("descriptor declares no tools")
     return reasons
@@ -521,6 +622,14 @@ def _check_entry(root: Path, entry: dict) -> None:
         raise ToolkitError(
             f"toolkit item {name!r}: vendored dir {entry['dir']} is missing "
             f"under {root}"
+        )
+    irregular = irregular_paths(item_dir)
+    if irregular:
+        raise ToolkitError(
+            f"toolkit item {name!r}: {entry['dir']}/{irregular[0]} is a "
+            "symlink or non-regular file — vendored content must be plain "
+            "files (a link's target would be read through it; PR #77 "
+            "finding 1)"
         )
     listed: dict[str, str] = entry["files"]
     actual = file_hashes(item_dir)
@@ -704,29 +813,81 @@ def stage_toolkit(resolved: dict, dest: Path | str) -> Path:
     exactly this copy — nothing is loaded from the clone or from any
     personal config.
 
+    Verified twice around the copy (PR #77 findings 1 and 4): the
+    SOURCE is walked before anything is written (no symlink, no
+    non-regular file, and the per-file hashes still equal the index
+    entry's — a mutation between resolve and stage refuses), and the
+    COPY is re-hashed afterwards and compared against the same entry, so
+    what the session reads is exactly what the index pins. A refusal
+    leaves no staged tree behind.
+
     Returns:
         The staged root (:class:`Path`).
+
+    Raises:
+        ToolkitError: The source carries irregular content or no longer
+            matches its index hashes, or the copy's hashes disagree.
     """
     dest = Path(dest)
+    root = Path(resolved["root"])
+    # Pre-copy: the source tree must be exactly what the index pinned —
+    # plain files, matching hashes, nothing mutated since resolve.
+    for entry in resolved["items"]:
+        source = root / entry["dir"]
+        irregular = irregular_paths(source)
+        if irregular:
+            raise ToolkitError(
+                f"toolkit item {entry['name']!r}: {entry['dir']}/"
+                f"{irregular[0]} is a symlink or non-regular file — "
+                "refusing to stage (a link's target would be copied "
+                "through and read by the session)"
+            )
+        actual = file_hashes(source)
+        if actual != entry["files"]:
+            differing = sorted(
+                set(actual) ^ set(entry["files"])
+                | {rel for rel in set(actual) & set(entry["files"])
+                   if actual[rel] != entry["files"][rel]}
+            )
+            raise ToolkitError(
+                f"toolkit item {entry['name']!r}: source no longer matches "
+                f"its index hashes ({', '.join(differing[:3])}) — refusing "
+                "to stage mutated content"
+            )
     if dest.exists():
         shutil.rmtree(dest)
-    dest.mkdir(parents=True)
-    (dest / ".claude-plugin").mkdir()
-    (dest / ".claude-plugin" / "plugin.json").write_text(
-        json.dumps({
-            "name": TOOLKIT_PLUGIN_NAME,
-            "description": "Factory-vetted agent toolkit, staged read-only "
-                           "(F-22). Admission is human: toolkit/index.yaml "
-                           "only changes through an owner-approved PR.",
-        }, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    root = Path(resolved["root"])
-    for entry in resolved["items"]:
-        shutil.copytree(root / entry["dir"], dest / entry["dir"])
-        if entry["kind"] == "mcp_server":
-            (dest / "mcp" / f"{entry['name']}.json").write_text(
-                json.dumps(entry["mcp"], indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
+    try:
+        dest.mkdir(parents=True)
+        (dest / ".claude-plugin").mkdir()
+        (dest / ".claude-plugin" / "plugin.json").write_text(
+            json.dumps({
+                "name": TOOLKIT_PLUGIN_NAME,
+                "description": "Factory-vetted agent toolkit, staged read-only "
+                               "(F-22). Admission is human: toolkit/index.yaml "
+                               "only changes through an owner-approved PR.",
+            }, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        for entry in resolved["items"]:
+            shutil.copytree(root / entry["dir"], dest / entry["dir"])
+            if entry["kind"] == "mcp_server":
+                (dest / "mcp" / f"{entry['name']}.json").write_text(
+                    json.dumps(entry["mcp"], indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+        # Post-copy: re-hash the copy itself and compare against the
+        # index entry — the session reads this tree, so this tree must
+        # be exactly what the pins describe (finding 4: resolve's
+        # verification of the source is not verification of the copy).
+        for entry in resolved["items"]:
+            copied = file_hashes(dest / entry["dir"])
+            if copied != entry["files"]:
+                raise ToolkitError(
+                    f"toolkit item {entry['name']!r}: the staged copy does "
+                    "not match its index hashes — refusing to hand the "
+                    "session an unpinned copy"
+                )
+    except BaseException:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
     return dest

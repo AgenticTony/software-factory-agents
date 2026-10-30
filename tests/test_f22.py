@@ -134,11 +134,19 @@ def _make_skill(toolkit: Path, name: str = "demo-skill",
 
 def _make_mcp(toolkit: Path, name: str = "docs",
               domains: list | None = None) -> dict:
-    """One vendored read-only MCP server item; its index entry."""
+    """One vendored read-only MCP server item; its index entry.
+
+    The spawn references ``{staged}`` (review finding 3): the server
+    runs from the vendored, hash-verified copy inside the staged
+    toolkit — never a runtime fetch (npx/uvx/…) or an ambient install.
+    """
     item_dir = toolkit / "mcp" / name
     item_dir.mkdir(parents=True, exist_ok=True)
     (item_dir / "LICENSE").write_text(MIT)
     (item_dir / "README.md").write_text(f"# {name}\n\nRead-only docs server.\n")
+    (item_dir / "server.js").write_text(
+        "// stub vendored server entrypoint (review finding 3 fixture)\n"
+    )
     files = _hash_tree(item_dir)
     return {
         "kind": "mcp_server",
@@ -152,7 +160,7 @@ def _make_mcp(toolkit: Path, name: str = "docs",
         "dir": f"mcp/{name}",
         "mcp": {
             "command": "node",
-            "args": ["server.js"],
+            "args": [f"{{staged}}/mcp/{name}/server.js"],
             "env": {"CACHE_MODE": "memory"},
             "tools": [
                 {"name": "search", "mode": "read"},
@@ -382,6 +390,10 @@ def test_ac_3(tmp_path: Path, capsys):
     assert VET_CLASSES == (
         "network", "shell", "encoded_blob", "credential_read", "env_harvest",
         "hidden_chars", "prompt_injection", "self_modify",
+        # Review finding 1: symlinks/non-regular files are a class of
+        # their own, beyond the contract's eight — a vendored link is an
+        # exfiltration channel, not a style problem.
+        "symlink",
     )
 
     # The clean fixture: no findings, licence admitted.
@@ -516,11 +528,13 @@ def test_ac_5(tmp_path: Path):
     staged, sandbox-confined descriptor."""
     from factory.toolkit import ToolkitError, vet_descriptor
 
-    # A write tool refuses (the descriptor gate the vet runs).
+    # A write tool refuses (the descriptor gate the vet runs). The base
+    # descriptor spawns from {staged} — the vendored, hash-verified copy
+    # (review finding 3).
     def descriptor(**overrides):
         base = {
             "command": "node",
-            "args": ["server.js"],
+            "args": ["{staged}/mcp/docs/server.js"],
             "env": {"CACHE_MODE": "memory"},
             "tools": [{"name": "search", "mode": "read"}],
             "domains": ["docs.example.com"],
@@ -590,7 +604,10 @@ def test_ac_5(tmp_path: Path):
     assert options.strict_mcp_config is True
     server = options.mcp_servers["docs"]
     assert server["command"] == "node"
-    assert server["args"] == ["server.js"]
+    # The {staged} placeholder is substituted with the staged root at
+    # build time (review finding 3): the spawn runs the vendored,
+    # hash-verified copy, not an ambient path.
+    assert server["args"] == [f"{staged}/mcp/docs/server.js"]
     assert server["env"] == {"CACHE_MODE": "memory"}  # exactly the descriptor's
     tools = [t for t in options.allowed_tools if t.startswith("mcp__docs__")]
     assert sorted(tools) == ["mcp__docs__fetch_doc", "mcp__docs__search"]
@@ -1048,3 +1065,244 @@ def test_report_path_cannot_escape_the_toolkit_dir(tmp_path: Path):
     _write_index(toolkit, [escape])
     with pytest.raises(ToolkitError, match="report"):
         load_index(toolkit)
+
+
+# ------------------- owner review round on PR #77 (4 findings, red-first) ---
+
+# Finding 2's live reproduction first proved the gap off-suite: one tiny
+# real turn through run_session (the f06 in-process seam — NOT
+# test_f06's ac_3/ac_4) with a stub stdio MCP server advertising a
+# listed read tool and an UNLISTED write tool. Pre-fix, on head 1b7e9c8:
+# {"status": "completed", "permission_denials": [], "result": "done",
+#  "marker_exists_after": true} — the model called the unlisted tool,
+# nothing denied it, the stub executed. bypassPermissions pre-approves
+# via allowed_tools and restricts nothing: the grant list alone cannot
+# enforce AC-5's "enabled one by one". The test below pins the
+# enforcement that closes it (a PreToolUse deny hook — deny hooks still
+# block under bypassPermissions, F-06's established fact).
+
+
+def test_review2_unlisted_mcp_tools_are_denied_builtins_untouched(
+        tmp_path: Path):
+    """Finding 2: under bypassPermissions, ``allowed_tools`` grants
+    nothing enforceable — a deny hook must refuse every ``mcp__`` call
+    whose (server, tool) pair the seat's toolkit never listed, while
+    listed tools, the vent tool and every built-in tool pass."""
+    import asyncio
+
+    from factory.vent import VentCollector
+
+    toolkit, skill, mcp = _toolkit_with(tmp_path)
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    spec = {"staged": str(staged), "items": [skill, mcp]}
+    options = build_options(
+        "implementer", tmp_path, 5,
+        base_url="https://api.z.ai/api/anthropic", token="t",
+        vent_collector=VentCollector(run_id="r", task_id="t",
+                                     seat="implementer"),
+        toolkit=spec,
+    )
+    mcp_hooks = [hm for hm in options.hooks["PreToolUse"]
+                 if hm.matcher and hm.matcher.startswith("mcp__")]
+    assert mcp_hooks, "no MCP guard hook is wired into the session options"
+
+    async def decision(tool_name: str) -> str:
+        verdicts = []
+        for matcher in mcp_hooks:
+            for callback in matcher.hooks:
+                verdict = await callback(
+                    {"tool_name": tool_name, "tool_input": {}}, None, {})
+                if verdict:
+                    verdicts.append(verdict)
+        assert len(verdicts) <= 1, "one deny is enough; no stacking"
+        out = verdicts[0] if verdicts else {}
+        decision_value = (out.get("hookSpecificOutput") or {}).get(
+            "permissionDecision")
+        return decision_value or "allow"
+
+    # Unlisted tools of a listed server are denied — the exact live
+    # reproduction's shape (docs advertises write_doc at runtime; the
+    # descriptor never listed it).
+    assert asyncio.run(decision("mcp__docs__write_doc")) == "deny"
+    # Tools of a server that is not in the seat's toolkit at all.
+    assert asyncio.run(decision("mcp__ghost__read")) == "deny"
+    # Malformed mcp names never match a grant.
+    assert asyncio.run(decision("mcp__docs")) == "deny"
+    assert asyncio.run(decision("mcp__vent__evil")) == "deny"
+    # Listed tools of toolkit servers pass…
+    assert asyncio.run(decision("mcp__docs__search")) == "allow"
+    assert asyncio.run(decision("mcp__docs__fetch_doc")) == "allow"
+    # …the vent tool (an in-process server, not a toolkit one) passes…
+    assert asyncio.run(decision("mcp__vent__vent")) == "allow"
+    # …and built-in tools are untouched by this hook.
+    assert asyncio.run(decision("Bash")) == "allow"
+    assert asyncio.run(decision("Write")) == "allow"
+
+
+def test_review1_symlinks_and_non_regular_files_refused_everywhere(
+        tmp_path: Path):
+    """Finding 1: a vendored symlink (file or dir) or any non-regular
+    file is refused at vet (its own class), at load, and at staging —
+    and the link target's content never reaches the staged copy or a
+    content hash. Pre-fix, ``rglob``+``is_file`` and ``copytree``
+    (symlinks=False) both FOLLOWED the link: the staged copy held the
+    outside file's content as a regular file, readable by the session."""
+    import os
+
+    from factory.toolkit import ToolkitError
+
+    outside = tmp_path / "outside" / "secret-notes.md"
+    outside.parent.mkdir(parents=True)
+    outside.write_text("OUTSIDE-CONTENT-MARKER\n")
+
+    # --- vet: a symlinked file is a finding of its own class, and the
+    # link target's content never enters the candidate's content hash.
+    cand = tmp_path / "cand-link"
+    cand.mkdir()
+    (cand / "LICENSE").write_text(MIT)
+    (cand / "SKILL.md").write_text(SKILL_MD)
+    (cand / "link.txt").symlink_to(outside)
+    result = vet_candidate(cand, allowlists=ALLOW)
+    links = [f for f in result.findings if f.cls == "symlink"]
+    assert any(f.file == "link.txt" for f in links), result.findings
+    # Hashed like the link never existed: exactly the regular files —
+    # the link target's content never enters the hash.
+    assert result.content_hash == _content_hash({
+        "LICENSE": _sha((cand / "LICENSE").read_bytes()),
+        "SKILL.md": _sha((cand / "SKILL.md").read_bytes()),
+    })
+
+    # --- vet: a symlinked directory and a fifo are findings too.
+    real_dir = tmp_path / "real-dir"
+    real_dir.mkdir()
+    (real_dir / "x.md").write_text("x\n")
+    cand2 = tmp_path / "cand-dirlink"
+    cand2.mkdir()
+    (cand2 / "LICENSE").write_text(MIT)
+    (cand2 / "SKILL.md").write_text(SKILL_MD)
+    (cand2 / "sub").symlink_to(real_dir)
+    result = vet_candidate(cand2, allowlists=ALLOW)
+    assert any(f.cls == "symlink" and f.file == "sub" for f in result.findings)
+
+    cand3 = tmp_path / "cand-fifo"
+    cand3.mkdir()
+    (cand3 / "LICENSE").write_text(MIT)
+    (cand3 / "SKILL.md").write_text(SKILL_MD)
+    os.mkfifo(cand3 / "pipe")
+    result = vet_candidate(cand3, allowlists=ALLOW)
+    assert any(f.cls == "symlink" and f.file == "pipe" for f in result.findings)
+
+    # --- load: a vendored item carrying a symlink refuses the index,
+    # the link named.
+    toolkit, skill, mcp = _toolkit_with(tmp_path / "tk1")
+    (toolkit / "skills" / "demo-skill" / "link.txt").symlink_to(outside)
+    with pytest.raises(ToolkitError, match="link.txt"):
+        load_index(toolkit)
+
+    # --- stage: refusing pre-copy, nothing staged — the outside
+    # content never appears in any staged copy.
+    toolkit2, skill2, mcp2 = _toolkit_with(tmp_path / "tk2")
+    resolved = {
+        "root": str(toolkit2),
+        "items": [skill2, mcp2],
+    }
+    (toolkit2 / "mcp" / "docs" / "link.txt").symlink_to(outside)
+    dest = tmp_path / "staged-out"
+    with pytest.raises(ToolkitError, match="link.txt"):
+        stage_toolkit(resolved, dest)
+    assert not dest.exists()
+    assert not list(tmp_path.glob("staged-out/**/*"))
+
+
+def test_review3_mcp_spawn_must_run_hash_verified_vendored_content(
+        tmp_path: Path):
+    """Finding 3: the pin was declarative. A descriptor whose command
+    fetches at spawn (npx/uvx/bunx/pipx/pip install/curl/wget/ssh) is
+    refused, and so is one that never references ``{staged}`` — the
+    server must run from the vendored, hash-verified copy inside the
+    staged toolkit, so the index pin describes what actually executes."""
+    from factory.toolkit import ToolkitError, vet_descriptor
+
+    def descriptor(**overrides):
+        base = {
+            "command": "node",
+            "args": ["{staged}/mcp/docs/server.js"],
+            "env": {"CACHE_MODE": "memory"},
+            "tools": [{"name": "search", "mode": "read"}],
+            "domains": ["docs.example.com"],
+        }
+        base.update(overrides)
+        return base
+
+    # Fetch-runners refuse, the runner named.
+    for command, args in (
+        ("npx", ["-y", "docs-server@1.2.3"]),
+        ("uvx", ["docs-server"]),
+        ("bunx", ["docs-server"]),
+        ("pipx", ["run", "docs-server"]),
+        ("pip", ["install", "docs-server"]),
+        ("python", ["-m", "pip", "install", "docs-server"]),
+        ("curl", ["-sSL", "https://get.docs.example/server.sh"]),
+        ("wget", ["https://get.docs.example/server.sh"]),
+        ("ssh", ["host", "docs-server"]),
+    ):
+        reasons = vet_descriptor(descriptor(command=command, args=args),
+                                 allowlists=ALLOW)
+        assert any(command in r for r in reasons), (command, reasons)
+
+    # A spawn that never touches the staged copy refuses: an ambient
+    # install is unpinned by construction.
+    reasons = vet_descriptor(descriptor(args=["/usr/local/server.js"]),
+                             allowlists=ALLOW)
+    assert any("{staged}" in r for r in reasons), reasons
+
+    # The vendored form passes.
+    assert vet_descriptor(descriptor(), allowlists=ALLOW) == []
+
+    # The index holds the same line: a fetch-runner entry refuses at
+    # load.
+    toolkit = tmp_path / "toolkit"
+    fetcher = _make_mcp(toolkit, name="fetcher")
+    fetcher["mcp"]["command"] = "npx"
+    fetcher["mcp"]["args"] = ["-y", "docs-server@1.2.3"]
+    _write_reports(toolkit, [fetcher])
+    _write_index(toolkit, [fetcher])
+    with pytest.raises(ToolkitError, match="npx"):
+        load_index(toolkit)
+
+
+def test_review4_staged_copy_is_reverified_after_staging(tmp_path: Path):
+    """Finding 4: resolve verified the source once; the copy was never
+    checked. stage_toolkit now verifies the source before copying AND
+    the staged copy against the index hashes after — a mutation between
+    resolve and stage (or during the copy) refuses, and no partial
+    staged tree survives."""
+    from factory.toolkit import ToolkitError
+
+    toolkit, skill, mcp = _toolkit_with(tmp_path)
+    profile = yaml.safe_load(_profile(tmp_path, {
+        "skills": ["demo-skill"], "plugins": [], "mcp_servers": ["docs"],
+    }).read_text())
+    resolved = resolve_toolkit(profile, "implementer", toolkit_root=toolkit)
+
+    # Mutate the source after resolve, before stage.
+    (toolkit / "skills" / "demo-skill" / "SKILL.md").write_text(
+        SKILL_MD + "swapped after resolve\n"
+    )
+    dest = tmp_path / "staged-review4"
+    with pytest.raises(ToolkitError, match="SKILL.md"):
+        stage_toolkit(resolved, dest)
+    assert not dest.exists(), "a refused stage leaves no partial copy"
+
+    # Happy path: the staged copy's per-file hashes equal the index's
+    # (recomputed on the copy itself, not trusted from the source).
+    toolkit2, skill2, mcp2 = _toolkit_with(tmp_path / "tk-ok")
+    profile2 = yaml.safe_load(_profile(tmp_path / "tk-ok", {
+        "skills": ["demo-skill"], "plugins": [], "mcp_servers": ["docs"],
+    }).read_text())
+    resolved2 = resolve_toolkit(profile2, "implementer",
+                                toolkit_root=toolkit2)
+    staged2 = stage_toolkit(resolved2, tmp_path / "staged-ok")
+    assert _hash_tree(staged2 / "skills" / "demo-skill") == skill2["files"]
+    assert _hash_tree(staged2 / "mcp" / "docs") == mcp2["files"]
