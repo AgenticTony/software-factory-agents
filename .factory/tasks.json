@@ -1115,7 +1115,8 @@
         "F-16",
         "F-22",
         "F-27",
-        "F-28"
+        "F-28",
+        "F-41"
       ],
       "risk": [
         "cross_repo"
@@ -3262,6 +3263,76 @@
           "check": {
             "type": "test",
             "ref": "tests/test_f40.py::test_ac_4"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 100,
+        "wall_clock_min": 60
+      }
+    },
+    {
+      "id": "F-41",
+      "title": "Final full review after fix rounds",
+      "source": "BUILD-ORDER.md#f-41--final-full-review-after-fix-rounds",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-23",
+        "F-38"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "When an attempt's fix rounds have ended in an L2 pass and at least one earlier L2 round ran in that attempt, the orchestrator runs one final full review before publish: the configured N reviewers in fresh contexts over the complete `base...head` diff, with no delta section and no carried-findings suppression, then the verifier vote. A task that passes L2 on its first round skips it, because that review was already full.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f41.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "The F-23 out-of-delta drop does not apply to the final review: a finding in a file the fix rounds never touched stands without a `missed_earlier` field. Only surviving `blocking` or `major` findings fail it. `minor` and `note` findings never fail it and reach the PR body within the nit budget.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f41.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "A failed final review sends its findings to one more implementer round, followed by L0, L1 and a repeat of the final review. The repeat count is bounded by a config value (default 1). When it is exhausted the task escalates `review_not_converging`: nothing is published with an unresolved blocking or major finding.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f41.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "The final review sits inside the attempt's turn and wall-clock budgets, sharing F-38's per-session turn rule. When the remaining budget can't fit it, the task escalates `budget_exhausted`: a run never skips the final review to publish in time.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f41.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "The attempt record and the F-30 trace show that the final review ran, its findings and its verdict. An end-to-end scripted test proves the gap this closes: a fix round breaks untested code in a file outside its delta, the delta review misses it, the final review catches it, and no PR opens until it is fixed.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f41.py::test_ac_5"
           }
         }
       ],
