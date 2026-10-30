@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-30T10:47:01Z",
+  "updated_at": "2026-10-30T15:18:24Z",
   "tasks": [
     {
       "id": "F-00",
@@ -1259,7 +1259,7 @@
       "source": "BUILD-ORDER.md#f-16--seeded-bug-validator-eval",
       "kind": "build",
       "priority": "P2",
-      "status": "draft",
+      "status": "in_review",
       "depends_on": [
         "F-07",
         "F-08",
@@ -1304,12 +1304,287 @@
         "max_turns": 200,
         "wall_clock_min": 150
       },
-      "attempts": [],
-      "links": {},
+      "attempts": [
+        {
+          "run_id": "20261030T120742Z-75e6df",
+          "slice_id": "F-16",
+          "started": "2026-10-30T12:07:44Z",
+          "ended": "2026-10-30T12:53:51Z",
+          "outcome": "fail",
+          "rounds": 1,
+          "turns": 109,
+          "input_tokens": 134117,
+          "output_tokens": 61779,
+          "prompt_versions": {
+            "implementer": "de4a232caf51b7dce0c425dfd31c405cb4fd5a01931957dae2d6a5c300e19a92",
+            "reviewer-1": "50d130484979b08c9f579a704d1c5dc1b56e89ce8a0683f0a967be887dd35a48",
+            "reviewer-2": "50d130484979b08c9f579a704d1c5dc1b56e89ce8a0683f0a967be887dd35a48",
+            "verifier": "18be46e80ac4f70221f3de383c1bf37edf6cebf32aaa4bb5f4fd922016cd184c"
+          },
+          "skills": [],
+          "model": "implementer=claude-opus-5-5",
+          "validator_report": "/Users/anthonyforan/factory/reports/software-factory/F-16/20261030T120742Z-75e6df-a1.json",
+          "sentinels": [
+            {
+              "name": "assertion_removed",
+              "kind": "builtin",
+              "verdict": "pass"
+            },
+            {
+              "name": "credential_added",
+              "kind": "builtin",
+              "verdict": "pass"
+            },
+            {
+              "name": "lint_suppression_added",
+              "kind": "builtin",
+              "verdict": "pass",
+              "detail": "no risk path touched"
+            },
+            {
+              "name": "skip_marker_added",
+              "kind": "builtin",
+              "verdict": "pass"
+            }
+          ]
+        },
+        {
+          "run_id": "20261030T120742Z-75e6df",
+          "slice_id": "F-16",
+          "started": "2026-10-30T12:53:51Z",
+          "ended": "2026-10-30T13:13:39Z",
+          "outcome": "fail",
+          "rounds": 2,
+          "turns": 44,
+          "input_tokens": 37612,
+          "output_tokens": 7254,
+          "prompt_versions": {
+            "implementer": "de4a232caf51b7dce0c425dfd31c405cb4fd5a01931957dae2d6a5c300e19a92",
+            "reviewer-1": "50d130484979b08c9f579a704d1c5dc1b56e89ce8a0683f0a967be887dd35a48",
+            "reviewer-2": "50d130484979b08c9f579a704d1c5dc1b56e89ce8a0683f0a967be887dd35a48",
+            "verifier": "18be46e80ac4f70221f3de383c1bf37edf6cebf32aaa4bb5f4fd922016cd184c"
+          },
+          "skills": [],
+          "model": "implementer=claude-opus-5-5",
+          "validator_report": "/Users/anthonyforan/factory/reports/software-factory/F-16/20261030T120742Z-75e6df-a2.json",
+          "sentinels": [
+            {
+              "name": "assertion_removed",
+              "kind": "builtin",
+              "verdict": "pass"
+            },
+            {
+              "name": "credential_added",
+              "kind": "builtin",
+              "verdict": "pass"
+            },
+            {
+              "name": "lint_suppression_added",
+              "kind": "builtin",
+              "verdict": "pass",
+              "detail": "no risk path touched"
+            },
+            {
+              "name": "skip_marker_added",
+              "kind": "builtin",
+              "verdict": "pass"
+            }
+          ]
+        },
+        {
+          "run_id": "20261030T120742Z-75e6df",
+          "slice_id": "F-16",
+          "started": "2026-10-30T13:13:39Z",
+          "ended": "2026-10-30T13:35:52Z",
+          "outcome": "escalated",
+          "rounds": 3,
+          "turns": 55,
+          "input_tokens": 66249,
+          "output_tokens": 16356,
+          "prompt_versions": {
+            "implementer": "de4a232caf51b7dce0c425dfd31c405cb4fd5a01931957dae2d6a5c300e19a92",
+            "reviewer-1": "50d130484979b08c9f579a704d1c5dc1b56e89ce8a0683f0a967be887dd35a48",
+            "reviewer-2": "50d130484979b08c9f579a704d1c5dc1b56e89ce8a0683f0a967be887dd35a48",
+            "verifier": "18be46e80ac4f70221f3de383c1bf37edf6cebf32aaa4bb5f4fd922016cd184c"
+          },
+          "skills": [],
+          "model": "implementer=claude-opus-5-5",
+          "validator_report": "/Users/anthonyforan/factory/reports/software-factory/F-16/20261030T120742Z-75e6df-a3.json",
+          "escalation": "attempts_exhausted",
+          "sentinels": [
+            {
+              "name": "assertion_removed",
+              "kind": "builtin",
+              "verdict": "pass"
+            },
+            {
+              "name": "credential_added",
+              "kind": "builtin",
+              "verdict": "pass"
+            },
+            {
+              "name": "lint_suppression_added",
+              "kind": "builtin",
+              "verdict": "pass",
+              "detail": "no risk path touched"
+            },
+            {
+              "name": "skip_marker_added",
+              "kind": "builtin",
+              "verdict": "pass"
+            }
+          ]
+        },
+        {
+          "run_id": "20261030T134446Z-f57b83",
+          "slice_id": "F-16",
+          "started": "2026-10-30T13:44:48Z",
+          "ended": "2026-10-30T14:43:05Z",
+          "outcome": "fail",
+          "rounds": 1,
+          "turns": 163,
+          "input_tokens": 193293,
+          "output_tokens": 79066,
+          "prompt_versions": {
+            "implementer": "de4a232caf51b7dce0c425dfd31c405cb4fd5a01931957dae2d6a5c300e19a92",
+            "reviewer-1": "50d130484979b08c9f579a704d1c5dc1b56e89ce8a0683f0a967be887dd35a48",
+            "reviewer-2": "50d130484979b08c9f579a704d1c5dc1b56e89ce8a0683f0a967be887dd35a48",
+            "verifier": "18be46e80ac4f70221f3de383c1bf37edf6cebf32aaa4bb5f4fd922016cd184c"
+          },
+          "skills": [],
+          "model": "implementer=claude-opus-5-5 reviewer=claude-opus-5-5 reviewer=claude-opus-5-5",
+          "validator_report": "/Users/anthonyforan/factory/reports/software-factory/F-16/20261030T134446Z-f57b83-a1.json",
+          "sentinels": [
+            {
+              "name": "assertion_removed",
+              "kind": "builtin",
+              "verdict": "pass"
+            },
+            {
+              "name": "credential_added",
+              "kind": "builtin",
+              "verdict": "pass"
+            },
+            {
+              "name": "lint_suppression_added",
+              "kind": "builtin",
+              "verdict": "pass",
+              "detail": "no risk path touched"
+            },
+            {
+              "name": "skip_marker_added",
+              "kind": "builtin",
+              "verdict": "pass"
+            }
+          ]
+        },
+        {
+          "run_id": "20261030T134446Z-f57b83",
+          "slice_id": "F-16",
+          "started": "2026-10-30T14:43:05Z",
+          "ended": "2026-10-30T15:18:18Z",
+          "outcome": "pass",
+          "rounds": 2,
+          "turns": 77,
+          "input_tokens": 180722,
+          "output_tokens": 35549,
+          "prompt_versions": {
+            "implementer": "de4a232caf51b7dce0c425dfd31c405cb4fd5a01931957dae2d6a5c300e19a92",
+            "reviewer-1": "50d130484979b08c9f579a704d1c5dc1b56e89ce8a0683f0a967be887dd35a48",
+            "reviewer-2": "50d130484979b08c9f579a704d1c5dc1b56e89ce8a0683f0a967be887dd35a48",
+            "verifier": "18be46e80ac4f70221f3de383c1bf37edf6cebf32aaa4bb5f4fd922016cd184c"
+          },
+          "skills": [],
+          "model": "implementer=claude-opus-5-5 reviewer=claude-opus-5-5 reviewer=claude-opus-5-5",
+          "validator_report": "/Users/anthonyforan/factory/reports/software-factory/F-16/20261030T134446Z-f57b83-a2.json",
+          "pr": "https://github.com/AgenticTony/software-factory-agents/pull/82",
+          "sentinels": [
+            {
+              "name": "assertion_removed",
+              "kind": "builtin",
+              "verdict": "pass"
+            },
+            {
+              "name": "credential_added",
+              "kind": "builtin",
+              "verdict": "pass"
+            },
+            {
+              "name": "lint_suppression_added",
+              "kind": "builtin",
+              "verdict": "pass",
+              "detail": "no risk path touched"
+            },
+            {
+              "name": "skip_marker_added",
+              "kind": "builtin",
+              "verdict": "pass"
+            }
+          ],
+          "review_drops": [
+            {
+              "text": "Sibling site of the carried n/a-not-zero finding, surviving after the fix: when L2 is skipped, the seed rows print \"NOT CAUGHT (expected L2)\" (eval.py:738) and the rate table prints \"L2: 0% (0 of N seeds)\" (eval.py:753-754) — measured negatives about a layer that never ran, quoted standalone as AC-3 tick evidence. The header's \"L2: skipped\" only helps a reader who keeps the two lines together. Same treatment as the clean row: n/a (L2 skipped) for the affected rows, or omit the L2 rate row. missed_earlier: the prior round's own finding text explicitly called the seed path \"honest\" (empty caught_by → NOT CAUGHT), which masked this sibling; the delta's n/a fix named the display-honesty class, making the sibling visible.",
+              "reason": "nit_budget",
+              "id": "U-5",
+              "axis": "standards",
+              "severity": "minor",
+              "file": "factory/eval.py",
+              "line": 738,
+              "reported_by": [
+                2
+              ]
+            },
+            {
+              "text": "Carried finding (orchestrator privates reached across modules: orchestrator._review_prompt at eval.py:626, _verifier_prompt at eval.py:643, _gate_settings at eval.py:819) — still stands. What changed: the delta added a comment (eval.py:801-805) justifying the reach-ins as drift-proof and deferring promotion of public entry points to an owner change on the protected path. The rationale is coherent, but the structure is unchanged: any rename inside orchestrator.py still breaks the monthly eval at import/call time, and the comment documents the debt rather than paying it.",
+              "reason": "nit_budget",
+              "id": "U-6",
+              "axis": "standards",
+              "severity": "minor",
+              "file": "factory/eval.py",
+              "line": 801,
+              "reported_by": [
+                2
+              ]
+            },
+            {
+              "text": "Carried feature-envy finding re-raised after the delta: the reach-ins (orchestrator._review_prompt, _verifier_prompt, _gate_settings) are unchanged in code — the delta adds only a comment declaring them deliberate, on the grounds that promoting them means editing orchestrator.py, a protected path. The governance argument is valid, but the exposure stands: any rename inside orchestrator silently breaks the monthly eval until an owner PR follows; today the F-16 suite contains that risk, and it should be named in the owner step when the promotion eventually happens.",
+              "reason": "nit_budget",
+              "id": "U-3",
+              "axis": "standards",
+              "severity": "note",
+              "file": "factory/eval.py",
+              "line": 791,
+              "reported_by": [
+                1
+              ]
+            }
+          ]
+        }
+      ],
+      "links": {
+        "pr": "https://github.com/AgenticTony/software-factory-agents/pull/82",
+        "branch": "factory/f-16-20261030t134446z-f57b83",
+        "revalidated": {
+          "pr": "c7e83e5ae11d0d5a0d8e3b25846c123db2837ddb",
+          "default": "75c64da94c960b964f22601ffd20d485f3c80228"
+        }
+      },
       "owner_steps": [
         {
           "text": "Run the AC-3 eval once on demand after F-16 merges and record its per-diff report (seeded bug caught or not; blocking findings per known-clean diff) as the tick evidence.",
           "done": false
+        }
+      ],
+      "acceptance_hash": "4c263cadb68bfe326f84db5b7bdf05e94eb7289d2adccd16260ded6bd9c7933d",
+      "approved_at": "2026-10-30T12:07:11Z",
+      "approved_by": "Anthony",
+      "attempt_resets": [
+        {
+          "at": "2026-10-30T13:44:36Z",
+          "evidence": "attempts 2-3 passed L0/L1 then crashed at L2: fan-out scratch unreadable under denied home, fixed in #80",
+          "done_by": "Anthony",
+          "slice_id": "F-16",
+          "prior_attempts": 3
         }
       ]
     },
@@ -2234,7 +2509,7 @@
       "source": "BUILD-ORDER.md#f-31--read-only-dashboard-factory-dashboard",
       "kind": "build",
       "priority": "P2",
-      "status": "needs_human",
+      "status": "ready",
       "depends_on": [
         "F-11",
         "F-30"
@@ -2420,7 +2695,16 @@
       "links": {},
       "acceptance_hash": "e656d126458f306bde9c876b6dc8ec179f369b7aa62caacc5c4352a1b4a24084",
       "approved_at": "2026-10-29T09:09:09Z",
-      "approved_by": "Anthony"
+      "approved_by": "Anthony",
+      "attempt_resets": [
+        {
+          "at": "2026-10-30T12:07:28Z",
+          "evidence": "all 3 attempts lost to environment bugs: venv SDK (#73), Bash EPERM + host setup (#74), local port binding (#76)",
+          "done_by": "Anthony",
+          "slice_id": "F-31",
+          "prior_attempts": 3
+        }
+      ]
     },
     {
       "id": "F-32",
@@ -2809,7 +3093,7 @@
       "source": "BUILD-ORDER.md#f-38--parallel-review-with-verifier-voting",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-09",
         "F-23"
@@ -2871,7 +3155,10 @@
         "wall_clock_min": 150
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "acceptance_hash": "73341fb8c4a11450774948be55d41f72b2ecab08e1a33a1813deb5cecdc08872",
+      "approved_at": "2026-10-30T12:06:49Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-39",
@@ -2914,6 +3201,67 @@
           "check": {
             "type": "test",
             "ref": "tests/test_f39.py::test_ac_3"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 100,
+        "wall_clock_min": 60
+      }
+    },
+    {
+      "id": "F-40",
+      "title": "Profile-declared toolchain",
+      "source": "BUILD-ORDER.md#f-40--profile-declared-toolchain",
+      "kind": "build",
+      "priority": "P2",
+      "status": "draft",
+      "depends_on": [
+        "F-05"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "`project.yaml` gains an optional `toolchain` list (schema-validated, red-first): each entry is a binary name resolved on PATH, or an absolute or `~/` path to a binary or SDK `bin` directory. Absent, the sandbox's defaults are exactly today's `TOOLCHAIN_BINS`, proven by an unchanged-settings test.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f40.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Profile load refuses an entry that is `$HOME` itself, an ancestor of it, or inside a credential location (`~/.ssh`, `~/.aws`, `~/.config/gh`, `~/.gnupg`), naming the entry. A relative path or an entry that resolves to nothing is refused the same way.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f40.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "A profile-listed tool under the denied home executes in the gate runner AND every session seat, proven on real srt with a fixture tool under a denied HOME, while a sibling file beside the tool's install stays unreadable: only what `_toolchain_allowread` re-allows becomes readable, never the parent. Nothing is added to `allowWrite`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f40.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "The gate runner's run-local venv stays Python-only in effect: a profile with no Python commands still gates end to end through the real runner (fixture project whose setup, lint and test use only the listed tool).",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f40.py::test_ac_4"
           }
         }
       ],
