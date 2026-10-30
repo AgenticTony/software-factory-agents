@@ -106,6 +106,7 @@ from factory.sandbox import (
 )
 from factory.state import now_iso
 from factory.toolkit import (
+    ENV_SCRUB,
     STAGED_PLACEHOLDER,
     TOOLKIT_PLUGIN_NAME,
     stage_toolkit,
@@ -832,7 +833,14 @@ def _apply_toolkit(options: ClaudeAgentOptions, toolkit: dict) -> None:
                 "command": staged_path(str(descriptor["command"])),
                 "args": [staged_path(str(arg))
                          for arg in descriptor.get("args") or []],
-                "env": dict(descriptor.get("env") or {}),
+                # Review round 3: the CLI merges this env over its own
+                # for the child (config wins — the SDK passes this dict
+                # verbatim via --mcp-config), so ENV_SCRUB's inert
+                # neutralizers beat any control variable that rode the
+                # session env, and the descriptor's admitted (inert)
+                # keys ride on top. Exactly these names cross: scrub +
+                # admitted, nothing else.
+                "env": {**ENV_SCRUB, **dict(descriptor.get("env") or {})},
             }
             for tool in descriptor.get("tools") or []:
                 allowed.append(f"mcp__{item['name']}__{tool['name']}")

@@ -32,10 +32,16 @@ allowlists are per project). The spawn itself is an ALLOWLIST (see
 allowed interpreter running a ``{staged}/...`` script as its first
 operand — never a fetch-at-spawn command, a shell, a code/module flag
 or a URL argument, so the index pin describes exactly what executes.
+The descriptor's env is an allowlist too (see :func:`_env_reasons`):
+inert keys only (locale/zone/color/verbosity), path-free values — env
+is a code-injection channel like any other (``NODE_OPTIONS --require``,
+``PYTHONPATH``), and the child's cwd is the implementer-written clone.
 At session time the runner spawns them from the staged descriptor —
 inside the F-05 sandbox, everything the runner spawns is confined —
 with each tool granted one by one and enforced by the session's MCP
-guard hook (a deny hook still blocks under ``bypassPermissions``).
+guard hook (a deny hook still blocks under ``bypassPermissions``), and
+the child's env neutralized over the CLI's merge (see
+:data:`ENV_SCRUB`).
 
 Content addressing: an item's ``content_hash`` is sha256 over the sorted
 ``(relpath, per-file sha256)`` pairs of its vendored dir; attempts
@@ -550,6 +556,80 @@ _CODE_FLAGS = frozenset({
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ash", "fish", "ksh",
                      "env"})
 _URL_PREFIXES = ("http://", "https://", "ftp://", "ws://", "wss://")
+
+# --- descriptor env allowlist (review round 3 on PR #77) ------------------
+# The spawn allowlist closed argv, but ENV is a code-injection channel
+# of its own: NODE_OPTIONS carries --require, PYTHONPATH/PYTHONSTARTUP
+# load from wherever they point, LD_*/DYLD_* preload — and the child's
+# cwd is the run clone the implementer writes, so relative paths run
+# planted code. Env is an allowlist of INERT keys with path-free value
+# grammars, enforced at the same three layers as the spawn rule.
+#
+# Admitted keys, each justified:
+# * LANG / LC_* — locale identifiers (``sv_SE.UTF-8``); grammar has no
+#   separator, so no path can be spelled.
+# * TZ — an IANA zone name (``Europe/Stockholm``); slash-separated
+#   components of [A-Za-z0-9_+-] — dots excluded, so no ``..`` and no
+#   path outside the zone database's fixed root.
+# * NO_COLOR — the no-CLI-color convention switch ("" or any token).
+# * TERM — terminal identifier (``dumb``); the child's own TTY knobs.
+# * LOG_LEVEL / LOGLEVEL — a verbosity knob servers already use.
+# Every grammar excludes $ ~ { } \ and (but for TZ's dot-free
+# separators) / — so no path (outside {staged} or anywhere), no shell
+# expansion, no placeholder can ride a value.
+_ENV_LOCALE_RE = re.compile(r"^[A-Za-z0-9_@+-][A-Za-z0-9_@.+-]*$")
+_ENV_ZONE_RE = re.compile(r"^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$")
+_ENV_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]*$")
+_ENV_ADMITTED_KEYS = {
+    "LANG": _ENV_LOCALE_RE,
+    "TZ": _ENV_ZONE_RE,
+    "NO_COLOR": _ENV_TOKEN_RE,
+    "TERM": _ENV_TOKEN_RE,
+    "LOG_LEVEL": _ENV_TOKEN_RE,
+    "LOGLEVEL": _ENV_TOKEN_RE,
+}
+# Interpreter and loader control variables — every one is code or
+# module loading by another door; refused with the key named, and
+# neutralized at the session spawn (see ENV_SCRUB).
+_ENV_CONTROL_EXACT = frozenset({
+    "NODE_OPTIONS", "NODE_PATH", "NODE_EXTRA_CA_CERTS",
+    "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME", "PYTHONUSERBASE",
+    "PYTHONINSPECT", "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+    "BASH_ENV", "ENV", "PATH", "HOME",
+})
+_ENV_CONTROL_PREFIXES = ("PYTHON", "LD_", "DYLD_", "NODE_")
+
+# The session spawn's neutralizing values (review round 3): the CLI
+# merges the config env over its inherited environment for the MCP
+# child (config wins on conflicts — the SDK passes this dict verbatim
+# via --mcp-config), so each control variable gets an inert value that
+# beats anything inherited. Verified per-runtime on this stack: empty
+# NODE_OPTIONS adds no options (node execArgv unchanged); empty
+# PYTHONHOME/PYTHONSTARTUP/LD_PRELOAD/DYLD_*/BASH_ENV mean "none";
+# PYTHONPATH and PYTHONUSERBASE get a path the sandbox's write
+# allowlist (the run dir only) can never let exist — an EMPTY
+# PYTHONPATH would add the child's CWD, the implementer-written clone,
+# to sys.path, which is the exact injection this round closes.
+_NEVER_PATH = "/factory-mcp-scrub"
+ENV_SCRUB: dict[str, str] = {
+    "NODE_OPTIONS": "",
+    "NODE_PATH": "",
+    "NODE_EXTRA_CA_CERTS": "",
+    "PYTHONPATH": _NEVER_PATH,
+    "PYTHONSTARTUP": "",
+    "PYTHONHOME": "",
+    "PYTHONUSERBASE": _NEVER_PATH,
+    "PYTHONINSPECT": "",
+    "LD_PRELOAD": "",
+    "LD_LIBRARY_PATH": "",
+    "LD_AUDIT": "",
+    "DYLD_INSERT_LIBRARIES": "",
+    "DYLD_LIBRARY_PATH": "",
+    "BASH_ENV": "",
+    "ENV": "",
+}
+
 # The placeholder an admitted descriptor references: the vendored,
 # hash-verified copy inside the staged toolkit.
 STAGED_PLACEHOLDER = "{staged}"
@@ -679,12 +759,52 @@ def _spawn_reasons(mcp: dict) -> list[str]:
     return reasons
 
 
+def _env_reasons(env: dict | None) -> list[str]:
+    """Why a descriptor's env refuses admission (review round 3); empty
+    = admitted.
+
+    An allowlist of inert keys with path-free value grammars (see
+    :data:`_ENV_ADMITTED_KEYS`): locale/zone/color/verbosity knobs —
+    data, never code, never a path. Every interpreter or loader control
+    variable refuses with the key named (see :data:`_ENV_CONTROL_EXACT`
+    and the prefixes), and so does every key outside the allowlist:
+    fail closed, extend by review.
+    """
+    reasons: list[str] = []
+    for key, value in (env or {}).items():
+        grammar = _ENV_ADMITTED_KEYS.get(key)
+        if key.startswith("LC_"):
+            grammar = _ENV_LOCALE_RE
+        if grammar is None:
+            why = (
+                "an interpreter or loader control variable — code or "
+                "module loading by another door"
+                if key in _ENV_CONTROL_EXACT
+                or key.startswith(_ENV_CONTROL_PREFIXES)
+                else "not one of the inert keys (LANG, LC_*, TZ, "
+                     "NO_COLOR, TERM, LOG_LEVEL, LOGLEVEL)"
+            )
+            reasons.append(
+                f"env {key!r} refuses: {why}; the MCP child's "
+                "environment carries inert data only"
+            )
+        elif not grammar.match(str(value)):
+            reasons.append(
+                f"env {key!r} value {str(value)!r} fails its grammar — "
+                "values are identifiers and knobs, never paths (outside "
+                f"{STAGED_PLACEHOLDER} or anywhere), expansions or "
+                "placeholders"
+            )
+    return reasons
+
+
 def _descriptor_reasons(mcp: dict, allowlists: Sequence[str]) -> list[str]:
     """Why an MCP descriptor refuses admission (AC-5); empty = admitted.
 
     Read-only tools, no credentials in the environment, every domain
-    inside the allowlists, and a spawn that runs the vendored content
-    (no runtime fetch). The pinned version + integrity hash are
+    inside the allowlists, a spawn that runs the vendored content (no
+    runtime fetch), and an inert env allowlist (no control variables,
+    no paths in values). The pinned version + integrity hash are
     schema-checked on the index entry, not here.
     """
     reasons: list[str] = []
@@ -711,6 +831,7 @@ def _descriptor_reasons(mcp: dict, allowlists: Sequence[str]) -> list[str]:
                 f"domain {domain!r} is outside the project's allowlists"
             )
     reasons.extend(_spawn_reasons(mcp))
+    reasons.extend(_env_reasons(mcp.get("env")))
     if not reasons and not (mcp.get("tools") or []):
         reasons.append("descriptor declares no tools")
     return reasons

@@ -161,7 +161,10 @@ def _make_mcp(toolkit: Path, name: str = "docs",
         "mcp": {
             "command": "node",
             "args": [f"{{staged}}/mcp/{name}/server.js"],
-            "env": {"CACHE_MODE": "memory"},
+            # Admitted inert keys only (review round 3: descriptor env
+            # is an allowlist — CACHE_MODE-style knobs were never inert
+            # by construction, so the fixture uses the real admitted set).
+            "env": {"NO_COLOR": "1", "TZ": "Europe/Stockholm"},
             "tools": [
                 {"name": "search", "mode": "read"},
                 {"name": "fetch_doc", "mode": "read"},
@@ -535,7 +538,7 @@ def test_ac_5(tmp_path: Path):
         base = {
             "command": "node",
             "args": ["{staged}/mcp/docs/server.js"],
-            "env": {"CACHE_MODE": "memory"},
+            "env": {"NO_COLOR": "1"},
             "tools": [{"name": "search", "mode": "read"}],
             "domains": ["docs.example.com"],
         }
@@ -608,7 +611,10 @@ def test_ac_5(tmp_path: Path):
     # build time (review finding 3): the spawn runs the vendored,
     # hash-verified copy, not an ambient path.
     assert server["args"] == [f"{staged}/mcp/docs/server.js"]
-    assert server["env"] == {"CACHE_MODE": "memory"}  # exactly the descriptor's
+    # Exactly the descriptor's admitted keys, on top of the spawn's
+    # inert neutralizers (review round 3) — no other name crosses.
+    assert server["env"]["NO_COLOR"] == "1"
+    assert server["env"]["NODE_OPTIONS"] == "" and "CACHE_MODE" not in server["env"]
     tools = [t for t in options.allowed_tools if t.startswith("mcp__docs__")]
     assert sorted(tools) == ["mcp__docs__fetch_doc", "mcp__docs__search"]
     # The staged descriptor rides the read-only staged copy (AC-7's
@@ -1228,7 +1234,7 @@ def test_review3_mcp_spawn_must_run_hash_verified_vendored_content(
         base = {
             "command": "node",
             "args": ["{staged}/mcp/docs/server.js"],
-            "env": {"CACHE_MODE": "memory"},
+            "env": {"NO_COLOR": "1"},
             "tools": [{"name": "search", "mode": "read"}],
             "domains": ["docs.example.com"],
         }
@@ -1391,3 +1397,143 @@ def test_review6_file_hashes_refuse_links_at_the_choke_point(tmp_path: Path):
             file_hashes(tree)
         with pytest.raises(ToolkitError):
             content_hash_of(tree)
+
+
+# --------------- owner review round 3 on PR #77 (1 finding, red-first) ------
+
+
+def test_review7_descriptor_env_is_an_allowlist(tmp_path: Path):
+    """Finding (round 3): the spawn allowlist closed argv, but the
+    descriptor's ENV still injected code into the server process
+    (NODE_OPTIONS --require, PYTHONPATH, PYTHONSTARTUP, LD_PRELOAD) —
+    and the child's cwd is the run clone the implementer writes, so
+    relative variants run planted code too. Env is now an allowlist of
+    inert keys with path-free value grammars, enforced at the same
+    three layers as the spawn rule — vet, load, resolve."""
+    from factory.toolkit import ToolkitError, vet_descriptor
+
+    def spawn_env(env):
+        return vet_descriptor({
+            "command": "node",
+            "args": ["{staged}/mcp/docs/server.js"],
+            "env": env,
+            "tools": [{"name": "search", "mode": "read"}],
+            "domains": ["docs.example.com"],
+        }, allowlists=ALLOW)
+
+    # The reviewer's four probes plus relative variants and the rest of
+    # the interpreter/loader control set — each refused, key named.
+    refused = [
+        ("NODE_OPTIONS", "--require /tmp/evil.js"),
+        ("NODE_OPTIONS", "--require ./x.js"),
+        ("NODEPATH", "/tmp/mods"),  # typo-guard: near-miss key refuses too
+        ("NODE_PATH", "/tmp/mods"),
+        ("NODE_EXTRA_CA_CERTS", "/tmp/ca.pem"),
+        ("PYTHONPATH", "/tmp/evil"),
+        ("PYTHONPATH", "."),
+        ("PYTHONSTARTUP", "/tmp/evil.py"),
+        ("PYTHONSTARTUP", "./evil.py"),
+        ("PYTHONHOME", "/tmp"),
+        ("PYTHONUSERBASE", "/tmp"),
+        ("PYTHONINSPECT", "1"),
+        ("LD_PRELOAD", "/tmp/x.so"),
+        ("LD_PRELOAD", "./x.so"),
+        ("LD_LIBRARY_PATH", "/tmp"),
+        ("LD_AUDIT", "/tmp/x.so"),
+        ("DYLD_INSERT_LIBRARIES", "/tmp/x.so"),
+        ("DYLD_LIBRARY_PATH", "/tmp"),
+        ("BASH_ENV", "/tmp/evil.sh"),
+        ("ENV", "/tmp/evil.sh"),
+        ("PATH", "/tmp/bin"),
+        ("HOME", "/tmp/home"),
+    ]
+    for key, value in refused:
+        reasons = spawn_env({key: value})
+        assert reasons, (key, value)
+        assert any(key in r for r in reasons), (key, value, reasons)
+
+    # The admitted keys: locale/zone/color/verbosity knobs, inert data.
+    assert spawn_env({
+        "LANG": "sv_SE.UTF-8",
+        "LC_ALL": "C",
+        "TZ": "Europe/Stockholm",
+        "NO_COLOR": "1",
+        "TERM": "dumb",
+        "LOG_LEVEL": "debug",
+    }) == []
+
+    # Value grammar: no path (outside {staged} or anywhere), no
+    # expansions, no placeholder — a path in an inert key's value is a
+    # smuggle attempt, not a locale.
+    for key, value in [
+        ("LANG", "/tmp/evil"), ("LANG", "./x"), ("LANG", "${HOME}/x"),
+        ("TZ", "../etc"), ("TZ", "/etc/passwd"), ("TZ", "Europe/../x"),
+        ("NO_COLOR", "./x"), ("LOG_LEVEL", "/var/log/app"), ("TERM", "x;y"),
+    ]:
+        reasons = spawn_env({key: value})
+        assert reasons, (key, value)
+
+    # The same gate at load: an index entry whose descriptor env carries
+    # a control variable refuses, key named.
+    toolkit = tmp_path / "toolkit"
+    poisoned = _make_mcp(toolkit, name="poisoned")
+    poisoned["mcp"]["env"] = {"NODE_OPTIONS": "--require /tmp/evil.js"}
+    _write_reports(toolkit, [poisoned])
+    _write_index(toolkit, [poisoned])
+    with pytest.raises(ToolkitError, match="NODE_OPTIONS"):
+        load_index(toolkit)
+
+    # …and at resolve: a relative-path PYTHONPATH refuses against the
+    # running profile.
+    toolkit2, skill2, mcp2 = _toolkit_with(tmp_path / "tk2")
+    mcp2["mcp"]["env"] = {"PYTHONPATH": "."}
+    _write_index(toolkit2, [skill2, mcp2])
+    profile = yaml.safe_load(_profile(tmp_path / "tk2", {
+        "skills": [], "plugins": [], "mcp_servers": ["docs"],
+    }).read_text())
+    with pytest.raises(ToolkitError, match="PYTHONPATH"):
+        resolve_toolkit(profile, "implementer", toolkit_root=toolkit2)
+
+
+def test_review8_session_neutralizes_control_vars_in_the_mcp_child_env(
+        tmp_path: Path, monkeypatch):
+    """Finding (round 3), session side: whatever the CLI merges into the
+    MCP child's environment, the config env wins — so the spawn passes
+    inert neutralizing values for every interpreter/loader control
+    variable (verified per-runtime: empty NODE_OPTIONS adds no options;
+    PYTHONPATH=\"\" would add the child's CWD — the implementer-written
+    clone — so it gets a path the sandbox's write-allowlist can never
+    let exist) on top of the descriptor's admitted keys. Nothing else
+    crosses: the config env is exactly the scrub set plus the admitted
+    descriptor env."""
+    from factory.toolkit import ENV_SCRUB
+
+    # Control vars riding the parent (session) environment — the window
+    # and sandbox layers should never let these through, but the spawn
+    # boundary does not trust them either.
+    monkeypatch.setenv("NODE_OPTIONS", "--require /tmp/evil.js")
+    monkeypatch.setenv("PYTHONPATH", "/tmp/evil")
+    monkeypatch.setenv("LD_PRELOAD", "/tmp/x.so")
+
+    toolkit, skill, mcp = _toolkit_with(tmp_path)
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    spec = {"staged": str(staged), "items": [mcp]}
+    options = build_options(
+        "implementer", tmp_path, 5,
+        base_url="https://api.z.ai/api/anthropic", token="t", toolkit=spec,
+    )
+    child_env = options.mcp_servers["docs"]["env"]
+    # Neutralized: an inherited value loses the merge to these.
+    assert child_env["NODE_OPTIONS"] == ""
+    assert child_env["LD_PRELOAD"] == ""
+    assert child_env["PYTHONPATH"] == "/factory-mcp-scrub"
+    assert child_env["PYTHONUSERBASE"] == "/factory-mcp-scrub"
+    assert child_env["NODE_PATH"] == ""
+    assert child_env["BASH_ENV"] == ""
+    # The descriptor's admitted keys ride along unchanged…
+    assert child_env["NO_COLOR"] == "1"
+    assert child_env["TZ"] == "Europe/Stockholm"
+    # …and the config env is exactly scrub + admitted: no other name
+    # crosses this boundary, whatever the parent carried.
+    assert set(child_env) == set(ENV_SCRUB) | {"NO_COLOR", "TZ"}
