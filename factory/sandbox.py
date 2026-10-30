@@ -392,7 +392,8 @@ def build_settings(
 
     Args:
         profile: The loaded ``project.yaml`` (``docs_allowlist`` /
-            ``network_allowlist`` keys are read; both optional here).
+            ``network_allowlist`` / ``sandbox`` keys are read; all
+            optional here).
         run_dir: The session's run dir — the only writable, self-readable
             path inside the sandbox.
         model_endpoint: The seat's model endpoint (Z.ai base URL or bare
@@ -426,6 +427,30 @@ def build_settings(
     Raises:
         SandboxError: ``run_dir`` doesn't follow the canonical layout and no
             explicit ``factory_root`` was given.
+
+    ``sandbox.allow_local_binding: true`` (the profile opt-in, default
+    off — every seat funnels through here with the same profile, so it
+    covers implementer, reviewer and gate runner alike) sets srt's
+    ``network.allowLocalBinding``. What that flag actually permits, read
+    from the pinned srt source (node_modules/@anthropic-ai/sandbox-
+    runtime/dist/sandbox/macos-sandbox-utils.js):
+
+    - macOS (Seatbelt), three added rules:
+      ``(allow network-bind (local ip "*:*"))`` — bind() on ANY local
+      address/port, not loopback-only. The ``*`` is forced: Seatbelt
+      cannot express "localhost" for IPv4-mapped IPv6 sockets
+      (::ffff:127.0.0.1), so ``*:*`` is the only token that admits them.
+      ``(allow network-inbound (local ip "*:*"))`` — inbound accepted on
+      any local address/port; Seatbelt matches the local endpoint only,
+      so the ORIGIN is unrestricted (host processes, and off-host hosts
+      if the sandboxed code binds a non-loopback interface).
+      ``(allow network-outbound (remote ip "localhost:*"))`` — connect()
+      to 127.0.0.1/::1 on any port: host loopback services become
+      reachable. External-domain egress stays allowlisted through the
+      proxy in all cases.
+    - Linux (bubblewrap): the flag is never read — a no-op. The sandbox
+      is its own network namespace; TCP bind inside it already works and
+      nothing outside the namespace can reach those sockets.
     """
     run_dir = Path(run_dir).resolve()
     runs_root = run_dir.parent.parent
@@ -469,8 +494,14 @@ def build_settings(
     toolchain_reads = sorted(
         _toolchain_allowread(home, toolchain), key=str
     )
+    network: dict = {"allowedDomains": allowed_domains, "deniedDomains": []}
+    if (profile.get("sandbox") or {}).get("allow_local_binding"):
+        # Off by default: the key is absent unless the profile opts in,
+        # so srt's deny stays the default posture (see the docstring for
+        # exactly what the flag permits per platform).
+        network["allowLocalBinding"] = True
     return {
-        "network": {"allowedDomains": allowed_domains, "deniedDomains": []},
+        "network": network,
         "filesystem": {
             "denyRead": [
                 str(home),

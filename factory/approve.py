@@ -48,6 +48,7 @@ from factory.publish import PublishError
 from factory.runs import FACTORY_ROOT_DEFAULT
 from factory.state import (
     TaskQueue,
+    attempts_reset_eligible,
     credential_recovery_eligible,
     now_iso,
     open_owner_steps,
@@ -267,6 +268,7 @@ def recover_task(
     *,
     assume_yes: bool = False,
     evidence: str | None = None,
+    reset_attempts: bool = False,
     done_by: str | None = None,
     factory_root: Path | None = None,
     pr_state: Callable[[str], str] | None = None,
@@ -274,7 +276,8 @@ def recover_task(
     echo: Callable[[str], None] = print,
 ) -> str:
     """Queue a fix round for a parked escalation (F-26 round-5 finding 2;
-    credential_added re-queue per TASK-CONTRACT §credential_added).
+    credential_added re-queue per TASK-CONTRACT §credential_added;
+    attempts_exhausted budget reset per the F-31 fix review).
 
     ``factory recover`` is the owner's explicit fix-round word — the one
     recovery intent GitHub cannot express for a ``pr_closed`` task: its
@@ -295,6 +298,14 @@ def recover_task(
     evidence, ``done_by``, a timestamp) written after the state move —
     the audit trail, not just the terminal echo (review round on #74).
 
+    A task parked on ``attempts_exhausted`` (F-31: three attempts died
+    to a sandbox bug the code could never fix) exits the same
+    human-paced way, plus ``--reset-attempts``: the budget is spent, so
+    a plain re-queue would park the task straight back on the pre-run
+    guard. The reset deletes nothing — every attempt record stays — it
+    appends an ``attempt_resets`` marker and the budget counts only
+    attempts after it (:func:`factory.state.attempt_budget_used`).
+
     Refused — :class:`ApprovalError`, nothing written — when the task
     isn't parked on a recoverable escalation (the same gates the
     transitions enforce), or when GitHub does not report the PR
@@ -308,11 +319,17 @@ def recover_task(
         queue: The queue to write through (its only writer path).
         task_id: Task to recover.
         assume_yes: Skip the confirmation prompt (never allowed for a
-            credential_added task).
-        evidence: Required for a credential_added task: what the owner
-            checked; persisted in the task's progress log.
-        done_by: Who confirmed a credential recovery (default: the git
-            user, like ``factory tick``); recorded in the log entry.
+            credential_added or attempts_exhausted task).
+        evidence: Required for a credential_added or attempts_exhausted
+            task: what the owner checked; persisted in the task's
+            progress log.
+        reset_attempts: Required for an attempts_exhausted task: the
+            explicit budget grant. Without it the command refuses and
+            says why — the flag is the owner's acknowledgment that new
+            attempts are being spent.
+        done_by: Who confirmed a recovery (default: the git user, like
+            ``factory tick``); recorded in the log entry and the reset
+            marker.
         factory_root: Factory root for the progress log (default
             ``~/factory``).
         pr_state: GitHub PR-state seam (default
@@ -336,14 +353,21 @@ def recover_task(
             done_by=done_by, factory_root=factory_root,
             confirm=confirm, echo=echo,
         )
+    if attempts_reset_eligible(task):
+        return _recover_attempts_task(
+            queue, task_id, task, evidence=evidence, reset_attempts=reset_attempts,
+            assume_yes=assume_yes, done_by=done_by, factory_root=factory_root,
+            confirm=confirm, echo=echo,
+        )
     if not recovery_task_eligible(task):
         raise ApprovalError(
             f"{task_id}: not recoverable — only a stale_base/pr_closed "
-            "escalation holding a PR link, or a credential_added "
-            "escalation with --evidence, can take the fix-round edge. "
+            "escalation holding a PR link, a credential_added escalation "
+            "with --evidence, or an attempts_exhausted escalation with "
+            "--evidence and --reset-attempts, can take the fix-round edge. "
             "Re-open the PR on GitHub (the sweep returns it to in_review), "
-            "confirm the credential finding, or change the contract and "
-            "re-approve."
+            "confirm the credential finding, grant a fresh attempt budget, "
+            "or change the contract and re-approve."
         )
     url = task["links"]["pr"]
     state: str | None
@@ -440,6 +464,92 @@ def _recover_credential_task(
             "recovered_at": now_iso(),
             "note": f"credential_added re-queued ({new_status}) by "
                     f"{who}: {evidence.strip()}",
+        })
+    except ProgressLogError as exc:
+        raise ApprovalError(
+            f"{task_id}: moved to {new_status}, but the progress log could "
+            f"not be written — the confirmation is NOT durably recorded: {exc}"
+        ) from exc
+    assert entry.get("outcome") == "recovered"
+    return new_status
+
+
+def _recover_attempts_task(
+    queue: TaskQueue,
+    task_id: str,
+    task: dict,
+    *,
+    evidence: str | None,
+    reset_attempts: bool,
+    assume_yes: bool,
+    done_by: str | None,
+    factory_root: Path | None,
+    confirm: Callable[[str], bool],
+    echo: Callable[[str], None],
+) -> str:
+    """The attempts_exhausted re-queue: evidence + --reset-attempts +
+    interactive y/N, the state layer's dedicated edge
+    (:meth:`TaskQueue.recover_attempts`), history kept (the reset appends
+    an ``attempt_resets`` marker; the budget counts only attempts after
+    it) and the confirmation persisted to the task's progress log
+    (outcome ``recovered``, the escalation, the evidence, ``done_by``,
+    how many attempts were reset, a timestamp). Refuses before any write
+    on a missing or empty evidence, on a missing --reset-attempts (with
+    the reason), on ``--yes``, and on a declined prompt."""
+    if not reset_attempts:
+        raise ApprovalError(
+            f"{task_id}: attempts_exhausted recovery requires "
+            "--reset-attempts — the budget is spent, so re-queueing alone "
+            "would park the task straight back on the pre-run guard. Pass "
+            "the flag to grant a fresh budget (history is kept; every "
+            "attempt record stays) with --evidence saying what you checked "
+            "(e.g. 'all attempts died to the sandbox bind bug, fixed in "
+            "PR #NN')."
+        )
+    if not (evidence or "").strip():
+        raise ApprovalError(
+            f"{task_id}: attempts_exhausted recovery requires --evidence — "
+            "what you checked before granting more attempts (the three "
+            "burned attempts are the reason this gate exists)"
+        )
+    if assume_yes:
+        raise ApprovalError(
+            f"{task_id}: attempts_exhausted recovery is interactive only — "
+            "--yes is not accepted; spending a fresh budget is a human "
+            "decision, not a default"
+        )
+    attempts = task.get("attempts") or []
+    echo(
+        f"{task_id}: {task.get('title')}\n"
+        f"  escalation: {attempts[-1].get('escalation')} "
+        f"({len(attempts)} attempt record(s) on file)\n"
+        f"  evidence: {evidence.strip()}\n"
+        "  recover re-queues the task with a fresh attempt budget; every "
+        "existing attempt record is kept (the budget counts only attempts "
+        "after the reset marker)."
+    )
+    if not confirm(f"Re-queue {task_id} with a fresh attempt budget?"):
+        raise ApprovalDeclined(f"{task_id}: attempt reset declined")
+    who = done_by or default_approver()
+    new_status = queue.recover_attempts(task_id, evidence, done_by=who)
+    marker = (queue.get(task_id).get("attempt_resets") or [{}])[-1]
+    # The audit trail: the state has moved, so a log failure is loud —
+    # same posture as the credential exit.
+    try:
+        entry = ProgressLog.for_task(
+            factory_root or FACTORY_ROOT_DEFAULT,
+            queue.doc.get("project") or "unknown",
+            task_id,
+        ).append({
+            "outcome": "recovered",
+            "escalation": "attempts_exhausted",
+            "evidence": evidence.strip(),
+            "done_by": who,
+            "recovered_at": now_iso(),
+            "attempts_reset": marker.get("prior_attempts"),
+            "note": f"attempts_exhausted re-queued ({new_status}) with a "
+                    f"fresh budget by {who}; {marker.get('prior_attempts')} "
+                    f"attempt(s) kept on file: {evidence.strip()}",
         })
     except ProgressLogError as exc:
         raise ApprovalError(

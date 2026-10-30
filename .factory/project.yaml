@@ -167,4 +167,14 @@ network_allowlist:
   # the sandboxed gate runner and fetches from the npm registry.
   - registry.npmjs.org
 
+# F-31 attempt 3 (owner-approved in the fix review): this repo's own test
+# suite starts real loopback servers (the F-31 dashboard tests bind
+# 127.0.0.1), and every sandboxed seat that runs pytest — implementer,
+# reviewer, gate — needs the bind or the tests fail on the environment,
+# not the code (3 attempts lost that way). macOS: srt grants bind on ANY
+# interface + any-origin inbound + loopback outbound connect (see
+# schema/project.schema.json); the tests themselves bind loopback only.
+sandbox:
+  allow_local_binding: true
+
 cross_repo: []

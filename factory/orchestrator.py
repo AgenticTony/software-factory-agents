@@ -105,9 +105,9 @@ from factory.session import (
     seat_token,
 )
 from factory.state import (
-    RECOVERY_ESCALATIONS,
     RunInProgressError,
     TaskQueue,
+    attempt_budget_used,
     now_iso,
     open_owner_steps,
     recovery_task_eligible,
@@ -1583,16 +1583,12 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
     slice_id = slice_["id"] if slice_ else task_id
     budget = task["budget"]
     max_attempts = budget["max_attempts"]
-    used = sum(
-        1 for a in task.get("attempts") or []
-        if a.get("slice_id") == slice_id and a.get("outcome") != "aborted"
-        # Round-5 finding 1: stale_base/pr_closed attempts are the
-        # sweep's session-less records, not spent work — the recovery
-        # fix round starts with its slot unspent (a stale_base
-        # escalation after a passing round must not exhaust the budget
-        # before the fix round's session can run).
-        and a.get("escalation") not in RECOVERY_ESCALATIONS
-    )
+    # The one budget filter (factory.state.attempt_budget_used): same-slice
+    # attempts, not aborted, not session-less sweep escalations (round-5
+    # finding 1), and only those at or after the latest reset marker — an
+    # owner-granted reset (factory recover --reset-attempts) restores the
+    # budget without deleting any attempt record.
+    used = attempt_budget_used(task, slice_id)
     versions = prompt_versions(profile)
     log = ProgressLog.for_task(ctx.factory_root, project, task_id)
     protected = list((profile.get("paths") or {}).get("protected") or [])

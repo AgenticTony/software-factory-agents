@@ -22,6 +22,19 @@
     "escalation": {
       "enum": ["attempts_exhausted", "budget_exhausted", "risk_path_touched", "new_dependency", "protected_path_touched", "contract_ambiguous", "quota_exhausted", "live_check_failed", "cross_repo", "pr_create_failed", "orchestrator_error", "publish_refused", "review_not_converging", "sentinel_failed", "credential_added", "stale_base", "pr_closed"]
     },
+    "attempt_reset": {
+      "type": "object",
+      "required": ["at", "evidence", "done_by", "slice_id", "prior_attempts"],
+      "additionalProperties": false,
+      "description": "One owner-directed budget reset. prior_attempts is the task's attempts-array length at reset time; the budget for slice_id counts only attempts at positions >= it (attempts are append-only, so the position is stable).",
+      "properties": {
+        "at": { "type": "string", "format": "date-time" },
+        "evidence": { "type": "string", "minLength": 1, "description": "What the owner checked before granting more attempts" },
+        "done_by": { "type": "string", "minLength": 1 },
+        "slice_id": { "type": "string", "description": "The slice whose budget was reset (the escalated attempt's slice; the task id when unsliced)" },
+        "prior_attempts": { "type": "integer", "minimum": 0 }
+      }
+    },
     "check": {
       "type": "object",
       "required": ["type"],
@@ -153,6 +166,11 @@
           }
         },
         "attempts": { "type": "array", "items": { "$ref": "#/$defs/attempt" } },
+        "attempt_resets": {
+          "type": "array",
+          "description": "Owner-directed attempt-budget resets (factory recover --reset-attempts), append-only like attempts. The budget counts only attempts after the latest reset marker; history is never deleted.",
+          "items": { "$ref": "#/$defs/attempt_reset" }
+        },
         "links": {
           "type": "object",
           "additionalProperties": false,

@@ -2014,3 +2014,122 @@ def test_a_venv_interpreter_imports_from_its_own_site_packages(
         f"a sibling file in the denied home was readable\n"
         f"{proc.stdout}{proc.stderr}"
     )
+
+
+# --- F-31 run blocker: sandbox.allow_local_binding profile opt-in ------------
+#
+# F-31's dashboard tests bind 127.0.0.1 in the gate sandbox and every bind
+# died at EPERM (Errno 1) — srt's Seatbelt profile denies network-bind by
+# default. The pinned srt supports network.allowLocalBinding; the factory
+# exposes it as a per-profile opt-in, off unless the project asks.
+
+
+def test_allow_local_binding_is_absent_by_default(tmp_path: Path):
+    """The opt-in is deny-by-default: a profile that says nothing must
+    produce settings whose network block carries NO allowLocalBinding key
+    (absent, not false — srt treats the key's presence as its own signal)."""
+    run, _, _ = _make_run(tmp_path)
+    settings = build_settings({}, run.root, model_endpoint=MODEL_ENDPOINT)
+    assert "allowLocalBinding" not in settings["network"], settings["network"]
+
+
+def test_allow_local_binding_opt_in_sets_the_srt_key(tmp_path: Path):
+    """``sandbox.allow_local_binding: true`` in the profile is the one way
+    the key appears — and every sandboxed seat funnels through
+    build_settings with the same profile dict (implementer, reviewer, gate
+    runner, probe), so the opt-in is a statement about the project's tests,
+    not about one seat."""
+    run, _, _ = _make_run(tmp_path)
+    settings = build_settings(
+        {"sandbox": {"allow_local_binding": True}},
+        run.root,
+        model_endpoint=MODEL_ENDPOINT,
+    )
+    assert settings["network"]["allowLocalBinding"] is True
+
+    # the other spellings must not smuggle the key in
+    for profile in ({"sandbox": {"allow_local_binding": False}},
+                    {"sandbox": {}},
+                    {"allow_local_binding": True}):
+        settings = build_settings(profile, run.root, model_endpoint=MODEL_ENDPOINT)
+        assert "allowLocalBinding" not in settings["network"], profile
+
+
+def test_gate_settings_carry_allow_local_binding(tmp_path: Path):
+    """The gate runner is the seat that lost F-31: _gate_settings feeds the
+    L0 commands' sandbox, so the profile opt-in must survive that path —
+    proving the seat decision (all seats) rather than the funnel alone."""
+    import factory.orchestrator as orch
+    from factory.runs import RunDir
+
+    run, root, _ = _make_run(tmp_path)
+    clean = RunDir(project="fixture", run_id=run.root.name, root=run.root,
+                   settings_path=run.settings_path)
+    orch._gate_settings(
+        {"sandbox": {"allow_local_binding": True}}, clean, root
+    )
+    gate_settings = json.loads(run.settings_path.read_text())
+    assert gate_settings["network"]["allowLocalBinding"] is True
+
+
+_BIND_SCRIPT = textwrap.dedent(
+    """
+    import socket, sys
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        srv.bind(("127.0.0.1", 0))
+    except PermissionError as exc:
+        print(f"bind:EPERM {exc.errno}", flush=True)
+        sys.exit(3)
+    print(f"bound:{srv.getsockname()[1]}", flush=True)
+    srv.close()
+    """
+)
+
+
+def test_local_binding_off_refused_on_permitted_by_opt_in(tmp_path: Path):
+    """The real-srt proof, both directions, on a real Seatbelt profile:
+    binding 127.0.0.1:0 fails with EPERM when the profile says nothing,
+    and succeeds with ``sandbox.allow_local_binding: true``.
+
+    Linux documents the asymmetry (read from the pinned srt source): the
+    bwrap path never reads allowLocalBinding — the sandbox is its own
+    network namespace, TCP bind inside it already works and no host socket
+    is reachable — so the flag is a no-op there and binding succeeds under
+    both settings. macOS is where the F-31 failure lives, so macOS is
+    where the off-direction must refuse."""
+    run, root, _ = _make_run(tmp_path)
+
+    src2 = tmp_path / "src2"
+    src2.mkdir()
+    root2 = tmp_path / "root2"
+    opt_in = create_run("fixture", _fixture_repo(src2), factory_root=root2)
+    write_settings(
+        build_settings(
+            {"sandbox": {"allow_local_binding": True}},
+            opt_in.root,
+            model_endpoint=MODEL_ENDPOINT,
+        ),
+        opt_in.settings_path,
+    )
+
+    for label, settings_run in (("off", run), ("on", opt_in)):
+        proc = run_sandboxed(_child(_BIND_SCRIPT, []), settings_run.root,
+                             settings_run.settings_path, timeout=120)
+        out = proc.stdout + proc.stderr
+        if sys.platform == "darwin":
+            if label == "off":
+                assert proc.returncode == 3 and "bind:EPERM 1" in proc.stdout, (
+                    f"bind was not refused with the flag off\n{out}"
+                )
+            else:
+                assert proc.returncode == 0 and "bound:" in proc.stdout, (
+                    f"bind still failed with the flag on\n{out}"
+                )
+        else:
+            # Linux: the netns allows the bind either way — the flag is
+            # srt-macOS-only; asserting this pins the no-op (a future srt
+            # change that makes Linux refuse would surface here).
+            assert proc.returncode == 0 and "bound:" in proc.stdout, (
+                f"bind failed inside the Linux netns ({label})\n{out}"
+            )

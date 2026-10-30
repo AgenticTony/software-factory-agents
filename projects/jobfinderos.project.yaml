@@ -122,4 +122,11 @@ network_allowlist:
   - fonts.googleapis.com   # next/font/google fetches at build time
   - fonts.gstatic.com
 
+# TODO(verify): whether JobFinderOS tests bind ports (FastAPI's TestClient
+# uses ASGI in-process, but any httpx/live-server test would need this the
+# way F-31 did). Set preemptively so the first dogfood run doesn't burn an
+# attempt on the environment; revisit with the repo's test suite in hand.
+sandbox:
+  allow_local_binding: true
+
 cross_repo: []
