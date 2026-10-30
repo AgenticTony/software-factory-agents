@@ -1089,7 +1089,10 @@ def test_home_reads_are_denied(tmp_path: Path):
     """~ is denied for reads (the run dir is re-allowed): the WO's "other
     projects" plus everything else in the owner's home — ~/.aws, shell rc
     files, other checkouts — is none of a session's business."""
-    probe = Path("~/.factory-sandbox-probe").expanduser()
+    # Pid-suffixed: under pytest-xdist each worker needs its own probe in the
+    # real home — a fixed name lets one worker's unlink make another worker's
+    # read fail for a reason that is not the one under test.
+    probe = Path(f"~/.factory-sandbox-probe-{os.getpid()}").expanduser()
     probe.write_text("home secret\n")
     try:
         run, _, settings = _make_run(tmp_path)
@@ -1326,34 +1329,36 @@ def test_env_dict_of_os_environ_is_allowlisted(tmp_path: Path, monkeypatch):
     assert seen["API_TIMEOUT_MS"] == "3000000", proc.stdout
 
 
-def test_toolchain_under_home_is_executable(tmp_path: Path):
+def test_toolchain_under_home_is_executable(tmp_path: Path, monkeypatch):
     """F-06 runs the Claude Code CLI, which may live under $HOME
     (~/.local/bin/claude, pyenv, uv, nvm). The home-wide denyRead must not
     make the session's own toolchain unexecutable: build_settings re-allows
     the resolved toolchain paths (binary dir, its sibling lib/ when the
-    dir is a bin/, and the literal symlinks on the way — never ancestors)."""
-    home = Path.home()
-    tool_root = home / ".factory-sandbox-toolchain-test"
-    tool_bin = tool_root / "bin"
-    tool_bin.mkdir(parents=True, exist_ok=True)
-    try:
-        claude = tool_bin / "claude"
-        claude.write_text("#!/bin/sh\necho 'claude 2.0.0 (toolchain ok)'\n")
-        claude.chmod(0o755)
-        run, _, _ = _make_run(tmp_path)
-        settings = build_settings(
-            {}, run.root, model_endpoint=MODEL_ENDPOINT, toolchain=[claude]
-        )
-        write_settings(settings, run.settings_path)
-        proc = run_sandboxed(
-            [str(claude), "--version"], run.root, run.settings_path, timeout=60
-        )
-        assert "toolchain ok" in proc.stdout, (
-            f"toolchain binary under $HOME could not run: rc={proc.returncode}\n"
-            f"{proc.stdout}{proc.stderr}"
-        )
-    finally:
-        shutil.rmtree(tool_root, ignore_errors=True)
+    dir is a bin/, and the literal symlinks on the way — never ancestors).
+
+    HOME is a per-test fake: the deny/allow scheme keys on HOME at
+    build_settings time (see the symlinked-home test below), and a fixed
+    tool root under the real home would race parallel workers (pytest-xdist).
+    tmp_path owns the cleanup."""
+    home = tmp_path / "home"
+    tool_bin = home / ".factory-sandbox-toolchain-test" / "bin"
+    tool_bin.mkdir(parents=True)
+    claude = tool_bin / "claude"
+    claude.write_text("#!/bin/sh\necho 'claude 2.0.0 (toolchain ok)'\n")
+    claude.chmod(0o755)
+    run, _, _ = _make_run(tmp_path)
+    monkeypatch.setenv("HOME", str(home))
+    settings = build_settings(
+        {}, run.root, model_endpoint=MODEL_ENDPOINT, toolchain=[claude]
+    )
+    write_settings(settings, run.settings_path)
+    proc = run_sandboxed(
+        [str(claude), "--version"], run.root, run.settings_path, timeout=60
+    )
+    assert "toolchain ok" in proc.stdout, (
+        f"toolchain binary under $HOME could not run: rc={proc.returncode}\n"
+        f"{proc.stdout}{proc.stderr}"
+    )
 
 
 def test_home_is_a_writable_scratch_inside_the_run(tmp_path: Path):
@@ -1637,27 +1642,28 @@ def test_toolchain_allowread_survives_a_symlinked_home(tmp_path: Path, monkeypat
     assert str(real / ".local" / "bin") in allow, allow
 
 
-def test_toolchain_bin_dir_under_home_still_executes(tmp_path: Path):
+def test_toolchain_bin_dir_under_home_still_executes(tmp_path: Path, monkeypatch):
     """The narrowed toolchain reads must still let a binary under $HOME run:
-    the round-3 exec fix has to survive its own scope reduction."""
-    home = Path.home()
-    tool_root = home / ".factory-sandbox-toolchain-r4"
-    tool_bin = tool_root / "bin"
-    tool_bin.mkdir(parents=True, exist_ok=True)
-    try:
-        probe = tool_bin / "probe"
-        probe.write_text("#!/bin/sh\necho 'r4 toolchain ok'\n")
-        probe.chmod(0o755)
-        run, _, _ = _make_run(tmp_path)
-        settings = build_settings({}, run.root, model_endpoint=MODEL_ENDPOINT,
-                                  toolchain=[probe])
-        write_settings(settings, run.settings_path)
-        proc = run_sandboxed([str(probe)], run.root, run.settings_path, timeout=60)
-        assert "r4 toolchain ok" in proc.stdout, (
-            f"rc={proc.returncode}\n{proc.stdout}{proc.stderr}"
-        )
-    finally:
-        shutil.rmtree(tool_root, ignore_errors=True)
+    the round-3 exec fix has to survive its own scope reduction.
+
+    HOME is a per-test fake (see test_toolchain_under_home_is_executable):
+    same deny/allow semantics, no fixed path in the real home to race
+    parallel workers."""
+    home = tmp_path / "home"
+    tool_bin = home / ".factory-sandbox-toolchain-r4" / "bin"
+    tool_bin.mkdir(parents=True)
+    probe = tool_bin / "probe"
+    probe.write_text("#!/bin/sh\necho 'r4 toolchain ok'\n")
+    probe.chmod(0o755)
+    run, _, _ = _make_run(tmp_path)
+    monkeypatch.setenv("HOME", str(home))
+    settings = build_settings({}, run.root, model_endpoint=MODEL_ENDPOINT,
+                              toolchain=[probe])
+    write_settings(settings, run.settings_path)
+    proc = run_sandboxed([str(probe)], run.root, run.settings_path, timeout=60)
+    assert "r4 toolchain ok" in proc.stdout, (
+        f"rc={proc.returncode}\n{proc.stdout}{proc.stderr}"
+    )
 
 
 def test_home_and_tmp_scratch_are_git_excluded(tmp_path: Path):
@@ -1712,45 +1718,47 @@ def test_timeout_preserves_partial_output(tmp_path: Path):
 # --- review round 5 ----------------------------------------------------------
 
 
-def test_toolchain_symlink_under_home_executes(tmp_path: Path):
+def test_toolchain_symlink_under_home_executes(tmp_path: Path, monkeypatch):
     """The native Claude Code install is a symlink under $HOME
     (~/.local/bin/claude -> ~/.local/share/claude/versions/X). Exec through
     the link — directly and via a PATH lookup — must work, not just through
-    the resolved path: F-06 finds the CLI by name."""
-    home = Path.home()
+    the resolved path: F-06 finds the CLI by name.
+
+    HOME is a per-test fake (see test_toolchain_under_home_is_executable):
+    same deny/allow semantics, no fixed path in the real home to race
+    parallel workers."""
+    home = tmp_path / "home"
     base = home / ".factory-sandbox-tc-r5"
     link_dir = base / "bin"
     real_dir = base / "share" / "tool" / "versions" / "1.0"
-    real_dir.mkdir(parents=True, exist_ok=True)
-    link_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        real = real_dir / "r5tool"
-        real.write_text("#!/bin/sh\necho 'r5 symlink ok'\n")
-        real.chmod(0o755)
-        link = link_dir / "r5tool"
-        link.symlink_to(Path("..") / "share" / "tool" / "versions" / "1.0" / "r5tool")
-        run, _, _ = _make_run(tmp_path)
-        settings = build_settings({}, run.root, model_endpoint=MODEL_ENDPOINT,
-                                  toolchain=[link])
-        write_settings(settings, run.settings_path)
-        via_link = run_sandboxed([str(link)], run.root, run.settings_path, timeout=60)
-        assert "r5 symlink ok" in via_link.stdout, (
-            f"exec via the symlink failed: rc={via_link.returncode}\n"
-            f"{via_link.stdout}{via_link.stderr}"
-        )
-        via_path = run_sandboxed(
-            ["r5tool"], run.root, run.settings_path, timeout=60,
-            env={"PATH": f"{link_dir}{os.pathsep}{os.environ['PATH']}"},
-        )
-        assert "r5 symlink ok" in via_path.stdout, (
-            f"PATH lookup of the symlinked tool failed: rc={via_path.returncode}\n"
-            f"{via_path.stdout}{via_path.stderr}"
-        )
-        # Only the link file itself is re-allowed, never its directory.
-        allow = settings["filesystem"]["allowRead"]
-        assert str(link) in allow and str(link_dir) not in allow
-    finally:
-        shutil.rmtree(base, ignore_errors=True)
+    real_dir.mkdir(parents=True)
+    link_dir.mkdir(parents=True)
+    real = real_dir / "r5tool"
+    real.write_text("#!/bin/sh\necho 'r5 symlink ok'\n")
+    real.chmod(0o755)
+    link = link_dir / "r5tool"
+    link.symlink_to(Path("..") / "share" / "tool" / "versions" / "1.0" / "r5tool")
+    run, _, _ = _make_run(tmp_path)
+    monkeypatch.setenv("HOME", str(home))
+    settings = build_settings({}, run.root, model_endpoint=MODEL_ENDPOINT,
+                              toolchain=[link])
+    write_settings(settings, run.settings_path)
+    via_link = run_sandboxed([str(link)], run.root, run.settings_path, timeout=60)
+    assert "r5 symlink ok" in via_link.stdout, (
+        f"exec via the symlink failed: rc={via_link.returncode}\n"
+        f"{via_link.stdout}{via_link.stderr}"
+    )
+    via_path = run_sandboxed(
+        ["r5tool"], run.root, run.settings_path, timeout=60,
+        env={"PATH": f"{link_dir}{os.pathsep}{os.environ['PATH']}"},
+    )
+    assert "r5 symlink ok" in via_path.stdout, (
+        f"PATH lookup of the symlinked tool failed: rc={via_path.returncode}\n"
+        f"{via_path.stdout}{via_path.stderr}"
+    )
+    # Only the link file itself is re-allowed, never its directory.
+    allow = settings["filesystem"]["allowRead"]
+    assert str(link) in allow and str(link_dir) not in allow
 
 
 def test_bin_dir_parent_never_reopens_a_shared_prefix():

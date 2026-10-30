@@ -36,6 +36,11 @@ agents do the volume. Architecture and reasoning: `DESIGN-LOCAL-FACTORY.md`.
 ## Working here
 
 - Python >= 3.11; CI tests 3.11 and 3.13. CLI: `factory --help`.
+- Tests run in parallel: `pytest -q -n auto` (pytest-xdist, pinned in the
+  `[dev]` extra). Plain `pytest -q` still works. The two real-session tests in
+  `tests/test_f06.py` (`test_ac_3`/`test_ac_4`) go live against the `factory-zai`
+  credential when one exists and are conventionally deselected (`--deselect`)
+  from local parallel runs.
 - Setup: `pip install -e ".[dev]"` **and** `npm ci` (installs the pinned sandbox
   runtime `srt` from `package-lock.json`; needs Node >= 22.12). System deps:
   none on macOS; Linux `bubblewrap socat ripgrep`, and on Ubuntu
