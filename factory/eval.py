@@ -68,11 +68,18 @@ class SeedSpec:
     ``contract`` is the per-seed task acceptance used by L1 (only the
     ``tautological-test`` seed carries one: the other classes ship no
     contract test, and L1 passes trivially without refs).
+
+    ``markers`` are the strings a catch must name: the phantom table's
+    name, the read whose filter was dropped, and so on. They are the
+    independent expectation the report is measured against — attribution
+    never runs off a layer verdict alone (a layer that failed over
+    findings unrelated to the seed caught nothing).
     """
 
     id: str
     layer: str
     title: str
+    markers: tuple[str, ...] = ()
     edits: tuple[tuple[str, str], ...] = ()
     files: dict[str, str] = field(default_factory=dict)
     contract: dict = field(default_factory=dict)
@@ -319,6 +326,7 @@ SOLOADVENTURER_SEEDS = [
         id="phantom-table",
         layer="L0",
         title="a write path retargeted to a table the schema doesn't know",
+        markers=("archived_trips",),
         edits=(
             ('store.insert("trip_archive", {"trip_id": trip_id})',
              'store.insert("archived_trips", {"trip_id": trip_id})'),
@@ -328,6 +336,7 @@ SOLOADVENTURER_SEEDS = [
         id="removed-rls-filter",
         layer="L0",
         title="the ownership filter dropped from an owner-scoped read",
+        markers=("owner", "trips_for", "rows"),
         edits=(
             ('    return [row for row in rows if row["owner_id"] == owner_id]',
              "    return list(rows)"),
@@ -337,6 +346,7 @@ SOLOADVENTURER_SEEDS = [
         id="off-by-one",
         layer="L0",
         title="the pack-list cap reads one item past the limit",
+        markers=("pack_list", "limit"),
         edits=(
             ("    return items[:limit]", "    return items[: limit + 1]"),
         ),
@@ -345,6 +355,7 @@ SOLOADVENTURER_SEEDS = [
         id="deleted-await",
         layer="L0",
         title="the await dropped from the checkin-count fetch",
+        markers=("checkin_count", "fetchone", "await", "coroutine"),
         edits=(
             ("    row = await store.fetchone(", "    row = store.fetchone("),
         ),
@@ -353,6 +364,7 @@ SOLOADVENTURER_SEEDS = [
         id="mocks-what-it-tests",
         layer="L2",
         title="a test that mocks the function it claims to test",
+        markers=("mock", "checkin_count"),
         edits=(
             (
                 "import asyncio\n\nfrom app.api import archive_trip, checkin_count, "
@@ -374,6 +386,7 @@ SOLOADVENTURER_SEEDS = [
         id="tautological-test",
         layer="L1",
         title="a contract test that already passes on base — it proves nothing",
+        markers=("test_archive", "tautolog", "proves nothing", "already pass"),
         files={
             "tests/test_archive.py": (
                 "from app.api import archive_trip\n"
@@ -462,8 +475,9 @@ def run_seed(
     left on the seed's branch.
 
     Returns the per-diff record: each layer's report dict and the layers
-    that caught the seed (verdict not ``pass``); a clean diff carries the
-    number of blocking findings its review drew instead.
+    that caught the seed (a failing layer whose own recorded evidence
+    names one of the seed's ``markers``); a clean diff carries the number
+    of blocking findings its review drew — ``None`` when L2 never ran.
     """
     repo = Path(repo)
     profile = eval_profile(repo)
@@ -494,11 +508,53 @@ def run_seed(
     if isinstance(seed, SeedSpec):
         record["caught_by"] = [
             name for name, report in layers.items()
-            if report["verdict"] not in (None, "pass")
+            if _catches(report, seed.markers)
         ]
     else:
-        record["blocking_findings"] = _count_blocking(layers.get("L2"))
+        record["blocking_findings"] = (
+            _count_blocking(layers.get("L2")) if "L2" in layers else None
+        )
     return record
+
+
+def _catches(report: dict, markers: tuple[str, ...]) -> bool:
+    """True when a layer's own recorded evidence names the seeded defect.
+
+    The verdict alone is not the catch (a layer that failed over
+    findings unrelated to the seed caught nothing — exactly the false
+    positive the known-clean diffs exist to dial). The evidence is what
+    the layer itself recorded: the output of the commands and sentinels
+    that failed, L1's red-reason table, and — for L2 — the surviving
+    findings (a finding the verifier dropped never survived, so it
+    never counts).
+    """
+    if report.get("verdict") in (None, "pass") or not markers:
+        return False
+    evidence = "\n".join(
+        part for part in _catch_evidence(report) if part
+    ).lower()
+    return any(marker.lower() in evidence for marker in markers)
+
+
+def _catch_evidence(report: dict) -> list[str]:
+    """The human-readable output a layer's failure is attributed to."""
+    parts = []
+    for command in report.get("commands") or []:
+        if (isinstance(command, dict)
+                and (command.get("exit_code") not in (0, None)
+                     or command.get("timed_out"))):
+            parts.append(str(command.get("output") or ""))
+    for sentinel in report.get("sentinel_results") or []:
+        if isinstance(sentinel, dict) and sentinel.get("verdict") == "fail":
+            parts.append(str(sentinel.get("detail") or ""))
+    red_reasons = report.get("red_reasons")
+    if isinstance(red_reasons, dict):
+        parts += [f"{ref} {reason or ''}" for ref, reason in red_reasons.items()]
+    for finding in report.get("findings") or []:
+        if isinstance(finding, dict):
+            parts.append(f"{finding.get('file') or ''} "
+                         f"{finding.get('text', '')}")
+    return parts
 
 
 def _seed_task(seed: SeedSpec | CleanSpec) -> dict:
@@ -651,7 +707,8 @@ def run_seeded_eval(
 
 
 def catch_rate_by_layer(seed_records: list) -> dict:
-    """The share of seeds each layer caught (verdict not ``pass``)."""
+    """The share of seeds each layer caught (a failing layer whose own
+    evidence names the seed — see :func:`_catches`)."""
     counts = caught_counts_by_layer(seed_records)
     total = len(seed_records) or 1
     return {layer: counts[layer] / total for layer in LAYERS}
@@ -685,10 +742,10 @@ def render_report(report: dict) -> str:
             f"(expected {expected}) — {record['title']}"
         )
     for record in report["clean"]:
-        lines.append(
-            f"- clean {record['id']}: {record['blocking_findings']} blocking "
-            f"finding(s) — {record['title']}"
-        )
+        blocking = record.get("blocking_findings")
+        drew = ("n/a (L2 skipped)" if blocking is None
+                else f"{blocking} blocking finding(s)")
+        lines.append(f"- clean {record['id']}: {drew} — {record['title']}")
     lines += ["", "## Catch rate per layer", ""]
     counts = report["caught_counts"]
     total = len(report["seeds"])
@@ -729,7 +786,8 @@ def run_on_demand_eval(
         out_path: Where the report JSON goes (default
             ``<factory_root>/eval/seeded-eval-<stamp>.json``; the
             rendered markdown sits beside it).
-        reviewers: Reviewer sessions per diff (F-38's fan-out width).
+        reviewers: Reviewer sessions per diff (F-38's fan-out width);
+            ``factory eval`` passes the factory config's ``reviewers``.
         session_runner / command_runner: Overrides for tests; the
             defaults drive real sessions and the real sandbox.
         keep_fixture: Keep the fixture repo for inspection (default:
@@ -740,6 +798,12 @@ def run_on_demand_eval(
     """
     from factory.orchestrator import _gate_settings, sandboxed_runner
     from factory.runs import FACTORY_ROOT_DEFAULT, RunDir
+    # The reach-ins above (with run_l2_review's _review_prompt /
+    # _verifier_prompt) are deliberate: AC-3 measures the pipeline the
+    # queue actually runs, so the eval calls the orchestrator's own
+    # prompt builders and gate settings rather than a copy that could
+    # drift. Promoting them to public entry points means editing
+    # factory/orchestrator.py — a protected path, so an owner change.
 
     factory_root = Path(factory_root) if factory_root else FACTORY_ROOT_DEFAULT
     eval_root = factory_root / "eval"

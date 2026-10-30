@@ -32,4 +32,26 @@ Then `ruff check . && pytest -q -n auto` (parallel via pytest-xdist; plain
 actions for real and are never skipped: a missing `srt` or system dependency
 fails them, by design. CI (`.github/workflows/ci.yml`) runs the same steps.
 
+## Operating: the monthly validator eval (F-16)
+
+The validator is measured, not assumed. `factory eval` seeds the known
+bug classes on branches of the SoloAdventurer fixture, runs every layer
+over each seeded diff plus known-clean diffs, and writes a per-diff
+report: which layers caught each seed, how many blocking findings each
+known-clean diff drew, and the catch rate per layer.
+
+- **On demand**: run `factory eval` whenever the validator changes
+  (a gate, a prompt, the review fan-out) or after a run escaped it.
+- **Monthly**: run it once a month regardless — a validator nobody has
+  re-tested is just another claim. It drives real model sessions, so it
+  is never in CI or `factory run`/`loop`; this command is the only thing
+  that starts it.
+
+Owner steps per run: read the rendered report it prints and saves under
+`<factory-root>/eval/`, record it as tick evidence, and act on a layer
+whose catch rate is falling — fix it or drop it. The reviewer fan-out
+width is the `reviewers` knob in `<factory-root>/config.yaml` (override
+per run with `--reviewers`), so the eval always measures the review
+pipeline the queue actually runs.
+
 Private by design. Nothing here deploys anywhere; it's a CLI.

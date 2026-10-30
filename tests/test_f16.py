@@ -139,6 +139,140 @@ def test_ac_1(tmp_path: Path):
         assert clean["blocking_findings"] == 0, clean["id"]
 
 
+def test_l2_catch_requires_a_finding_that_names_the_seed(tmp_path: Path):
+    """AC-3: the report says whether the SURVIVING findings caught the
+    seed — not whether the layer's verdict failed. An L2 review that
+    fails over findings unrelated to the seeded defect (fixture style,
+    the ratchet script, anything) is a false positive the known-clean
+    diffs exist to dial, and the report must not book it as a catch.
+    The same seed with a finding that names the defect IS caught."""
+    repo = _fixture(tmp_path)
+    seed = seed_by_id("mocks-what-it-tests")
+    unrelated = dict(
+        _finding(), id="R-9", file="scripts/check_schema_refs.py",
+        text="this script should use pathlib APIs consistently",
+    )
+    miss = run_seed(
+        repo, seed,
+        session_runner=ScriptedSeats({"EVAL-mocks-what-it-tests": [unrelated]}),
+    )
+    assert miss["layers"]["L2"]["verdict"] == "fail"
+    assert miss["caught_by"] == [], miss["caught_by"]
+    hit = run_seed(
+        repo, seed,
+        session_runner=ScriptedSeats({"EVAL-mocks-what-it-tests": [_finding()]}),
+    )
+    assert hit["caught_by"] == ["L2"]
+
+
+def test_clean_diff_without_l2_is_reported_na_not_zero(tmp_path: Path):
+    """With L2 skipped (no session runner) no review ran, so a known-clean
+    diff drew no measured blocking findings — the report says n/a, never
+    a 0 that implies a clean review that never happened."""
+    repo = _fixture(tmp_path)
+    report = run_seeded_eval(repo)
+    assert report["l2"] == "skipped"
+    for record in report["clean"]:
+        assert record["blocking_findings"] is None, record["id"]
+    text = render_report(report)
+    assert "n/a" in text
+    assert "0 blocking" not in text
+
+
+def test_l0_catch_requires_evidence_that_names_the_seed(tmp_path: Path):
+    """The same rule for L0: a failing layer is a catch only when its own
+    recorded evidence names the seeded defect. The phantom-table seed's
+    L0 evidence is the ratchet's output naming ``archived_trips``; a
+    seed table whose failure output named nothing would not be caught."""
+    repo = _fixture(tmp_path)
+    record = run_seed(repo, seed_by_id("phantom-table"))
+    assert record["caught_by"] == ["L0"]
+    assert "archived_trips" in json.dumps(record["layers"]["L0"])
+
+
+def test_factory_eval_runs_at_the_configured_reviewer_width(tmp_path, monkeypatch):
+    """``factory eval``'s help promises "(default: the factory config)" —
+    it must read <factory-root>/config.yaml the way the orchestrator
+    does, not the dataclass defaults: the eval certifies the catch rate
+    for the fan-out width the factory actually runs (AC-3)."""
+    from factory import cli
+
+    root = tmp_path / "factory-root"
+    root.mkdir()
+    (root / "config.yaml").write_text("reviewers: 3\n")
+    seen = {}
+
+    def fake_run(factory_root, out_path, *, reviewers, keep_fixture):
+        seen["factory_root"] = factory_root
+        seen["reviewers"] = reviewers
+        rendered = tmp_path / "rendered.md"
+        rendered.write_text("report")
+        report = tmp_path / "report.json"
+        report.write_text("{}")
+        return {"report_path": report, "rendered_path": rendered}
+
+    monkeypatch.setattr(cli, "run_on_demand_eval", fake_run)
+    args = cli.build_parser().parse_args(["eval", "--factory-root", str(root)])
+    assert cli._run_eval(args) == 0
+    assert seen["reviewers"] == 3
+    assert seen["factory_root"] == root
+
+
+def test_factory_eval_config_default_and_flag_override(tmp_path, monkeypatch):
+    """No config file: the documented default (2). ``--reviewers`` beats
+    both."""
+    from factory import cli
+
+    root = tmp_path / "factory-root"
+    root.mkdir()
+    seen = []
+
+    def fake_run(factory_root, out_path, *, reviewers, keep_fixture):
+        seen.append(reviewers)
+        rendered = tmp_path / "rendered.md"
+        rendered.write_text("report")
+        report = tmp_path / "report.json"
+        report.write_text("{}")
+        return {"report_path": report, "rendered_path": rendered}
+
+    monkeypatch.setattr(cli, "run_on_demand_eval", fake_run)
+    args = cli.build_parser().parse_args(["eval", "--factory-root", str(root)])
+    assert cli._run_eval(args) == 0
+    args = cli.build_parser().parse_args(
+        ["eval", "--factory-root", str(root), "--reviewers", "4"]
+    )
+    assert cli._run_eval(args) == 0
+    assert seen == [2, 4]
+
+
+def test_factory_eval_refuses_a_malformed_config(tmp_path, monkeypatch, capsys):
+    """A malformed config.yaml is the promised exit 2 with a message, not
+    a traceback (cli contract) — and no eval runs on unreadable config."""
+    from factory import cli
+
+    root = tmp_path / "factory-root"
+    root.mkdir()
+    (root / "config.yaml").write_text("reviewers: 0\n")
+
+    def boom(*args, **kwargs):
+        raise AssertionError("no eval may run on unreadable config")
+
+    monkeypatch.setattr(cli, "run_on_demand_eval", boom)
+    parsed = cli.build_parser().parse_args(["eval", "--factory-root", str(root)])
+    assert cli._run_eval(parsed) == 2
+    err = capsys.readouterr().err
+    assert "factory eval" in err and "reviewers" in err
+
+
+def test_monthly_owner_step_is_documented():
+    """AC-3: the eval runs on demand AND monthly. The monthly cadence is
+    an owner step, so the repo has to record it — the README's operating
+    notes name the command and the cadence."""
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+    assert "factory eval" in readme
+    assert "monthly" in readme.lower()
+
+
 def test_l2_runs_the_f38_fanout(tmp_path: Path):
     """Every seeded diff with findings gets N parallel reviewers and one
     verifier vote over the union — F-38's pipeline, not a single reviewer."""

@@ -18,7 +18,7 @@ from factory.approve import (
     reconcile_bootstrap,
     recover_task,
 )
-from factory.config import ConfigError, FactoryConfig, load_config
+from factory.config import CONFIG_FILE, ConfigError, load_config
 from factory.contract import ContractError, load_profile, load_tasks, read_file
 from factory.eval import EvalError, run_on_demand_eval
 from factory.gates import GateError
@@ -456,17 +456,25 @@ def _run_eval(args: argparse.Namespace) -> int:
     """Dispatch the seeded-bug validator eval (F-16 AC-3's owner step).
 
     It drives real model sessions, so it only ever runs explicitly, by
-    this command — never from ``run``/``loop`` or CI. Known failures
-    exit 2 with a message, not a traceback."""
-    reviewers = args.reviewers or FactoryConfig().reviewers
+    this command — never from ``run``/``loop`` or CI. The reviewer
+    fan-out width is the factory config's (the same
+    ``load_config(factory_root / CONFIG_FILE)`` read the orchestrator
+    does, so the eval certifies the width the queue actually runs);
+    ``--reviewers`` overrides it. Known failures exit 2 with a message,
+    not a traceback."""
+    factory_root = (Path(args.factory_root) if args.factory_root
+                    else FACTORY_ROOT_DEFAULT)
     try:
+        reviewers = args.reviewers or load_config(
+            factory_root / CONFIG_FILE
+        ).reviewers
         result = run_on_demand_eval(
-            Path(args.factory_root) if args.factory_root else None,
+            factory_root if args.factory_root else None,
             Path(args.out) if args.out else None,
             reviewers=reviewers,
             keep_fixture=args.keep_fixture,
         )
-    except (EvalError, GateError, RunError, SandboxError,
+    except (ConfigError, EvalError, GateError, RunError, SandboxError,
             SessionConfigError) as exc:
         print(f"factory eval: {exc}", file=sys.stderr)
         return 2
