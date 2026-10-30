@@ -114,7 +114,7 @@
         "allow_local_binding": {
           "type": "boolean",
           "default": false,
-          "description": "Set srt's network.allowLocalBinding for every sandboxed seat of this project (implementer, reviewer, gate runner): its tests bind sockets. macOS Seatbelt semantics (pinned srt source): bind on ANY local address/port (not loopback-only), inbound accepted on any local address/port (origin not inspectable — host processes, and off-host if the code binds a non-loopback interface), plus outbound connect to 127.0.0.1/::1 on any port; external-domain egress stays allowlisted. Linux: no-op (bwrap netns already allows in-namespace binds). Off unless a human sets it."
+          "description": "Authorize srt's network.allowLocalBinding for the GATE RUNNER's settings only (L0/L1 commands and the stale-base re-validation clone — the project's fixed test suite, run after L0's diff policy): its tests bind sockets. The session seats (implementer, reviewer, importer) never receive it whatever this says — srt's macOS rules grant bind on ANY local address/port (not loopback-only), inbound from ANY origin, AND outbound connect to 127.0.0.1/::1 on any port (every host loopback service: a logged-in browser's DevTools ports, local databases, dev/MCP servers), reach model-written session code must not have. External-domain egress stays allowlisted. Linux: no-op (bwrap netns already allows in-namespace binds; nothing outside can reach them). Off unless a human sets it."
         }
       }
     },

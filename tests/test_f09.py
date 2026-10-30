@@ -50,7 +50,7 @@ def _sha(text: str) -> str:
 # with its pin here — test_ac_2 fails until the pin is updated, so a silent
 # prompt edit can never ride a green run.
 PROMPT_PINS = {
-    IMPLEMENTER_FILE: "7d793fd022e3d309789084a1f0557cc64543ab6e8d4fcb8600a0b9cebbae37e5",
+    IMPLEMENTER_FILE: "89170d411e03b941092202cb662e035c75a47468453f9b26fcaf0bdb6c64f2fd",
     REVIEWER_FILE: "dbab8437904a53e2256ff942167a9c01d689460f05a48384f4fb70f18cf9f6e7",
 }
 

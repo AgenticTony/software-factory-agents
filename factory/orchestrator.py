@@ -309,9 +309,19 @@ def _gate_settings(profile: dict, clean: RunDir, factory_root: Path) -> None:
 
     The model endpoint is on the allowlist only because ``build_settings``
     always adds it; the gate environment carries no credential for it.
+
+    This is the one seat allowed to request local binding when the
+    profile opts in (``sandbox.allow_local_binding``, review decision on
+    #76): the L0/L1 commands and the stale-base re-validation clone that
+    share these settings run the project's fixed test suite — port
+    binding is exactly what server tests do. The session seats never get
+    it: srt's macOS rules would also hand them outbound connect to every
+    host loopback port (see build_settings' docstring).
     """
     settings = build_settings(
-        profile, clean.root, model_endpoint=DEFAULT_BASE_URL, factory_root=factory_root
+        profile, clean.root, model_endpoint=DEFAULT_BASE_URL,
+        factory_root=factory_root,
+        local_binding=bool((profile.get("sandbox") or {}).get("allow_local_binding")),
     )
     write_settings(settings, clean.settings_path)
 

@@ -128,6 +128,7 @@ The adapter. Everything the factory must know about a repo that isn't in a task.
 | `live_checks` | Post-deploy commands the orchestrator runs **outside** the sandbox with secrets from the macOS keychain. |
 | `holdouts` | Directory outside the repo (`~/factory/holdouts/<project>/`) and how to run it. |
 | `docs_allowlist` | Domains the agent may fetch for docs grounding (both projects mandate official-docs lookups). |
+| `sandbox.allow_local_binding` | Authorizes srt's `network.allowLocalBinding` for the **gate runner's settings only** (L0/L1 and the stale-base re-validation clone): the project's tests bind sockets. The session seats never receive it — srt's macOS rules also grant outbound connect to every host loopback port, reach model-written session code must not have. Default false. |
 | `standards` | Optional repo-relative paths of the project's coding-standards docs (e.g. `CODING_STANDARDS.md`, `CONTRIBUTING.md`). **Read by the L2 reviewer only**, never pushed to the implementer. Mechanical rules belong in L0 tooling, not here. |
 | `cross_repo` | Sibling repos whose changes can break this one. v0: any task touching them → `needs_human`. |
 
