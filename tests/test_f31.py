@@ -13,9 +13,12 @@ What is real and what is stubbed:
   factory root needs no sandbox, no model session and no git history.
 
 Every test drives the server over real HTTP on ``127.0.0.1`` — the seam
-the contract names. Request paths stay raw (``..``, ``%2e%2e`` and
-absolute-form targets are sent as-is), because the point of AC-6 is
-exactly what the server does with hostile paths.
+the contract names. Request paths stay raw (``..`` and ``%2e%2e`` are
+sent as-is), because the point of AC-6 is exactly what the server does
+with hostile paths. The one header the tests ever pin beyond the default
+is the Host of the absolute-form probes: http.client derives a *bare*
+``127.0.0.1`` from such a target's netloc, which AC-2 (rightly) 403s —
+those probes test target-form routing, so they must arrive Host-valid.
 """
 
 import contextlib
@@ -497,30 +500,32 @@ def test_ac_3(tmp_path: Path):
         assert "step two" in page
         assert "step one" in page
         assert "data-step-done" in page and "data-step-open" in page
+
+        # Invalid state (schema-invalid queue): an error page, never the
+        # tasks that would still validate. The server stays up — only
+        # the state behind it goes bad.
+        broken = {
+            "version": 1,
+            "project": PROJECT,
+            "updated_at": "2026-10-18T15:00:00Z",
+            "tasks": [
+                {"id": "T-9", "status": "not-a-status",
+                 "title": "Half-written queue"},
+            ],
+        }
+        queue.write_text(json.dumps(broken))
+        status, headers, body = srv.get("/queue")
+        assert status >= 400
+        assert headers["Content-Type"].startswith("text/html")
+        page = body.decode()
+        assert "T-9" not in page
+        assert "Half-written queue" not in page
+        # No partial data either: the earlier, valid fixture's content is
+        # gone.
+        assert "T-B" not in page
+        assert "3 attempts failed L0" not in page
     finally:
         srv.close()
-
-    # Invalid state (schema-invalid queue): an error page, never the
-    # tasks that would still validate.
-    broken = {
-        "version": 1,
-        "project": PROJECT,
-        "updated_at": "2026-10-18T15:00:00Z",
-        "tasks": [
-            {"id": "T-9", "status": "not-a-status",
-             "title": "Half-written queue"},
-        ],
-    }
-    queue.write_text(json.dumps(broken))
-    status, headers, body = srv.get("/queue")
-    assert status >= 400
-    assert headers["Content-Type"].startswith("text/html")
-    page = body.decode()
-    assert "T-9" not in page
-    assert "Half-written queue" not in page
-    # No partial data either: the earlier, valid fixture's content is gone.
-    assert "T-B" not in page
-    assert "3 attempts failed L0" not in page
 
 
 def test_ac_4(tmp_path: Path):
@@ -643,7 +648,6 @@ def test_ac_6(tmp_path: Path):
             "/runs/20260101T000000Z-AB12CD",  # wrong case for the hex part
             "/runs/20260101T000000Z-ffffff",  # well-formed run id, no trace
             "/tasks/T-ZZZ",                   # well-formed id, no such task
-            "http://127.0.0.1/tasks.json",    # absolute-form request target
         ]
         for path in escapes:
             status, _, body = srv.get(path)
@@ -651,6 +655,22 @@ def test_ac_6(tmp_path: Path):
             assert queue_marker.encode() not in body, path
             assert b"T-B" not in body, path
             assert b"tasks.json" not in body.replace(b"..%2f", b""), path
+
+        # Absolute-form request targets: a client that names the server
+        # in the target instead of the path still cannot route. The Host
+        # header is pinned explicitly — http.client derives a *bare*
+        # ``127.0.0.1`` from the target's netloc, and AC-2 (rightly)
+        # 403s that; this probe is about the target form, so it must
+        # arrive as a Host-valid request and fail on routing alone.
+        for target in ("http://127.0.0.1/tasks.json",
+                       f"http://localhost:{srv.port}/tasks.json",
+                       "http://evil.example/tasks.json",
+                       "http://127.0.0.1/../../tasks.json"):
+            status, _, body = srv.get(
+                target, host=f"127.0.0.1:{srv.port}")
+            assert status == 404, f"{target}: got {status}"
+            assert queue_marker.encode() not in body, target
+            assert b"T-B" not in body, target
 
         # Real ids still serve.
         assert srv.get(f"/runs/{RUN_ID}")[0] == 200
