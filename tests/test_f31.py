@@ -38,7 +38,7 @@ import yaml
 from factory.cli import build_parser
 from factory.cli import main as cli_main
 from factory.contract import acceptance_hash
-from factory.dashboard import GET_ROUTES, make_server
+from factory.dashboard import GET_ROUTES, Dashboard, make_server
 from factory.trace import TraceWriter
 
 PROJECT = "fixture"
@@ -444,7 +444,8 @@ def test_ac_2(tmp_path: Path):
 
         # Every other method gets 405, with the one allowed method named.
         for route in routes:
-            for method in ("POST", "PUT", "DELETE", "HEAD", "PATCH"):
+            for method in ("POST", "PUT", "DELETE", "HEAD", "PATCH",
+                           "OPTIONS", "TRACE", "CONNECT", "FROBNICATE"):
                 status, headers, _ = srv.request(route, method=method)
                 assert status == 405, f"{route} {method}: got {status}"
                 assert headers.get("Allow") == "GET"
@@ -461,8 +462,9 @@ def test_ac_2(tmp_path: Path):
             assert srv.get(route, host=f"127.0.0.1:{srv.port}")[0] == 200
             assert srv.get(route, host=f"localhost:{srv.port}")[0] == 200
 
-        # The sweep — reads only: no file under the factory root changed.
-        assert _snapshot(root) == _snapshot(root)
+        # The sweep — reads only: no file under the factory root changed
+        # by anything above, refused requests included.
+        assert _snapshot(root) == before
     finally:
         srv.close()
 
@@ -592,6 +594,50 @@ def test_ac_4(tmp_path: Path):
             conn.close()
     finally:
         srv.close()
+
+
+def _stream_lines(dashboard: Dashboard, target: str) -> list[dict]:
+    """Drive the SSE body directly and return the frames as events."""
+    route = dashboard.get(target)
+    frames: list[bytes] = []
+    dashboard.stream_events(route, frames.append)
+    return [json.loads(f.decode().removeprefix("data: ").strip()) for f in frames]
+
+
+def test_stream_skips_what_the_page_already_embedded(tmp_path: Path):
+    """The page embeds the trace so far, so its stream must start after
+    the last embedded event: a replay from line one renders every event
+    twice. ``run_end`` always goes out, or a finished run's EventSource
+    would never close and would reconnect forever."""
+    root, queue = _root(tmp_path)
+    run_id = "20261020T100000Z-aaaaaa"
+    _trace(root, run_id)
+    dashboard = Dashboard(root, queue)
+    everything = _stream_lines(dashboard, f"/runs/{run_id}/events")
+    last_seq = everything[-1]["seq"]
+    assert [e["seq"] for e in everything] == sorted(e["seq"] for e in everything)
+
+    resumed = _stream_lines(dashboard, f"/runs/{run_id}/events?after=2")
+    assert [e["seq"] for e in resumed] == [
+        e["seq"] for e in everything if e["seq"] > 2]
+
+    finished = _stream_lines(dashboard, f"/runs/{run_id}/events?after={last_seq}")
+    assert [e["type"] for e in finished] == ["run_end"]
+
+    # A malformed cursor is not a filter: the stream stays complete.
+    garbled = _stream_lines(dashboard, f"/runs/{run_id}/events?after=abc")
+    assert garbled == everything
+
+
+def test_page_asks_the_stream_for_events_after_its_embedded_trace():
+    """The renderer resumes from the embedded trace and resets per-phase
+    cost, so one phase's spend never shows on the next."""
+    script = (Path(__file__).resolve().parent.parent
+              / "factory" / "dashboard_static" / "app.js").read_text()
+    assert '/events?after=' in script
+    assert "event.seq <= lastSeq" in script
+    start = script.index('if (event.type === "phase_start") {')
+    assert "cost = null;" in script[start:start + 80]
 
 
 def test_ac_5(tmp_path: Path):

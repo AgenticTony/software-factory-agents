@@ -122,6 +122,7 @@ class EventsRoute:
     run_id: str
     project: str
     trace: Path
+    after: int = 0
 
 
 def _esc(text: Any) -> str:
@@ -194,7 +195,8 @@ class Dashboard:
         """Route one GET path. Returns the response, or an
         :class:`EventsRoute` for the SSE route (the handler streams
         it)."""
-        path = urllib.parse.unquote(path.partition("?")[0])
+        path, _, query = path.partition("?")
+        path = urllib.parse.unquote(path)
         if "\x00" in path or "\\" in path:
             return _error(404, "Not found")
         if path == "/":
@@ -216,7 +218,7 @@ class Dashboard:
             return self.task_page(match.group(1))
         match = re.fullmatch(rf"/runs/({RUN_ID_RE.pattern})/events", path)
         if match:
-            return self.events_route(match.group(1))
+            return self.events_route(match.group(1), _after_seq(query))
         match = re.fullmatch(rf"/runs/({RUN_ID_RE.pattern})", path)
         if match:
             return self.run_page(match.group(1))
@@ -409,12 +411,12 @@ class Dashboard:
             return _error(404, "Not found")
         return project, path
 
-    def events_route(self, run_id: str) -> Response | EventsRoute:
+    def events_route(self, run_id: str, after: int = 0) -> Response | EventsRoute:
         found = self._trace_of(run_id)
         if isinstance(found, Response):
             return found
         project, path = found
-        return EventsRoute(run_id, project, path)
+        return EventsRoute(run_id, project, path, after)
 
     def run_page(self, run_id: str) -> Response:
         found = self._trace_of(run_id)
@@ -454,7 +456,8 @@ class Dashboard:
         A vanished client ends the write and the stream; nothing is
         written to the factory root."""
         def send(line: str) -> None:
-            write(f"data: {line}\n\n".encode())
+            if not _already_embedded(line, route.after):
+                write(f"data: {line}\n\n".encode())
 
         run_dir = self.factory_root / "runs" / route.project / route.run_id
 
@@ -465,6 +468,28 @@ class Dashboard:
             read_trace(route.trace, follow=True, out=send, live=live)
         except (OSError, TraceError):
             pass  # the client is gone (or the trace is corrupt): stop
+
+
+def _after_seq(query: str) -> int:
+    """The ``after`` cursor of an events URL: the last ``seq`` the page
+    embedded. Anything but a non-negative integer means no cursor, so a
+    bad value can only replay events, never hide them."""
+    values = urllib.parse.parse_qs(query).get("after") or [""]
+    return int(values[0]) if values[0].isdecimal() else 0
+
+
+def _already_embedded(line: str, after: int) -> bool:
+    """Whether the page already holds this trace line. ``run_end`` is
+    never skipped: it is what closes the page's EventSource, which would
+    otherwise reconnect to a finished run forever. A line with no usable
+    ``seq`` is sent, since it can't be shown to be a duplicate."""
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return False
+    seq = event.get("seq") if isinstance(event, dict) else None
+    return (isinstance(seq, int) and seq <= after
+            and event.get("type") != "run_end")
 
 
 def _noscript_lanes(events: list[dict]) -> str:
@@ -588,12 +613,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self._send(Response(405, b"GET only\n",
                             "text/plain; charset=utf-8", (("Allow", "GET"),)))
 
-    do_POST = _refuse
-    do_PUT = _refuse
-    do_DELETE = _refuse
-    do_PATCH = _refuse
-    do_OPTIONS = _refuse
-    do_HEAD = _refuse
+    def __getattr__(self, name: str) -> Any:
+        # http.server answers 501 for a method with no do_<METHOD>, so every
+        # method but GET resolves here: AC-2 says all of them get 405.
+        if name.startswith("do_"):
+            return self._refuse
+        raise AttributeError(name)
 
 
 class DashboardServer(http.server.ThreadingHTTPServer):

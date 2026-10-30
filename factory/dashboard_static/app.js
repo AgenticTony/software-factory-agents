@@ -79,6 +79,7 @@ function renderLanes(container, events) {
 
   for (const event of events) {
     if (event.type === "phase_start") {
+      cost = null;
       lane = el("div", "lane");
       lane.dataset.phase = event.phase || "?";
       lane.append(el("h3", "", event.phase || "?"));
@@ -118,7 +119,12 @@ function main() {
   if (!runId || typeof EventSource === "undefined") return;
 
   // Live: the same events, appended as the run writes them.
-  const source = new EventSource("/runs/" + encodeURIComponent(runId) + "/events");
+  // The page already holds the trace so far, so the stream starts after it;
+  // a browser reconnect reuses this URL, so old frames are skipped below too.
+  let lastSeq = events.reduce(
+    (max, e) => (Number.isInteger(e.seq) && e.seq > max ? e.seq : max), 0);
+  const source = new EventSource(
+    "/runs/" + encodeURIComponent(runId) + "/events?after=" + lastSeq);
   let live = true;
   source.onopen = () => {
     if (state) { state.textContent = "live"; state.className = "live"; }
@@ -133,6 +139,10 @@ function main() {
         source.close();
         if (state) { state.textContent = "ended: " + (event.outcome || "?"); }
         return;
+      }
+      if (Number.isInteger(event.seq)) {
+        if (event.seq <= lastSeq) return;
+        lastSeq = event.seq;
       }
       events.push(event);
       renderLanes(container, events);
