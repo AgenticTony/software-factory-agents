@@ -39,6 +39,17 @@ in-memory collector; the vents ride the record out and the orchestrator
 flushes them into the task's progress log. Venting never touches the
 outcome, the attempt record or the budget.
 
+Toolkit (F-22): a project may give its sessions a vetted, version-
+pinned toolkit (skills, plugins, read-only MCP servers) chosen in
+``project.yaml`` and admitted in ``toolkit/index.yaml``. The session
+gets it from a **staged read-only copy outside the clone** (the
+runner-staging pattern): skills ride one local plugin so
+``setting_sources=[]`` keeps holding — nothing loads from the owner's
+personal Claude setup — and MCP servers spawn from the staged
+descriptor as children of this sandboxed runner, each tool granted one
+by one. The record's ``skills`` lists what loaded, ``name@hash``, for
+F-19's attribution.
+
 Clock: the wall clock (:func:`asyncio.wait_for` around each message
 receive, budgeted by the remaining deadline) covers **only** the message
 stream — setup and record-building sit outside it, so a session's budget
@@ -94,6 +105,12 @@ from factory.sandbox import (
     write_settings,
 )
 from factory.state import now_iso
+from factory.toolkit import (
+    ENV_SCRUB,
+    STAGED_PLACEHOLDER,
+    TOOLKIT_PLUGIN_NAME,
+    stage_toolkit,
+)
 from factory.trace import STREAM_PREFIX, scrub_literal, snippet
 from factory.vent import VENT_QUALIFIED_NAME, VENT_TOOL_NAME, VentCollector, vent_server
 
@@ -737,6 +754,114 @@ def bash_guard_hook(protected: "Sequence[str]" = ()) -> HookMatcher:
 
 # ----------------------------------------------------------- options/record --
 
+
+def mcp_guard_hook(granted: "frozenset[tuple[str, str]]") -> HookMatcher:
+    """PreToolUse hook over MCP tools: the enforcement under
+    ``bypassPermissions`` (F-22 review, PR #77 finding 2).
+
+    Both seats run prompt-bypassed (nobody can answer a permission
+    prompt), and under bypass the CLI's ``allowed_tools`` only
+    *pre-approves* — it restricts nothing: a live turn proved it (a
+    stub server's UNLISTED write tool ran unchallenged, empty
+    ``permission_denials``). A deny hook still blocks under
+    ``bypassPermissions`` (F-06's established fact), so THIS hook is
+    what makes AC-5's "tools enabled one by one" real: every
+    ``mcp__<server>__<tool>`` call whose pair the seat's toolkit never
+    granted — an unlisted tool of a listed server, or any tool of a
+    server that is not in the toolkit at all — is denied. Built-in
+    tools never match the hook's matcher and pass untouched; the vent
+    tool is granted like any other in-process server. Fail closed: a
+    malformed ``mcp__`` name matches no grant.
+    """
+
+    async def _hook(
+        input: dict[str, Any], tool_use_id: str | None, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        name = str(input.get("tool_name") or "")
+        if not name.startswith("mcp__"):
+            return {}  # the matcher routes only mcp__ names; defence anyway
+        parts = name.split("__")
+        if len(parts) != 3 or (parts[1], parts[2]) not in granted:
+            return _deny(
+                f"MCP tool {name} is not granted to this seat's toolkit — "
+                "admitted servers expose their tools one by one; an "
+                "unlisted tool is never callable"
+            )
+        return {}
+
+    return HookMatcher(matcher="mcp__.*", hooks=[_hook])
+
+
+def _apply_toolkit(options: ClaudeAgentOptions, toolkit: dict) -> None:
+    """Wire a resolved, staged toolkit into the options (F-22).
+
+    Skills ride ONE local plugin — the staged wrapper
+    ``factory-toolkit`` — so the CLI discovers them through
+    ``--plugin-dir`` while ``setting_sources`` stays ``[]``: nothing is
+    loaded from the owner's personal setup or from the clone (AC-7).
+    Plugin items keep their own manifests (their own ``--plugin-dir``).
+    MCP servers spawn from the staged descriptor's command/args/env
+    with the ``{staged}`` placeholder substituted by the staged root —
+    they run the vendored, hash-verified copy (PR #77 finding 3), as
+    children of this sandboxed runner, so srt confines them too (AC-5).
+    Each tool is granted in ``allowed_tools`` one by one, and
+    :func:`mcp_guard_hook` enforces exactly that set — under
+    ``bypassPermissions`` the grant list alone pre-approves and
+    restricts nothing (finding 2). ``strict_mcp_config`` shuts the
+    CLI's config-file MCP discovery off whenever a toolkit server is
+    attached (defence in depth under ``setting_sources=[]``).
+    """
+    staged = Path(toolkit["staged"])
+    plugin_dirs: list[dict] = []
+    skills: list[str] = []
+    mcp_servers: dict[str, dict] = {}
+    granted: set[tuple[str, str]] = set()
+    allowed = list(options.allowed_tools)
+
+    def staged_path(token: str) -> str:
+        return token.replace(STAGED_PLACEHOLDER, str(staged))
+
+    for item in toolkit.get("items") or []:
+        if item["kind"] == "skill":
+            skills.append(f"{TOOLKIT_PLUGIN_NAME}:{item['name']}")
+        elif item["kind"] == "plugin":
+            plugin_dirs.append({"type": "local", "path": str(staged / item["dir"])})
+        elif item["kind"] == "mcp_server":
+            descriptor = item["mcp"]
+            mcp_servers[item["name"]] = {
+                "type": "stdio",
+                "command": staged_path(str(descriptor["command"])),
+                "args": [staged_path(str(arg))
+                         for arg in descriptor.get("args") or []],
+                # Review round 3: the CLI merges this env over its own
+                # for the child (config wins — the SDK passes this dict
+                # verbatim via --mcp-config), so ENV_SCRUB's inert
+                # neutralizers beat any control variable that rode the
+                # session env, and the descriptor's admitted (inert)
+                # keys ride on top. Exactly these names cross: scrub +
+                # admitted, nothing else.
+                "env": {**ENV_SCRUB, **dict(descriptor.get("env") or {})},
+            }
+            for tool in descriptor.get("tools") or []:
+                allowed.append(f"mcp__{item['name']}__{tool['name']}")
+                granted.add((item["name"], tool["name"]))
+    if skills:
+        # The wrapper plugin (skills' on-disk home) rides first; plugin
+        # items keep their own manifests.
+        plugin_dirs.insert(0, {"type": "local", "path": str(staged)})
+    options.plugins = plugin_dirs
+    if skills:
+        options.skills = skills
+    if mcp_servers:
+        options.mcp_servers = {**(options.mcp_servers or {}), **mcp_servers}
+        options.strict_mcp_config = True
+    options.allowed_tools = allowed
+    # Finding 2: the granted pairs are the enforced set, not a wish.
+    if VENT_TOOL_NAME in (options.mcp_servers or {}):
+        granted.add((VENT_TOOL_NAME, VENT_TOOL_NAME))
+    options.hooks["PreToolUse"].append(mcp_guard_hook(frozenset(granted)))
+
+
 def build_options(
     seat: str,
     cwd: Path,
@@ -750,6 +875,7 @@ def build_options(
     model: str | None = None,
     system_prompt: str | None = None,
     vent_collector: VentCollector | None = None,
+    toolkit: dict | None = None,
 ) -> ClaudeAgentOptions:
     """Build the per-seat ClaudeAgentOptions (WO F-06 options list).
 
@@ -767,6 +893,13 @@ def build_options(
     ``allowed_tools`` (a grant, no restriction); without a collector no
     server is attached and the grant is inert — the option-shape tests
     build this way.
+
+    ``toolkit`` (F-22): the resolved, staged toolkit spec (``{"staged":
+    <path>, "items": [...]}`` — see
+    :func:`factory.toolkit.resolve_toolkit`/:func:`stage_toolkit`).
+    Skills load from the staged read-only copy as one local plugin, MCP
+    servers attach with their tools granted one by one; without it a
+    session gets exactly the pre-F-22 shape (no skills, no servers).
     """
     seat_config = _seat(seat)
     options = ClaudeAgentOptions(
@@ -789,6 +922,8 @@ def build_options(
     )
     if vent_collector is not None:
         options.mcp_servers = {VENT_TOOL_NAME: vent_server(vent_collector)}
+    if toolkit is not None:
+        _apply_toolkit(options, toolkit)
     if cli_path is not None:
         options.cli_path = str(Path(cli_path).expanduser().resolve())
     if model is not None:
@@ -806,6 +941,14 @@ class SessionRecord:
     out on this record's stdout channel; the orchestrator flushes them
     into the task's progress log. Empty when a session never vented —
     including every record built before F-27 (``from_dict`` defaults it).
+
+    ``skills`` (F-22 AC-8) records the toolkit this session actually
+    loaded, as ``<name>@<content-hash>`` — the staged, hash-verified
+    items the session was configured with (the CLI offers no
+    acknowledgement channel for skill *use*; hash-verified-at-load is
+    the honest maximum, and it is what F-19 attributes failures
+    against). Empty when the project declares no toolkit — as every
+    record built before F-22 is (``from_dict`` defaults it).
     """
 
     seat: str
@@ -824,6 +967,7 @@ class SessionRecord:
     result: str | None = None
     permission_denials: list[Any] | None = None
     vents: list[dict[str, Any]] = field(default_factory=list)
+    skills: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1011,6 +1155,7 @@ async def run_session(
     task_id: str | None = None,
     vent_collector: VentCollector | None = None,
     trace_sink: Callable[[dict[str, Any]], None] | None = None,
+    toolkit: dict | None = None,
 ) -> SessionRecord:
     """Run one seat's session and return what it recorded.
 
@@ -1050,6 +1195,11 @@ async def run_session(
             The sandboxed entry point passes :func:`stdout_trace_sink`;
             in-process callers pass a :class:`~factory.trace.TraceWriter`'s
             append (or anything else) directly.
+        toolkit: F-22's staged toolkit spec (``{"staged": <path>,
+            "items": [...]}``); staged and hash-verified outside, read
+            here only. The record's ``skills`` lists what this session
+            loaded as ``<name>@<content-hash>`` (AC-8), on every exit
+            path.
 
     Returns:
         The record: ``completed`` / ``failed`` (with reason) / ``aborted``
@@ -1077,12 +1227,20 @@ async def run_session(
         model=model,
         system_prompt=system_prompt,
         vent_collector=vent_collector,
+        toolkit=toolkit,
     )
 
     def _carry(record: SessionRecord) -> SessionRecord:
         # Every exit path ships the vents (F-27 AC-3): outcome untouched,
         # friction never lost — including aborts.
         record.vents = list(vent_collector.vents)
+        # ...and the loaded-toolkit stamp (F-22 AC-8): what the session
+        # was configured with rides out whatever the outcome, so F-19
+        # can attribute failures to toolkit versions.
+        record.skills = [
+            f"{item['name']}@{item['content_hash']}"
+            for item in (toolkit or {}).get("items") or []
+        ]
         return record
 
     result_message: ResultMessage | None = None
@@ -1324,6 +1482,7 @@ def run_session_sandboxed(
     run_id: str | None = None,
     task_id: str | None = None,
     trace_sink: Callable[[dict[str, Any]], None] | None = None,
+    toolkit: dict | None = None,
 ) -> SessionRecord:
     """Run one session with the whole runner process inside the F-05 sandbox.
 
@@ -1363,6 +1522,11 @@ def run_session_sandboxed(
             observes inside the sandbox is handed to this callable as its
             prefixed stdout line arrives (see :func:`trace_line_forwarder`);
             None runs the session untraced.
+        toolkit: F-22 — the seat's resolved toolkit (from
+            :func:`factory.toolkit.resolve_toolkit`). Staged into a
+            read-only copy next to the settings (outside the clone, the
+            runner-staging pattern) and carried in the spec; None gives
+            the pre-F-22 session shape (no skills, no MCP servers).
 
     Returns:
         The session's record (any status — completed/failed/aborted are
@@ -1432,6 +1596,7 @@ def run_session_sandboxed(
             teardown_grace_sec=teardown_grace_sec,
             read_only=review_guard, writable_roots=reviewer_writable,
             run_id=run_id, task_id=task_id, trace_sink=trace_sink,
+            toolkit=toolkit,
         )
     finally:
         try:
@@ -1476,6 +1641,7 @@ def _run_prepared(
     run_id: str | None = None,
     task_id: str | None = None,
     trace_sink: Callable[[dict[str, Any]], None] | None = None,
+    toolkit: dict | None = None,
 ) -> SessionRecord:
     """Stage the runner, write settings, run the sandboxed entry and parse
     its record. :func:`run_session_sandboxed` wraps this in the reviewer
@@ -1493,6 +1659,19 @@ def _run_prepared(
         )
 
     runner_dir = _stage_runner(settings_path.with_name(settings_path.name + "-runner"))
+    # F-22: the toolkit stages the same way — a read-only copy OUTSIDE
+    # the clone (the runner-staging pattern), next to the settings. The
+    # sandbox re-allows reading exactly this dir; nothing under it is
+    # writable, so the session can consume its toolkit but never edit
+    # what it was given.
+    toolkit_spec: dict | None = None
+    allow_read: list[Path] = [runner_dir]
+    if toolkit is not None:
+        staged_toolkit = stage_toolkit(
+            toolkit, settings_path.with_name(settings_path.name + "-toolkit")
+        )
+        toolkit_spec = {"staged": str(staged_toolkit), "items": toolkit["items"]}
+        allow_read.append(staged_toolkit)
     # The spec lives inside the staged runner dir — OUTSIDE the clone
     # (finding 6): a stray file in the run dir would ride into the PR via
     # `git add -A`, leaking the prompt and the orchestrator's paths.
@@ -1515,6 +1694,9 @@ def _run_prepared(
                 # collector stamps both on every vent(category, text) call.
                 "run_id": run_id,
                 "task_id": task_id,
+                # F-22: the staged toolkit — the in-sandbox runner wires
+                # it into the session's options (see _apply_toolkit).
+                "toolkit": toolkit_spec,
             }
         )
     )
@@ -1525,7 +1707,7 @@ def _run_prepared(
         model_endpoint=base_url,
         factory_root=factory_root,
         toolchain=default_toolchain(extra=[cli]),
-        allow_read=[runner_dir],
+        allow_read=allow_read,
         read_only=read_only,
         writable_roots=writable_roots,
     )
@@ -1606,6 +1788,7 @@ def _main(argv: list[str] | None = None) -> int:
                 cli_path=Path(spec["cli_path"]) if spec.get("cli_path") else None,
                 run_id=spec.get("run_id"),
                 task_id=spec.get("task_id"),
+                toolkit=spec.get("toolkit"),
                 # F-30: tool_call events ride stdout as prefixed lines;
                 # the orchestrator's on_stdout_line callback appends them
                 # to the trace (the trace path is not writable in here).

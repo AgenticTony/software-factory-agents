@@ -113,6 +113,7 @@ from factory.state import (
     recovery_task_eligible,
     unmet_dependencies,
 )
+from factory.toolkit import resolve_toolkit
 from factory.trace import TraceWriter, prune_traces
 from factory.vent import flush_vents
 
@@ -359,7 +360,9 @@ def reclaim_runs(queue: TaskQueue, project: str, factory_root: Path) -> list[Pat
                                    sandbox / f"{project}-{run_dir.name}.json"))
                 removed.append(run_dir)
         if sandbox.is_dir():
-            stray = re.compile(rf"^{re.escape(project)}-{_RUN_ID}\.json(-runner|-scratch)?$")
+            stray = re.compile(
+                rf"^{re.escape(project)}-{_RUN_ID}\.json(-runner|-scratch|-toolkit)?$"
+            )
             for entry in sorted(sandbox.iterdir()):
                 if stray.match(entry.name):
                     if entry.is_dir() and not entry.is_symlink():
@@ -1154,7 +1157,7 @@ def _sweep_escalation(
         "input_tokens": 0,
         "output_tokens": 0,
         "prompt_versions": dict(prompt_versions(profile)),
-        "skills": [],  # setting_sources=[]: no session ran
+        "skills": [],  # no session ran: nothing was loaded
         "escalation": escalation,
         "note": note,
     }
@@ -1605,6 +1608,12 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
     implementer_system = assemble_implementer_prompt(profile)
     reviewer_system = assemble_reviewer_prompt(profile)
     session_seconds = 0.0
+    # F-22: the project's vetted toolkit, per seat (a seat section in the
+    # profile narrows the reviewer to a read-only subset). Resolved once,
+    # against the loaded index, before any session starts — an index that
+    # drifted since load_profile refuses here, not mid-attempt.
+    toolkit_implementer = resolve_toolkit(profile, "implementer")
+    toolkit_reviewer = resolve_toolkit(profile, "reviewer")
 
     # F-23 review-convergence state, living across this run's rounds. The
     # prior finding keys seed from the task's progress log (an earlier run
@@ -1651,7 +1660,13 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                 "input_tokens": sum(_tokens(r, "input_tokens") for r in records),
                 "output_tokens": sum(_tokens(r, "output_tokens") for r in records),
                 "prompt_versions": dict(versions),
-                "skills": [],  # setting_sources=[]: sessions load no skills
+                # F-22 AC-8: what the round's sessions actually loaded,
+                # name@content-hash, off the session records themselves.
+                "skills": sorted({
+                    skill
+                    for record in records if record is not None
+                    for skill in (record.skills or [])
+                }),
             }
             models = [f"{r.seat}={r.model}" for r in records if r and r.model]
             if models:
@@ -1745,6 +1760,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                         system_prompt=implementer_system, srt_bin_path=ctx.srt_bin_path,
                         run_id=work.run_id, task_id=task_id,
                         trace_sink=trace.append,  # F-30: live tool_call events
+                        toolkit=toolkit_implementer,  # F-22: vetted toolkit
                     )
                     session_seconds += time.monotonic() - t0
                     records = [impl]
@@ -1881,6 +1897,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                     # but its vents belong to the task's run.
                                     run_id=work.run_id, task_id=task_id,
                                     trace_sink=trace.append,  # F-30
+                                    toolkit=toolkit_reviewer,  # F-22: narrowed
                                 )
                                 session_seconds += time.monotonic() - t0
                                 records.append(review)

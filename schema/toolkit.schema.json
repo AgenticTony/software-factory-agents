@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factory.local/schema/toolkit.schema.json",
+  "title": "Vetted agent toolkit index (toolkit/index.yaml)",
+  "description": "The factory-owned, version-pinned toolkit (F-22). Admission is a human-approved PR carrying the vetting report; this schema is the shape every load validates against. Vendored files live under toolkit/ next to their upstream LICENSE and are content-hashed by the index.",
+  "type": "object",
+  "required": ["items"],
+  "additionalProperties": false,
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "name", "upstream", "pin", "licence", "content_hash", "files", "report", "dir"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": { "enum": ["skill", "plugin", "mcp_server"] },
+          "name": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+          "upstream": {
+            "type": "string",
+            "pattern": "^https://",
+            "description": "The real upstream repo (or package registry URL) the item was vendored from. Aggregators (awesome lists, mcpmarket, the GitHub MCP Registry) are discovery sources only and are refused at load."
+          },
+          "pin": {
+            "description": "Either a pinned commit SHA, or a package version plus a sha256 integrity hash (MCP servers always the latter, AC-5).",
+            "oneOf": [
+              {
+                "type": "object",
+                "required": ["commit"],
+                "additionalProperties": false,
+                "properties": { "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" } }
+              },
+              {
+                "type": "object",
+                "required": ["version", "integrity"],
+                "additionalProperties": false,
+                "properties": {
+                  "version": { "type": "string", "minLength": 1 },
+                  "integrity": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+                }
+              }
+            ]
+          },
+          "licence": { "enum": ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC"] },
+          "content_hash": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "sha256 over the sorted (relpath, per-file sha256) pairs of the item's vendored dir; what attempts record as name@hash (AC-8)."
+          },
+          "files": {
+            "type": "object",
+            "minProperties": 1,
+            "description": "Every file under the item's vendored dir, content-addressed. A file missing, extra or tampered refuses the load (AC-1).",
+            "propertyNames": { "type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9._/@-]+$" },
+            "additionalProperties": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          },
+          "report": {
+            "type": "string",
+            "pattern": "^reports/(?!.*\\.\\.)[A-Za-z0-9._/@-]+\\.md$",
+            "description": "Path (under toolkit/) of this exact version's vetting report; it must exist and name the content hash it vetted, so a version bump cannot ride an old report (AC-4). No '..' segments — the report lives under toolkit/."
+          },
+          "dir": { "type": "string", "pattern": "^(skills|plugins|mcp)/[a-z0-9][a-z0-9-]*$" },
+          "mcp": {
+            "type": "object",
+            "required": ["command", "tools", "domains"],
+            "additionalProperties": false,
+            "properties": {
+              "command": { "type": "string", "minLength": 1 },
+              "args": { "type": "array", "items": { "type": "string" } },
+              "env": { "type": "object", "additionalProperties": { "type": "string" } },
+              "tools": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "required": ["name", "mode"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "name": { "type": "string", "pattern": "^[a-z0-9_]+$" },
+                    "mode": { "enum": ["read", "write", "send", "deploy"] }
+                  }
+                }
+              },
+              "domains": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "kind": { "const": "mcp_server" } } },
+            "then": { "required": ["mcp"] }
+          },
+          {
+            "if": { "properties": { "kind": { "not": { "const": "mcp_server" } } } },
+            "then": { "not": { "required": ["mcp"] } }
+          },
+          {
+            "if": { "properties": { "kind": { "const": "mcp_server" } } },
+            "then": { "properties": { "pin": { "required": ["version", "integrity"] } } }
+          }
+        ]
+      }
+    }
+  }
+}

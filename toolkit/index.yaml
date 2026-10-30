@@ -1,0 +1,14 @@
+# The vetted agent toolkit index (F-22 AC-1). Schema: schema/toolkit.schema.json.
+#
+# EMPTY until PR 2 (AC-9): an item enters here only through a PR carrying
+# its vetting report, approved by the owner (AC-4) — `factory toolkit vet`
+# never admits on its own. The first admission is the JobFinderOS toolkit
+# (one skill, one read-only docs MCP server).
+#
+# Each entry: kind, name, the real upstream repo (aggregators are
+# discovery-only), a pin (commit SHA, or version + sha256 integrity for
+# MCP servers), the SPDX licence (allowlist only), the content hash and
+# per-file hashes of the vendored dir, and the vetting report for THIS
+# content hash. Vendored files live next to their upstream LICENSE under
+# toolkit/<kind>/<name>/.
+items: []

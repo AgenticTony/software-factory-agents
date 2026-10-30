@@ -42,6 +42,7 @@ MORE_JUDGE_MODULES = [
     "factory/tick.py",        # F-29 human owner-step gate
     "factory/state.py",       # F-03 allowed-transition table, picker
     "factory/prbody.py",      # F-10 PR evidence built from validator facts
+    "factory/toolkit.py",     # F-22 vet/index gate on what sessions load
 ]
 
 # Files that change how pytest collects or ruff lints without touching a
@@ -64,7 +65,10 @@ TEST_CONFIG_FILES = [
 # left them unreconciled). Pinned by name: checking every in_review task
 # would also catch a fix round's own branch-only test file, and the
 # session cannot edit .factory/** to satisfy it.
-MERGED_UNRECONCILED = ["tests/test_f11.py", "tests/test_f12.py"]
+# tests/test_f22.py: merges while F-22 is still draft (it closes via
+# BOOTSTRAP.md + factory approve --reconcile-bootstrap, like F-11/F-12).
+MERGED_UNRECONCILED = ["tests/test_f11.py", "tests/test_f12.py",
+                       "tests/test_f22.py"]
 
 
 def _profile() -> dict:
