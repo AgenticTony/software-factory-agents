@@ -139,8 +139,11 @@ for one:
   `note`. A finding without either, or with any other severity value,
   makes the whole verdict invalid, and an invalid verdict is treated as a
   FAIL.
-- A `blocking` finding on **either** axis means FAIL, whatever the other
-  axis says.
+- A `blocking` or `major` finding on **either** axis means FAIL, whatever
+  the other axis says — and whatever the declared verdict says: a
+  declared pass does not override a surviving `major`. `minor` and
+  `note` never fail a round; rate a real defect `major` or `blocking`,
+  not an inflated `minor`.
 - `verdict: "fail"` stands even without a blocking finding — use it when
   the evidence for an acceptance item simply isn't there.
 - Findings are not re-ranked across axes; the axes stay separate.

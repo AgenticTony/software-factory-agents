@@ -1,8 +1,9 @@
 """Factory-level configuration (BUILD-ORDER F-10 AC-4).
 
 Settings that belong to the factory, not to any one project: today, the
-peak window during which ``factory loop`` starts no session, and how many
-reviewer sessions L2 fans out to (F-38). The Z.ai Coding Plan's quota is
+peak window during which ``factory loop`` starts no session, how many
+reviewer sessions L2 fans out to (F-38), and how many times a failed
+final full review may repeat (F-41). The Z.ai Coding Plan's quota is
 shared with the owner's own interactive use, and the owner works
 08:00–12:00 Mon–Fri Swedish time, so that is the default window.
 
@@ -14,6 +15,7 @@ The file is YAML at ``<factory_root>/config.yaml`` (absent = defaults)::
       start: "08:00"   # inclusive
       end: "12:00"     # exclusive
     reviewers: 2       # L2 reviewer sessions per review (F-38), >= 1
+    final_review_repeats: 1   # failed final review repeats (F-41), >= 0
 
 Anything malformed is refused with :class:`ConfigError` — a window that
 silently failed to parse would let the factory spend the quota at the
@@ -32,6 +34,7 @@ import yaml
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 CONFIG_FILE = "config.yaml"
 DEFAULT_REVIEWERS = 2
+DEFAULT_FINAL_REVIEW_REPEATS = 1
 
 
 class ConfigError(Exception):
@@ -60,10 +63,17 @@ class FactoryConfig:
     ``reviewers`` (F-38) is how many reviewer sessions run over one diff:
     a whole number >= 1, default 2. A reviewer fan-out of zero reviews
     nothing, so it is a config error, not a quiet single-review fallback.
+
+    ``final_review_repeats`` (F-41) bounds how often a failed final full
+    review sends its findings to one more implementer round and repeats:
+    a whole number >= 0, default 1. Zero means the first failed final
+    review escalates ``review_not_converging`` at once — nothing is
+    published with an unresolved blocking or major finding either way.
     """
 
     peak_window: PeakWindow | None = field(default=DEFAULT_PEAK_WINDOW)
     reviewers: int = DEFAULT_REVIEWERS
+    final_review_repeats: int = DEFAULT_FINAL_REVIEW_REPEATS
 
 
 def _clock(value, key: str) -> time:
@@ -116,6 +126,19 @@ def _reviewers(raw) -> int:
     return raw
 
 
+def _final_review_repeats(raw) -> int:
+    """Validate the ``final_review_repeats`` knob (F-41): a whole
+    number >= 0. Same bool refusal as ``reviewers`` — a quiet 1 from
+    ``true`` would silently spend a repeat round no owner granted."""
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ConfigError(
+            f"final_review_repeats must be a whole number >= 0, got {raw!r}")
+    if raw < 0:
+        raise ConfigError(
+            f"final_review_repeats must be a whole number >= 0, got {raw!r}")
+    return raw
+
+
 def load_config(path: Path | str | None) -> FactoryConfig:
     """Load the factory config.
 
@@ -127,7 +150,8 @@ def load_config(path: Path | str | None) -> FactoryConfig:
 
     Raises:
         ConfigError: The file is unreadable, not a mapping, has unknown
-            keys, or carries a malformed ``peak_window`` or ``reviewers``.
+            keys, or carries a malformed ``peak_window``, ``reviewers`` or
+            ``final_review_repeats``.
     """
     if path is None or not Path(path).exists():
         return FactoryConfig()
@@ -139,7 +163,7 @@ def load_config(path: Path | str | None) -> FactoryConfig:
         return FactoryConfig()
     if not isinstance(raw, dict):
         raise ConfigError(f"factory config {path} must be a mapping")
-    unknown = sorted(set(raw) - {"peak_window", "reviewers"})
+    unknown = sorted(set(raw) - {"peak_window", "reviewers", "final_review_repeats"})
     if unknown:
         raise ConfigError(f"factory config {path}: unknown keys {unknown}")
     return FactoryConfig(
@@ -147,6 +171,10 @@ def load_config(path: Path | str | None) -> FactoryConfig:
         else DEFAULT_PEAK_WINDOW,
         reviewers=_reviewers(raw["reviewers"]) if "reviewers" in raw
         else DEFAULT_REVIEWERS,
+        final_review_repeats=(
+            _final_review_repeats(raw["final_review_repeats"])
+            if "final_review_repeats" in raw else DEFAULT_FINAL_REVIEW_REPEATS
+        ),
     )
 
 

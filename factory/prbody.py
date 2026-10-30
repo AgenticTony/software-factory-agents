@@ -298,11 +298,14 @@ def _validator_section(reports: dict) -> str:
     multiline payload. Inside the JSON fence the same text was always
     safe (newlines escaped there)."""
     body_reports = dict(reports)
+    for key in ("L2", "L2-delta"):
+        report = reports.get(key)
+        if isinstance(report, dict) and "verifier_dropped" in report:
+            body_reports[key] = {
+                item: value for item, value in report.items()
+                if item != "verifier_dropped"
+            }
     l2 = reports.get("L2")
-    if isinstance(l2, dict) and "verifier_dropped" in l2:
-        body_reports["L2"] = {
-            key: value for key, value in l2.items() if key != "verifier_dropped"
-        }
     section = fence(json.dumps(body_reports, indent=2, ensure_ascii=False), "json")
     if (
         isinstance(l2, dict)
@@ -318,7 +321,11 @@ def _validator_section(reports: dict) -> str:
             "finding, so the effective verdict is pass** (the vote's drops "
             "are recorded in the attempt's `review_drops`):\n\n" + section
         )
+    # F-41: when a final review ran, the round's delta review rides as
+    # "L2-delta" (the final review owns "L2") — its out-of-scope drops
+    # belong in front of the human exactly the same.
     dropped = (reports.get("L2") or {}).get("dropped") or []
+    dropped = dropped + ((reports.get("L2-delta") or {}).get("dropped") or [])
     if dropped:
         lines = [
             f"- [{_flat(d.get('finding', {}).get('severity'))}] "

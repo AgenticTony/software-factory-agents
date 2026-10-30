@@ -178,7 +178,11 @@ class Scripted:
     unmoved one (an empty delta). Every review seat of a round — the F-38
     fan-out's two reviewer sessions and the verifier — returns
     ``reviews[round-1]`` (the last verdict repeats), so a scenario scripts
-    exactly what each round's review says. For the verifier that text is
+    exactly what each round's review says — EXCEPT the round's second
+    fan-out, the F-41 final review, which returns ``final`` (default: a
+    clean pass — the scenarios here script the round's own review, and a
+    final that echoed the delta's droppable findings back would test F-41,
+    not F-23; tests/test_f41.py does that). For the verifier that text is
     an invalid vote shape, which by design drops nothing: every finding
     survives the vote and F-23's convergence alone decides the round.
     Indexing is by IMPLEMENTER round (the implementer runs alone, before
@@ -193,12 +197,15 @@ class Scripted:
         "def answer():\n    return 42  # fix round 2\n",
     )
 
-    def __init__(self, impls=SAME, reviews=(_verdict(),), result="Implemented."):
+    def __init__(self, impls=SAME, reviews=(_verdict(),), result="Implemented.",
+                 final=None):
         self.impls = list(impls)
         self.reviews = list(reviews)
+        self.final = final  # the F-41 final review's script (default: clean pass)
         self.result = result
         self.lock = threading.Lock()
         self.calls: list[tuple[str, str, Path, dict]] = []
+        self.round_reviews = 0  # reviewer calls since this round's implementer
 
     def prompts(self, seat: str) -> list[str]:
         return [prompt for s, prompt, _, _ in self.calls if s == seat]
@@ -208,6 +215,10 @@ class Scripted:
         with self.lock:
             self.calls.append((seat, prompt, run_dir, kwargs))
             round_no = sum(1 for s, *_ in self.calls if s == "implementer")
+            if seat == "implementer":
+                self.round_reviews = 0
+            else:
+                self.round_reviews += 1
         if seat == "implementer":
             body = self.impls[min(round_no - 1, len(self.impls) - 1)]
             (run_dir / "impl.py").write_text(body)
@@ -216,7 +227,12 @@ class Scripted:
                 seat=seat, status="completed", num_turns=3, model="stub-model",
                 tokens={"input_tokens": 120, "output_tokens": 40}, result=self.result,
             )
-        verdict = self.reviews[min(round_no - 1, len(self.reviews) - 1)]
+        if self.round_reviews > 2:
+            # The round's second fan-out: the F-41 final review (the
+            # fan-out is 2 wide in every scenario here).
+            verdict = self.final if self.final is not None else _verdict()
+        else:
+            verdict = self.reviews[min(round_no - 1, len(self.reviews) - 1)]
         return SessionRecord(
             seat=seat, status="completed", num_turns=1, model="stub-model",
             tokens={"input_tokens": 60, "output_tokens": 10}, result=verdict,
@@ -361,6 +377,9 @@ def test_ac_2(tmp_path: Path):
     # Integration half: round 2's reviewer prompt scopes to the delta since
     # the last reviewed sha, keeps the full diff for reference — and an
     # out-of-delta finding really is dropped from the effective verdict.
+    # F-41: the passing delta round then runs the FINAL full review
+    # (scripted clean — F-41's own tests script it otherwise), and the
+    # delta review's report rides the record as "L2-delta".
     env = Env(tmp_path)
     seats = Scripted(
         impls=Scripted.MOVING,  # a moving head: round 2's delta is non-empty
@@ -373,14 +392,15 @@ def test_ac_2(tmp_path: Path):
     )
     result = env.run(seats)
     assert result.outcome == "pr_opened"  # the drop flipped the effective verdict
-    round1, round2 = _review_rounds(seats)
+    rounds = _review_rounds(seats)
+    round1, round2 = rounds[0], rounds[1]
     assert "## Diff (base...head)" in round1  # round 1: the full diff is the scope
     assert "## Delta since the last review (primary scope)" in round2
     assert "## Full diff (base...head, reference only)" in round2
     delta = round2.split("primary scope)", 1)[1].split("## Full diff", 1)[0]
     assert "# fix round" in delta  # the delta carries round 2's change...
     assert "return 0" not in delta  # ...and only that: base content is outside it
-    second = env.report(2)["L2"]
+    second = env.report(2)["L2-delta"]
     assert second["dropped"][0]["finding"]["file"] == "tests/test_base.py"
 
 
@@ -554,6 +574,7 @@ def test_review2_delta_survives_a_rewritten_prior_round(tmp_path: Path):
         if seat != "implementer":
             return base_call(seat, prompt, run_dir, profile, **kwargs)
         seats.calls.append((seat, prompt, Path(run_dir), kwargs))
+        seats.round_reviews = 0  # keep Scripted's round tracking honest
         round_no = sum(1 for s, *_ in seats.calls if s == "implementer")
         (Path(run_dir) / "impl.py").write_text(
             f"def answer():\n    return 42  # round {round_no}\n")
@@ -673,7 +694,10 @@ def test_review7_fileless_findings_are_never_dropped(tmp_path: Path):
     )
     result = env.run(seats)
     assert result.outcome == "pr_opened"
-    assert len(_review_rounds(seats)) == 3  # red before: 2 (PR at round 2)
+    # Three review fan-outs before F-41's final: round 1, round 2's
+    # (failed) delta review, round 3's (passing) delta review — then the
+    # final full review, scripted clean, that publishes (F-41).
+    assert len(_review_rounds(seats)) == 4
     second = env.report(2)["L2"]
     assert second["findings"] and second["verdict"] == "fail"
     assert not second["dropped"]
@@ -722,7 +746,9 @@ def test_review9_dropped_findings_reach_the_human(tmp_path: Path):
     assert "dropped as out of scope" in body  # red before: JSON blob only
     assert "pre-existing oddity" in body
     round2_findings = env.log().entries()[1]["findings"]
-    assert any("[L2 dropped" in line for line in round2_findings)
+    # F-41: the round's delta review rides the record as L2-delta once
+    # the final review owns L2 — its drops render like L2's own.
+    assert any("[L2-delta dropped" in line for line in round2_findings)
 
 
 # --- owner review round 2 (PR #35; 9 findings on 116e16b — all fixed) ------
@@ -757,6 +783,7 @@ def test_review10_fallback_round_does_not_carry_repeats_as_untouched(tmp_path: P
         if seat != "implementer":
             return base_call(seat, prompt, run_dir, profile, **kwargs)
         seats.calls.append((seat, prompt, Path(run_dir), kwargs))
+        seats.round_reviews = 0  # keep Scripted's round tracking honest
         round_no = sum(1 for s, *_ in seats.calls if s == "implementer")
         (Path(run_dir) / "impl.py").write_text(
             f"def answer():\n    return 42  # round {round_no}\n")
@@ -1054,6 +1081,7 @@ def test_review21_an_l0l1_failed_round_keeps_the_open_l2_findings(tmp_path: Path
         if seat != "implementer":
             return base_call(seat, prompt, run_dir, profile, **kwargs)
         seats.calls.append((seat, prompt, Path(run_dir), kwargs))
+        seats.round_reviews = 0  # keep Scripted's round tracking honest
         round_no = sum(1 for s, *_ in seats.calls if s == "implementer")
         answer = 41 if round_no == 2 else 42  # round 2 breaks the test: L1 fail
         (Path(run_dir) / "impl.py").write_text(

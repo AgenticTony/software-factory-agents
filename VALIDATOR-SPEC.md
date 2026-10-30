@@ -72,7 +72,7 @@ L1 therefore records **how** each ref went red (`assertion` vs `collection`) in 
     - Does its expected value come from an independent source (a literal, a worked example, the acceptance text), or does it recompute what the code does?
     - Does it assert through the public interface, or on mocked internal collaborators, private methods or call counts? Mocks belong only at system boundaries (external APIs, time, randomness).
 - **Model:** a different model from the implementer where possible. With GLM-only, the self-preference bias is real, so L0, L1 and L3 — none judged by the model — carry most of the weight. Add a cross-provider reviewer when budget allows (see design doc §7).
-- Output: JSON `{verdict, findings: [{id, axis, severity, file, line, text}]}`, with `axis` being `spec` or `standards`, stored as the `validator_report`. A finding with severity `blocking` on either axis means FAIL. Findings are not re-ranked across axes.
+- Output: JSON `{verdict, findings: [{id, axis, severity, file, line, text}]}`, with `axis` being `spec` or `standards`, stored as the `validator_report`. A finding with severity `blocking` or `major` on either axis means FAIL (F-41: a surviving major weighs exactly as much as a blocking finding, and a declared pass overrides neither). Findings are not re-ranked across axes.
 
 ### L3 — Holdout scenarios (agents never see them)
 
