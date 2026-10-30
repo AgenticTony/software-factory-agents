@@ -1,0 +1,65 @@
+/* factory dashboard (F-31) — local, read-only, no framework. */
+
+:root {
+  --bg: #14161a;
+  --fg: #e8e6e3;
+  --muted: #9a948c;
+  --line: #2b2f36;
+  --ok: #6fbf73;
+  --bad: #e06c5b;
+  --accent: #6ca0d8;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  padding: 0.6rem 1.2rem;
+  border-bottom: 1px solid var(--line);
+}
+
+header h1 { font-size: 1rem; margin: 0; color: var(--muted); }
+header nav a { color: var(--accent); margin-right: 0.8rem; }
+
+main { padding: 1rem 1.2rem; max-width: 60rem; }
+
+h2 { font-size: 1.05rem; border-bottom: 1px solid var(--line); padding-bottom: 0.2rem; }
+h3 { font-size: 0.95rem; }
+
+a { color: var(--accent); text-decoration: none; }
+
+.task { list-style: none; margin: 0.3rem 0; }
+.task-id { font-weight: 600; color: var(--accent); }
+.escalation { color: var(--bad); margin: 0.15rem 0 0.3rem 1.2rem; }
+.step[data-step-done] { color: var(--muted); }
+.step[data-step-open] { color: var(--fg); }
+.task-link { margin-left: 0.6rem; font-size: 0.85em; }
+
+/* Run view: swim lanes on a time axis. */
+.lane {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  margin: 0.6rem 0;
+  padding: 0.4rem 0.8rem;
+}
+.lane h3 { margin: 0.2rem 0; color: var(--accent); }
+.lane ul { margin: 0.3rem 0; padding-left: 1rem; }
+.lane li { list-style: none; }
+.lane li.failed { color: var(--bad); }
+.lane .spend { color: var(--muted); font-size: 0.9em; }
+
+#stream-state { color: var(--muted); font-size: 0.9em; }
+#stream-state.live { color: var(--ok); }
+#stream-state.polling { color: var(--bad); }
+
+table { border-collapse: collapse; }
+th, td { border: 1px solid var(--line); padding: 0.2rem 0.6rem; text-align: left; }

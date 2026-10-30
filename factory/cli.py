@@ -20,6 +20,7 @@ from factory.approve import (
 )
 from factory.config import CONFIG_FILE, ConfigError, load_config
 from factory.contract import ContractError, load_profile, load_tasks, read_file
+from factory.dashboard import DEFAULT_PORT, make_server
 from factory.eval import EvalError, run_on_demand_eval
 from factory.gates import GateError
 from factory.importer import apply_import, run_import
@@ -145,6 +146,19 @@ def build_parser() -> argparse.ArgumentParser:
                             "(default: %(default)s)")
     trace.add_argument("--factory-root", default=None,
                        help="factory root (default: ~/factory)")
+
+    dashboard = sub.add_parser(
+        "dashboard", help="read-only local dashboard: queue, metrics, runs (F-31)")
+    dashboard.add_argument(
+        "--port", type=int, default=DEFAULT_PORT,
+        help="loopback port to serve on (default: %(default)s)")
+    dashboard.add_argument(
+        "--queue", default=".factory/tasks.json",
+        help="queue path; the project is read from its profile "
+             "(default: %(default)s)")
+    dashboard.add_argument(
+        "--factory-root", default=None,
+        help="factory root holding traces and runs (default: ~/factory)")
 
     eval_cmd = sub.add_parser(
         "eval",
@@ -355,6 +369,30 @@ def _run_trace(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("factory trace: interrupted", file=sys.stderr)
         return 130
+
+
+def _run_dashboard(args: argparse.Namespace) -> int:
+    """Dispatch the dashboard subcommand (F-31). It serves read-only on
+    127.0.0.1; a port it cannot bind exits 1 with a message, never a
+    traceback."""
+    root = Path(args.factory_root) if args.factory_root else FACTORY_ROOT_DEFAULT
+    try:
+        server = make_server(factory_root=root, queue=args.queue,
+                             port=args.port)
+    except OSError as exc:
+        print(f"factory dashboard: cannot bind 127.0.0.1:{args.port}: {exc}",
+              file=sys.stderr)
+        return 1
+    port = server.server_address[1]
+    print(f"factory dashboard: http://127.0.0.1:{port} (Ctrl-C to stop)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("factory dashboard: interrupted", file=sys.stderr)
+        return 130
+    finally:
+        server.server_close()
+    return 0
 
 
 def _run_status(args: argparse.Namespace) -> int:
@@ -613,6 +651,8 @@ def main(argv: list | None = None) -> int:
         return _run_trace(args)
     if args.command == "status":
         return _run_status(args)
+    if args.command == "dashboard":
+        return _run_dashboard(args)
     if args.command == "sentinels":
         return _run_sentinels_replay(args)
     if args.command == "toolkit":
