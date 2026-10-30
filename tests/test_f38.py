@@ -1152,6 +1152,51 @@ def test_real_fanout_scratch_reads_back_under_a_denied_home(tmp_path, monkeypatc
     assert proc.stdout.split() == ["isolated", "readback-ok"], proc.stdout + proc.stderr
 
 
+def test_real_single_session_scratch_reads_back_under_a_denied_home(
+    tmp_path, monkeypatch,
+):
+    """The verifier runs as one guarded session, not through the fan-out,
+    so its scratch arrives as ``writable_roots`` through the run dir's
+    ``.home``/``.tmp`` links. Writable alone still kills the CLI at startup
+    under a denied home (F-16 run 20261030T134446Z-f57b83: the verifier
+    failed in 5s in both rounds while the fan-out reviewers completed)."""
+    from factory.sandbox import build_settings, run_sandboxed, write_settings
+    from factory.session import _reviewer_scratch, _teardown_reviewer_scratch
+
+    repo, profile = _sandbox_repo(tmp_path)
+    home = tmp_path / "home"
+    root = home / "factory"
+    run = root / "runs" / "p" / "20261030T000000Z-aaaaaa"
+    run.mkdir(parents=True)
+    sandbox_dir = root / "sandbox"
+    sandbox_dir.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    settings = sandbox_dir / "verifier.json"
+    writable = _reviewer_scratch(settings, run)
+    built = build_settings(
+        profile, run, factory_root=root,
+        model_endpoint="https://api.z.ai/api/anthropic",
+        read_only=True, writable_roots=writable,
+    )
+    write_settings(built, settings)
+    script = textwrap.dedent("""
+        import os, pathlib
+        for var in ("HOME", "TMPDIR"):
+            probe = pathlib.Path(os.environ[var]) / "probe.txt"
+            probe.write_text("x")
+            assert probe.read_text() == "x"
+        print("readback-ok")
+    """)
+    try:
+        proc = run_sandboxed(
+            [sys.executable, "-c", script], run, settings, timeout=120,
+        )
+    finally:
+        _teardown_reviewer_scratch(run)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.split() == ["readback-ok"], proc.stdout + proc.stderr
+
+
 def test_review2_a_unanimous_blocking_finding_survives_the_vote():
     """Finding 2: a blocking or major finding that EVERY reviewer reported
     cannot be dropped by one verifier — it survives tagged important, and

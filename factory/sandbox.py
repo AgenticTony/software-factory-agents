@@ -577,10 +577,12 @@ def build_settings(
             "allowRead": [str(run_dir), str(srt_package)]
             + [str(entry) for entry in toolchain_reads]
             + [str(Path(entry).resolve()) for entry in allow_read]
-            # A fan-out session's scratch sits under the denied home: being
+            # A review seat's scratch sits under the denied home: being
             # writable does not make it readable, and the CLI dies at startup
-            # reading its own $HOME (run 20261030T120742Z-75e6df).
-            + [str(Path(entry).resolve()) for entry in scratch_write or ()],
+            # reading its own $HOME (runs 20261030T120742Z-75e6df, fan-out;
+            # 20261030T134446Z-f57b83, the single-session verifier).
+            + [str(Path(entry).resolve())
+               for entry in (*(scratch_write or ()), *writable_roots)],
             # Read-only mode (the reviewer seat): the run dir itself is NOT
             # writable — only scratch. A reviewer that can write the repo it
             # reviews can "fix" the code, watch its own fix pass, and report
