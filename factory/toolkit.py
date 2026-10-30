@@ -27,10 +27,15 @@ tools classified read|write|send|deploy, network domains). They are
 admitted read-only with no credentials in their environment and their
 domains inside the *running project's* allowlists (re-checked at
 :func:`resolve_toolkit` time, because the index is factory-global while
-allowlists are per project). At session time the runner spawns them from
-the staged descriptor — inside the F-05 sandbox, everything the runner
-spawns is confined — with each tool enabled one by one through
-``allowed_tools``.
+allowlists are per project). The spawn itself is an ALLOWLIST (see
+:func:`_spawn_reasons`): a ``{staged}/...`` vendored executable, or an
+allowed interpreter running a ``{staged}/...`` script as its first
+operand — never a fetch-at-spawn command, a shell, a code/module flag
+or a URL argument, so the index pin describes exactly what executes.
+At session time the runner spawns them from the staged descriptor —
+inside the F-05 sandbox, everything the runner spawns is confined —
+with each tool granted one by one and enforced by the session's MCP
+guard hook (a deny hook still blocks under ``bypassPermissions``).
 
 Content addressing: an item's ``content_hash`` is sha256 over the sorted
 ``(relpath, per-file sha256)`` pairs of its vendored dir; attempts
@@ -47,7 +52,7 @@ import re
 import shutil
 import stat
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Sequence
 
 import yaml
@@ -156,15 +161,31 @@ def irregular_paths(root: Path) -> list[str]:
 
 
 def file_hashes(root: Path) -> dict[str, str]:
-    """``{posix relpath: sha256}`` over every REGULAR file under
-    ``root`` — symlinked and other irregular entries are excluded, never
-    hashed through (their targets' content must never enter a toolkit
-    hash).
+    """``{posix relpath: sha256}`` over every file under ``root``.
 
     The walk is sorted and path-based, so the result is independent of
     directory iteration order and inode numbers.
+
+    Raises:
+        ToolkitError: Any symlink or other non-regular file (fifo,
+            socket, device) sits under ``root`` — named in the message.
+            This is the one choke point (review round 2, finding 2: the
+            round-1 walker *skipped* irregular entries, so refusal
+            depended on every caller remembering a separate check — one
+            that forgot would hash a tree with a link in it and never
+            notice). :func:`content_hash_of` and every future caller
+            inherit the refusal; :func:`vet_candidate` is the one
+            deliberate exception (a candidate's link is a *finding* for
+            the report, not a crash — it walks via :func:`_scan_tree`
+            itself).
     """
-    files, _ = _scan_tree(root)
+    files, irregular = _scan_tree(root)
+    if irregular:
+        raise ToolkitError(
+            f"{root}: {irregular[0]} is a symlink or non-regular file — "
+            "toolkit content is plain files (a link's target would be "
+            "read through it)"
+        )
     return {rel: _sha256(path.read_bytes()) for rel, path in files.items()}
 
 
@@ -447,7 +468,11 @@ def vet_candidate(path: Path | str, *, allowlists: Sequence[str]) -> VetResult:
         findings=findings,
         licence=licence,
         licence_reason=reason,
-        content_hash=_aggregate(file_hashes(root)),
+        # The candidate's own walked regular files (file_hashes would
+        # raise on the very links this scan reports as findings).
+        content_hash=_aggregate(
+            {rel: _sha256(path.read_bytes()) for rel, path in files.items()}
+        ),
     )
 
 
@@ -489,13 +514,44 @@ _CRED_ENV_KEY = re.compile(
     r"TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|PRIVATE_?KEY|CREDENTIAL", re.I
 )
 
-# Commands that fetch (or reach out) at spawn: what actually runs is
-# whatever the network returned, so an index pin beside them is
-# declarative only (PR #77 finding 3). The placeholder an admitted
-# descriptor MUST reference: the vendored, hash-verified copy inside
-# the staged toolkit.
-_FETCH_COMMANDS = frozenset({"npx", "uvx", "bunx", "pipx", "curl", "wget",
-                             "ssh"})
+# The MCP spawn ALLOWLIST (review round 2 on PR #77: the round-1
+# denylist was bypassable — argv0 outside the set, ``args[:2]`` exact
+# spellings, and a ``{staged}`` token anywhere were all enough). An
+# admitted spawn is one of two shapes and nothing else:
+#
+# * shape (a): the command itself is a ``{staged}/...`` path — a
+#   vendored executable inside the staged copy;
+# * shape (b): the command is an interpreter below and its FIRST
+#   non-option argument is a ``{staged}/...`` script.
+#
+# The interpreters are exactly the runtimes a vendored server is
+# realistically written in (JS on node; Python on python3, bare-python
+# aliases and the versioned spellings) — each addition (bun, deno, …)
+# is a reviewed change to this set, not a default.
+_INTERPRETERS = frozenset(
+    {"node", "python", "python3", *(f"python3.{n}" for n in range(9, 14))}
+)
+# Flags that may precede the staged script under shape (b): plain
+# runtime behaviour, no code, no module loading, nothing that consumes
+# a following argument. Exact tokens only — anything else before the
+# script refuses, so option bundles (``-Ic``) cannot smuggle a code
+# letter past exact matching.
+_BENIGN_PRE_SCRIPT_FLAGS = frozenset({"-u", "-B", "-E", "-O", "-OO",
+                                      "-q", "-qq"})
+# Code and module flags: refused anywhere in the arguments (after the
+# script they are the script's own argv, but refusing there too is the
+# safe side of exact-token matching — ``--port`` is not ``-p``).
+_CODE_FLAGS = frozenset({
+    "-c", "-e", "--eval", "-p", "--print", "-m", "-r", "--require",
+    "--import", "--loader", "--experimental-loader", "-I", "-S",
+})
+# Shells and wrappers: argv0 or wrapper — a shell re-parses everything
+# after it, so no pin can describe what runs.
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ash", "fish", "ksh",
+                     "env"})
+_URL_PREFIXES = ("http://", "https://", "ftp://", "ws://", "wss://")
+# The placeholder an admitted descriptor references: the vendored,
+# hash-verified copy inside the staged toolkit.
 STAGED_PLACEHOLDER = "{staged}"
 
 
@@ -509,41 +565,116 @@ def _credential_shaped(value: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9_\-]{32,}", value))
 
 
-def _spawn_reasons(mcp: dict) -> list[str]:
-    """Why a descriptor's spawn refuses admission (PR #77 finding 3).
+def _staged_relpath(token: str) -> str | None:
+    """The in-root path a token names, or None when it is not a plain
+    ``{staged}/<inside>`` path (no placeholder, a bare placeholder, a
+    ``..`` escape, or the placeholder buried mid-token)."""
+    marker = STAGED_PLACEHOLDER + "/"
+    if not token.startswith(marker):
+        return None
+    rest = token[len(marker):]
+    if not rest or ".." in PurePosixPath(rest).parts:
+        return None
+    return rest
 
-    The pin must describe what actually executes: the command runs from
-    the vendored, hash-verified copy inside the staged toolkit — the
-    ``{staged}`` placeholder, substituted with the staged root at option
-    build time — and never fetches at spawn (npx/uvx/bunx/pipx, pip
-    install, curl/wget/ssh): a runtime fetch executes whatever the
-    network returned, which no index pin can vouch for.
+
+def _spawn_reasons(mcp: dict) -> list[str]:
+    """Why a descriptor's spawn refuses admission (PR #77 finding 3,
+    review round 2: an ALLOWLIST, not a denylist — every bypass probe
+    of the round-1 denylist was admitted).
+
+    An admitted spawn runs vendored, hash-verified content, one of two
+    shapes and nothing else:
+
+    * **(a)** the command itself is a ``{staged}/...`` path — a vendored
+      executable inside the staged copy; or
+    * **(b)** the command is an allowed interpreter (see
+      :data:`_INTERPRETERS`) whose FIRST non-option argument is a
+      ``{staged}/...`` script, with only benign runtime flags (see
+      :data:`_BENIGN_PRE_SCRIPT_FLAGS`) before it.
+
+    Everything else refuses: shells and wrappers (a shell re-parses
+    everything after it, so no pin can describe what runs); inline-code
+    and module flags anywhere in the arguments (``-c``, ``-e``,
+    ``--eval``, ``-p``, ``--print``, ``-m``, ``-r``/``--require``,
+    ``--import``, ``--loader``, ``--experimental-loader``, and python's
+    ``-I``/``-S``); any URL argument (a URL is a fetch by
+    construction); and any ``{staged}`` token that normalises out of
+    the staged root (``{staged}/../x``). Flags match as exact tokens
+    (``--port`` is not ``-p``), and nothing but the benign runtime
+    flags may precede the script, so option bundles like ``-Ic`` cannot
+    smuggle a code letter past exact matching.
     """
     command = str(mcp.get("command") or "")
     args = [str(arg) for arg in mcp.get("args") or []]
-    argv0 = Path(command).name
     reasons: list[str] = []
-    if argv0 in _FETCH_COMMANDS:
+    for arg in args:
+        if arg.startswith(_URL_PREFIXES):
+            reasons.append(
+                f"argument {arg!r} is a URL — a URL argument is a fetch by "
+                "construction; the server runs vendored content, it does "
+                "not download it"
+            )
+            break
+    for token in [command, *args]:
+        if STAGED_PLACEHOLDER in token and _staged_relpath(token) is None:
+            reasons.append(
+                f"argument {token!r} does not name a path inside the staged "
+                f"root ({STAGED_PLACEHOLDER}/… with no '..' segments)"
+            )
+    for arg in args:
+        if arg in _CODE_FLAGS or any(
+            arg.startswith(flag + "=")
+            for flag in _CODE_FLAGS if flag.startswith("--")
+        ):
+            reasons.append(
+                f"flag {arg!r} runs inline code or loads a module — the "
+                "spawn carries no code and no module flags, only the "
+                "vendored script and its own arguments"
+            )
+    argv0 = Path(command).name
+    if argv0 in _SHELLS:
         reasons.append(
-            f"command {command!r} fetches or reaches out at spawn: an MCP "
-            "server must run from the vendored, hash-verified copy inside "
-            f"the staged toolkit ({STAGED_PLACEHOLDER}), never a runtime "
-            "fetch — an index pin beside a fetch is declarative only"
+            f"command {command!r} is a shell or wrapper: it re-parses "
+            "everything after it, so no index pin can describe what runs"
         )
-    elif (argv0 in {"pip", "pip3"} and "install" in args) or (
-        argv0 in {"python", "python3"} and args[:2] == ["-m", "pip"]
-        and "install" in args
-    ):
+    elif _staged_relpath(command) is not None:
+        pass  # shape (a): the command IS a vendored executable
+    elif argv0 in _INTERPRETERS:
+        # Shape (b): the first non-option argument must be the staged
+        # script; only benign runtime flags may precede it.
+        pre_flags: list[str] = []
+        first_operand = None
+        for arg in args:
+            if arg.startswith("-"):
+                pre_flags.append(arg)
+                continue
+            first_operand = arg
+            break
+        smuggled = [f for f in pre_flags
+                    if f not in _BENIGN_PRE_SCRIPT_FLAGS]
+        if smuggled:
+            reasons.append(
+                f"flag {smuggled[0]!r} precedes the staged script — only "
+                "benign runtime flags ("
+                + " ".join(sorted(_BENIGN_PRE_SCRIPT_FLAGS)) +
+                ") may, so option bundles cannot smuggle a code flag"
+            )
+        if first_operand is None or _staged_relpath(first_operand) is None:
+            reasons.append(
+                f"interpreter {command!r} must run a staged script as its "
+                f"first non-option argument ({STAGED_PLACEHOLDER}/…) — an "
+                "interpreter without a vendored script executes whatever "
+                "it is handed, and no pin vouches for that"
+            )
+    else:
         reasons.append(
-            f"command {command!r} installs at spawn ({' '.join([command, *args])}): "
-            "an MCP server must run from the vendored, hash-verified copy "
-            f"inside the staged toolkit ({STAGED_PLACEHOLDER})"
-        )
-    if not any(STAGED_PLACEHOLDER in token for token in [command, *args]):
-        reasons.append(
-            f"descriptor never references {STAGED_PLACEHOLDER}: the server "
-            "must run from the vendored copy inside the staged toolkit, so "
-            "the index pin describes what actually executes"
+            f"command {command!r} is neither a staged vendored executable "
+            f"({STAGED_PLACEHOLDER}/…) nor an allowed interpreter ("
+            + ", ".join(sorted(_INTERPRETERS)) +
+            ") running one — an MCP server runs the vendored, "
+            "hash-verified copy, and anything else is unpinned by "
+            "construction"
         )
     return reasons
 

