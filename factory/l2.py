@@ -543,7 +543,26 @@ def apply_convergence(
             for f in l2_findings
         )
     )
-    everything_dropped = not active and bool(dropped or report.verifier_dropped)
+    # Review finding 4: on the FIRST review (no delta, nothing out of
+    # scope), a declared fail whose every finding the verifier voted out
+    # is an unsupported fail — the vote removed its whole substance, so
+    # the round passes on L2 (the drops stay recorded; the PR body says
+    # the reviewers' fail was voted out). On a delta round (2+) the
+    # F-23 all_dropped stop keeps its original meaning: findings dropped
+    # as out of scope, or voted out, leave a fail with nothing to fix.
+    vote_rejected_fail = (
+        not active
+        and not delta_mode
+        and not dropped
+        and bool(report.verifier_dropped)
+        and report.parse_error is None
+    )
+    if vote_rejected_fail:
+        verdict = "pass"
+    everything_dropped = (
+        not active and bool(dropped or report.verifier_dropped)
+        and not vote_rejected_fail
+    )
     no_progress = verdict == "fail" and (
         only_this_runs_carries or everything_dropped
     )
@@ -751,9 +770,20 @@ def _default_tag(severity: str | None) -> str:
     return "important" if heavy else "nit"
 
 
+def _unanimous(finding: L2Finding, reviewers: int) -> bool:
+    """Whether every reviewer of the fan-out reported this blocking or
+    major finding (review finding 2's unanimous rule)."""
+    if reviewers < 1:
+        return False
+    heavy = (finding.severity or "").strip().lower() in ("blocking", "major")
+    reported = set(finding.reported_by or [])
+    return heavy and reported == set(range(1, reviewers + 1))
+
+
 def apply_vote(
     report: L2Report,
     outcome: VerifierOutcome,
+    reviewers: int = 1,
 ) -> L2Report:
     """Apply the verifier's vote: rank, tag and budget the survivors (F-38).
 
@@ -766,6 +796,15 @@ def apply_vote(
       author's PR is a contradiction — if it truly predates the diff and
       should not block, the verifier's tool is the DROP, with a reason,
       not a re-tag. Every other severity keeps the verifier's tag.
+    * **The unanimous rule** (review finding 2): a ``blocking`` or
+      ``major`` finding that EVERY reviewer of the fan-out reported cannot
+      be dropped by the one verifier — independent agreement is stronger
+      evidence than one voter's objection. The drop is refused: the
+      finding survives tagged ``important`` and the ledger records the
+      attempt as ``override_refused: <the verifier's reason>`` (the reason
+      is kept — a refused drop with no why is a hole in the audit). A
+      finding fewer than all reviewers reported keeps the vote's full
+      semantics, drop and all.
     * Survivors are ranked by severity first (the Anthropic record's
       "sorted by severity"), then by tag (important, nit, pre-existing),
       then by union order.
@@ -781,13 +820,40 @@ def apply_vote(
     Args:
         report: The union report (:func:`merge_reviews` output).
         outcome: The parsed vote (:func:`parse_verifier_vote` output).
+        reviewers: How many reviewer sessions the fan-out ran (the
+            unanimous rule needs N; default 1 — with one reviewer,
+            every finding is by definition unanimous).
 
     Returns:
         The post-vote :class:`L2Report` — ranked survivors in ``findings``,
         the verifier's and the budget's drops in ``verifier_dropped``.
     """
+    kept = list(outcome.kept)
+    drops: list[dict] = []
+    unanimous_pool = {
+        finding.id: finding for finding in report.findings
+        if isinstance(finding, L2Finding) and _unanimous(finding, reviewers)
+    }
+    for entry in outcome.dropped:
+        finding = unanimous_pool.get((entry.get("finding") or {}).get("id"))
+        if finding is None:
+            drops.append(entry)
+            continue
+        kept.append(replace(
+            finding,
+            tag="important",
+            verifier_reason=(
+                "vote to drop refused (every reviewer reported it): "
+                f"{entry.get('reason')}"
+            ),
+        ))
+        drops.append({
+            **entry,
+            "reason": f"override_refused: {entry.get('reason')}",
+        })
+
     decorated: list[tuple] = []
-    for index, finding in enumerate(outcome.kept):
+    for index, finding in enumerate(kept):
         if not isinstance(finding, L2Finding):
             decorated.append((0, 0, index, finding))
             continue
@@ -803,7 +869,6 @@ def apply_vote(
     decorated.sort(key=lambda entry: entry[:3])
     ranked = [entry[3] for entry in decorated]
 
-    drops = list(outcome.dropped)
     survivors: list = []
     nits = 0
     for finding in ranked:

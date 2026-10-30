@@ -51,6 +51,14 @@ evidence it is wrong, never to slim the list. Severity is the reviewer's
 to set and yours to challenge only with a drop plus reason — do not
 re-rate by tag.
 
+One drop the orchestrator will refuse: a `blocking` or `major` finding
+that **every reviewer reported** (its `reported_by` lists them all) is
+unanimous, and one verifier cannot outvote the whole fan-out. Your drop
+is recorded, but the finding survives tagged `important` and the round
+still fails on it. Vote your judgement anyway — a unanimous finding you
+genuinely disprove is exactly what the owner needs to see flagged in the
+ledger — but know the mechanism before you spend your reasoning on it.
+
 ## Verdict
 
 You do not return a verdict. The reviewers' findings that survive your

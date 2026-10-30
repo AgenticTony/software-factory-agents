@@ -162,6 +162,11 @@ _PR_NOTES_CAP = 8000
 _PR_BODY_LIMIT = 65_000
 _REVIEW_OUTPUT_TAIL = 6000
 _REVIEW_DIFF_CAP = 200_000
+# F-38 review finding 3: the smallest per-session turn cap a review seat
+# may start with. Below it the fan-out / verifier refuses to start and the
+# round escalates budget_exhausted — a review that cannot take a tool turn
+# and answer is not a review.
+_REVIEW_TURN_FLOOR = 2
 
 _IDENTITY = ("-c", "user.name=Software Factory", "-c", "user.email=factory@localhost",
              "-c", "commit.gpgsign=false")
@@ -425,6 +430,19 @@ def _tokens(record: SessionRecord | None, key: str) -> int:
     usage = (record.tokens if record else None) or {}
     value = usage.get(key) or 0
     return int(value) if isinstance(value, (int, float)) else 0
+
+
+def _turns_spent(records: list) -> int:
+    """Turns the attempt's sessions have actually spent so far (F-38
+    review finding 3): the implementer included — the fan-out shares the
+    REMAINDER of the task's turn budget, so every session's spend must be
+    counted before the next one is capped."""
+    total = 0
+    for record in records:
+        turns = getattr(record, "num_turns", None) if record else None
+        if isinstance(turns, (int, float)) and not isinstance(turns, bool):
+            total += int(turns)
+    return total
 
 
 def _compact(report: dict | None, tail: int) -> dict | None:
@@ -2007,23 +2025,57 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                 review_prompt = _review_prompt(
                                     task, diff, reports["L0"], reports["L1"],
                                     delta=delta, carried=raised)
+                                # F-38 review finding 3: the fan-out shares the
+                                # REMAINDER of the attempt's turn budget —
+                                # each reviewer session capped at
+                                # remaining // N, so the sessions' summed
+                                # turns can never exceed max_turns. A share
+                                # below the floor refuses to start (a review
+                                # that cannot take a tool turn and answer is
+                                # not a review), escalating exactly like the
+                                # wall-clock path.
+                                remaining_turns = (
+                                    budget["max_turns"] - _turns_spent(records)
+                                )
+                                reviewer_share = (
+                                    remaining_turns // ctx.config.reviewers
+                                )
+                                if reviewer_share < _REVIEW_TURN_FLOOR:
+                                    path = _store(reports_dir, work.run_id,
+                                                  attempt_no, reports)
+                                    attempt = attempt_record(
+                                        attempt_no, started, "escalated", records,
+                                        path, escalation="budget_exhausted",
+                                        note=(f"turn budget spent before the review "
+                                              f"fan-out: {remaining_turns} of "
+                                              f"{budget['max_turns']} turns left, "
+                                              f"{reviewer_share} per reviewer session"),
+                                    )
+                                    finish(attempt, "needs_human", [
+                                        f"1. turn budget spent before the review "
+                                        f"fan-out ({remaining_turns} turns left for "
+                                        f"{ctx.config.reviewers} reviewer sessions)",
+                                    ])
+                                    return RunResult(
+                                        "needs_human", task_id,
+                                        escalation="budget_exhausted",
+                                        reports=reports,
+                                    )
                                 # F-38: N reviewer sessions over the same diff,
                                 # each a fresh context, in parallel — one
                                 # integrity guard spanning every one of them
-                                # (the fan-out's own reviewer scratch, one
-                                # baseline, one workspace check after all
-                                # finish; a mutation by any session fails the
-                                # whole fan-out). The fan-out sits inside the
-                                # attempt's budgets: every session runs under
-                                # the task's per-session turn cap and the
-                                # remaining wall clock.
+                                # (one baseline before, one workspace check
+                                # after all finish; a mutation by any session
+                                # fails the whole fan-out), each session with
+                                # its own settings and scratch, and all inside
+                                # the attempt's turn and wall-clock budgets.
                                 reviews = run_sessions_parallel(
                                     [("reviewer", review_prompt)]
                                     * ctx.config.reviewers,
                                     clean.root, profile,
                                     runner=ctx.session_runner,
                                     factory_root=ctx.factory_root,
-                                    max_turns=budget["max_turns"],
+                                    max_turns=reviewer_share,
                                     timeout_min=remaining_review,
                                     protected=protected,
                                     system_prompt=reviewer_system,
@@ -2077,17 +2129,26 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                         budget["wall_clock_min"]
                                         - session_seconds / 60.0
                                     )
-                                    if remaining_verifier <= 0:
+                                    verifier_turns = (
+                                        budget["max_turns"] - _turns_spent(records)
+                                    )
+                                    if remaining_verifier <= 0 or (
+                                        verifier_turns < _REVIEW_TURN_FLOOR
+                                    ):
+                                        spent = (
+                                            "wall-clock" if remaining_verifier <= 0
+                                            else "turn"
+                                        )
                                         path = _store(reports_dir, work.run_id,
                                                       attempt_no, reports)
                                         attempt = attempt_record(
                                             attempt_no, started, "escalated", records,
                                             path, escalation="budget_exhausted",
-                                            note="wall-clock budget spent before "
+                                            note=f"{spent} budget spent before "
                                                  "the verifier pass",
                                         )
                                         finish(attempt, "needs_human", [
-                                            "1. wall-clock budget spent before "
+                                            f"1. {spent} budget spent before "
                                             "the verifier pass",
                                         ])
                                         return RunResult(
@@ -2102,7 +2163,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                         "verifier", verifier_prompt,
                                         clean.root, profile,
                                         factory_root=ctx.factory_root,
-                                        max_turns=budget["max_turns"],
+                                        max_turns=verifier_turns,
                                         timeout_min=remaining_verifier,
                                         protected=protected,
                                         system_prompt=verifier_system,
@@ -2144,6 +2205,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                             else None,
                                             union.findings,
                                         ),
+                                        reviewers=ctx.config.reviewers,
                                     )
                                 l2 = apply_convergence(
                                     l2,

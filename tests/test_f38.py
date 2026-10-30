@@ -196,7 +196,9 @@ class Fanout:
     maps a finding-text substring to its verifier vote; findings with no
     entry are kept with the default tag. Thread-safe: the fan-out calls
     seats concurrently. ``on_reviewer`` runs inside the reviewer branch
-    (the budget test flips its fake clock there).
+    (the budget test flips its fake clock there). ``echo_turn_cap`` (the
+    review-round turn-budget tests): True → a review seat reports half its
+    max_turns cap as turns, False → its full cap; None → fixed counts.
     """
 
     def __init__(self, reviews: str = _verdict(), vote_by_text: dict | None = None,
@@ -205,8 +207,15 @@ class Fanout:
         self.vote_by_text = vote_by_text or {}
         self.on_reviewer = on_reviewer
         self.implementer_turns = implementer_turns
+        self.echo_turn_cap = None
         self.lock = threading.Lock()
         self.calls: list[tuple[str, str, Path, dict]] = []
+
+    def _review_turns(self, seat: str, kwargs: dict) -> int:
+        if self.echo_turn_cap is None:
+            return 2 if seat != "verifier" else 1
+        cap = int(kwargs.get("max_turns") or 1)
+        return max(1, cap // 2) if self.echo_turn_cap else cap
 
     def seats(self) -> list[str]:
         return [seat for seat, *_ in self.calls]
@@ -236,7 +245,8 @@ class Fanout:
                 if scripted is not None:
                     result = scripted
             return SessionRecord(
-                seat=seat, status="completed", num_turns=2, model="stub-model",
+                seat=seat, status="completed",
+                num_turns=self._review_turns(seat, kwargs), model="stub-model",
                 tokens={"input_tokens": 60, "output_tokens": 10}, result=result,
             )
         if seat == "verifier":
@@ -257,7 +267,8 @@ class Fanout:
                 else:
                     votes.append({"id": finding["id"], **_vote(**spec)})
             return SessionRecord(
-                seat=seat, status="completed", num_turns=1, model="stub-model",
+                seat=seat, status="completed",
+                num_turns=self._review_turns(seat, kwargs), model="stub-model",
                 tokens={"input_tokens": 55, "output_tokens": 5},
                 result=_votes_payload(*votes),
             )
@@ -529,8 +540,10 @@ def test_ac_4(tmp_path: Path):
     assert len(unique) == 1 and unique[0]["reported_by"] == [1]
 
     # Case 2 — a finding the verifier drops never reaches the verdict or the
-    # PR body. The dropped finding is the only blocking one, and the
-    # reviewers declared pass: the verdict flips to pass and the PR opens.
+    # PR body. The dropped finding is the only blocking one and only ONE
+    # reviewer reported it (a unanimous one would survive the vote — the
+    # review round's unanimous rule), the reviewers declared pass: the
+    # verdict flips to pass and the PR opens.
     env2 = Env(tmp_path / "case2")
     seats2 = Fanout(
         reviews=_verdict(
@@ -546,6 +559,15 @@ def test_ac_4(tmp_path: Path):
             "rename helper": _vote(tag="nit", reason="real, small"),
         },
     )
+    scripts2 = [seats2.reviews, _verdict(declared="pass")]  # reviewer 2: clean
+    state2 = {"n": 0}
+
+    def pick_review2():
+        with seats2.lock:
+            state2["n"] += 1
+            return scripts2[min(state2["n"] - 1, 1)]
+
+    seats2.on_reviewer = pick_review2
     result2 = env2.run(seats2)
     assert result2.outcome == "pr_opened", result2
     report2 = _report_of(env2)
@@ -599,12 +621,15 @@ def test_ac_5(tmp_path: Path, monkeypatch):
     assert versions["verifier"] == prompt_hash(assemble_verifier_prompt(env.profile))
     assert versions["verifier"] != versions["reviewer-1"]
 
-    # The fan-out is inside the attempt's turn budget: every session runs
-    # under the task's per-session turn cap, and the attempt's recorded
-    # turns are the sum over ALL of them (nothing runs uncounted).
-    for kw in seats.kwargs("reviewer") + seats.kwargs("verifier"):
-        assert kw["max_turns"] == 20  # the task budget's max_turns
+    # The fan-out is inside the attempt's turn budget (review round
+    # finding 3): the reviewers share the remainder after the implementer
+    # ((20-3)//2 = 8 each), the verifier gets what they actually spent
+    # left over (20-3-2-2 = 13) — the caps can never sum past max_turns —
+    # and the attempt's recorded turns are the sum over ALL sessions.
+    assert {kw["max_turns"] for kw in seats.kwargs("reviewer")} == {(20 - 3) // 2}
+    assert seats.kwargs("verifier")[0]["max_turns"] == 20 - 3 - 2 - 2
     assert attempt["turns"] == 3 + 2 + 2 + 1  # impl + reviewer x2 + verifier
+    assert attempt["turns"] <= 20
 
     # And inside the wall-clock budget: the verifier inherits the remaining
     # time after the reviewers, and never starts once it is spent.
@@ -746,13 +771,14 @@ def test_fanout_guard_covers_every_reviewer_session(tmp_path, monkeypatch):
     ).stdout
     assert porcelain == "", f"tree not clean after restore: {porcelain!r}"
     assert not (repo / "src" / "smuggled.py").exists()
-    assert (repo / ".home").is_dir() and not (repo / ".home").is_symlink()
-    # The fan-out's per-session settings and staged runners are gone (the
-    # shared scratch stays for cleanup_run, exactly as the single-session
-    # reviewer flow leaves it).
+    # Per-session scratch (review finding 1): nothing was ever created or
+    # symlinked inside the clone — no .home/.tmp at all.
+    assert not (repo / ".home").exists() and not (repo / ".tmp").exists()
+    # Every per-session artifact is gone: settings, staged runner, scratch.
     sandbox_dir = (tmp_path / "base.json").parent
     assert not list(sandbox_dir.glob("base.json-r*.json"))
     assert not list(sandbox_dir.glob("base.json-r*-runner"))
+    assert not list(sandbox_dir.glob("base.json-r*-scratch"))
 
 
 def _sandbox_repo(tmp_path: Path):
@@ -879,6 +905,10 @@ def test_verifier_dropped_section_never_reaches_the_pr_body():
 
 
 def test_no_progress_when_the_verifier_drops_everything():
+    """Review round finding 4 split this case: on a delta round (2+) the
+    F-23 all_dropped stop fires exactly as before; on the FIRST round the
+    reviewers' declared fail lost its whole substance to the vote, so the
+    round passes (see test_review4)."""
     from factory.l2 import (
         apply_convergence,
         apply_vote,
@@ -895,7 +925,7 @@ def test_no_progress_when_the_verifier_drops_everything():
         {"id": union.findings[0].id, "keep": False, "reason": "not real"},
     )
     voted = apply_vote(union, parse_verifier_vote(votes, union.findings))
-    final = apply_convergence(voted, prior={}, delta_files=set(), delta_mode=False)
+    final = apply_convergence(voted, prior={}, delta_files=set(), delta_mode=True)
     assert final.verdict == "fail"  # the declared fail stands
     assert final.no_progress and final.no_progress_reason == "all_dropped"
 
@@ -937,3 +967,296 @@ def test_two_real_sandboxes_run_concurrently(tmp_path: Path):
     assert outputs == [["r1:ok"], ["r2:ok"]], (
         f"a concurrent sandbox died:\n{[p.stdout + p.stderr for p in procs]}"
     )
+
+
+# ------------------------------------------------- owner review round (PR #78) --
+
+
+def test_review1_fanout_scratch_is_per_session(tmp_path, monkeypatch):
+    """Finding 1: every fan-out session gets its OWN writable scratch —
+    no shared .home/.tmp, so no session can read or rewrite another's
+    state. Unit half: sandbox_env points HOME/TMPDIR/CLAUDE_CODE_TMPDIR/
+    GIT_TEMPLATE_DIR at the given scratch; wiring half: the fan-out hands
+    each session a distinct scratch and a settings file whose allowWrite
+    lists only that session's scratch (never run_dir/.home — a shared
+    writable dir would be a covert channel — and never the other
+    session's)."""
+    import factory.session as session_module
+    from factory.sandbox import sandbox_env
+
+    home1, tmp1 = tmp_path / "s1" / "home", tmp_path / "s1" / "tmp"
+    env = sandbox_env(tmp_path / "run", scratch=(home1, tmp1))
+    assert env["HOME"] == str(home1)
+    assert env["TMPDIR"] == str(tmp1)
+    assert env["CLAUDE_CODE_TMPDIR"] == str(tmp1)
+    assert env["GIT_TEMPLATE_DIR"].startswith(str(home1))
+    assert home1.is_dir() and tmp1.is_dir()
+
+    repo, profile = _sandbox_repo(tmp_path / "repo-root")
+    captured: list[tuple[tuple, list]] = []  # (scratch, allowWrite)
+
+    def fake_run(cmd, run_dir, settings_path, *, scratch=None, **kwargs):
+        allow_write = json.loads(
+            Path(settings_path).read_text()
+        )["filesystem"]["allowWrite"]
+        captured.append((scratch, allow_write))
+        return subprocess.CompletedProcess(
+            cmd, 0,
+            stdout=json.dumps(
+                {"seat": "reviewer", "status": "completed", "result": "{}"}
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(session_module, "run_sandboxed", fake_run)
+    session_module.run_sessions_parallel(
+        [("reviewer", "one"), ("reviewer", "two")],
+        repo, profile,
+        factory_root=tmp_path / "repo-root", settings_path=tmp_path / "base.json",
+        max_turns=5, timeout_min=1, token="t", cli_path=Path("/bin/echo"),
+    )
+    assert len(captured) == 2
+    scratches = [scratch for scratch, _ in captured]
+    assert scratches[0] is not None and scratches[1] is not None
+    assert scratches[0] != scratches[1]  # distinct per session
+    allow_writes = [writes for _, writes in captured]
+    assert not any(str(repo / ".home") in w for w in allow_writes), (
+        "the run dir's .home must not be fan-out-writable: a shared writable "
+        "dir is a channel between 'independent' reviewers"
+    )
+    (scratch_a, writes_a), (scratch_b, writes_b) = captured
+    for scratch, writes in ((scratch_a, writes_a), (scratch_b, writes_b)):
+        assert str(scratch[0]) in writes and str(scratch[1]) in writes
+    assert str(scratch_b[0]) not in writes_a and str(scratch_b[1]) not in writes_a
+    assert str(scratch_a[0]) not in writes_b and str(scratch_a[1]) not in writes_b
+    # Every per-session scratch (and settings, and staged runner) is gone.
+    sandbox_dir = (tmp_path / "base.json").parent
+    assert not list(sandbox_dir.glob("base.json-r*"))
+
+
+def test_review1_real_sandboxes_isolate_their_homes(tmp_path: Path):
+    """Finding 1, the real-sandbox half: two concurrent srt children, each
+    with its own scratch, each writes a marker into its $HOME and lists
+    $HOME — each sees exactly its own file. A shared HOME would show two."""
+    from factory.sandbox import build_settings, run_sandboxed, write_settings
+
+    repo, profile = _sandbox_repo(tmp_path)
+    root = tmp_path / "factory-root"
+    runs = root / "runs" / "p" / "20261030T000000Z-bbbbbb"
+    runs.mkdir(parents=True)
+    sandbox_dir = root / "sandbox"
+    sandbox_dir.mkdir(parents=True)
+    script = textwrap.dedent(
+        """
+        import os, pathlib
+        home = pathlib.Path(os.environ["HOME"])
+        (home / "marker").write_text("mine")
+        files = sorted(p.name for p in home.iterdir() if not p.name.startswith("."))
+        print("files:" + ",".join(files))
+        """
+    )
+
+    def one(name: str):
+        scratch = (sandbox_dir / f"{name}-scratch" / "home",
+                   sandbox_dir / f"{name}-scratch" / "tmp")
+        settings = sandbox_dir / f"{name}.json"
+        write_settings(
+            build_settings(
+                profile, runs, factory_root=root, read_only=True,
+                scratch_write=scratch,
+                model_endpoint="https://api.z.ai/api/anthropic",
+            ),
+            settings,
+        )
+        return run_sandboxed(
+            [sys.executable, "-c", script], runs, settings, timeout=120,
+            scratch=scratch,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        procs = [pool.submit(one, "r1").result(), pool.submit(one, "r2").result()]
+    markers = sorted(
+        line for proc in procs for line in proc.stdout.splitlines()
+        if line.startswith("files:")
+    )
+    assert markers == ["files:marker", "files:marker"], (
+        f"a session saw the other's HOME file:\n{[p.stdout + p.stderr for p in procs]}"
+    )
+
+
+def test_review2_a_unanimous_blocking_finding_survives_the_vote():
+    """Finding 2: a blocking or major finding that EVERY reviewer reported
+    cannot be dropped by one verifier — it survives tagged important, and
+    the refused drop lands in the ledger as override_refused. A finding
+    fewer than all reviewers reported keeps today's semantics (droppable,
+    verdict and all)."""
+    from factory.l2 import apply_vote, merge_reviews, parse_verdict, parse_verifier_vote
+
+    unanimous = parse_verdict(_verdict(
+        _finding("all reviewers saw this bug", severity="blocking"),
+    ))
+    union = merge_reviews([unanimous, parse_verdict(_verdict(
+        _finding("all reviewers saw this bug", severity="blocking"),
+    ))])
+    assert union.findings[0].reported_by == [1, 2]
+    votes = _votes_payload(
+        {"id": union.findings[0].id, "keep": False, "reason": "not real"},
+    )
+    report = apply_vote(union, parse_verifier_vote(votes, union.findings), reviewers=2)
+    assert [f.text for f in report.findings] == ["all reviewers saw this bug"]
+    assert report.findings[0].tag == "important"
+    assert report.verdict == "fail"  # the round still fails
+    assert len(report.verifier_dropped) == 1
+    assert report.verifier_dropped[0]["reason"].startswith("override_refused:")
+
+    # Fewer than all reviewers: droppable, exactly as before.
+    minority = parse_verdict(_verdict(
+        _finding("only one reviewer saw this bug", severity="blocking"),
+        declared="pass",
+    ))
+    union2 = merge_reviews([minority, parse_verdict(_verdict(declared="pass"))])
+    votes2 = _votes_payload(
+        {"id": union2.findings[0].id, "keep": False, "reason": "not real"},
+    )
+    report2 = apply_vote(
+        union2, parse_verifier_vote(votes2, union2.findings), reviewers=2
+    )
+    assert not report2.findings and report2.verdict == "pass"
+
+
+def test_review2_unanimous_blocking_still_fails_the_round(tmp_path: Path):
+    """Finding 2, integration: both reviewers report the same blocking
+    finding, the verifier tries to drop it, the round still fails and the
+    refused drop is recorded in the attempt record."""
+    env = Env(tmp_path, tasks=[_one_round_task()])
+    blocking = _finding("phantom table blocks the release", severity="blocking")
+    seats = Fanout(
+        reviews=_verdict(blocking, declared="fail"),
+        vote_by_text={
+            "phantom table": {"drop": True, "reason": "not real: schema has it"},
+        },
+    )
+    result = env.run(seats)
+    assert result.outcome == "needs_human", result
+    report = _report_of(env)
+    assert _by_text(report["L2"], "phantom table")["severity"] == "blocking"
+    assert report["L2"]["verdict"] == "fail"
+    drops = env.task()["attempts"][-1]["review_drops"]
+    assert any(
+        d["reason"].startswith("override_refused:") for d in drops
+    ), f"the refused drop is not in the ledger: {drops}"
+
+
+def test_review3_turn_budget_is_aggregate(tmp_path: Path):
+    """Finding 3: the fan-out shares the REMAINDER of the attempt's turn
+    budget (implementer included), each session capped at its share, the
+    verifier at what is left — so a round can never spend more than the
+    task's max_turns across its sessions."""
+    env = Env(tmp_path)
+    # The stub echoes half its cap as turns: implementer 3, each reviewer
+    # capped at the shared remainder (20-3)//2 = 8 and spending 4, the
+    # verifier capped at what is left (20 - 3 - 4 - 4 = 9) and spending 4.
+    seats = Fanout(
+        reviews=_verdict(_finding("rename helper", severity="minor"), declared="pass"),
+    )
+    seats.echo_turn_cap = True
+    result = env.run(seats)
+    assert result.outcome == "pr_opened", result
+    reviewer_caps = {kw["max_turns"] for kw in seats.kwargs("reviewer")}
+    assert reviewer_caps == {(20 - 3) // 2}  # the shared remainder, per session
+    verifier_cap = seats.kwargs("verifier")[0]["max_turns"]
+    assert verifier_cap == 20 - 3 - 2 * 4  # what the reviewers actually spent
+    attempt = env.task()["attempts"][-1]
+    assert attempt["turns"] == 3 + 4 + 4 + 4  # impl + reviewers + verifier echoes
+    assert attempt["turns"] <= 20
+
+    # Refusal: the implementer spends 19 of the 20 turns — the share for
+    # two reviewers is 0, below the floor, so the fan-out never starts.
+    env2 = Env(tmp_path / "spent", tasks=[_one_round_task()])
+    seats2 = Fanout(
+        reviews=_verdict(declared="pass"),
+        implementer_turns=19,
+    )
+    result2 = env2.run(seats2)
+    assert result2.outcome == "needs_human", result2
+    assert result2.escalation == "budget_exhausted"
+    assert "reviewer" not in seats2.seats() and "verifier" not in seats2.seats()
+
+    # Refusal before the verifier: the reviewers spend down to a remainder
+    # below the floor — the verifier never starts.
+    env3 = Env(tmp_path / "verifier-floor", tasks=[_one_round_task()])
+    seats3 = Fanout(
+        reviews=_verdict(_finding("rename helper", severity="minor"),
+                         declared="pass"),
+        implementer_turns=15,
+    )
+    seats3.echo_turn_cap = False  # reviewers burn their FULL caps
+    result3 = env3.run(seats3)
+    assert result3.outcome == "needs_human", result3
+    assert result3.escalation == "budget_exhausted"
+    assert "verifier" not in seats3.seats()
+    assert "verifier" in env3.task()["attempts"][-1]["note"]
+
+
+def test_review4_round_one_fail_voted_out_passes(tmp_path: Path):
+    """Finding 4: on the FIRST review, a declared fail whose every finding
+    the verifier voted out is an unsupported fail — the round passes on
+    L2, the PR opens, and the PR body says the reviewers' fail was voted
+    out. Delta rounds keep the F-23 all_dropped stop (unit half in
+    test_no_progress_when_the_verifier_drops_everything)."""
+    from factory.l2 import (
+        apply_convergence,
+        apply_vote,
+        merge_reviews,
+        parse_verdict,
+        parse_verifier_vote,
+    )
+
+    verdict = parse_verdict(_verdict(
+        _finding("voted out", severity="minor"), declared="fail",
+    ))
+    union = merge_reviews([verdict])
+    votes = _votes_payload(
+        {"id": union.findings[0].id, "keep": False, "reason": "not real"},
+    )
+    voted = apply_vote(union, parse_verifier_vote(votes, union.findings))
+    first = apply_convergence(voted, prior={}, delta_files=set(), delta_mode=False)
+    assert first.verdict == "pass"  # the unsupported fail does not stand
+    assert not first.no_progress
+
+    env = Env(tmp_path)
+    seats = Fanout(
+        reviews=_verdict(
+            _finding("minor quibble the vote removes", severity="minor"),
+            declared="fail",
+        ),
+        vote_by_text={"minor quibble": {"drop": True, "reason": "style-only: noise"}},
+    )
+    result = env.run(seats)
+    assert result.outcome == "pr_opened", result
+    report = _report_of(env)
+    assert report["L2"]["declared"] == "fail" and report["L2"]["verdict"] == "pass"
+    assert report["L2"]["verifier_dropped"]
+    body = env.prs[0].body
+    assert "reviewers declared FAIL" in body and "voted out" in body
+
+
+def test_review5_fanout_forwards_per_session_kwargs(tmp_path: Path):
+    """Finding 5 (structural guard): the fan-out forwards unknown per-session
+    kwargs through the shared _run_prepared step unchanged — so F-22's
+    toolkit= threads through session_kwargs with no fan-out change when
+    that PR rebases onto this one (or vice versa)."""
+    seen: list[dict] = []
+
+    def runner(seat, prompt, run_dir, profile, **kwargs):
+        seen.append(kwargs)
+        return SessionRecord(seat=seat, status="completed", num_turns=1)
+
+    from factory.session import run_sessions_parallel
+
+    run_sessions_parallel(
+        [("reviewer", "one")], tmp_path, {},
+        runner=runner, max_turns=5, timeout_min=1,
+        toolkit={"staged": "/tmp/fake-toolkit", "items": []},
+    )
+    assert seen[0].get("toolkit") == {"staged": "/tmp/fake-toolkit", "items": []}

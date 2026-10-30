@@ -29,6 +29,7 @@ from factory.prompts import (
     IMPLEMENTER_FILE,
     PROMPTS_DIR,
     REVIEWER_FILE,
+    VERIFIER_FILE,
     PromptError,
     assemble_implementer_prompt,
     assemble_reviewer_prompt,
@@ -53,6 +54,8 @@ def _sha(text: str) -> str:
 PROMPT_PINS = {
     IMPLEMENTER_FILE: "89170d411e03b941092202cb662e035c75a47468453f9b26fcaf0bdb6c64f2fd",
     REVIEWER_FILE: "dbab8437904a53e2256ff942167a9c01d689460f05a48384f4fb70f18cf9f6e7",
+    # F-38; re-pinned in its review round (the unanimous-rule paragraph).
+    VERIFIER_FILE: "d7e5db822401e928ef64d8c032a34b66c3505f0f0fc115ca67fd0d8ea92c694b",
 }
 
 

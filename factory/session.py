@@ -276,10 +276,7 @@ def _reviewer_scratch(settings_path: Path, run_dir: Path) -> tuple[Path, Path]:
     either.
     """
     scratch = settings_path.with_name(settings_path.name + "-scratch")
-    home = scratch / "home"
-    tmp = scratch / "tmp"
-    home.mkdir(parents=True, exist_ok=True)
-    tmp.mkdir(parents=True, exist_ok=True)
+    home, tmp = _scratch_dirs(scratch)
     for name, target in ((".home", home), (".tmp", tmp)):
         link = run_dir / name
         if link.is_dir() and not link.is_symlink():
@@ -287,6 +284,21 @@ def _reviewer_scratch(settings_path: Path, run_dir: Path) -> tuple[Path, Path]:
         elif link.is_symlink() or link.exists():
             link.unlink()
         link.symlink_to(target)
+    return home, tmp
+
+
+def _scratch_dirs(scratch: Path) -> tuple[Path, Path]:
+    """The (home, tmp) writable dirs under one scratch root, created.
+
+    The single-session reviewer path and every fan-out session create
+    their scratch the same way (F-38 review finding 1); only the root
+    differs — each fan-out session gets its OWN ``<settings>-scratch``,
+    never a shared one.
+    """
+    home = scratch / "home"
+    tmp = scratch / "tmp"
+    home.mkdir(parents=True, exist_ok=True)
+    tmp.mkdir(parents=True, exist_ok=True)
     return home, tmp
 
 
@@ -1672,16 +1684,18 @@ def run_sessions_parallel(
     (one thread each — each real session is a sandboxed subprocess, so
     the parallelism is real wall-clock, not cooperative).
 
-    With the real :func:`run_session_sandboxed` the fan-out shares ONE
-    integrity guard across every session instead of per-session ones: the
-    scratch symlinks are created once and the git baseline taken once,
-    BEFORE any session starts, and the workspace is verified once after
-    all of them finish — a mutation by ANY session fails the whole
-    fan-out (no verdict from a review that touched its own workspace is
-    trusted; attribution inside the fan-out is impossible by design, and
-    the conservative rule is to trust none of them). Per-session srt
-    settings and staged runners sit at ``<base>-r1``, ``<base>-r2``, …
-    (the seat's ordinal), so concurrent sessions never share a spec file,
+    With the real :func:`run_session_sandboxed` the fan-out wraps every
+    session in ONE integrity guard instead of per-session ones: the git
+    baseline is taken once, BEFORE any session starts, and the workspace
+    is verified once after all of them finish — a mutation by ANY session
+    fails the whole fan-out (no verdict from a review that touched its own
+    workspace is trusted; attribution inside the fan-out is impossible by
+    design, and the conservative rule is to trust none of them). Each
+    session gets its OWN srt settings, staged runner and writable scratch
+    (``<base>-r1.json`` / ``<base>-r1-scratch/``, ``<base>-r2.json`` / …,
+    the seat's ordinal — review finding 1: no shared HOME, TMPDIR,
+    CLAUDE_CODE_TMPDIR or cwd slug, so no session can read or rewrite
+    another's state, and nothing inside the readable clone is writable),
     and the fan-out removes them all on exit.
 
     With any other runner (the orchestrator's test stubs), the seats are
@@ -1746,7 +1760,15 @@ def _fanout_sandboxed(
     settings_path: Path | None = None,
     **session_kwargs,
 ) -> list[SessionRecord]:
-    """The real-runner fan-out: one shared guard, per-session settings."""
+    """The real-runner fan-out: one shared guard, per-session settings and
+    per-session scratch. Each session goes through :func:`_run_prepared`
+    — the SAME per-session prepare/run/parse step :func:`run_session_sandboxed`
+    uses — so a per-session option (F-22's ``toolkit=``) threads through
+    ``session_kwargs`` into one place; only the guard (baseline + workspace
+    check spanning every session) and the scratch naming are the fan-out's
+    own. Per-session artifacts (settings, staged runner, scratch) are
+    removed on every exit path; the F-22 rebase adds its ``-toolkit``
+    siblings to the same cleanup loop and to cleanup_run's sweep."""
     token = session_kwargs.get("token")
     if token is None:
         token = seat_token()
@@ -1758,38 +1780,32 @@ def _fanout_sandboxed(
             "(or run where ANTHROPIC_AUTH_TOKEN is set). The factory refuses "
             "to start a session that cannot authenticate."
         )
-    # run_session_sandboxed's own defaults, which its callers may omit: the
-    # fan-out hands each session straight to _run_prepared, so it fills
-    # them itself. max_turns and timeout_min stay required on purpose — a
-    # fan-out outside the attempt's budgets must refuse to run.
-    session_kwargs.setdefault("base_url", DEFAULT_BASE_URL)
-    session_kwargs.setdefault("timeout_ms", DEFAULT_TIMEOUT_MS)
-    session_kwargs.setdefault("protected", ())
-    session_kwargs.setdefault("model", None)
-    session_kwargs.setdefault("system_prompt", None)
-    session_kwargs.setdefault("cli_path", None)
-    session_kwargs.setdefault("srt_bin_path", None)
-    session_kwargs.setdefault("teardown_grace_sec", 120.0)
 
     run_dir = Path(run_dir)
     factory_root, base = _derive_settings_path(run_dir, factory_root, settings_path)
     base.parent.mkdir(parents=True, exist_ok=True)
-    # Per-session settings, named by spec order (spec 0 is reviewer 1
-    # whatever the scheduling does): concurrent sessions never share a
-    # spec file or a staged runner.
+    # Per-session settings AND scratch, named by spec order (spec 0 is
+    # reviewer 1 whatever the scheduling does): concurrent sessions share
+    # no spec file, no staged runner and — review finding 1 — no writable
+    # scratch. Each session's HOME/TMPDIR/CLAUDE_CODE_TMPDIR point at its
+    # own scratch (see _run_prepared), and its settings' allowWrite lists
+    # exactly that scratch: nothing inside the readable clone is writable,
+    # so no session can leave a note where another reads.
     counts: dict[str, int] = {}
     per_session: list[Path] = []
+    per_scratch: list[tuple[Path, Path]] = []
     for seat, _ in specs:
         counts[seat] = counts.get(seat, 0) + 1
         suffix = ("r" if seat == "reviewer" else "v") + str(counts[seat])
-        per_session.append(base.with_name(f"{base.name}-{suffix}.json"))
+        settings = base.with_name(f"{base.name}-{suffix}.json")
+        per_session.append(settings)
+        per_scratch.append(
+            _scratch_dirs(settings.with_name(settings.name + "-scratch"))
+        )
 
-    # ONE scratch + ONE baseline before any session starts: the symlinks
-    # exist before the baseline (their presence can never look like a
-    # mutation), and every session shares the same writable scratch —
-    # concurrent reviewers writing $HOME through one link, each into its
-    # own session state under it.
-    reviewer_writable = _reviewer_scratch(base, run_dir)
+    # ONE baseline before any session starts: the workspace integrity
+    # guard spans the whole fan-out (a mutation by ANY session fails every
+    # record — see the docstring for why none of them is trusted).
     baseline = _git_state(run_dir)
     records: list[SessionRecord | None] = [None] * len(specs)
     try:
@@ -1797,7 +1813,7 @@ def _fanout_sandboxed(
             return _run_prepared(
                 seat, prompt, run_dir, profile, per_session[index],
                 factory_root=factory_root,
-                read_only=True, writable_roots=reviewer_writable,
+                read_only=True, scratch=per_scratch[index],
                 **session_kwargs,
             )
 
@@ -1810,9 +1826,8 @@ def _fanout_sandboxed(
         try:
             # The integrity backstop spans the WHOLE fan-out: whatever any
             # session did, the workspace must be exactly what it was before
-            # the fan-out. A mutation fails every record (see the docstring
-            # for why none of them is trusted) and is undone, so nothing a
-            # reviewer wrote can ride the branch F-10 pushes.
+            # the fan-out. A mutation fails every record and is undone, so
+            # nothing a reviewer wrote can ride the branch F-10 pushes.
             if baseline is not None and _git_state(run_dir) != baseline:
                 _restore_workspace(run_dir, baseline)
                 for record in records:
@@ -1820,11 +1835,11 @@ def _fanout_sandboxed(
                         record.status = "failed"
                         record.reason = REVIEWER_MUTATION
         finally:
-            _teardown_reviewer_scratch(run_dir)
-            for settings in per_session:
+            for settings, (home, _) in zip(per_session, per_scratch):
                 settings.unlink(missing_ok=True)
                 shutil.rmtree(settings.with_name(settings.name + "-runner"),
                               ignore_errors=True)
+                shutil.rmtree(home.parent, ignore_errors=True)
     return [record for record in records if record is not None]
 
 
@@ -1835,28 +1850,41 @@ def _run_prepared(
     profile: dict,
     settings_path: Path,
     *,
-    factory_root: Path | None,
+    factory_root: Path | None = None,
     max_turns: int,
     timeout_min: float,
-    base_url: str,
-    timeout_ms: int,
-    protected: "Sequence[str]",
-    model: str | None,
-    system_prompt: str | None,
-    token: str,
-    cli_path: Path | None,
-    srt_bin_path: Path | None,
-    teardown_grace_sec: float,
-    read_only: bool,
-    writable_roots: "Sequence[Path]",
+    base_url: str = DEFAULT_BASE_URL,
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    protected: "Sequence[str]" = (),
+    model: str | None = None,
+    system_prompt: str | None = None,
+    token: str = "",
+    cli_path: Path | None = None,
+    srt_bin_path: Path | None = None,
+    teardown_grace_sec: float = 120.0,
+    read_only: bool = False,
+    writable_roots: "Sequence[Path]" = (),
+    scratch: "tuple[Path, Path] | None" = None,
     run_id: str | None = None,
     task_id: str | None = None,
     trace_sink: Callable[[dict[str, Any]], None] | None = None,
     toolkit: dict | None = None,
 ) -> SessionRecord:
     """Stage the runner, write settings, run the sandboxed entry and parse
-    its record. :func:`run_session_sandboxed` wraps this in the reviewer
-    guard; this function knows nothing about seats beyond ``read_only``."""
+    its record — the ONE per-session prepare/run/parse step every sandboxed
+    seat goes through: :func:`run_session_sandboxed` wraps it in the
+    single-session reviewer guard, and the F-38 fan-out calls it once per
+    session under its spanning guard. This is the seam a per-session
+    option threads through exactly once: F-22's ``toolkit=`` (not built
+    here) grows this signature, its staging lands beside the runner
+    staging below, and both callers pick it up from their ``**kwargs``
+    unchanged.
+
+    ``scratch`` (F-38 review finding 1): the session's own ``(home, tmp)``
+    dirs — HOME/TMPDIR/CLAUDE_CODE_TMPDIR point there and the settings'
+    writable list is exactly it. None is the single-session shape (the
+    run dir's .home/.tmp plus ``writable_roots``).
+    """
     # The pinned CLI (finding 5): the SDK's bundled binary, or an explicit
     # test override. An auto-discovered ~/.local/bin/claude is never used —
     # it updates itself out from under the pin.
@@ -1921,6 +1949,7 @@ def _run_prepared(
         allow_read=allow_read,
         read_only=read_only,
         writable_roots=writable_roots,
+        scratch_write=scratch,
     )
     write_settings(settings, settings_path)
 
@@ -1935,6 +1964,7 @@ def _run_prepared(
         },
         timeout=timeout_min * 60.0 + teardown_grace_sec,
         srt_bin_path=srt_bin_path,
+        scratch=scratch,
         # F-30: tool_call events stream out as prefixed lines while the
         # session runs; the record stays the last un-prefixed line.
         on_stdout_line=(

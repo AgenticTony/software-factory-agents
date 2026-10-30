@@ -304,6 +304,20 @@ def _validator_section(reports: dict) -> str:
             key: value for key, value in l2.items() if key != "verifier_dropped"
         }
     section = fence(json.dumps(body_reports, indent=2, ensure_ascii=False), "json")
+    if (
+        isinstance(l2, dict)
+        and l2.get("declared") == "fail"
+        and l2.get("verdict") == "pass"
+        and l2.get("verifier_dropped")
+    ):
+        # F-38 review finding 4: the first-round declared fail lost its
+        # whole substance to the vote — say so in front of the JSON, not
+        # buried in it (the drops themselves stay in the attempt record).
+        section = (
+            "**The reviewers declared FAIL; the verifier voted out every "
+            "finding, so the effective verdict is pass** (the vote's drops "
+            "are recorded in the attempt's `review_drops`):\n\n" + section
+        )
     dropped = (reports.get("L2") or {}).get("dropped") or []
     if dropped:
         lines = [
