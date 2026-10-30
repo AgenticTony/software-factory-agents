@@ -6,6 +6,21 @@
   "type": "object",
   "required": ["name", "repo", "commands", "paths", "deploy", "live_checks", "docs_allowlist"],
   "additionalProperties": false,
+  "$defs": {
+    "toolkitNameList": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" }
+    },
+    "toolkitChoice": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "skills": { "$ref": "#/$defs/toolkitNameList" },
+        "plugins": { "$ref": "#/$defs/toolkitNameList" },
+        "mcp_servers": { "$ref": "#/$defs/toolkitNameList" }
+      }
+    }
+  },
   "properties": {
     "name": { "type": "string", "pattern": "^[a-z0-9-]+$" },
     "repo": {
@@ -113,6 +128,22 @@
         "required": ["name", "path", "reason"],
         "additionalProperties": false,
         "properties": { "name": { "type": "string" }, "path": { "type": "string" }, "reason": { "type": "string" } }
+      }
+    },
+    "toolkit": {
+      "type": "object",
+      "description": "The project's vetted agent toolkit (F-22 AC-6): names of admitted index entries (toolkit/index.yaml). Every name must be an index entry of the matching kind — an unknown name refuses the profile at load, as F-02 does for invalid state. Seats may narrow the choice (a subset), so e.g. the reviewer gets a read-only subset.",
+      "additionalProperties": false,
+      "properties": {
+        "skills": { "$ref": "#/$defs/toolkitNameList" },
+        "plugins": { "$ref": "#/$defs/toolkitNameList" },
+        "mcp_servers": { "$ref": "#/$defs/toolkitNameList" },
+        "seats": {
+          "type": "object",
+          "description": "Per-seat narrowing: each key is a seat name whose lists override (and must be a subset of) the project's own lists.",
+          "propertyNames": { "enum": ["implementer", "reviewer"] },
+          "additionalProperties": { "$ref": "#/$defs/toolkitChoice" }
+        }
       }
     }
   }

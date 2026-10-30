@@ -1,9 +1,10 @@
 """Factory CLI — the control-plane entry point.
 
 ``approve`` (F-04), ``run`` and ``loop`` (F-10), ``status`` (F-11),
-``tick`` (F-29), ``trace`` (F-30), ``sentinels replay`` (F-33) and
-``import`` (F-12) are real. Every other subcommand is a stub naming the
-work order that implements it (BUILD-ORDER.md).
+``tick`` (F-29), ``trace`` (F-30), ``sentinels replay`` (F-33),
+``import`` (F-12) and ``toolkit vet`` (F-22) are real. Every other
+subcommand is a stub naming the work order that implements it
+(BUILD-ORDER.md).
 """
 
 import argparse
@@ -32,6 +33,7 @@ from factory.session import SessionConfigError
 from factory.state import TaskQueue, run_lease_held
 from factory.status import StatusError, render_status
 from factory.tick import TickError, tick_steps
+from factory.toolkit import ToolkitError
 from factory.trace import TraceError, read_trace, trace_path
 
 # run/loop exit codes: 0 = a PR opened, nothing to do, the peak window, or
@@ -42,7 +44,8 @@ _EXIT = {"pr_opened": 0, "idle": 0, "peak_window": 0, "queue_empty": 0,
          "concurrency_wait": 0,
          "needs_human": 1, "escalation": 1, "quota_exhausted": 3, "error": 2}
 _RUN_ERRORS = (ConfigError, ContractError, GateError, PRBodyError, ProgressLogError,
-               PublishError, PushRefused, RunError, SandboxError, SessionConfigError)
+               PublishError, PushRefused, RunError, SandboxError, SessionConfigError,
+               ToolkitError)
 
 # subcommand -> the work order that implements it
 STUBS: dict[str, str] = {
@@ -148,6 +151,24 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--queue", default=".factory/tasks.json",
                         help="queue path; the profile is read from next to "
                              "it (default: %(default)s)")
+
+    toolkit_cmd = sub.add_parser(
+        "toolkit", help="vetted agent toolkit utilities (F-22)")
+    toolkit_sub = toolkit_cmd.add_subparsers(dest="toolkit_command", required=True)
+    vet = toolkit_sub.add_parser(
+        "vet",
+        help="scan a candidate item and report — admission evidence only; "
+             "a clean scan never admits (an item enters toolkit/index.yaml "
+             "only through an owner-approved PR)")
+    vet.add_argument("path", help="candidate item directory")
+    vet.add_argument(
+        "--profile", default=".factory/project.yaml",
+        help="project.yaml whose allowlists the vet judges against "
+             "(default: %(default)s)")
+    vet.add_argument(
+        "--report", default=None,
+        help="write the vetting report (markdown) to this path — the "
+             "artifact an admission PR carries")
 
     for name, text in (
         ("run", "pick the next ready task and take it to a PR (F-10)"),
@@ -403,6 +424,49 @@ def _run_sentinels_replay(args: argparse.Namespace) -> int:
         return 1
 
 
+def _run_toolkit_vet(args: argparse.Namespace) -> int:
+    """Dispatch ``toolkit vet`` (F-22 AC-3/AC-4).
+
+    Reads the candidate and prints the verdict; ``--report`` writes the
+    markdown an admission PR carries. It never writes the index — a
+    clean scan is evidence, not admission: an item enters
+    ``toolkit/index.yaml`` only through an owner-approved PR. Refusals
+    exit 1, never a traceback.
+    """
+    from factory.toolkit import ToolkitError, render_report, vet_candidate
+
+    try:
+        profile = load_profile(args.profile)
+    except ContractError as exc:
+        print(f"factory toolkit vet: {exc}", file=sys.stderr)
+        return 1
+    allowlists = list(profile.get("docs_allowlist") or []) + list(
+        profile.get("network_allowlist") or []
+    )
+    try:
+        result = vet_candidate(args.path, allowlists=allowlists)
+    except ToolkitError as exc:
+        print(f"factory toolkit vet: {exc}", file=sys.stderr)
+        return 1
+    if result.licence:
+        print(f"licence: {result.licence}")
+    else:
+        print(f"licence: REFUSED — {result.licence_reason}")
+    if not result.findings:
+        print("findings: none (clean scan — admission stays a human PR)")
+    for finding in result.findings:
+        where = f"{finding.file}:{finding.line}" if finding.line else finding.file
+        print(f"{finding.cls} {where} {finding.detail}")
+    if args.report:
+        report_path = Path(args.report)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            render_report(result, args.path, allowlists), encoding="utf-8"
+        )
+        print(f"report: {args.report}")
+    return 0 if result.clean else 1
+
+
 def _run_extra(result) -> str:
     """The detail printed after a run's outcome.
 
@@ -492,6 +556,8 @@ def main(argv: list | None = None) -> int:
         return _run_status(args)
     if args.command == "sentinels":
         return _run_sentinels_replay(args)
+    if args.command == "toolkit":
+        return _run_toolkit_vet(args)
     if args.command == "import":
         return _run_import(args)
     print(

@@ -62,6 +62,12 @@ paths:
     - "factory/prompts.py"
     - "factory/trace.py"
     - "prompts/**"
+    # F-22: the vetted toolkit is what sessions are GIVEN (index, vendored
+    # files, the vet corpus that judges admission) — a session editing its
+    # own toolkit is self-modification one level up from the sandbox's
+    # deny layer. toolkit.py is the vetter/loader itself (judge class).
+    - "toolkit/**"
+    - "factory/toolkit.py"
     # PR #50-#62 review (#52 finding 1): the step-1 list above matched the
     # BUILD-ORDER text, and the text missed modules that also judge or
     # gate agents. l0 hands its skip/assertion/credential scans to
@@ -124,6 +130,9 @@ paths:
     - "tests/test_f29.py"
     - "tests/test_f30.py"
     - "tests/test_f33.py"
+    # F-22: merges while the task is still draft (closes via
+    # BOOTSTRAP.md + reconcile, like the F-11/F-12 precedent above).
+    - "tests/test_f22.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 

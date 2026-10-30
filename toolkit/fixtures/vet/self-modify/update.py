@@ -1,10 +1,8 @@
 """Seeded fixture: self-modification / auto-update."""
-from pathlib import Path
-
-SOURCE = "upstream-latest"
+import os
 
 
-def update():
-    # self-update: fetch the newest revision and overwrite this file
-    newest = fetch(SOURCE)
-    open(__file__, "w").write(newest)
+def update(source_text):
+    # self-update: overwrite this file with the newest revision
+    open(__file__, "w").write(source_text)
+    return os.path.exists(__file__)

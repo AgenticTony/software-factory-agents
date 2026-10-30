@@ -32,7 +32,6 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import yaml
-from claude_agent_sdk import AssistantMessage
 
 from factory.contract import ContractError, acceptance_hash, load_profile
 from factory.mergeorder import Protection
@@ -213,6 +212,7 @@ def _profile(tmp: Path, toolkit_section: dict | None = None) -> Path:
     profile = dict(PROFILE_EXTRA_BASE)
     if toolkit_section is not None:
         profile["toolkit"] = toolkit_section
+    tmp.mkdir(parents=True, exist_ok=True)
     path = tmp / "project.yaml"
     path.write_text(yaml.safe_dump(profile, sort_keys=False))
     return path
@@ -277,9 +277,10 @@ def test_ac_1(tmp_path: Path):
 
     def broken(mutate) -> None:
         entries = [_make_skill(toolkit, name="x-skill"), _make_mcp(toolkit, name="x-docs")]
+        _write_reports(toolkit, entries)  # valid reports first; the
+        # mutation then breaks the entry shape, not the report plumbing.
         for e in entries:
             mutate(e)
-        _write_reports(toolkit, entries)
         _write_index(toolkit, entries)
         with pytest.raises(ToolkitError):
             load_index(toolkit)
@@ -289,7 +290,7 @@ def test_ac_1(tmp_path: Path):
     broken(lambda e: e.update(licence="Proprietary"))        # licence enum
     broken(lambda e: e.update(content_hash="not-a-hash"))    # hash shape
     broken(lambda e: e.update(dir="../outside"))             # dir escape
-    broken(lambda e: e["pin"].pop("commit"))                 # pin: neither form
+    broken(lambda e: e["pin"].pop("commit", None))           # pin: neither form
     broken(lambda e: e.update(report="reports/missing.md"))  # report absent
 
     # Rebuild the good index for the tamper checks.
@@ -433,7 +434,7 @@ def test_ac_3(tmp_path: Path, capsys):
     # The vetter reads only: the scanned trees are byte-identical after
     # both the direct scans and the CLI runs below.
     before = {
-        name: _tree_state(FIXTURES / dirname) for dirname in committed.values()
+        dirname: _tree_state(FIXTURES / dirname) for dirname in committed.values()
     }
     # The CLI end to end: clean exits 0; a seeded fixture exits 1 naming
     # its class on stdout.
@@ -908,7 +909,7 @@ def test_ac_8(tmp_path: Path, monkeypatch):
         protection=lambda r, b: Protection(checked=True, strict=True),
         pr_state=lambda url: "open",
     )
-    assert result.stop_reason == "pr_opened", result.stop_reason
+    assert result.outcome == "pr_opened", result.outcome
     # The implementer got the full toolkit, the reviewer its narrowed subset.
     assert seat_toolkits["implementer"] == ["demo-skill", "docs"]
     assert seat_toolkits["reviewer"] == ["docs"]
@@ -962,3 +963,88 @@ def test_benign_env_access_is_not_harvest(tmp_path: Path):
     )
     result = vet_candidate(cand, allowlists=ALLOW)
     assert [f for f in result.findings if f.cls == "env_harvest"] == []
+
+
+def test_staged_toolkit_is_cleaned_up(tmp_path: Path, monkeypatch):
+    """The F-06 cleanup contract covers the staged toolkit: a session
+    with a toolkit leaves no ``-toolkit`` copy under ``sandbox/`` after
+    ``cleanup_run`` (the staged copy is per-session, never a cache)."""
+    from factory import session as session_mod
+    from factory.runs import RunDir, cleanup_run
+
+    run_root = tmp_path / "runs" / "demo" / "20260101T000000Z-ab12cd"
+    run_root.mkdir(parents=True)
+    settings_path = tmp_path / "sandbox" / "demo-20260101T000000Z-ab12cd.json"
+    toolkit, _skill, _mcp = _toolkit_with(tmp_path / "tk")
+    resolved = {"root": str(toolkit), "items": [_skill]}
+
+    def fake_run_sandboxed(cmd, run_dir_arg, settings_arg, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd, 0, json.dumps(SessionRecord(
+                seat="implementer", status="completed").to_dict()) + "\n", "")
+
+    monkeypatch.setattr(session_mod, "run_sandboxed", fake_run_sandboxed)
+    session_mod.run_session_sandboxed(
+        seat="implementer", prompt="p", run_dir=run_root, profile={},
+        max_turns=1, timeout_min=1, token="stub-token",
+        toolkit=resolved, factory_root=tmp_path,
+    )
+    staged = settings_path.with_name(settings_path.name + "-toolkit")
+    assert staged.is_dir() and (staged / "skills" / "demo-skill").is_dir()
+    cleanup_run(RunDir("demo", "20260101T000000Z-ab12cd", run_root,
+                       settings_path))
+    assert not staged.exists()
+    assert not settings_path.exists()
+    assert not settings_path.with_name(settings_path.name + "-runner").exists()
+
+
+def test_reclaim_sweep_removes_a_stray_staged_toolkit(tmp_path: Path):
+    """The reclaim path too: an abandoned run's stray ``-toolkit`` dir
+    under ``sandbox/`` is swept like ``-runner``/``-scratch`` (the F-26
+    stray regex knows the sibling)."""
+    from factory.orchestrator import reclaim_runs
+    from factory.state import TaskQueue
+
+    root = tmp_path / "factory-root"
+    sandbox = root / "sandbox"
+    sandbox.mkdir(parents=True)
+    queue_path = tmp_path / "tasks.json"
+    queue_path.write_text(json.dumps(
+        {"version": 1, "project": "demo", "tasks": []}))
+    run_id = "20260101T000000Z-ab12cd"
+    stray = sandbox / f"demo-{run_id}.json-toolkit"
+    (stray / "skills" / "x").mkdir(parents=True)
+    # A live lease must not be needed: an idle queue reclaims strays.
+    removed_runs = reclaim_runs(TaskQueue(queue_path), "demo", root)
+    assert removed_runs == []  # no run dir existed; only the stray did
+    assert not stray.exists()
+
+
+def test_hidden_chars_survive_a_utf16_file(tmp_path: Path):
+    """A zero-width marker re-encoded as UTF-16 still trips the
+    hidden-character class — the scan decodes the real characters
+    instead of replacing them into garbage."""
+    cand = tmp_path / "cand-utf16"
+    cand.mkdir()
+    (cand / "LICENSE").write_text(MIT)
+    zwsp = chr(0x200B)  # explicit — an invisible literal proves nothing
+    (cand / "SKILL.md").write_bytes(
+        f"Always{zwsp}follow the marker\n".encode("utf-16"))
+    result = vet_candidate(cand, allowlists=ALLOW)
+    assert any(f.cls == "hidden_chars" for f in result.findings), (
+        result.findings
+    )
+
+
+def test_report_path_cannot_escape_the_toolkit_dir(tmp_path: Path):
+    """An index entry whose report path carries ``..`` is refused by the
+    schema — the report lives under toolkit/, never outside it."""
+    from factory.toolkit import ToolkitError
+
+    toolkit = tmp_path / "toolkit"
+    escape = _make_skill(toolkit)
+    escape["report"] = "reports/../outside.md"
+    _write_reports(toolkit, [escape])
+    _write_index(toolkit, [escape])
+    with pytest.raises(ToolkitError, match="report"):
+        load_index(toolkit)

@@ -206,6 +206,17 @@ def _validate(instance: Any, schema_path: Path, origin: str) -> None:
         raise ContractError(f"{origin}: schema violation at {loc}: {error.message}")
 
 
+def validate_against_schema(instance: Any, schema_path: Path | str,
+                            origin: str) -> None:
+    """Public schema validation for the repo's other documents (F-22's
+    toolkit index is the first consumer: it wraps this in ToolkitError).
+
+    See :func:`_validate` — the shape is identical; this is the seam for
+    callers outside this module.
+    """
+    _validate(instance, Path(schema_path), origin)
+
+
 def validate_queue(
     data: Any, origin: str = "tasks", schema_path: Path | None = None
 ) -> None:
@@ -250,12 +261,15 @@ def load_tasks(path: Path | str, schema_path: Path | None = None) -> dict:
     return data
 
 
-def _check_profile_semantics(data: dict, origin: str) -> None:
+def _check_profile_semantics(data: dict, origin: str, *,
+                             toolkit_root: Path | str | None = None) -> None:
     """Readable front-end checks on a parsed profile (schema backs them).
 
     Args:
         data: The parsed profile mapping.
         origin: Profile path, for the error message.
+        toolkit_root: Toolkit index root for the ``toolkit`` names check
+            (F-22 AC-6); default the factory checkout's ``toolkit/``.
 
     Raises:
         ContractError: On the first semantic violation found.
@@ -270,14 +284,71 @@ def _check_profile_semantics(data: dict, origin: str) -> None:
                 f"paths.risk.{flag} globs or drop the sentinels key "
                 "(a skipped-forever sentinel reads as checked when it can't be)"
             )
+    _check_profile_toolkit(data.get("toolkit"), origin,
+                           toolkit_root=toolkit_root)
 
 
-def load_profile(path: Path | str, schema_path: Path | None = None) -> dict:
+def _check_profile_toolkit(section: Any, origin: str, *,
+                           toolkit_root: Path | str | None) -> None:
+    """F-22 AC-6: every toolkit name in a profile must be an index entry
+    of the right kind, and a seat section may only narrow (a subset of
+    the project's own lists) — never widen. Unknown or unvetted names
+    refuse the profile at load, exactly as F-02 refuses invalid state.
+
+    The import is deferred: factory.toolkit imports this module, so a
+    module-level cycle would bite at import time.
+    """
+    if section is None:
+        return
+    from factory.toolkit import ToolkitError, default_toolkit_dir, load_index
+
+    root = Path(toolkit_root) if toolkit_root is not None else default_toolkit_dir()
+    try:
+        index = load_index(root)
+    except ToolkitError as exc:
+        raise ContractError(f"{origin}: {exc}") from exc
+    kinds: dict[str, str] = {
+        entry["name"]: entry["kind"] for entry in index["items"]
+    }
+    lists = (("skills", "skill"), ("plugins", "plugin"),
+             ("mcp_servers", "mcp_server"))
+    for key, kind in lists:
+        for name in section.get(key) or []:
+            if name not in kinds:
+                raise ContractError(
+                    f"{origin}: toolkit.{key} names {name!r}, which is not "
+                    f"in the toolkit index ({root / 'index.yaml'}) — every "
+                    "toolkit name must be an admitted index entry (F-22 AC-6)"
+                )
+            if kinds[name] != kind:
+                raise ContractError(
+                    f"{origin}: toolkit.{key} names {name!r}, which is a "
+                    f"{kinds[name]} in the index, not a {kind}"
+                )
+    for seat, seat_section in (section.get("seats") or {}).items():
+        for key, _kind in lists:
+            widened = sorted(
+                set(seat_section.get(key) or [])
+                - set(section.get(key) or [])
+            )
+            if widened:
+                raise ContractError(
+                    f"{origin}: toolkit.seats.{seat}.{key} widens beyond the "
+                    f"project's toolkit.{key}: {', '.join(map(repr, widened))} "
+                    "— a seat narrows the toolkit, never extends it (AC-6)"
+                )
+
+
+def load_profile(path: Path | str, schema_path: Path | None = None, *,
+                 toolkit_root: Path | str | None = None) -> dict:
     """Load and fully validate a project.yaml profile.
 
     Args:
         path: Path to the profile file (e.g. ``.factory/project.yaml``).
         schema_path: Optional override for the profile schema path.
+        toolkit_root: Optional override for the toolkit index root
+            (F-22's ``toolkit:`` names check; default this checkout's
+            ``toolkit/`` dir).
 
     Returns:
         The parsed profile mapping.
@@ -285,7 +356,9 @@ def load_profile(path: Path | str, schema_path: Path | None = None) -> dict:
     Raises:
         ContractError: If the file is unreadable or not YAML, not a mapping,
             schema-invalid, or semantically inconsistent (F-25: a
-            ``sentinels.<flag>`` whose flag has no ``paths.risk`` globs).
+            ``sentinels.<flag>`` whose flag has no ``paths.risk`` globs;
+            F-22: a toolkit name that is not an admitted index entry, or
+            a seat section that widens the project's toolkit).
     """
     path = Path(path)
     origin = str(path)
@@ -298,5 +371,5 @@ def load_profile(path: Path | str, schema_path: Path | None = None) -> dict:
             f"{origin}: profile must be a YAML mapping, got {type(data).__name__}"
         )
     _validate(data, schema_path or SCHEMA_DIR / "project.schema.json", origin)
-    _check_profile_semantics(data, origin)
+    _check_profile_semantics(data, origin, toolkit_root=toolkit_root)
     return data
