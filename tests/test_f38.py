@@ -1096,6 +1096,62 @@ def test_review1_real_sandboxes_isolate_their_homes(tmp_path: Path):
     )
 
 
+def test_real_fanout_scratch_reads_back_under_a_denied_home(tmp_path, monkeypatch):
+    """A session must READ what it writes to its own scratch. The real
+    factory root sits under $HOME, which the sandbox denies for reading,
+    so a scratch only on allowWrite kills every real reviewer at CLI
+    startup (F-16 run 20261030T120742Z-75e6df: ProcessError exit 1 in 5s,
+    no model call). The earlier real-sandbox test missed it because its
+    tmp_path scratch sat outside the denied home. Here the factory root
+    is under a denied HOME, as in production, and the other session's
+    scratch stays unreadable."""
+    from factory.sandbox import build_settings, run_sandboxed, write_settings
+    from factory.session import _scratch_dirs
+
+    repo, profile = _sandbox_repo(tmp_path)
+    home = tmp_path / "home"
+    root = home / "factory"
+    run = root / "runs" / "p" / "20261030T000000Z-aaaaaa"
+    run.mkdir(parents=True)
+    sandbox_dir = root / "sandbox"
+    sandbox_dir.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    mine = _scratch_dirs(sandbox_dir / "base.json-r1.json-scratch")
+    other = _scratch_dirs(sandbox_dir / "base.json-r2.json-scratch")
+    (other[0] / "secret.txt").write_text("other session\n")
+
+    settings = sandbox_dir / "base.json-r1.json"
+    built = build_settings(
+        profile, run, factory_root=root,
+        model_endpoint="https://api.z.ai/api/anthropic",
+        read_only=True, scratch_write=mine,
+    )
+    write_settings(built, settings)
+    assert str(mine[0].resolve()) in built["filesystem"]["allowRead"]
+    assert str(other[0].resolve()) not in built["filesystem"]["allowRead"]
+
+    script = textwrap.dedent("""
+        import os, pathlib, sys
+        for var in ("HOME", "TMPDIR"):
+            probe = pathlib.Path(os.environ[var]) / "probe.txt"
+            probe.write_text("x")
+            assert probe.read_text() == "x"
+        try:
+            pathlib.Path(sys.argv[1]).read_text()
+        except OSError:
+            print("isolated")
+        else:
+            print("LEAK")
+        print("readback-ok")
+    """)
+    proc = run_sandboxed(
+        [sys.executable, "-c", script, str(other[0] / "secret.txt")],
+        run, settings, timeout=120, scratch=mine,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.split() == ["isolated", "readback-ok"], proc.stdout + proc.stderr
+
+
 def test_review2_a_unanimous_blocking_finding_survives_the_vote():
     """Finding 2: a blocking or major finding that EVERY reviewer reported
     cannot be dropped by one verifier — it survives tagged important, and
