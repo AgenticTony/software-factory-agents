@@ -30,6 +30,10 @@ factory = "factory.cli:main"
 [tool.setuptools.packages.find]
 include = ["factory*"]
 
+# F-31: the dashboard's static assets ship in the package.
+[tool.setuptools.package-data]
+"factory" = ["dashboard_static/*"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
