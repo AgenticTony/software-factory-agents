@@ -31,17 +31,20 @@ drives real model sessions (:func:`run_on_demand_eval`, the
 in this module is on any routine path.
 """
 
+import contextlib
 import json
 import shlex
+import shutil
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 from factory.gates import git as hardened_git
 from factory.l0 import run_l0
 from factory.l1 import run_l1
 from factory.l2 import apply_vote, merge_reviews, parse_verdict, parse_verifier_vote
-from factory.session import run_sessions_parallel
+from factory.session import run_session_sandboxed, run_sessions_parallel
 
 # Per-session budgets for the eval's L2 seats. An eval diff is tiny
 # compared to a real attempt; the caps keep a confused session bounded.
@@ -232,11 +235,10 @@ def eval_profile(repo: Path, python: str | None = None) -> dict:
     """The fixture project's profile: what the gates run and what the
     L2 seats are allowed to read.
 
-    ``python`` overrides the interpreter in the command strings — the
-    on-demand driver passes the run-local gate venv's (``.venv/bin/python``),
-    because the sandbox refuses to execute the orchestrator's own
-    interpreter; tests keep ``sys.executable`` (unconfined, like the
-    F-07/F-08 fixtures).
+    ``python`` overrides the interpreter in the command strings; the
+    default is this process's (the F-38 fixture convention — under the
+    gate sandbox the commands run exactly as a real profile's do, with
+    the run-local gate venv first on PATH).
     """
     python = python or sys.executable
     quoted = shlex.quote(python)
@@ -449,6 +451,7 @@ def run_seed(
     command_runner=None,
     session_runner=None,
     reviewers: int = DEFAULT_REVIEWERS,
+    factory_root: Path | None = None,
 ) -> dict:
     """Run the validator's layers over one seeded (or clean) diff.
 
@@ -480,7 +483,7 @@ def run_seed(
         layers["L2"] = run_l2_review(
             repo, profile, base_ref, f"eval/{seed.id}", task,
             session_runner=session_runner, reviewers=reviewers,
-            l0=l0, l1=l1,
+            l0=l0, l1=l1, factory_root=factory_root,
         ).to_dict()
     record = {
         "id": seed.id,
@@ -541,6 +544,7 @@ def run_l2_review(
     reviewers: int = DEFAULT_REVIEWERS,
     l0=None,
     l1=None,
+    factory_root: Path | None = None,
 ):
     """L2 as F-38's parallel reviewer and verifier over one diff.
 
@@ -557,7 +561,7 @@ def run_l2_review(
             the report dicts already on the record when re-reviewing.
     """
     from factory import orchestrator
-    from factory.prompts import assemble_reviewer_prompt
+    from factory.prompts import assemble_reviewer_prompt, assemble_verifier_prompt
 
     diff = _git(repo, "diff", "--no-color", "--no-ext-diff",
                 f"{base_ref}...{head_ref}")
@@ -568,6 +572,7 @@ def run_l2_review(
         [("reviewer", review_prompt)] * reviewers,
         repo, profile,
         runner=session_runner,
+        factory_root=factory_root,
         max_turns=SEAT_MAX_TURNS,
         timeout_min=SEAT_TIMEOUT_MIN,
         protected=list((profile.get("paths") or {}).get("protected") or []),
@@ -580,10 +585,9 @@ def run_l2_review(
     if union.parse_error is not None or not union.findings:
         return union
     verifier_prompt = orchestrator._verifier_prompt(task, diff, union.findings)
-    from factory.prompts import assemble_verifier_prompt
-
     verifier = session_runner(
         "verifier", verifier_prompt, repo, profile,
+        factory_root=factory_root,
         max_turns=SEAT_MAX_TURNS,
         timeout_min=SEAT_TIMEOUT_MIN,
         protected=list((profile.get("paths") or {}).get("protected") or []),
@@ -615,6 +619,7 @@ def run_seeded_eval(
     command_runner=None,
     session_runner=None,
     reviewers: int = DEFAULT_REVIEWERS,
+    factory_root: Path | None = None,
 ) -> dict:
     """Run the whole eval over the fixture set and return its report.
 
@@ -630,6 +635,7 @@ def run_seeded_eval(
         "command_runner": command_runner,
         "session_runner": session_runner,
         "reviewers": reviewers,
+        "factory_root": factory_root,
     }
     seeds = [run_seed(repo, seed, **common) for seed in SOLOADVENTURER_SEEDS]
     clean = [run_seed(repo, diff, **common) for diff in CLEAN_DIFFS]
@@ -693,3 +699,84 @@ def render_report(report: dict) -> str:
         )
     lines.append("")
     return "\n".join(lines)
+
+
+def run_on_demand_eval(
+    factory_root: Path | None = None,
+    out_path: Path | None = None,
+    *,
+    reviewers: int = DEFAULT_REVIEWERS,
+    session_runner=None,
+    command_runner=None,
+    keep_fixture: bool = False,
+) -> dict:
+    """One on-demand (or monthly) eval run — the AC-3 owner step.
+
+    Builds a fresh SoloAdventurer fixture, runs every seeded bug and
+    known-clean diff through the full validator — L0 and L1 through the
+    pinned srt sandbox (:func:`factory.orchestrator.sandboxed_runner`,
+    the same gate path a real run uses), L2 as F-38's parallel reviewer
+    and verifier over **real model sessions**
+    (:func:`factory.session.run_session_sandboxed`, the default) — and
+    writes the per-diff report next to the factory's own records. This
+    is what ``factory eval`` runs and what the owner records as tick
+    evidence; nothing routine ever calls it.
+
+    Args:
+        factory_root: Factory root (default ``~/factory``); the fixture,
+            the sandbox settings and the report live under
+            ``<factory_root>/eval/``.
+        out_path: Where the report JSON goes (default
+            ``<factory_root>/eval/seeded-eval-<stamp>.json``; the
+            rendered markdown sits beside it).
+        reviewers: Reviewer sessions per diff (F-38's fan-out width).
+        session_runner / command_runner: Overrides for tests; the
+            defaults drive real sessions and the real sandbox.
+        keep_fixture: Keep the fixture repo for inspection (default:
+            removed with the run's scratch; the reports stay).
+
+    Returns:
+        ``{"report", "report_path", "rendered_path"}``.
+    """
+    from factory.orchestrator import _gate_settings, sandboxed_runner
+    from factory.runs import FACTORY_ROOT_DEFAULT, RunDir
+
+    factory_root = Path(factory_root) if factory_root else FACTORY_ROOT_DEFAULT
+    eval_root = factory_root / "eval"
+    eval_root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    fixture_dir = eval_root / "soloadventurer"
+    if fixture_dir.exists():
+        shutil.rmtree(fixture_dir)
+    fixture = build_soloadventurer_fixture(fixture_dir)
+    settings_path = eval_root / f"srt-settings-{stamp}.json"
+    profile = eval_profile(fixture)
+    if command_runner is None:
+        _gate_settings(profile, RunDir("soloadventurer", stamp, fixture,
+                                       settings_path), factory_root)
+        command_runner = sandboxed_runner(fixture, settings_path)
+    try:
+        report = run_seeded_eval(
+            fixture,
+            command_runner=command_runner,
+            session_runner=session_runner if session_runner is not None
+            else run_session_sandboxed,
+            reviewers=reviewers,
+            factory_root=factory_root,
+        )
+        out_path = Path(out_path) if out_path else (
+            eval_root / f"seeded-eval-{stamp}.json"
+        )
+        out_path.write_text(json.dumps(report, indent=2) + "\n")
+        rendered_path = out_path.with_suffix(".md")
+        rendered_path.write_text(render_report(report))
+        return {
+            "report": report,
+            "report_path": out_path,
+            "rendered_path": rendered_path,
+        }
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            settings_path.unlink()
+        if not keep_fixture:
+            shutil.rmtree(fixture_dir, ignore_errors=True)

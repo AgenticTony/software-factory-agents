@@ -18,8 +18,9 @@ from factory.approve import (
     reconcile_bootstrap,
     recover_task,
 )
-from factory.config import ConfigError, load_config
+from factory.config import ConfigError, FactoryConfig, load_config
 from factory.contract import ContractError, load_profile, load_tasks, read_file
+from factory.eval import EvalError, run_on_demand_eval
 from factory.gates import GateError
 from factory.importer import apply_import, run_import
 from factory.orchestrator import run_loop, run_once
@@ -144,6 +145,24 @@ def build_parser() -> argparse.ArgumentParser:
                             "(default: %(default)s)")
     trace.add_argument("--factory-root", default=None,
                        help="factory root (default: ~/factory)")
+
+    eval_cmd = sub.add_parser(
+        "eval",
+        help="seeded-bug validator eval, on demand (F-16) — drives real "
+             "model sessions; never part of run, loop or CI",
+    )
+    eval_cmd.add_argument(
+        "--out", default=None,
+        help="report JSON path (default: <factory-root>/eval/"
+             "seeded-eval-<stamp>.json, rendered markdown beside it)")
+    eval_cmd.add_argument("--factory-root", default=None,
+                          help="factory root (default: ~/factory)")
+    eval_cmd.add_argument(
+        "--reviewers", type=int, default=None,
+        help="reviewer sessions per diff (default: the factory config)")
+    eval_cmd.add_argument(
+        "--keep-fixture", action="store_true",
+        help="keep the fixture repo after the run for inspection")
 
     sentinels = sub.add_parser(
         "sentinels", help="built-in sentinel utilities")
@@ -433,6 +452,29 @@ def _run_sentinels_replay(args: argparse.Namespace) -> int:
         return 1
 
 
+def _run_eval(args: argparse.Namespace) -> int:
+    """Dispatch the seeded-bug validator eval (F-16 AC-3's owner step).
+
+    It drives real model sessions, so it only ever runs explicitly, by
+    this command — never from ``run``/``loop`` or CI. Known failures
+    exit 2 with a message, not a traceback."""
+    reviewers = args.reviewers or FactoryConfig().reviewers
+    try:
+        result = run_on_demand_eval(
+            Path(args.factory_root) if args.factory_root else None,
+            Path(args.out) if args.out else None,
+            reviewers=reviewers,
+            keep_fixture=args.keep_fixture,
+        )
+    except (EvalError, GateError, RunError, SandboxError,
+            SessionConfigError) as exc:
+        print(f"factory eval: {exc}", file=sys.stderr)
+        return 2
+    print(result["rendered_path"].read_text(), end="")
+    print(f"factory eval: report written to {result['report_path']}")
+    return 0
+
+
 def _run_toolkit_vet(args: argparse.Namespace) -> int:
     """Dispatch ``toolkit vet`` (F-22 AC-3/AC-4).
 
@@ -567,6 +609,8 @@ def main(argv: list | None = None) -> int:
         return _run_sentinels_replay(args)
     if args.command == "toolkit":
         return _run_toolkit_vet(args)
+    if args.command == "eval":
+        return _run_eval(args)
     if args.command == "import":
         return _run_import(args)
     print(

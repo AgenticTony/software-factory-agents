@@ -22,9 +22,9 @@ from factory.eval import (
     CLEAN_DIFFS,
     SOLOADVENTURER_SEEDS,
     build_soloadventurer_fixture,
+    render_report,
     run_seed,
     run_seeded_eval,
-    render_report,
     seed_by_id,
 )
 from factory.session import SessionRecord
@@ -167,3 +167,82 @@ def test_render_report_shows_the_per_diff_table(tmp_path: Path):
     assert "catch rate" in text.lower()
     for layer in ("L0", "L1", "L2"):
         assert layer in text
+
+
+# --- AC-3 (manual check; these hold the mechanism to its constraints) -------
+
+
+def test_ac_3(tmp_path: Path):
+    """The eval is on-demand and monthly, never on a routine path.
+
+    AC-3 drives real model sessions, so its evidence is the owner's
+    recorded run (a `manual` check). What a test CAN hold: nothing on
+    the routine path — no gate, no orchestrator round, no CI workflow —
+    reaches the eval; only the explicit ``factory eval`` command does.
+    """
+    repo = Path(__file__).resolve().parent.parent
+    for path in (repo / ".github").glob("workflows/*.y*ml"):
+        assert "factory eval" not in path.read_text(), path
+    for path in (repo / "factory").glob("*.py"):
+        if path.name in ("eval.py", "cli.py"):
+            continue
+        src = path.read_text()
+        assert "factory.eval" not in src and "run_on_demand_eval" not in src, path
+
+
+def test_factory_eval_command_is_not_a_stub():
+    """``factory eval`` dispatches the real driver, unlike the stub
+    subcommands."""
+    from factory.cli import STUBS, build_parser
+
+    assert "eval" not in STUBS
+    parser = build_parser()
+    args = parser.parse_args(["eval"])
+    assert args.command == "eval"
+
+
+def test_on_demand_driver_reports_and_cleans_up(tmp_path: Path):
+    """One on-demand run, end to end: the real gate path (the pinned srt
+    sandbox runs every L0/L1 command), the L2 seats scripted, the report
+    written where the owner records it, the scratch removed."""
+    from factory.eval import run_on_demand_eval
+
+    factory_root = tmp_path / "factory-root"
+    result = run_on_demand_eval(
+        factory_root, session_runner=ScriptedSeats(MOCK_SEED_FINDINGS)
+    )
+    report = result["report"]
+    assert result["report_path"].exists()
+    assert json.loads(result["report_path"].read_text()) == report
+    assert result["rendered_path"].exists()
+    assert result["rendered_path"].read_text() == render_report(report)
+    for record in report["seeds"]:
+        assert record["caught_by"] == [record["expected_layer"]], record["id"]
+    for record in report["clean"]:
+        assert record["blocking_findings"] == 0, record["id"]
+    # The scratch is gone; the evidence stays.
+    assert not (factory_root / "eval" / "soloadventurer").exists()
+
+
+def test_on_demand_driver_plumbing_with_unconfined_gates(tmp_path: Path):
+    """The driver's own plumbing — fresh fixture, report files, cleanup —
+    with the gates unconfined (INC-007 keeps the sandboxed variant for a
+    host that can apply a profile; the assertions are the same)."""
+    from factory.eval import run_on_demand_eval
+    from factory.gates import run_command
+
+    factory_root = tmp_path / "factory-root"
+    result = run_on_demand_eval(
+        factory_root,
+        session_runner=ScriptedSeats(MOCK_SEED_FINDINGS),
+        command_runner=run_command,
+    )
+    report = result["report"]
+    assert json.loads(result["report_path"].read_text()) == report
+    assert result["rendered_path"].read_text() == render_report(report)
+    for record in report["seeds"]:
+        assert record["caught_by"] == [record["expected_layer"]], record["id"]
+    for record in report["clean"]:
+        assert record["blocking_findings"] == 0, record["id"]
+    assert not (factory_root / "eval" / "soloadventurer").exists()
+    assert list((factory_root / "eval").glob("srt-settings-*.json")) == []
