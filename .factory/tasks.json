@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-30T15:18:24Z",
+  "updated_at": "2026-10-30T17:04:46Z",
   "tasks": [
     {
       "id": "F-00",
@@ -1260,7 +1260,7 @@
       "source": "BUILD-ORDER.md#f-16--seeded-bug-validator-eval",
       "kind": "build",
       "priority": "P2",
-      "status": "in_review",
+      "status": "awaiting_owner",
       "depends_on": [
         "F-07",
         "F-08",
@@ -1568,7 +1568,8 @@
         "revalidated": {
           "pr": "c7e83e5ae11d0d5a0d8e3b25846c123db2837ddb",
           "default": "75c64da94c960b964f22601ffd20d485f3c80228"
-        }
+        },
+        "merged": "https://github.com/AgenticTony/software-factory-agents/pull/82"
       },
       "owner_steps": [
         {
@@ -1848,7 +1849,7 @@
       "source": "BUILD-ORDER.md#f-22--vetted-agent-toolkit-skills-plugins-mcp-servers",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-06",
         "F-09",
@@ -1943,7 +1944,10 @@
         "wall_clock_min": 150
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "acceptance_hash": "e3e3174601261b346fe6ae60bdb3dfdb02dcca48caa080e29e8274d13ebbc73c",
+      "approved_at": "2026-10-30T15:43:15Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-23",
@@ -2510,7 +2514,7 @@
       "source": "BUILD-ORDER.md#f-31--read-only-dashboard-factory-dashboard",
       "kind": "build",
       "priority": "P2",
-      "status": "ready",
+      "status": "in_review",
       "depends_on": [
         "F-11",
         "F-30"
@@ -2691,9 +2695,141 @@
               "verdict": "pass"
             }
           ]
+        },
+        {
+          "run_id": "20261030T154335Z-02fd39",
+          "slice_id": "F-31",
+          "started": "2026-10-30T15:43:36Z",
+          "ended": "2026-10-30T16:29:34Z",
+          "outcome": "fail",
+          "rounds": 1,
+          "turns": 104,
+          "input_tokens": 152458,
+          "output_tokens": 71528,
+          "prompt_versions": {
+            "implementer": "de4a232caf51b7dce0c425dfd31c405cb4fd5a01931957dae2d6a5c300e19a92",
+            "reviewer-1": "50d130484979b08c9f579a704d1c5dc1b56e89ce8a0683f0a967be887dd35a48",
+            "reviewer-2": "50d130484979b08c9f579a704d1c5dc1b56e89ce8a0683f0a967be887dd35a48",
+            "verifier": "18be46e80ac4f70221f3de383c1bf37edf6cebf32aaa4bb5f4fd922016cd184c"
+          },
+          "skills": [],
+          "model": "implementer=claude-opus-5-5",
+          "validator_report": "/Users/anthonyforan/factory/reports/software-factory/F-31/20261030T154335Z-02fd39-a1.json",
+          "sentinels": [
+            {
+              "name": "assertion_removed",
+              "kind": "builtin",
+              "verdict": "pass"
+            },
+            {
+              "name": "credential_added",
+              "kind": "builtin",
+              "verdict": "pass"
+            },
+            {
+              "name": "lint_suppression_added",
+              "kind": "builtin",
+              "verdict": "pass",
+              "detail": "no risk path touched"
+            },
+            {
+              "name": "skip_marker_added",
+              "kind": "builtin",
+              "verdict": "pass"
+            }
+          ]
+        },
+        {
+          "run_id": "20261030T154335Z-02fd39",
+          "slice_id": "F-31",
+          "started": "2026-10-30T16:29:35Z",
+          "ended": "2026-10-30T17:04:37Z",
+          "outcome": "pass",
+          "rounds": 2,
+          "turns": 75,
+          "input_tokens": 223715,
+          "output_tokens": 46794,
+          "prompt_versions": {
+            "implementer": "de4a232caf51b7dce0c425dfd31c405cb4fd5a01931957dae2d6a5c300e19a92",
+            "reviewer-1": "50d130484979b08c9f579a704d1c5dc1b56e89ce8a0683f0a967be887dd35a48",
+            "reviewer-2": "50d130484979b08c9f579a704d1c5dc1b56e89ce8a0683f0a967be887dd35a48",
+            "verifier": "18be46e80ac4f70221f3de383c1bf37edf6cebf32aaa4bb5f4fd922016cd184c"
+          },
+          "skills": [],
+          "model": "implementer=claude-opus-5-5 reviewer=claude-opus-5-5 reviewer=claude-opus-5-5 verifier=claude-opus-5-5",
+          "validator_report": "/Users/anthonyforan/factory/reports/software-factory/F-31/20261030T154335Z-02fd39-a2.json",
+          "pr": "https://github.com/AgenticTony/software-factory-agents/pull/86",
+          "sentinels": [
+            {
+              "name": "assertion_removed",
+              "kind": "builtin",
+              "verdict": "pass"
+            },
+            {
+              "name": "credential_added",
+              "kind": "builtin",
+              "verdict": "pass"
+            },
+            {
+              "name": "lint_suppression_added",
+              "kind": "builtin",
+              "verdict": "pass",
+              "detail": "no risk path touched"
+            },
+            {
+              "name": "skip_marker_added",
+              "kind": "builtin",
+              "verdict": "pass"
+            }
+          ],
+          "review_drops": [
+            {
+              "text": "Duplicated Code: `task_page` reimplements the most-recent-escalated-attempt scan (reversed attempts, first with `escalation`, take reason+note) that already exists as `factory.status._escalation_of` — the exact logic the queue view consumes one call away via `needs_human_tasks`. If the escalation-derivation rule changes (e.g. escalation moved to its own queue field), the task detail page and the queue page will disagree. Extract and share one helper.",
+              "reason": "nit_budget",
+              "id": "U-6",
+              "axis": "standards",
+              "severity": "minor",
+              "file": "factory/dashboard.py",
+              "line": 367,
+              "reported_by": [
+                2
+              ]
+            },
+            {
+              "text": "Duplicated Code: `metrics_page` calls `load_profile(...)` directly after `self.project()` already loaded the same file (line 230) to get the same dict's `name` and `repo.path`. One profile read returned to both callers would remove the double read and the duplicated path construction (`self.queue_path.parent / \"project.yaml\"` appears in both).",
+              "reason": "nit_budget",
+              "id": "U-4",
+              "axis": "standards",
+              "severity": "note",
+              "file": "factory/dashboard.py",
+              "line": 383,
+              "reported_by": [
+                1
+              ]
+            },
+            {
+              "text": "`metrics_page` parses and schema-validates project.yaml twice — once indirectly through `self.project()` and again directly for `profile[\"repo\"][\"path\"]` — the same file read through the same loader in one request. Have `project()` return the profile (or add a `_profile()` helper) and read the name from it.",
+              "reason": "nit_budget",
+              "id": "U-7",
+              "axis": "standards",
+              "severity": "note",
+              "file": "factory/dashboard.py",
+              "line": 383,
+              "reported_by": [
+                2
+              ]
+            }
+          ]
         }
       ],
-      "links": {},
+      "links": {
+        "pr": "https://github.com/AgenticTony/software-factory-agents/pull/86",
+        "branch": "factory/f-31-20261030t154335z-02fd39",
+        "revalidated": {
+          "pr": "90e61895464fbc04ccddcf2fac27b07041cc5efe",
+          "default": "42084cc0293009c7e41d1aca21b312277d4043f1"
+        }
+      },
       "acceptance_hash": "e656d126458f306bde9c876b6dc8ec179f369b7aa62caacc5c4352a1b4a24084",
       "approved_at": "2026-10-29T09:09:09Z",
       "approved_by": "Anthony",
@@ -3334,15 +3470,23 @@
             "type": "test",
             "ref": "tests/test_f41.py::test_ac_5"
           }
+        },
+        {
+          "id": "AC-6",
+          "text": "A surviving `major` finding fails an L2 round exactly as a `blocking` one does, on every round, in `apply_vote` and in `apply_convergence`: a PR never opens with a surviving major finding. F-31's run (2026-10-30) published with a confirmed major defect because only `blocking` failed a round. A declared pass does not override it. The F-23 convergence stops still apply, so a repeated major finding escalates `review_not_converging` and never loops. `REVIEW.md` and `prompts/reviewer.md` state the rule, and the prompt pin is updated.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f41.py::test_ac_6"
+          }
         }
       ],
       "attempts": [],
       "links": {},
       "budget": {
-        "size": "S",
+        "size": "M",
         "max_attempts": 3,
-        "max_turns": 100,
-        "wall_clock_min": 60
+        "max_turns": 200,
+        "wall_clock_min": 150
       }
     }
   ]
