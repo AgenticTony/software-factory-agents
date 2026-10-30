@@ -1537,3 +1537,76 @@ def test_review8_session_neutralizes_control_vars_in_the_mcp_child_env(
     # …and the config env is exactly scrub + admitted: no other name
     # crosses this boundary, whatever the parent carried.
     assert set(child_env) == set(ENV_SCRUB) | {"NO_COLOR", "TZ"}
+
+
+# ------------------------------------------------- AC-9: the first toolkit ---
+
+# JobFinderOS's real allowlists, read from its origin/main profile
+# (2026-10-29). The vet report for strict-api was generated against
+# exactly these (toolkit/reports/strict-api.md).
+JFOS_DOCS = [
+    "fastapi.tiangolo.com", "docs.sqlalchemy.org", "alembic.sqlalchemy.org",
+    "docs.pydantic.dev", "pypdf.readthedocs.io", "supabase.com",
+    "nextjs.org", "react.dev", "tailwindcss.com", "docs.z.ai",
+    "resend.com", "developers.cloudflare.com", "render.com",
+]
+JFOS_NETWORK = [
+    "pypi.org", "files.pythonhosted.org", "registry.npmjs.org",
+    "fonts.googleapis.com", "fonts.gstatic.com",
+]
+
+
+def test_ac_9(tmp_path: Path):
+    """AC-9 (re-scoped 2026-10-30, owner-directed, the F-27 AC-4
+    precedent): the first JobFinderOS toolkit is ONE vetted skill —
+    strict-api — taken through the whole process against the REAL merged
+    index: a JobFinderOS-shaped profile loads with it (AC-6 against the
+    real index), a session gets exactly it (AC-7's shape), and the
+    record stamps name@hash (AC-8). Scripted, no model."""
+    # The real repo index carries the admitted item, clean through every
+    # load gate (schema, licence, hashes, report hash).
+    index = load_index(TOOLKIT_DIR)
+    entry = next(i for i in index["items"] if i["name"] == "strict-api")
+    assert entry["kind"] == "skill" and entry["licence"] == "MIT"
+    assert entry["pin"]["commit"] == "0496583603e56cdd5022dd61c823bd784a80a752"
+
+    # A JobFinderOS-shaped profile choosing strict-api loads against the
+    # real index (AC-6's gate over the merged toolkit, not a fixture).
+    profile = dict(
+        PROFILE_EXTRA_BASE,
+        name="jobfinderos",
+        docs_allowlist=JFOS_DOCS,
+        network_allowlist=JFOS_NETWORK,
+        toolkit={"skills": ["strict-api"], "plugins": [], "mcp_servers": []},
+    )
+    profile_path = tmp_path / "project.yaml"
+    profile_path.write_text(yaml.safe_dump(profile, sort_keys=False))
+    loaded = load_profile(profile_path, toolkit_root=TOOLKIT_DIR)
+    assert loaded["toolkit"]["skills"] == ["strict-api"]
+
+    # The session: staged from the real vendored bytes, exactly the one
+    # skill visible, record stamped with the index's content hash.
+    resolved = resolve_toolkit(loaded, "implementer", toolkit_root=TOOLKIT_DIR)
+    staged = stage_toolkit(resolved, tmp_path / "staged")
+    assert (staged / "skills" / "strict-api" / "SKILL.md").read_bytes() == (
+        TOOLKIT_DIR / "skills" / "strict-api" / "SKILL.md"
+    ).read_bytes()
+
+    captured: dict = {}
+
+    async def query(*, prompt, options, transport=None):
+        captured["options"] = options
+        yield _result_message()
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    record = asyncio.run(run_session(
+        "implementer", "p", run_dir, 4, 5,
+        query_fn=query, base_url="https://api.z.ai/api/anthropic", token="t",
+        toolkit={"staged": str(staged), "items": resolved["items"]},
+    ))
+    assert record.status == "completed"
+    options = captured["options"]
+    assert options.setting_sources == []
+    assert options.skills == [f"{TOOLKIT_PLUGIN_NAME}:strict-api"]
+    assert record.skills == [f"strict-api@{entry['content_hash']}"]

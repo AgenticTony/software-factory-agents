@@ -895,6 +895,19 @@ def test_gate_runner_uses_a_run_local_venv_not_ambient_pip(
         (decoy / name).write_text(
             f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\nexit 1\n")
         (decoy / name).chmod(0o755)
+    # Warm the interpreter-toolchain cache while PATH is still clean:
+    # `_python_toolchain` probes PATH pythons by EXECUTING them (correct
+    # in production — that is how it sees through pyenv shims), and it is
+    # lru-cached per process. If this test is the first caller in its
+    # process (fresh run, or an xdist worker whose earlier tests never
+    # built settings), the probe would execute the decoy and touch the
+    # marker — collaterally, before any GATE command runs — and the
+    # marker assertion below would report a hit the gate never made (a
+    # test-order flake, reproduced in isolation on 764c46d). Warming the
+    # cache first keeps the marker proof about exactly what it asserts:
+    # the gate commands resolve the run-local venv, never the decoy.
+    from factory.sandbox import _python_toolchain
+    _python_toolchain()
     monkeypatch.setenv("PATH", f"{decoy}:{os.environ.get('PATH', '')}")
 
     root = tmp_path / "factory-root"
