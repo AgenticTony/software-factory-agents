@@ -1763,12 +1763,16 @@ def _fanout_sandboxed(
     """The real-runner fan-out: one shared guard, per-session settings and
     per-session scratch. Each session goes through :func:`_run_prepared`
     — the SAME per-session prepare/run/parse step :func:`run_session_sandboxed`
-    uses — so a per-session option (F-22's ``toolkit=``) threads through
-    ``session_kwargs`` into one place; only the guard (baseline + workspace
-    check spanning every session) and the scratch naming are the fan-out's
-    own. Per-session artifacts (settings, staged runner, scratch) are
-    removed on every exit path; the F-22 rebase adds its ``-toolkit``
-    siblings to the same cleanup loop and to cleanup_run's sweep."""
+    uses — so a per-session option threads through ``session_kwargs`` into
+    one place: F-22's ``toolkit=`` rides here unchanged, staged per session
+    into its own ``<settings>-toolkit`` dir (each reviewer and the verifier
+    get their own copy — hash-verified by ``stage_toolkit``, the MCP guard
+    hook granted per the resolved items, ``allow_read`` covering exactly
+    that session's staged dir). Only the guard (baseline + workspace check
+    spanning every session) and the scratch naming are the fan-out's own.
+    Per-session artifacts (settings, staged runner, staged toolkit,
+    scratch) are removed on every exit path; ``cleanup_run``'s sweep
+    remains the crash backstop for all of them."""
     token = session_kwargs.get("token")
     if token is None:
         token = seat_token()
@@ -1839,6 +1843,8 @@ def _fanout_sandboxed(
                 settings.unlink(missing_ok=True)
                 shutil.rmtree(settings.with_name(settings.name + "-runner"),
                               ignore_errors=True)
+                shutil.rmtree(settings.with_name(settings.name + "-toolkit"),
+                              ignore_errors=True)  # F-22 sibling
                 shutil.rmtree(home.parent, ignore_errors=True)
     return [record for record in records if record is not None]
 

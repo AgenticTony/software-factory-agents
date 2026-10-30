@@ -208,8 +208,19 @@ class Fanout:
         self.on_reviewer = on_reviewer
         self.implementer_turns = implementer_turns
         self.echo_turn_cap = None
+        self.stamp_toolkit_skills = False
         self.lock = threading.Lock()
         self.calls: list[tuple[str, str, Path, dict]] = []
+
+    def _skills(self, kwargs: dict) -> list:
+        """The F-22 pattern: a stub mimics the runner's record stamping
+        from the toolkit kwarg the session was actually handed."""
+        if not self.stamp_toolkit_skills:
+            return []
+        tk = kwargs.get("toolkit")
+        if not tk:
+            return []
+        return sorted(f"{i['name']}@{i['content_hash']}" for i in tk["items"])
 
     def _review_turns(self, seat: str, kwargs: dict) -> int:
         if self.echo_turn_cap is None:
@@ -236,7 +247,7 @@ class Fanout:
             return SessionRecord(
                 seat=seat, status="completed", num_turns=self.implementer_turns,
                 model="stub-model", tokens={"input_tokens": 120, "output_tokens": 40},
-                result="Implemented answer().",
+                result="Implemented answer().", skills=self._skills(kwargs),
             )
         if seat == "reviewer":
             result = self.reviews
@@ -248,6 +259,7 @@ class Fanout:
                 seat=seat, status="completed",
                 num_turns=self._review_turns(seat, kwargs), model="stub-model",
                 tokens={"input_tokens": 60, "output_tokens": 10}, result=result,
+                skills=self._skills(kwargs),
             )
         if seat == "verifier":
             votes = []
@@ -270,7 +282,7 @@ class Fanout:
                 seat=seat, status="completed",
                 num_turns=self._review_turns(seat, kwargs), model="stub-model",
                 tokens={"input_tokens": 55, "output_tokens": 5},
-                result=_votes_payload(*votes),
+                result=_votes_payload(*votes), skills=self._skills(kwargs),
             )
         raise AssertionError(f"unexpected seat {seat!r}")
 
@@ -1260,3 +1272,263 @@ def test_review5_fanout_forwards_per_session_kwargs(tmp_path: Path):
         toolkit={"staged": "/tmp/fake-toolkit", "items": []},
     )
     assert seen[0].get("toolkit") == {"staged": "/tmp/fake-toolkit", "items": []}
+
+
+# ------------------------------- review round 2 (PR #78): the toolkit through the fan-out --
+
+
+def test_review6_fanout_sessions_carry_the_toolkit(tmp_path, monkeypatch):
+    """F-22 × F-38 (a): every fan-out session gets toolkit_reviewer through
+    _run_prepared exactly as a single reviewer did — staged per session
+    into its OWN -toolkit dir, allow_read covering exactly that staged
+    dir, and the built options carrying the plugin dir, the MCP server
+    and the mcp guard hook. The options half drives run_session per seat
+    with the spec the fan-out's own staging produced (the f22 ac_7
+    pattern); the plumbing half captures specs/settings per session from
+    a monkeypatched sandbox."""
+    from test_f22 import _toolkit_with
+
+    import factory.session as session_module
+    from factory.toolkit import resolve_toolkit
+
+    toolkit_root, skill, mcp = _toolkit_with(tmp_path / "tk")
+    repo, profile = _sandbox_repo(tmp_path / "repo-root")
+    profile["docs_allowlist"] = ["docs.example.com"]  # the MCP server's domain
+    profile["toolkit"] = {
+        "skills": ["demo-skill"], "plugins": [],
+        "mcp_servers": ["docs"],
+        "seats": {"reviewer": {"skills": ["demo-skill"],
+                               "mcp_servers": ["docs"]}},
+    }
+    resolved = resolve_toolkit(profile, "reviewer", toolkit_root=toolkit_root)
+    assert [i["name"] for i in resolved["items"]] == ["demo-skill", "docs"]
+
+    specs_seen: list[dict] = []
+
+    def fake_run(cmd, run_dir, settings_path, *, scratch=None, **kwargs):
+        spec = json.loads(Path(cmd[-1]).read_text())
+        staged = Path(spec["toolkit"]["staged"])
+        # Inside the fake: the staged tree exists while the session runs
+        # (the fan-out's cleanup removes it before the test can look).
+        specs_seen.append({
+            "spec": spec,
+            "settings": json.loads(Path(settings_path).read_text()),
+            "staged": staged,
+            "staged_files_ok": (
+                (staged / "skills" / "demo-skill" / "SKILL.md").is_file()
+                and (staged / "mcp" / "docs" / "server.js").is_file()
+            ),
+            "scratch": scratch,
+        })
+        return subprocess.CompletedProcess(
+            cmd, 0,
+            stdout=json.dumps(
+                {"seat": "reviewer", "status": "completed", "result": "{}"}
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(session_module, "run_sandboxed", fake_run)
+    session_module.run_sessions_parallel(
+        [("reviewer", "one"), ("reviewer", "two")],
+        repo, profile,
+        factory_root=tmp_path / "repo-root", settings_path=tmp_path / "base.json",
+        max_turns=5, timeout_min=1, token="t", cli_path=Path("/bin/echo"),
+        toolkit=resolved,
+    )
+    assert len(specs_seen) == 2
+    staged_roots = []
+    for entry in specs_seen:
+        staged = entry["staged"]
+        staged_roots.append(staged)
+        assert staged.name.endswith("-toolkit")
+        assert entry["staged_files_ok"], "the staged copy is incomplete"
+        # allow_read covers exactly this session's staged dir…
+        written = entry["settings"]
+        assert str(staged) in written["filesystem"]["allowRead"]
+        # …and nothing is writable there (read-only copy).
+        assert not any(
+            Path(w) == staged or staged in Path(w).parents
+            for w in written["filesystem"]["allowWrite"]
+        )
+    assert staged_roots[0] != staged_roots[1]  # per-session staging, no sharing
+
+    # The options half: with one fan-out session's staged spec, the built
+    # options carry the plugin dir, the MCP server and the guard hook —
+    # for the reviewer seat AND the verifier seat (both get
+    # toolkit_reviewer; the verifier judges the reviewers' findings, so it
+    # needs the same read-only evidence surface — see the orchestrator's
+    # verifier call).
+    import asyncio
+
+    async def query(*, prompt, options, transport=None):
+        entry["options"] = options
+        yield type("M", (), {"is_error": False, "subtype": None, "num_turns": 1})()
+
+    for seat in ("reviewer", "verifier"):
+        captured: dict = {}
+
+        async def q(*, prompt, options, transport=None):
+            captured["options"] = options
+            yield type("M", (), {"is_error": False, "subtype": None,
+                                 "num_turns": 1})()
+
+        asyncio.run(session_module.run_session(
+            seat, "p", tmp_path, 2, 1,
+            query_fn=q, base_url="https://api.z.ai/api/anthropic", token="t",
+            toolkit={"staged": str(staged_roots[0]),
+                     "items": resolved["items"]},
+        ))
+        options = captured["options"]
+        assert options.plugins and options.plugins[0]["path"] == str(staged_roots[0])
+        assert "docs" in options.mcp_servers
+        assert any(
+            hm.matcher and hm.matcher.startswith("mcp__")
+            for hm in options.hooks["PreToolUse"]
+        ), f"the {seat} seat has no MCP guard hook"
+
+
+def test_review7_toolkit_dirs_torn_down_even_on_exception(tmp_path, monkeypatch):
+    """F-22 × F-38 (b): each session's -toolkit dir (with its settings,
+    runner and scratch) is gone after the fan-out — on the happy path AND
+    when a session raises mid-fan-out."""
+    from test_f22 import _toolkit_with
+
+    import factory.session as session_module
+    from factory.toolkit import resolve_toolkit
+
+    def run(exc: bool):
+        toolkit_root, _, _ = _toolkit_with(tmp_path / f"tk{int(exc)}")
+        repo, profile = _sandbox_repo(tmp_path / f"repo{int(exc)}")
+        profile["docs_allowlist"] = ["docs.example.com"]
+        profile["toolkit"] = {"skills": ["demo-skill"], "plugins": [],
+                              "mcp_servers": []}
+        resolved = resolve_toolkit(profile, "reviewer",
+                                   toolkit_root=toolkit_root)
+        calls = {"n": 0}
+
+        def fake_run(cmd, run_dir, settings_path, *, scratch=None, **kwargs):
+            calls["n"] += 1
+            if exc and calls["n"] == 2:
+                raise RuntimeError("session 2 blew up mid-fan-out")
+            return subprocess.CompletedProcess(
+                cmd, 0,
+                stdout=json.dumps({"seat": "reviewer", "status": "completed",
+                                   "result": "{}"}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_module, "run_sandboxed", fake_run)
+
+        base = tmp_path / f"base{int(exc)}.json"
+        try:
+            session_module.run_sessions_parallel(
+                [("reviewer", "one"), ("reviewer", "two")],
+                repo, profile,
+                factory_root=tmp_path, settings_path=base,
+                max_turns=5, timeout_min=1, token="t",
+                cli_path=Path("/bin/echo"), toolkit=resolved,
+            )
+        except RuntimeError:
+            pass
+        leftovers = sorted(
+            p.name for p in base.parent.glob(base.name + "*")
+            if p.name != base.name  # the caller's own base file is not ours
+        )
+        assert not [n for n in leftovers if "-toolkit" in n], leftovers
+        assert not leftovers, f"fan-out artifacts survived: {leftovers}"
+
+    run(exc=False)  # happy path: everything staged, everything gone
+    run(exc=True)   # session 2 raises: staged toolkits still torn down
+
+
+def test_review8_attempt_skills_union_across_the_fanout(tmp_path, monkeypatch):
+    """F-22 × F-38 (c): the attempt's skills list carries every loaded
+    item exactly once — three fan-out sessions (two reviewers + the
+    verifier, all on toolkit_reviewer) each stamp their record, and the
+    attempt's sorted set unions them (name@content-hash, no duplicates)."""
+    from test_f22 import _toolkit_with
+
+    import factory.toolkit as toolkit_mod
+
+    toolkit_root, skill, mcp = _toolkit_with(tmp_path / "tk")
+    monkeypatch.setattr(toolkit_mod, "default_toolkit_dir",
+                        lambda: toolkit_root)
+    expected = sorted([
+        f"{skill['name']}@{skill['content_hash']}",
+        f"{mcp['name']}@{mcp['content_hash']}",
+    ])
+
+    env = Env(tmp_path)
+    env.profile["docs_allowlist"] = ["docs.example.com"]
+    env.profile["toolkit"] = {
+        "skills": ["demo-skill"], "plugins": [], "mcp_servers": ["docs"],
+    }
+    import yaml
+
+    (env.repo / ".factory" / "project.yaml").write_text(
+        yaml.safe_dump(env.profile)
+    )
+    _git(env.repo, "add", "-A")
+    _git(env.repo, "commit", "-m", "toolkit profile")
+
+    seats = Fanout(
+        reviews=_verdict(
+            _finding("rename helper _do to _render", severity="minor"),
+            declared="pass",
+        ),
+    )
+    seats.stamp_toolkit_skills = True
+    result = env.run(seats)
+    assert result.outcome == "pr_opened", result
+    attempt = env.task()["attempts"][-1]
+    assert attempt["skills"] == expected  # once, from three stamping sessions
+    toolkits = [tuple(sorted(i["name"] for i in kw["toolkit"]["items"]))
+                for kw in seats.kwargs("reviewer") + seats.kwargs("verifier")
+                if kw.get("toolkit")]
+    assert toolkits == [("demo-skill", "docs")] * 3  # every session got it
+
+
+def test_review9_reclaim_regex_sweeps_every_suffix(tmp_path: Path):
+    """F-22 × F-38 (d): the F-26 stray sweep matches every suffix either
+    PR creates — the base settings, -runner/-scratch/-toolkit (F-06/F-09/
+    F-22) and the fan-out's per-session spellings with their own
+    siblings — while a foreign project's and a non-run-id's files stay."""
+    from factory.orchestrator import reclaim_runs
+    from factory.state import TaskQueue
+
+    run_id = "20261030T000000Z-abc123"
+    base = f"demo-{run_id}.json"
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir(parents=True)
+    ours = [
+        base,
+        base + "-runner",
+        base + "-scratch",
+        base + "-toolkit",           # F-22
+        base + "-r1.json",           # F-38 per-session settings
+        base + "-r1.json-runner",
+        base + "-r1.json-toolkit",
+        base + "-r1-scratch",
+        base + "-v.json-toolkit",
+    ]
+    for name in ours:
+        target = sandbox / name
+        if name.endswith(".json"):
+            target.write_text("{}")
+        else:
+            target.mkdir()
+    foreign = sandbox / "otherproj-20261030T000000Z-abc123.json"
+    foreign.write_text("{}")
+    not_a_run = sandbox / "demo-not-a-run-id.json"
+    not_a_run.write_text("{}")
+
+    queue_path = tmp_path / "tasks.json"
+    queue_path.write_text(json.dumps(
+        {"version": 1, "project": "demo", "tasks": []}
+    ))
+    reclaim_runs(TaskQueue(queue_path), "demo", tmp_path)
+
+    for name in ours:
+        assert not (sandbox / name).exists(), f"{name} was left behind"
+    assert foreign.exists() and not_a_run.exists()

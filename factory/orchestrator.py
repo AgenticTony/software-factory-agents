@@ -376,8 +376,14 @@ def reclaim_runs(queue: TaskQueue, project: str, factory_root: Path) -> list[Pat
                                    sandbox / f"{project}-{run_dir.name}.json"))
                 removed.append(run_dir)
         if sandbox.is_dir():
+            # Every suffix either WO creates hangs off the run's own
+            # settings name: -runner/-scratch/-toolkit (F-06/F-09/F-22) and
+            # the F-38 fan-out's per-session spellings (-r1.json and its
+            # own -runner/-toolkit/-scratch siblings). The run id is
+            # unique, so anything past the base name is this run's
+            # artifact (the same argument cleanup_run's glob makes).
             stray = re.compile(
-                rf"^{re.escape(project)}-{_RUN_ID}\.json(-runner|-scratch|-toolkit)?$"
+                rf"^{re.escape(project)}-{_RUN_ID}\.json(-[\w.-]+)?$"
             )
             for entry in sorted(sandbox.iterdir()):
                 if stray.match(entry.name):
@@ -2170,6 +2176,17 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                         srt_bin_path=ctx.srt_bin_path,
                                         run_id=work.run_id, task_id=task_id,
                                         trace_sink=trace.append,  # F-30
+                                        # F-22 × F-38: the verifier gets the
+                                        # REVIEWER's narrowed toolkit, not the
+                                        # implementer's — it judges the
+                                        # reviewers' findings against the same
+                                        # read-only evidence surface they had
+                                        # (docs lookups, vetted skills); there
+                                        # is no "verifier" seat in the toolkit
+                                        # config, and giving it none would let
+                                        # reviewers cite evidence the verifier
+                                        # cannot open.
+                                        toolkit=toolkit_reviewer,
                                     )
                                     session_seconds += time.monotonic() - t0
                                     records.append(verifier)
