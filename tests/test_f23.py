@@ -19,6 +19,7 @@ import shlex
 import subprocess
 import sys
 import textwrap
+import threading
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -174,9 +175,15 @@ class Scripted:
     repeats). The contract test must pass for L2 to run at all, so every
     body returns 42; the *content* differs when a scenario needs a moving
     head (a non-empty review delta) and is identical when it needs an
-    unmoved one (an empty delta). The reviewer returns ``reviews[call-1]``
-    (the last verdict repeats), so a scenario scripts exactly what each
-    round's review says.
+    unmoved one (an empty delta). Every review seat of a round — the F-38
+    fan-out's two reviewer sessions and the verifier — returns
+    ``reviews[round-1]`` (the last verdict repeats), so a scenario scripts
+    exactly what each round's review says. For the verifier that text is
+    an invalid vote shape, which by design drops nothing: every finding
+    survives the vote and F-23's convergence alone decides the round.
+    Indexing is by IMPLEMENTER round (the implementer runs alone, before
+    the fan-out) and the calls log is appended under a lock — a raw
+    reviewer-call count is racy under the concurrent fan-out.
     """
 
     SAME = ("def answer():\n    return 42\n",)  # identical rounds: no new commit
@@ -190,6 +197,7 @@ class Scripted:
         self.impls = list(impls)
         self.reviews = list(reviews)
         self.result = result
+        self.lock = threading.Lock()
         self.calls: list[tuple[str, str, Path, dict]] = []
 
     def prompts(self, seat: str) -> list[str]:
@@ -197,9 +205,10 @@ class Scripted:
 
     def __call__(self, seat, prompt, run_dir, profile, **kwargs):
         run_dir = Path(run_dir)
-        self.calls.append((seat, prompt, run_dir, kwargs))
-        if seat == "implementer":
+        with self.lock:
+            self.calls.append((seat, prompt, run_dir, kwargs))
             round_no = sum(1 for s, *_ in self.calls if s == "implementer")
+        if seat == "implementer":
             body = self.impls[min(round_no - 1, len(self.impls) - 1)]
             (run_dir / "impl.py").write_text(body)
             (run_dir / "tests" / "test_feature.py").write_text(TEST_SOURCE)
@@ -207,12 +216,22 @@ class Scripted:
                 seat=seat, status="completed", num_turns=3, model="stub-model",
                 tokens={"input_tokens": 120, "output_tokens": 40}, result=self.result,
             )
-        call_no = sum(1 for s, *_ in self.calls if s == "reviewer")
+        verdict = self.reviews[min(round_no - 1, len(self.reviews) - 1)]
         return SessionRecord(
             seat=seat, status="completed", num_turns=1, model="stub-model",
-            tokens={"input_tokens": 60, "output_tokens": 10},
-            result=self.reviews[min(call_no - 1, len(self.reviews) - 1)],
+            tokens={"input_tokens": 60, "output_tokens": 10}, result=verdict,
         )
+
+
+def _review_rounds(seats) -> list[str]:
+    """One reviewer prompt per round: the F-38 fan-out runs two reviewer
+    sessions per round over the same diff, so the raw list carries every
+    round's prompt twice. The helper also pins that the two really are
+    identical — that sameness is the fan-out's contract."""
+    prompts = seats.prompts("reviewer")
+    assert len(prompts) % 2 == 0, f"odd reviewer prompt count: {len(prompts)}"
+    assert prompts[::2] == prompts[1::2], "the fan-out reviewers got different prompts"
+    return prompts[::2]
 
 
 # --- AC-1: stable finding keys; repeats are carried, not new ---------------
@@ -302,7 +321,7 @@ def test_prior_keys_seed_from_an_earlier_runs_progress_log(tmp_path: Path):
     # stop exists for.
     assert result.outcome == "needs_human"
     assert result.escalation == "review_not_converging"
-    assert len(seats.prompts("reviewer")) == 2
+    assert len(_review_rounds(seats)) == 2
     assert env.task()["attempts"][0]["outcome"] == "fail"  # round 1: a plain fail
     assert env.task()["attempts"][0].get("escalation") is None
     assert env.report(1)["L2"]["findings"][0]["state"] == "carried"
@@ -354,7 +373,7 @@ def test_ac_2(tmp_path: Path):
     )
     result = env.run(seats)
     assert result.outcome == "pr_opened"  # the drop flipped the effective verdict
-    round1, round2 = seats.prompts("reviewer")
+    round1, round2 = _review_rounds(seats)
     assert "## Diff (base...head)" in round1  # round 1: the full diff is the scope
     assert "## Delta since the last review (primary scope)" in round2
     assert "## Full diff (base...head, reference only)" in round2
@@ -393,8 +412,8 @@ def test_ac_3(tmp_path: Path):
     # Round 1 gets no fix section: there was nothing to fix yet.
     assert "## Findings to fix" not in seats.prompts("implementer")[0]
     # The next round's reviewer checks the siblings explicitly.
-    assert "sibling" in seats.prompts("reviewer")[1]
-    assert "sibling" not in seats.prompts("reviewer")[0].lower().split("## diff")[0]
+    assert "sibling" in _review_rounds(seats)[1]
+    assert "sibling" not in _review_rounds(seats)[0].lower().split("## diff")[0]
 
 
 # --- AC-4: no-progress stop → review_not_converging (schema, red-first) ----
@@ -427,7 +446,11 @@ def test_ac_4(tmp_path: Path):
     result = env.run(seats)
     assert result.outcome == "needs_human"
     assert result.escalation == "review_not_converging"
-    assert [c[0] for c in seats.calls] == ["implementer", "reviewer"] * 2  # 2, not 3
+    # F-38: each review round is a two-session fan-out plus a verifier
+    # (the repeat finding needs voting) — 2 rounds, not 3.
+    assert [c[0] for c in seats.calls] == [
+        "implementer", "reviewer", "reviewer", "verifier",
+    ] * 2
     task = env.task()
     assert task["status"] == "needs_human"
     assert len(task["attempts"]) == 2
@@ -448,7 +471,7 @@ def test_ac_4(tmp_path: Path):
     result2 = env2.run(seats2)
     assert result2.outcome == "needs_human"
     assert result2.escalation == "attempts_exhausted"
-    assert len(seats2.prompts("reviewer")) == 3
+    assert len(_review_rounds(seats2)) == 3
 
     # Mixed rounds continue: one carried finding plus one new one is progress.
     env3 = Env(tmp_path / "mixed")
@@ -481,7 +504,7 @@ def test_review1_an_invalid_review_does_not_advance_the_frontier(tmp_path: Path)
     result = env.run(seats)
     # Round 2's review covers everything since the last REAL review: the
     # full diff is the scope, not a delta against an unreviewed head.
-    prompt2 = seats.prompts("reviewer")[1]
+    prompt2 = _review_rounds(seats)[1]
     assert "## Delta since the last review" not in prompt2, (
         "the round-1 head was marked reviewed although its review "
         "produced no verdict"
@@ -507,7 +530,7 @@ def test_review1b_failed_session_variant(tmp_path: Path):
         return base_call(seat, prompt, run_dir, profile, **kwargs)
 
     result = env.run(runner)
-    prompt2 = seats.prompts("reviewer")[1]
+    prompt2 = _review_rounds(seats)[1]
     assert "## Delta since the last review" not in prompt2
     assert "## Diff (base...head)" in prompt2
     assert result.outcome == "pr_opened"
@@ -546,7 +569,7 @@ def test_review2_delta_survives_a_rewritten_prior_round(tmp_path: Path):
 
     result = env.run(amender)
     assert result.outcome == "pr_opened"  # red before: orchestrator_error
-    prompt2 = seats.prompts("reviewer")[1]
+    prompt2 = _review_rounds(seats)[1]
     assert "## Diff (base...head)" in prompt2  # fell back to the full diff
     assert "## Delta since the last review" not in prompt2
 
@@ -564,7 +587,7 @@ def test_review3_a_repeat_on_a_fixed_file_is_not_the_stop(tmp_path: Path):
     result = env.run(seats)
     assert result.outcome == "needs_human"
     assert result.escalation == "attempts_exhausted"  # red before: converging
-    assert len(seats.prompts("reviewer")) == 3
+    assert len(_review_rounds(seats)) == 3
     # The repeat on a touched file stands as the round's own finding.
     assert env.report(2)["L2"]["findings"][0]["state"] == "new"
 
@@ -627,7 +650,7 @@ def test_review6_declared_fail_with_everything_dropped_stops(tmp_path: Path):
     result = env.run(seats)
     assert result.outcome == "needs_human"
     assert result.escalation == "review_not_converging"  # red before: exhausted
-    assert len(seats.prompts("reviewer")) == 2  # round 3 never spent
+    assert len(_review_rounds(seats)) == 2  # round 3 never spent
     assert env.report(2)["L2"]["verdict"] == "fail"
     assert not env.report(2)["L2"]["findings"]
 
@@ -650,7 +673,7 @@ def test_review7_fileless_findings_are_never_dropped(tmp_path: Path):
     )
     result = env.run(seats)
     assert result.outcome == "pr_opened"
-    assert len(seats.prompts("reviewer")) == 3  # red before: 2 (PR at round 2)
+    assert len(_review_rounds(seats)) == 3  # red before: 2 (PR at round 2)
     second = env.report(2)["L2"]
     assert second["findings"] and second["verdict"] == "fail"
     assert not second["dropped"]
@@ -752,7 +775,7 @@ def test_review10_fallback_round_does_not_carry_repeats_as_untouched(tmp_path: P
     # Red on 116e16b: review_not_converging after 2 rounds (the fallback's
     # empty delta_files marked the impl.py repeat carried → untouched).
     assert result.escalation == "attempts_exhausted"
-    assert len(seats.prompts("reviewer")) == 3
+    assert len(_review_rounds(seats)) == 3
     assert env.report(2)["L2"]["findings"][0]["state"] == "new"
 
 
@@ -964,7 +987,7 @@ def test_review18_a_different_defect_on_the_same_ac_is_not_a_carry(tmp_path: Pat
     result = env.run(seats)
     assert result.outcome == "needs_human"
     assert result.escalation == "attempts_exhausted"  # red on 95f19d3: converging
-    assert len(seats.prompts("reviewer")) == 3
+    assert len(_review_rounds(seats)) == 3
     assert env.report(2)["L2"]["findings"][0]["state"] == "new"
 
 

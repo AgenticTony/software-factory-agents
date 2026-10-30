@@ -1,6 +1,6 @@
 """Seat prompts — BUILD-ORDER F-09.
 
-The factory's two agent seats run project-agnostic prompt *files* assembled
+The factory's agent seats run project-agnostic prompt *files* assembled
 with per-run project specifics. The files adapt mattpocock/skills @
 ``49dd158`` (MIT — vendored under ``prompts/vendor/mattpocock-skills/`` with
 the license and the source SHA); they are pinned by content hash in
@@ -15,6 +15,9 @@ Assembly rules (VALIDATOR-SPEC L2):
 * The **reviewer** gets the base prompt — axes, smell baseline, mandatory
   checklist, test-quality checks — plus every ``standards`` file's content,
   or an explicit "baseline only" statement when the project documents none.
+* The **verifier** (F-38) gets the same standards assembly as the reviewer:
+  it votes reviewer findings in or out, and judging whether a finding is
+  "style-only" or cites a real documented standard needs the same texts.
 
 Prompts are read orchestrator-side only: inside the sandbox the repo
 (including ``prompts/``) is unreadable by design (F-06), so the orchestrator
@@ -30,6 +33,7 @@ from pathlib import Path
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 IMPLEMENTER_FILE = "implementer.md"
 REVIEWER_FILE = "reviewer.md"
+VERIFIER_FILE = "verifier.md"
 
 
 class PromptError(Exception):
@@ -179,19 +183,74 @@ def assemble_reviewer_prompt(profile: dict | None = None) -> str:
     return prompt + "\n\n## Project standards\n\n" + "\n".join(sections)
 
 
-def prompt_versions(profile: dict | None = None) -> dict[str, str]:
-    """Seat -> content hash of the assembled prompt, for the attempt record
-    (``prompt_versions``, BUILD-ORDER F-10 AC-6) and credit assignment in
-    F-19. Hashing the *assembled* prompt means a change to the base file or
-    to what assembly injects both show up as a new version.
+def assemble_verifier_prompt(profile: dict | None = None) -> str:
+    """The verifier's system prompt (F-38): the base file (vote rules, drop
+    cases, tags) plus the same standards assembly the reviewer gets — the
+    verifier judges whether a finding is style-only or cites a real
+    documented standard, which needs the standards texts in hand.
 
     Args:
         profile: The loaded ``project.yaml`` mapping (optional in tests).
 
     Returns:
-        ``{"implementer": <sha256>, "reviewer": <sha256>}``.
+        The assembled system prompt text.
+
+    Raises:
+        PromptError: If a ``standards`` entry is absolute, resolves outside
+            the project repo, or names a file that doesn't exist or can't
+            be read (same rule as the reviewer: a verifier silently voting
+            without its standards would be worse than a loud refusal).
     """
-    return {
-        "implementer": prompt_hash(assemble_implementer_prompt(profile)),
-        "reviewer": prompt_hash(assemble_reviewer_prompt(profile)),
-    }
+    prompt = load_prompt(VERIFIER_FILE)
+    standards = (profile or {}).get("standards") or []
+    if not standards:
+        return (
+            prompt
+            + "\n\n## Project standards\n\n"
+            "This project documents no standards files: judge style-only "
+            "against the smell baseline the reviewers were given.\n"
+        )
+    sections: list[str] = []
+    for rel in standards:
+        path = _standards_path(profile, rel)
+        if not path.is_file():
+            raise PromptError(
+                f"standards file {rel!r} does not exist under the project repo "
+                f"({_repo_root(profile)}): fix project.yaml's 'standards' list"
+            )
+        try:
+            text = path.read_text()
+        except OSError as exc:
+            raise PromptError(
+                f"standards file {rel!r} cannot be read: {exc}"
+            ) from exc
+        sections.append(f"### {rel}\n\n{text.rstrip()}\n")
+    return prompt + "\n\n## Project standards\n\n" + "\n".join(sections)
+
+
+def prompt_versions(profile: dict | None = None, *, reviewers: int = 2) -> dict[str, str]:
+    """Seat -> content hash of the assembled prompt, for the attempt record
+    (``prompt_versions``, BUILD-ORDER F-10 AC-6, F-38 AC-5) and credit
+    assignment in F-19. Hashing the *assembled* prompt means a change to the
+    base file or to what assembly injects both show up as a new version.
+
+    The reviewer fan-out (F-38) gets one entry per session —
+    ``reviewer-1`` .. ``reviewer-N`` — so every session's prompt hash is
+    recorded even though the fan-out shares one assembled prompt; the
+    verifier gets its own entry. A reviewer count below 1 is treated as 1
+    (the config layer refuses it; this stays total for direct callers).
+
+    Args:
+        profile: The loaded ``project.yaml`` mapping (optional in tests).
+        reviewers: How many reviewer sessions the fan-out runs.
+
+    Returns:
+        ``{"implementer": <sha256>, "reviewer-1": <sha256>, …,
+        "verifier": <sha256>}``.
+    """
+    versions = {"implementer": prompt_hash(assemble_implementer_prompt(profile))}
+    reviewer_hash = prompt_hash(assemble_reviewer_prompt(profile))
+    for number in range(1, max(1, int(reviewers)) + 1):
+        versions[f"reviewer-{number}"] = reviewer_hash
+    versions["verifier"] = prompt_hash(assemble_verifier_prompt(profile))
+    return versions

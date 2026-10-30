@@ -202,9 +202,17 @@ def sandbox_env(
     extra: dict[str, str] | None = None,
     forbidden: tuple[str, ...] = (),
     venv: Path | None = None,
+    scratch: "tuple[Path, Path] | None" = None,
 ) -> dict[str, str]:
     """Build the child env: ambient base + allowlisted extras, HOME inside
     the run.
+
+    ``scratch`` (F-38 review finding 1): when given, a ``(home, tmp)``
+    pair of writable dirs the child's HOME / TMPDIR / CLAUDE_CODE_TMPDIR /
+    GIT_TEMPLATE_DIR point at INSTEAD of the run dir's ``.home``/``.tmp``
+    — the review fan-out gives each concurrent session its own scratch,
+    so no session can read or rewrite another's state. None is the
+    single-session shape every other caller uses, unchanged.
 
     Three rules, applied on every path:
 
@@ -255,10 +263,15 @@ def sandbox_env(
             the prefix.
     """
     run_dir = Path(run_dir)
-    home = run_dir / ".home"
-    home.mkdir(parents=True, exist_ok=True)
-    tmp = run_dir / ".tmp"
-    tmp.mkdir(parents=True, exist_ok=True)
+    if scratch is None:
+        home = run_dir / ".home"
+        home.mkdir(parents=True, exist_ok=True)
+        tmp = run_dir / ".tmp"
+        tmp.mkdir(parents=True, exist_ok=True)
+    else:
+        home, tmp = (Path(scratch[0]), Path(scratch[1]))
+        home.mkdir(parents=True, exist_ok=True)
+        tmp.mkdir(parents=True, exist_ok=True)
     git_templates = home / ".git-templates"
     git_templates.mkdir(parents=True, exist_ok=True)
     env = {
@@ -376,6 +389,31 @@ def default_toolchain(extra: "Sequence[Path] | None" = None) -> list[Path]:
     return toolchain
 
 
+def _allow_write(
+    run_dir: Path,
+    read_only: bool,
+    writable_roots: "Sequence[Path]",
+    scratch_write: "Sequence[Path] | None",
+) -> list[str]:
+    """The settings' allowWrite list, by session shape:
+
+    * a fan-out review session (``scratch_write``): EXACTLY its own
+      scratch dirs — nothing inside the readable clone, so no session can
+      leave anything for another (F-38 review finding 1);
+    * a single-session reviewer (``read_only``): the run dir's
+      ``.home``/``.tmp`` spellings plus the caller's outside-the-run
+      scratch dirs;
+    * the implementer/gates: the run dir itself.
+    """
+    if read_only:
+        if scratch_write is not None:
+            return [str(Path(root)) for root in scratch_write]
+        return [str(run_dir / ".home"), str(run_dir / ".tmp")] + [
+            str(Path(root)) for root in writable_roots
+        ]
+    return [str(run_dir)]
+
+
 def build_settings(
     profile: dict,
     run_dir: Path,
@@ -387,6 +425,7 @@ def build_settings(
     allow_read: "Sequence[Path]" = (),
     read_only: bool = False,
     writable_roots: "Sequence[Path]" = (),
+    scratch_write: "Sequence[Path] | None" = None,
     local_binding: bool = False,
 ) -> dict:
     """Build the srt settings dict for one run from the project profile.
@@ -428,6 +467,13 @@ def build_settings(
             the session seats (implementer, reviewer, the importer's
             reviewer seat) and the SDK probe must never ask, whatever the
             profile says — see below for why.
+        scratch_write: F-38 review finding 1 — the per-session scratch
+            dirs of a fan-out session. When given (with ``read_only``),
+            the writable list is EXACTLY these paths: not the run dir's
+            ``.home``/``.tmp`` (a shared writable dir inside the readable
+            clone would be a channel between "independent" reviewers) and
+            not any other session's scratch (each session's settings name
+            only its own). None is the single-session shape.
 
     Returns:
         A settings dict accepted by ``srt --settings``.
@@ -499,10 +545,12 @@ def build_settings(
     # would die at startup. Re-allow exactly the runtime's own package dir;
     # the factory's source (and everything else in the repo) stays denied.
     srt_package = _REPO_ROOT / "node_modules" / "@anthropic-ai" / "sandbox-runtime"
-    if read_only:
+    if read_only and scratch_write is None:
         # The scratch dirs must exist for the reviewer's tooling (TMPDIR/
         # HOME land here); sandbox_env also creates them, but settings
-        # built read-only are self-sufficient either way.
+        # built read-only are self-sufficient either way. A fan-out session
+        # (scratch_write given) uses its own scratch dirs instead — nothing
+        # inside the run dir is created or writable for it.
         for scratch in (run_dir / ".home", run_dir / ".tmp"):
             scratch.mkdir(parents=True, exist_ok=True)
     home = Path("~").expanduser()
@@ -545,11 +593,8 @@ def build_settings(
             # (__pycache__, .pytest_cache) fail closed: Python and pytest
             # degrade to warnings on unwritable caches, so read-only checks
             # still run.
-            "allowWrite": (
-                [str(run_dir / ".home"), str(run_dir / ".tmp")]
-                + [str(Path(root)) for root in writable_roots]
-                if read_only
-                else [str(run_dir)]
+            "allowWrite": _allow_write(
+                run_dir, read_only, writable_roots, scratch_write
             ),
             # The run's git control files are not the agent's to edit: a hook
             # or core.hooksPath/fsmonitor redirect planted here executes later,
@@ -692,6 +737,7 @@ def run_sandboxed(
     cwd: Path | None = None,
     srt_bin_path: Path | None = None,
     venv: Path | None = None,
+    scratch: "tuple[Path, Path] | None" = None,
     on_stdout_line=None,
 ) -> subprocess.CompletedProcess:
     """Run ``cmd`` under srt confined to ``run_dir``.
@@ -711,6 +757,9 @@ def run_sandboxed(
         venv: A run-local venv prepended to the child's PATH with
             VIRTUAL_ENV set (see :func:`sandbox_env`) — the gate commands'
             ``pip``/``python`` resolve into the run, never an ambient env.
+        scratch: F-38 review finding 1 — a per-session ``(home, tmp)``
+            pair (see :func:`sandbox_env`); the command's TMPDIR prefix
+            follows it. None is the single-session shape.
         timeout: Wall-clock seconds for the leader. While it runs, the
             pipes are pumped by a single-threaded ``select`` loop over
             non-blocking fds (``proc.wait`` on PIPEd output would deadlock
@@ -748,9 +797,13 @@ def run_sandboxed(
     binary = Path(srt_bin_path) if srt_bin_path else srt_bin()
     ensure_srt(srt_bin_path=binary)
     run_dir = Path(run_dir)
-    tmp = run_dir / ".tmp"
-    tmp.mkdir(parents=True, exist_ok=True)
-    child_env = sandbox_env(run_dir, extra=env, venv=venv)
+    if scratch is None:
+        tmp = run_dir / ".tmp"
+        tmp.mkdir(parents=True, exist_ok=True)
+    else:
+        tmp = Path(scratch[1])
+        tmp.mkdir(parents=True, exist_ok=True)
+    child_env = sandbox_env(run_dir, extra=env, venv=venv, scratch=scratch)
     # srt's Linux network bridges create unix sockets in node's tmpdir().
     # A TMPDIR deep inside the run dir overflows the kernel's ~108-byte
     # sun_path limit and the bridges silently never come up ("Failed to

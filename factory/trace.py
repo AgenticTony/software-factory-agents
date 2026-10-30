@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -202,6 +203,11 @@ class TraceWriter:
         self.disabled = False
         self._ended = False
         self._private = False
+        # F-38: the reviewer fan-out forwards tool_call events from
+        # concurrent sandboxed sessions; the seq stamp and the write must
+        # be atomic under them, or two threads interleave half-stamped
+        # lines and fork the sequence.
+        self._lock = threading.Lock()
         try:
             # Traces hold repo content: a directory this writer creates is
             # owner-only. An existing directory keeps its mode — never
@@ -228,27 +234,30 @@ class TraceWriter:
         """Stamp, redact and append one event; a failing write is reported
         once and the writer goes silent (the run never notices). The
         stamps merge AFTER the event, so no event dict — and nothing an
-        untrusted source put inside one — can override them."""
-        if self.disabled:
-            return
-        self.seq += 1
-        record = {
-            **event,
-            "seq": self.seq,
-            "ts": now_iso(),
-            "run_id": self.run_id,
-            "task_id": self.task_id,
-            "attempt": self.attempt,
-        }
-        line = json.dumps(_clean(record, self.secrets), ensure_ascii=False)
-        try:
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
-            if not self._private:
-                self.path.chmod(0o600)
-                self._private = True
-        except OSError as exc:
-            self._fail(exc)
+        untrusted source put inside one — can override them. Under the
+        lock: from F-38 the reviewer fan-out appends from concurrent
+        session threads."""
+        with self._lock:
+            if self.disabled:
+                return
+            self.seq += 1
+            record = {
+                **event,
+                "seq": self.seq,
+                "ts": now_iso(),
+                "run_id": self.run_id,
+                "task_id": self.task_id,
+                "attempt": self.attempt,
+            }
+            line = json.dumps(_clean(record, self.secrets), ensure_ascii=False)
+            try:
+                with self.path.open("a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+                if not self._private:
+                    self.path.chmod(0o600)
+                    self._private = True
+            except OSError as exc:
+                self._fail(exc)
 
     @contextmanager
     def phase(self, name: str) -> Iterator[_PhaseSpend]:
@@ -395,6 +404,12 @@ def gate_checks(report: dict) -> list[dict]:
                     f"{finding.get('text')}{where}")
             if finding.get("state") == "carried":
                 note += " (carried from an earlier round)"
+            if finding.get("tag"):
+                # F-38: the verifier's survivor tag (and which reviewers
+                # reported the finding, when the fan-out merged it).
+                note += f" [{finding['tag']}]"
+            if finding.get("reported_by"):
+                note += f" (reviewers {','.join(map(str, finding['reported_by']))})"
             checks.append({"type": "gate_check", "layer": "L2",
                            "item": f"finding:{finding.get('id')}",
                            "ok": False, "note": note})

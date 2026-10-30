@@ -133,6 +133,10 @@ paths:
     # F-22: merges while the task is still draft (closes via
     # BOOTSTRAP.md + reconcile, like the F-11/F-12 precedent above).
     - "tests/test_f22.py"
+    # F-38: its contract tests land with the work order itself (the
+    # test_f28 precedent) — this PR is the owner-reviewed interactive
+    # build, so the file is protected from the day it exists.
+    - "tests/test_f38.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 

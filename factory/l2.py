@@ -53,8 +53,26 @@ The effective verdict is recomputed over what survives, which is how a
 declared pass whose only out-of-scope blocker was dropped becomes the
 pass the reviewer actually declared.
 
-Running the reviewer session itself is F-10's wiring; everything here is
-pure parsing and judgement over the text a session produced.
+F-38 adds the parallel reviewer fan-out and the verifier vote. N reviewer
+verdicts merge into ONE union (:func:`merge_reviews`): findings two
+reviewers both report — the same stable key F-23 already defined — become
+one entry carrying which reviewers reported it, and one invalid verdict
+fails the whole review exactly as a single invalid one did. A verifier
+session then votes each union finding in or out
+(:func:`parse_verifier_vote`): a drop needs an explicit vote with a
+reason; everything the verifier failed to vote on, or voted on in a shape
+it wasn't asked for, is KEPT — an unverifiable vote may not remove a
+finding. :func:`apply_vote` tags and ranks the survivors, forces a
+``blocking`` severity to the ``important`` tag, and mechanically enforces
+REVIEW.md's nit budget (at most three ``minor``/``note`` findings; the
+rest drop with reason ``nit_budget``). Verifier and nit-budget drops land
+in ``verifier_dropped`` — the attempt record and the stored report, never
+the PR body — while ``dropped`` stays the F-23 out-of-delta list the PR
+body renders. The declared verdict is fail-closed across the fan-out:
+any reviewer's declared ``fail`` stands.
+
+Running the reviewer sessions themselves is F-10's wiring; everything here is
+pure parsing and judgement over the text sessions produced.
 """
 
 from __future__ import annotations
@@ -63,12 +81,20 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field, replace
-from typing import Any, ClassVar
+from typing import Any, ClassVar, NamedTuple, Sequence
 
 from factory.gates import Finding, GateReport
 
 VALID_AXES = ("spec", "standards")
 VALID_SEVERITIES = ("blocking", "major", "minor", "note")
+
+# F-38: the verifier's survivor tags (IMPORTANT reads worst-first) and the
+# REVIEW.md nit budget — at most three minor/note findings reach the human.
+VALID_TAGS = ("important", "nit", "pre-existing")
+NIT_BUDGET = 3
+
+_SEVERITY_RANK = {name: rank for rank, name in enumerate(VALID_SEVERITIES)}
+_TAG_RANK = {name: rank for rank, name in enumerate(VALID_TAGS)}
 
 # A fenced block (with or without the json tag) around the verdict object —
 # models habitually wrap their JSON; the fence is extracted before parsing.
@@ -85,7 +111,10 @@ class L2Finding:
     finding identity, set at parse time), ``missed_earlier`` (the
     reviewer's justification for a new finding outside the delta) and
     ``state`` (``new`` or ``carried``, set by :func:`apply_convergence`)
-    — and the shared location fields."""
+    — the F-38 fan-out fields — ``reported_by`` (1-based reviewer numbers
+    that reported it, set by :func:`merge_reviews`), ``verifier_reason``
+    and ``tag`` (set by :func:`parse_verifier_vote` /
+    :func:`apply_vote`) — and the shared location fields."""
 
     id: str
     text: str
@@ -96,6 +125,9 @@ class L2Finding:
     key: str | None = None
     missed_earlier: str | None = None
     state: str = "new"
+    reported_by: list = field(default_factory=list)
+    verifier_reason: str | None = None
+    tag: str | None = None
 
 
 def _normalise_summary(text: str) -> str:
@@ -141,6 +173,16 @@ class L2Report(GateReport):
     nothing it can fix. ``no_progress_reason`` says which case fired
     (``carried_repeats`` or ``all_dropped``) — the orchestrator renders
     the escalation note from it instead of re-deriving the branch.
+
+    F-38 adds the verifier's ledger, kept deliberately separate from
+    ``dropped``: ``verifier_dropped`` holds the findings the verifier voted
+    out and the ones the nit budget capped, each with its reason — they
+    land in the attempt record and the stored report, but NEVER in the PR
+    body (AC-4), which is why they don't ride ``dropped``.
+    ``verifier_error`` is set when the verifier's output was not valid
+    vote JSON: the vote then dropped nothing (every finding survived), and
+    the error names why — a broken verifier degrades to today's
+    no-filter review, never to a review that silently lost findings.
     """
 
     layer: ClassVar[str] = "L2"
@@ -149,6 +191,8 @@ class L2Report(GateReport):
     dropped: list = field(default_factory=list)
     no_progress: bool = False
     no_progress_reason: str | None = None
+    verifier_dropped: list = field(default_factory=list)
+    verifier_error: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -161,6 +205,8 @@ class L2Report(GateReport):
             "dropped": self.dropped,
             "no_progress": self.no_progress,
             "no_progress_reason": self.no_progress_reason,
+            "verifier_dropped": self.verifier_dropped,
+            "verifier_error": self.verifier_error,
         }
 
 
@@ -422,11 +468,13 @@ def apply_convergence(
     carried repeat from **this run** on untouched code (the bounce the
     stop exists for — a carry seeded from an earlier run doesn't count:
     this run's implementer has only just attempted it), or because every
-    finding was dropped and the declared fail stands with nothing left to
+    finding was dropped — out of delta by the F-23 rules, or by the F-38
+    verifier's vote — and the declared fail stands with nothing left to
     fix.
 
     Args:
-        report: The freshly parsed verdict of this round.
+        report: The freshly parsed verdict of this round (after the F-38
+            vote, in a fan-out pipeline: :func:`apply_vote`'s output).
         prior: Keys raised in earlier rounds, -> their raise sha or None.
         delta_files: Paths changed since the last reviewed sha.
         delta_mode: True when an earlier review in this run exists.
@@ -495,7 +543,26 @@ def apply_convergence(
             for f in l2_findings
         )
     )
-    everything_dropped = not active and bool(dropped)
+    # Review finding 4: on the FIRST review (no delta, nothing out of
+    # scope), a declared fail whose every finding the verifier voted out
+    # is an unsupported fail — the vote removed its whole substance, so
+    # the round passes on L2 (the drops stay recorded; the PR body says
+    # the reviewers' fail was voted out). On a delta round (2+) the
+    # F-23 all_dropped stop keeps its original meaning: findings dropped
+    # as out of scope, or voted out, leave a fail with nothing to fix.
+    vote_rejected_fail = (
+        not active
+        and not delta_mode
+        and not dropped
+        and bool(report.verifier_dropped)
+        and report.parse_error is None
+    )
+    if vote_rejected_fail:
+        verdict = "pass"
+    everything_dropped = (
+        not active and bool(dropped or report.verifier_dropped)
+        and not vote_rejected_fail
+    )
     no_progress = verdict == "fail" and (
         only_this_runs_carries or everything_dropped
     )
@@ -510,4 +577,327 @@ def apply_convergence(
         parse_error=report.parse_error,
         no_progress=no_progress,
         no_progress_reason=reason,
+        verifier_dropped=report.verifier_dropped,
+        verifier_error=report.verifier_error,
+    )
+
+
+# ------------------------------------------------------- F-38: the vote --
+
+def merge_reviews(reports: Sequence[L2Report]) -> L2Report:
+    """Merge N reviewer verdicts into the ONE union the verifier votes on.
+
+    Findings key by :func:`finding_key` (the same stable identity F-23
+    uses across rounds), so a defect two reviewers both report — however
+    they spaced or cased its text — is one union entry carrying both
+    reviewer numbers in ``reported_by``; a duplicate that one reviewer
+    rated more severely keeps the harsher severity (a fan-out that
+    downgraded a duplicate blocking call to "minor" would hide it).
+    Union ids are regenerated (``U-1`` …) because two reviewers' ``R-1``
+    are different findings, and the verifier votes by id.
+
+    The union's declared verdict is fail-closed: ANY reviewer's declared
+    ``fail`` stands — the fan-out adds eyes, it never dilutes a refusal.
+    And one invalid verdict invalidates the whole review (the single-
+    reviewer rule unchanged): the union is a FAIL whose ``parse_error``
+    names the reviewer that could not speak the protocol.
+
+    Args:
+        reports: The parsed verdicts, one per reviewer session, in fan-out
+            order (reviewer 1 first — the union's order follows it).
+
+    Returns:
+        The union :class:`L2Report` — findings with fresh ids, reported_by
+        and (merged) severity; or the invalid FAIL when any input was
+        unparsable.
+    """
+    for index, report in enumerate(reports, start=1):
+        if report.parse_error is not None:
+            reason = f"reviewer {index}: {report.parse_error}"
+            return L2Report(
+                verdict="fail",
+                findings=[Finding("invalid_verdict_json", reason)],
+                parse_error=reason,
+            )
+
+    merged: list[L2Finding] = []
+    index_of_key: dict[str, int] = {}
+    for number, report in enumerate(reports, start=1):
+        for finding in report.findings:
+            if not isinstance(finding, L2Finding):
+                continue  # an invalid-verdict Finding never reaches here
+            existing = (
+                merged[index_of_key[finding.key]]
+                if finding.key in index_of_key
+                else None
+            )
+            if existing is None:
+                union_finding = replace(
+                    finding, id=f"U-{len(merged) + 1}", reported_by=[number]
+                )
+                merged.append(union_finding)
+                index_of_key[union_finding.key] = len(merged) - 1
+                continue
+            if number not in existing.reported_by:
+                existing.reported_by.append(number)
+            if _SEVERITY_RANK.get(existing.severity, 99) < _SEVERITY_RANK.get(
+                finding.severity, 99
+            ):
+                # The duplicate is rated more harshly: keep the harsher
+                # call (replace() to preserve the entry's identity).
+                merged[index_of_key[existing.key]] = replace(
+                    existing, severity=finding.severity, text=finding.text
+                )
+
+    declared = (
+        "fail"
+        if any(report.declared == "fail" for report in reports)
+        else "pass"
+    )
+    blocking = any(
+        (f.severity or "").strip().lower() == "blocking" for f in merged
+    )
+    return L2Report(
+        verdict="fail" if declared == "fail" or blocking else "pass",
+        findings=merged,
+        declared=declared,
+    )
+
+
+class VerifierOutcome(NamedTuple):
+    """What one verifier session's vote did to the union.
+
+    ``kept`` are the union findings that survived, carrying the voter's
+    ``verifier_reason`` and ``tag`` (unvoted keeps carry neither).
+    ``dropped`` is the drop ledger — ``{"finding": <finding dict>,
+    "reason": <the voter's reason>}``. ``error`` is set iff the output was
+    not valid vote JSON, in which case ``kept`` is the whole union and
+    ``dropped`` empty: an unverifiable vote may not remove a finding.
+    """
+
+    kept: list
+    dropped: list
+    error: str | None
+
+
+def parse_verifier_vote(output: Any, findings: Sequence[L2Finding]) -> VerifierOutcome:
+    """Parse the verifier's vote over the union findings (F-38).
+
+    The protocol is one object ``{"votes": [{"id", "keep", "reason",
+    "tag?"}]}`` — extracted with the same candidate machinery as the
+    reviewer's verdict (fences, balanced objects, last-wins, duplicate
+    keys rejected). Every violation makes the WHOLE vote invalid: the
+    verifier that cannot speak the vote protocol voted on nothing, and
+    every finding survives it — the fail-open direction here is keeping
+    findings, never dropping them.
+
+    Args:
+        output: The verifier session's result text (or None / non-text
+            when the session failed — same treatment).
+        findings: The union findings the verifier was asked about.
+
+    Returns:
+        The :class:`VerifierOutcome`.
+    """
+    def invalid(reason: str) -> VerifierOutcome:
+        return VerifierOutcome(kept=list(findings), dropped=[], error=reason)
+
+    if not isinstance(output, str):
+        return invalid(
+            f"the verifier produced no vote text ({type(output).__name__}): "
+            "a failed or aborted session drops nothing"
+        )
+    try:
+        data = _extract_json(output)
+    except _InvalidVerdict as exc:
+        return invalid(f"no valid vote JSON in the verifier output ({exc})")
+    if not isinstance(data, dict) or not isinstance(data.get("votes"), list):
+        return invalid("vote JSON must be an object with a 'votes' list")
+
+    by_id = {f.id: f for f in findings if isinstance(f, L2Finding)}
+    votes: dict[str, dict] = {}
+    for index, vote in enumerate(data["votes"]):
+        if not isinstance(vote, dict):
+            return invalid(f"vote {index} is not an object")
+        vid = vote.get("id")
+        if vid not in by_id:
+            return invalid(f"vote {index} names an unknown finding id: {vid!r}")
+        if vid in votes:
+            return invalid(f"two votes for finding {vid!r}: an ambiguous vote "
+                           "is no vote")
+        if not isinstance(vote.get("keep"), bool):
+            return invalid(f"vote for {vid!r} carries no boolean 'keep'")
+        reason = vote.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            return invalid(f"vote for {vid!r} carries no reason")
+        if vote["keep"]:
+            tag = vote.get("tag")
+            if tag not in VALID_TAGS:
+                return invalid(
+                    f"vote for {vid!r} keeps without a valid tag "
+                    f"({VALID_TAGS}): {tag!r}"
+                )
+        votes[vid] = vote
+
+    kept: list[L2Finding] = []
+    dropped: list[dict] = []
+    for finding in findings:
+        if not isinstance(finding, L2Finding):
+            continue
+        vote = votes.get(finding.id)
+        if vote is None:
+            # Nobody voted on it: kept, and untagged by the vote (the
+            # default tag comes from severity at vote-application time).
+            kept.append(replace(finding))
+        elif vote["keep"]:
+            kept.append(
+                replace(
+                    finding,
+                    verifier_reason=vote["reason"],
+                    tag=vote["tag"],
+                )
+            )
+        else:
+            dropped.append(
+                {"finding": dict(finding.__dict__), "reason": vote["reason"]}
+            )
+    return VerifierOutcome(kept=kept, dropped=dropped, error=None)
+
+
+def _default_tag(severity: str | None) -> str:
+    """The tag an unvoted survivor gets: severity's own bucket."""
+    heavy = (severity or "").strip().lower() in ("blocking", "major")
+    return "important" if heavy else "nit"
+
+
+def _unanimous(finding: L2Finding, reviewers: int) -> bool:
+    """Whether every reviewer of the fan-out reported this blocking or
+    major finding (review finding 2's unanimous rule)."""
+    if reviewers < 1:
+        return False
+    heavy = (finding.severity or "").strip().lower() in ("blocking", "major")
+    reported = set(finding.reported_by or [])
+    return heavy and reported == set(range(1, reviewers + 1))
+
+
+def apply_vote(
+    report: L2Report,
+    outcome: VerifierOutcome,
+    reviewers: int = 1,
+) -> L2Report:
+    """Apply the verifier's vote: rank, tag and budget the survivors (F-38).
+
+    The mechanical rules, enforced here rather than trusted from the
+    model:
+
+    * A ``blocking`` finding is always tagged ``important``. A blocking
+      finding is the one thing that fails the round; tagging it
+      ``pre-existing`` ("not the author's fault") while it blocks the
+      author's PR is a contradiction — if it truly predates the diff and
+      should not block, the verifier's tool is the DROP, with a reason,
+      not a re-tag. Every other severity keeps the verifier's tag.
+    * **The unanimous rule** (review finding 2): a ``blocking`` or
+      ``major`` finding that EVERY reviewer of the fan-out reported cannot
+      be dropped by the one verifier — independent agreement is stronger
+      evidence than one voter's objection. The drop is refused: the
+      finding survives tagged ``important`` and the ledger records the
+      attempt as ``override_refused: <the verifier's reason>`` (the reason
+      is kept — a refused drop with no why is a hole in the audit). A
+      finding fewer than all reviewers reported keeps the vote's full
+      semantics, drop and all.
+    * Survivors are ranked by severity first (the Anthropic record's
+      "sorted by severity"), then by tag (important, nit, pre-existing),
+      then by union order.
+    * REVIEW.md's nit budget: at most :data:`NIT_BUDGET` findings of
+      severity ``minor`` or ``note`` survive; the rest move to
+      ``verifier_dropped`` with reason ``nit_budget``. ``blocking`` and
+      ``major`` are never capped.
+    * The verdict is recomputed over what survived the vote: a declared
+      fail stands, and so does any surviving blocking finding — the
+      reverse (a declared pass whose only blocking finding the verifier
+      dropped) is the pass the reviewers actually declared.
+
+    Args:
+        report: The union report (:func:`merge_reviews` output).
+        outcome: The parsed vote (:func:`parse_verifier_vote` output).
+        reviewers: How many reviewer sessions the fan-out ran (the
+            unanimous rule needs N; default 1 — with one reviewer,
+            every finding is by definition unanimous).
+
+    Returns:
+        The post-vote :class:`L2Report` — ranked survivors in ``findings``,
+        the verifier's and the budget's drops in ``verifier_dropped``.
+    """
+    kept = list(outcome.kept)
+    drops: list[dict] = []
+    unanimous_pool = {
+        finding.id: finding for finding in report.findings
+        if isinstance(finding, L2Finding) and _unanimous(finding, reviewers)
+    }
+    for entry in outcome.dropped:
+        finding = unanimous_pool.get((entry.get("finding") or {}).get("id"))
+        if finding is None:
+            drops.append(entry)
+            continue
+        kept.append(replace(
+            finding,
+            tag="important",
+            verifier_reason=(
+                "vote to drop refused (every reviewer reported it): "
+                f"{entry.get('reason')}"
+            ),
+        ))
+        drops.append({
+            **entry,
+            "reason": f"override_refused: {entry.get('reason')}",
+        })
+
+    decorated: list[tuple] = []
+    for index, finding in enumerate(kept):
+        if not isinstance(finding, L2Finding):
+            decorated.append((0, 0, index, finding))
+            continue
+        tag = finding.tag or _default_tag(finding.severity)
+        if (finding.severity or "").strip().lower() == "blocking":
+            tag = "important"
+        decorated.append((
+            _SEVERITY_RANK.get(finding.severity, 99),
+            _TAG_RANK.get(tag, 99),
+            index,
+            replace(finding, tag=tag),
+        ))
+    decorated.sort(key=lambda entry: entry[:3])
+    ranked = [entry[3] for entry in decorated]
+
+    survivors: list = []
+    nits = 0
+    for finding in ranked:
+        if (
+            isinstance(finding, L2Finding)
+            and (finding.severity or "").strip().lower() in ("minor", "note")
+        ):
+            nits += 1
+            if nits > NIT_BUDGET:
+                drops.append(
+                    {"finding": dict(finding.__dict__), "reason": "nit_budget"}
+                )
+                continue
+        survivors.append(finding)
+
+    blocking = any(
+        isinstance(f, L2Finding) and (f.severity or "").strip().lower() == "blocking"
+        for f in survivors
+    )
+    verdict = (
+        "fail"
+        if report.parse_error is not None or report.declared == "fail" or blocking
+        else "pass"
+    )
+    return L2Report(
+        verdict=verdict,
+        findings=survivors,
+        declared=report.declared,
+        parse_error=report.parse_error,
+        verifier_dropped=drops,
+        verifier_error=outcome.error,
     )

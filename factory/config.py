@@ -1,9 +1,10 @@
 """Factory-level configuration (BUILD-ORDER F-10 AC-4).
 
 Settings that belong to the factory, not to any one project: today, the
-peak window during which ``factory loop`` starts no session. The Z.ai
-Coding Plan's quota is shared with the owner's own interactive use, and
-the owner works 08:00–12:00 Mon–Fri Swedish time, so that is the default.
+peak window during which ``factory loop`` starts no session, and how many
+reviewer sessions L2 fans out to (F-38). The Z.ai Coding Plan's quota is
+shared with the owner's own interactive use, and the owner works
+08:00–12:00 Mon–Fri Swedish time, so that is the default window.
 
 The file is YAML at ``<factory_root>/config.yaml`` (absent = defaults)::
 
@@ -12,6 +13,7 @@ The file is YAML at ``<factory_root>/config.yaml`` (absent = defaults)::
       days: [mon, tue, wed, thu, fri]
       start: "08:00"   # inclusive
       end: "12:00"     # exclusive
+    reviewers: 2       # L2 reviewer sessions per review (F-38), >= 1
 
 Anything malformed is refused with :class:`ConfigError` — a window that
 silently failed to parse would let the factory spend the quota at the
@@ -29,6 +31,7 @@ import yaml
 
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 CONFIG_FILE = "config.yaml"
+DEFAULT_REVIEWERS = 2
 
 
 class ConfigError(Exception):
@@ -52,9 +55,15 @@ DEFAULT_PEAK_WINDOW = PeakWindow(
 
 @dataclass(frozen=True)
 class FactoryConfig:
-    """The parsed factory config."""
+    """The parsed factory config.
+
+    ``reviewers`` (F-38) is how many reviewer sessions run over one diff:
+    a whole number >= 1, default 2. A reviewer fan-out of zero reviews
+    nothing, so it is a config error, not a quiet single-review fallback.
+    """
 
     peak_window: PeakWindow | None = field(default=DEFAULT_PEAK_WINDOW)
+    reviewers: int = DEFAULT_REVIEWERS
 
 
 def _clock(value, key: str) -> time:
@@ -93,6 +102,20 @@ def _peak_window(raw) -> PeakWindow | None:
     return PeakWindow(str(raw["timezone"]), tuple(days), raw["start"], raw["end"])
 
 
+def _reviewers(raw) -> int:
+    """Validate the ``reviewers`` knob (F-38): a whole number >= 1.
+
+    ``bool`` is an ``int`` subclass, so ``true``/``false`` are rejected
+    explicitly — a quiet 1 from ``true`` would halve the fan-out with no
+    trace of why.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ConfigError(f"reviewers must be a whole number >= 1, got {raw!r}")
+    if raw < 1:
+        raise ConfigError(f"reviewers must be a whole number >= 1, got {raw!r}")
+    return raw
+
+
 def load_config(path: Path | str | None) -> FactoryConfig:
     """Load the factory config.
 
@@ -104,7 +127,7 @@ def load_config(path: Path | str | None) -> FactoryConfig:
 
     Raises:
         ConfigError: The file is unreadable, not a mapping, has unknown
-            keys, or carries a malformed ``peak_window``.
+            keys, or carries a malformed ``peak_window`` or ``reviewers``.
     """
     if path is None or not Path(path).exists():
         return FactoryConfig()
@@ -116,12 +139,15 @@ def load_config(path: Path | str | None) -> FactoryConfig:
         return FactoryConfig()
     if not isinstance(raw, dict):
         raise ConfigError(f"factory config {path} must be a mapping")
-    unknown = sorted(set(raw) - {"peak_window"})
+    unknown = sorted(set(raw) - {"peak_window", "reviewers"})
     if unknown:
         raise ConfigError(f"factory config {path}: unknown keys {unknown}")
-    if "peak_window" not in raw:
-        return FactoryConfig()
-    return FactoryConfig(peak_window=_peak_window(raw["peak_window"]))
+    return FactoryConfig(
+        peak_window=_peak_window(raw["peak_window"]) if "peak_window" in raw
+        else DEFAULT_PEAK_WINDOW,
+        reviewers=_reviewers(raw["reviewers"]) if "reviewers" in raw
+        else DEFAULT_REVIEWERS,
+    )
 
 
 def in_peak_window(now: datetime, window: PeakWindow | None) -> bool:

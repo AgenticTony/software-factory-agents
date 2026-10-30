@@ -323,8 +323,12 @@ def test_ac_1(tmp_path: Path):
     assert {g["layer"] for g in gates} == {"L0", "L1", "L2"}
 
     # session_end rows carry the record's spend, turns and model per seat.
+    # F-38: the review is a two-session fan-out (this passing verdict has
+    # no findings, so no verifier session runs).
     sessions = [e for e in events if e["type"] == "session_end"]
-    assert [s["seat"] for s in sessions] == ["implementer", "reviewer"]
+    assert [s["seat"] for s in sessions] == [
+        "implementer", "reviewer", "reviewer",
+    ]
     for session in sessions:
         assert session["status"] == "completed"
         assert isinstance(session["tokens"], dict)
@@ -614,12 +618,13 @@ def test_ac_7(tmp_path: Path):
         e["tokens"] for e in events
         if e["type"] == "phase_end" and e.get("tokens")
     ]
-    # The two session phases (implementer, L2) carry the two seats' spend.
+    # The two session phases (implementer, L2) carry the seats' spend —
+    # with F-38 the L2 phase holds the fan-out's two reviewer sessions.
     assert {e["phase"] for e in events
             if e["type"] == "phase_end" and e.get("tokens")} == {"implementer", "L2"}
     assert sum(t["input_tokens"] for t in phase_totals) == attempt["input_tokens"]
     assert sum(t["output_tokens"] for t in phase_totals) == attempt["output_tokens"]
-    assert attempt["input_tokens"] == 180 and attempt["output_tokens"] == 50
+    assert attempt["input_tokens"] == 240 and attempt["output_tokens"] == 60
 
 
 # --------------------------------------- beyond the ACs: the live transport --

@@ -90,6 +90,25 @@
         "prompt_versions": { "type": "object", "description": "seat -> prompt content hash (F-09); used for credit assignment in F-19", "additionalProperties": { "type": "string" } },
         "skills": { "type": "array", "items": { "type": "string" }, "description": "Skills loaded in the session, name@version" },
         "note": { "type": "string" },
+        "review_drops": {
+          "type": "array",
+          "description": "F-38: findings the L2 verifier voted out or the nit budget capped, each with its drop reason — the reviewer noise the verifier removed, in the attempt record so F-19 can measure it. Deliberately NOT rendered into the PR body (the stored validator report carries the same ledger for audit).",
+          "items": {
+            "type": "object",
+            "required": ["text", "reason"],
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string" },
+              "axis": { "type": "string" },
+              "severity": { "type": "string" },
+              "file": { "type": "string" },
+              "line": { "type": "integer" },
+              "text": { "type": "string" },
+              "reason": { "type": "string", "description": "The verifier's drop reason (e.g. 'style-only: …', 'not real: …') or 'nit_budget'." },
+              "reported_by": { "type": "array", "items": { "type": "integer" }, "description": "1-based reviewer numbers that reported the finding." }
+            }
+          }
+        },
         "sentinels": {
           "type": "array",
           "description": "Sentinel results recorded for this attempt (F-25): every sentinel L0 ran, pass or fail, so the human merge sees what was checked.",

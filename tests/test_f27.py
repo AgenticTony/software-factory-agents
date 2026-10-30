@@ -32,6 +32,7 @@ import json
 import subprocess
 import sys
 import textwrap
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -236,15 +237,19 @@ class Env:
 class Seats:
     """Stub seats (the f10 pattern) that may vent mid-run.
 
-    The implementer writes a correct change; the reviewer passes. Vent
+    The implementer writes a correct change; the review seats pass. Vent
     templates are dicts WITHOUT ``run_id``: the stub stamps each with the
     ``run_id``/``task_id`` the orchestrator handed the session — exactly
-    what a real session's collector does with the same kwargs.
+    what a real session's collector does with the same kwargs. The F-38
+    fan-out runs two reviewer sessions; only the first vents (one vent
+    per template is what the assertions below count), and the calls log
+    is appended under a lock because the fan-out is concurrent.
     """
 
     def __init__(self, impl_vents=(), review_vents=()):
         self.impl_vents = list(impl_vents)
         self.review_vents = list(review_vents)
+        self.lock = threading.Lock()
         self.calls: list[tuple[str, dict]] = []  # (seat, kwargs)
 
     @staticmethod
@@ -252,7 +257,12 @@ class Seats:
         return [{**v, "run_id": kwargs["run_id"]} for v in templates]
 
     def __call__(self, seat, prompt, run_dir, profile, **kwargs):
-        self.calls.append((seat, kwargs))
+        with self.lock:
+            self.calls.append((seat, kwargs))
+            first_review = (
+                seat == "reviewer"
+                and sum(1 for s, _ in self.calls if s == "reviewer") == 1
+            )
         run_dir = Path(run_dir)
         if seat == "implementer":
             (run_dir / "impl.py").write_text("def answer():\n    return 42\n")
@@ -263,10 +273,11 @@ class Seats:
                 result="Implemented answer().",
                 vents=self._stamped(self.impl_vents, kwargs),
             )
+        vents = self.review_vents if first_review else []
         return SessionRecord(
             seat=seat, status="completed", num_turns=1, model="stub-model",
             tokens={"input_tokens": 60, "output_tokens": 10},
-            result=REVIEW_PASS, vents=self._stamped(self.review_vents, kwargs),
+            result=REVIEW_PASS, vents=self._stamped(vents, kwargs),
         )
 
 

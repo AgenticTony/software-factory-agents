@@ -152,18 +152,34 @@ def create_run(
 def cleanup_run(run: RunDir) -> None:
     """Delete the run's clone, settings file, staged runner copy
     (``<settings>-runner/``, written by the F-06 session runner), staged
-    toolkit copy (``<settings>-toolkit/``, F-22) and reviewer scratch
+    toolkit copy (``<settings>-toolkit/``, F-22), reviewer scratch
     (``<settings>-scratch/``, written by the F-09 read-only reviewer
-    flow). Idempotent: a missing run (already cleaned, or never finished
-    creating) is not an error."""
+    flow) and every fan-out sibling (``<settings>-r1.json``,
+    ``<settings>-v.json`` and their runners/toolkits/scratches — F-38's
+    parallel review names its per-session settings after the run's own,
+    so a crash mid-fan-out leaves them for this sweep). Idempotent: a
+    missing run (already cleaned, or never finished creating) is not an
+    error."""
     shutil.rmtree(run.root, ignore_errors=True)
-    run.settings_path.unlink(missing_ok=True)
-    shutil.rmtree(run.settings_path.with_name(run.settings_path.name + "-runner"),
-                  ignore_errors=True)
-    shutil.rmtree(run.settings_path.with_name(run.settings_path.name + "-toolkit"),
-                  ignore_errors=True)
-    shutil.rmtree(run.settings_path.with_name(run.settings_path.name + "-scratch"),
-                  ignore_errors=True)
+    sandbox = run.settings_path.parent
+    names = {run.settings_path.name,
+             run.settings_path.name + "-runner",
+             run.settings_path.name + "-scratch"}
+    # Only this run's own derivatives: the run id is unique (timestamp +
+    # uuid), so no sibling run's settings can match the prefix. The glob
+    # is the sweep: -runner, -toolkit (F-22), -scratch and every
+    # per-session -r1/-v1 spelling with its own siblings all match.
+    try:
+        names |= {entry.name for entry in sandbox.iterdir()
+                  if entry.name.startswith(run.settings_path.name + "-")}
+    except OSError:
+        pass  # nothing to sweep (the sandbox dir is already gone)
+    for name in names:
+        target = sandbox / name
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+        else:
+            target.unlink(missing_ok=True)
 
 
 def new_run_id() -> str:
