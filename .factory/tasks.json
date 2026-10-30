@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-29T21:14:05Z",
+  "updated_at": "2026-10-30T10:47:01Z",
   "tasks": [
     {
       "id": "F-00",
@@ -1653,7 +1653,7 @@
         },
         {
           "id": "AC-9",
-          "text": "The first JobFinderOS toolkit goes through the whole process end to end: at least one skill and one read-only documentation MCP server, vetted, admitted by owner-approved PR, with reports committed. A JobFinderOS session test shows both available.",
+          "text": "The first JobFinderOS toolkit goes through the whole process end to end: one vetted skill (strict-api, vendored from `alirezarezvani/claude-skills` @ `0496583`, MIT), admitted by owner-approved PR, with its report committed. A JobFinderOS session test shows the skill available. *(Re-scoped 2026-10-30, owner-directed — the F-27 AC-4 precedent. Original text promised a read-only documentation MCP server in the same toolkit; the Phase-1 evaluation found no upstream docs MCP server that passes the spawn/env allowlists — context7-mcp (published dist needs external node packages), pypi-docs-mcp (httpx/bs4 absent from the session interpreter, arbitrary-URL tool, GitHub API hosts), docs-mcp-server (native deps, arbitrary-URL fetching), python-docs-mcp (pins mcp<2.0 vs the interpreter's 2.3.0, docs.python.org unallowlisted), pg-aiguide (Bun/TS RAG service on a credentialed LLM API). The MCP half is deferred to F-39 rather than bending the rules.)*",
           "check": {
             "type": "test",
             "ref": "tests/test_f22.py::test_ac_9"
@@ -2872,6 +2872,59 @@
       },
       "attempts": [],
       "links": {}
+    },
+    {
+      "id": "F-39",
+      "title": "Docs MCP server admission",
+      "source": "BUILD-ORDER.md#f-39--docs-mcp-server-admission",
+      "kind": "build",
+      "priority": "P3",
+      "status": "draft",
+      "depends_on": [
+        "F-22"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "One admission path is chosen at spec approval and implemented: either (a) vendored-bundle provenance — a reproducible bundle built from a pinned upstream, its build command and pinned build tool recorded in the index entry, every bundled dependency's licence allowlisted and recorded — or (b) a minimal factory-owned stdio server using only `mcp` and the standard library, every outbound request's host inside the running profile's `docs_allowlist` (scripted test: a host outside the allowlist is never fetched). The chosen server's spawn tokens and env keys pass the F-22 allowlists mechanically, proven red-first on the refusal cases.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f39.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "The vetter's network class no longer counts a URL inside a LICENSE/NOTICE file as a finding when it is the canonical licence URL of the declared SPDX licence — red-first: a candidate whose only finding is its own licence text's URL passes. (This is what blocked `frontend-design` from anthropics/skills: the Apache-2.0 text quotes `www.apache.org/licenses/`.)",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f39.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "The first docs MCP server is admitted through the F-22 process — vet report committed, owner-approved PR — and a JobFinderOS session test shows its read-only tools granted one by one through `allowed_tools` and enforced by the MCP guard hook (scripted, no model).",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f39.py::test_ac_3"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 100,
+        "wall_clock_min": 60
+      }
     }
   ]
 }
