@@ -278,6 +278,14 @@ def _validator_section(reports: dict) -> str:
     finding the orchestrator dropped as out of scope still belongs in
     front of the human merging the PR, not buried in the JSON).
 
+    F-38 draws the opposite line for the verifier's drops: a finding the
+    verifier voted out (or the nit budget capped) NEVER reaches the PR
+    body — removing that noise is the verifier's job — so the
+    ``verifier_dropped`` ledger is stripped from the rendered JSON here
+    while the stored validator report and the attempt record keep every
+    entry with its reason. The input dict is not mutated: the body renders
+    a projection.
+
     The dropped list is reviewer-controlled text, so it rides inside a
     ``text`` fence — the same treatment the implementer's notes get. The
     fence is what makes the payload inert: it is one backtick longer than
@@ -289,7 +297,13 @@ def _validator_section(reports: dict) -> str:
     the list — readability, not containment; the fence alone would hold a
     multiline payload. Inside the JSON fence the same text was always
     safe (newlines escaped there)."""
-    section = fence(json.dumps(reports, indent=2, ensure_ascii=False), "json")
+    body_reports = dict(reports)
+    l2 = reports.get("L2")
+    if isinstance(l2, dict) and "verifier_dropped" in l2:
+        body_reports["L2"] = {
+            key: value for key, value in l2.items() if key != "verifier_dropped"
+        }
+    section = fence(json.dumps(body_reports, indent=2, ensure_ascii=False), "json")
     dropped = (reports.get("L2") or {}).get("dropped") or []
     if dropped:
         lines = [

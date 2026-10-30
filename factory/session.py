@@ -30,8 +30,12 @@ Seats:
   restoring and failing the review on any change. Headless, so
   prompt-bypassed like the implementer (a default-mode Bash call would
   wait forever for an approval nobody can give).
+* ``verifier`` (F-38) — reads, never writes, same three ways: it votes
+  reviewer findings in or out, a judge of judges, so it carries the
+  reviewer's entire read-only contract (edit tools disallowed, read-only
+  sandbox, the same integrity guard).
 
-Both seats carry one extra tool (F-27): ``vent(category, text)``, an
+Every seat carries one extra tool (F-27): ``vent(category, text)``, an
 in-process SDK tool (``factory.vent``) the CLI exposes as
 ``mcp__vent__vent``, listed under that name in ``allowed_tools``. The
 handler runs inside this sandboxed runner, so it only appends to an
@@ -84,6 +88,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Sequence
@@ -347,6 +352,17 @@ SEATS: dict[str, SeatConfig] = {
         # disallowed edit tools above plus the PreToolUse hooks (protected
         # paths, push/gh ban) and the sandbox's own write/network
         # confinement — not from prompts no one can answer.
+        permission_mode="bypassPermissions",
+    ),
+    "verifier": SeatConfig(
+        name="verifier",
+        allowed_tools=(VENT_QUALIFIED_NAME,),
+        # F-38: the verifier votes reviewer findings in or out, so it is
+        # every bit the judge the reviewer is — same read-only contract
+        # (no edit tools, same integrity guard in run_session_sandboxed).
+        # A verifier that could write the workspace could "fix" the code a
+        # finding names and then vote the finding out on what it wrote.
+        disallowed_tools=("Write", "Edit", "NotebookEdit"),
         permission_mode="bypassPermissions",
     ),
 }
@@ -1555,27 +1571,17 @@ def run_session_sandboxed(
     run_dir = Path(run_dir)
     # Settings path first (derived once): the reviewer's scratch sibling and
     # the staged runner both hang off its name.
-    if settings_path is None:
-        if factory_root is None:
-            runs_root = run_dir.parent.parent
-            if runs_root.name != "runs":
-                raise SessionConfigError(
-                    f"cannot derive the factory root from {run_dir}: its layout "
-                    "is not runs/<project>/<run-id>. Pass factory_root "
-                    "explicitly, or the settings would land in a directory "
-                    "cleanup_run never looks at."
-                )
-            factory_root = runs_root.parent
-        settings_path = (
-            Path(factory_root) / "sandbox" / f"{run_dir.parent.name}-{run_dir.name}.json"
-        )
+    factory_root, settings_path = _derive_settings_path(
+        run_dir, factory_root, settings_path
+    )
 
-    # Reviewer integrity (owner review rounds 2 and 4): the reviewer gets a
-    # read-only sandbox and a workspace guard (branch, HEAD, tree, refs,
-    # ignored files; see _GitState). The scratch links exist
+    # Reviewer integrity (owner review rounds 2 and 4): the reviewer — and,
+    # since F-38, the verifier, which judges the reviewers' findings —
+    # gets a read-only sandbox and a workspace guard (branch, HEAD, tree,
+    # refs, ignored files; see _GitState). The scratch links exist
     # BEFORE the baseline so their (untracked) presence can never look
     # like a mutation between the two snapshots.
-    review_guard = seat == "reviewer"
+    review_guard = seat in ("reviewer", "verifier")
     reviewer_writable: tuple[Path, Path] = ()
     baseline: _GitState | None = None
     record: SessionRecord | None = None
@@ -1615,6 +1621,211 @@ def run_session_sandboxed(
             if review_guard:
                 _teardown_reviewer_scratch(run_dir)
     return record
+
+
+def _derive_settings_path(
+    run_dir: Path, factory_root: Path | None, settings_path: Path | None
+) -> "tuple[Path | None, Path]":
+    """The run's base settings location: ``(factory_root, settings_path)``.
+
+    run_session_sandboxed's derivation in one place, so the fan-out
+    derives the same sibling layout (scratch/runner/settings names hang
+    off the settings path's name). ``factory_root`` stays None when it was
+    None and an explicit settings path was given (callers downstream
+    derive their own).
+    """
+    if settings_path is None:
+        if factory_root is None:
+            runs_root = run_dir.parent.parent
+            if runs_root.name != "runs":
+                raise SessionConfigError(
+                    f"cannot derive the factory root from {run_dir}: its layout "
+                    "is not runs/<project>/<run-id>. Pass factory_root "
+                    "explicitly, or the settings would land in a directory "
+                    "cleanup_run never looks at."
+                )
+            factory_root = runs_root.parent
+        settings_path = (
+            Path(factory_root) / "sandbox"
+            / f"{run_dir.parent.name}-{run_dir.name}.json"
+        )
+    return (
+        Path(factory_root) if factory_root is not None else None,
+        Path(settings_path),
+    )
+
+
+def run_sessions_parallel(
+    specs: "Sequence[tuple[str, str]]",
+    run_dir: Path,
+    profile: dict,
+    *,
+    runner: "Callable[..., SessionRecord] | None" = None,
+    factory_root: Path | None = None,
+    settings_path: Path | None = None,
+    **session_kwargs,
+) -> list[SessionRecord]:
+    """Run the review fan-out: N independent sessions over one diff (F-38).
+
+    Every spec is a ``(seat, prompt)`` pair; every seat must be a guard
+    seat (``reviewer`` or ``verifier``). The sessions run **concurrently**
+    (one thread each — each real session is a sandboxed subprocess, so
+    the parallelism is real wall-clock, not cooperative).
+
+    With the real :func:`run_session_sandboxed` the fan-out shares ONE
+    integrity guard across every session instead of per-session ones: the
+    scratch symlinks are created once and the git baseline taken once,
+    BEFORE any session starts, and the workspace is verified once after
+    all of them finish — a mutation by ANY session fails the whole
+    fan-out (no verdict from a review that touched its own workspace is
+    trusted; attribution inside the fan-out is impossible by design, and
+    the conservative rule is to trust none of them). Per-session srt
+    settings and staged runners sit at ``<base>-r1``, ``<base>-r2``, …
+    (the seat's ordinal), so concurrent sessions never share a spec file,
+    and the fan-out removes them all on exit.
+
+    With any other runner (the orchestrator's test stubs), the seats are
+    called with the same signature through the same thread pool — the
+    concurrency is the behaviour under test, and there is no shared
+    sandbox state to guard.
+
+    Args:
+        specs: ``(seat, prompt)`` pairs, fan-out order (spec 0 is reviewer
+            1 for id/reporting purposes).
+        run_dir: The run dir (the clean gate clone) every session reads.
+        profile: The project profile.
+        runner: The seat runner; default :func:`run_session_sandboxed`.
+        factory_root / settings_path: The base srt settings location (the
+            same derivation as run_session_sandboxed when omitted).
+        **session_kwargs: Everything each session takes (max_turns,
+            timeout_min, protected, system_prompt, …) — handed to the
+            runner unchanged.
+
+    Returns:
+        One :class:`SessionRecord` per spec, in spec order.
+
+    Raises:
+        SessionConfigError: A seat that is not a guard seat, no token, or
+            any per-session configuration fault (re-raised from its thread
+            after the guard has torn down).
+    """
+    seats = [seat for seat, _ in specs]
+    for seat in seats:
+        if seat not in ("reviewer", "verifier"):
+            raise SessionConfigError(
+                f"run_sessions_parallel is the review fan-out: seat {seat!r} "
+                "is not a guard seat (reviewer/verifier)"
+            )
+    if not specs:
+        return []
+    if runner is None or runner is run_session_sandboxed:
+        return _fanout_sandboxed(
+            specs, run_dir, profile,
+            factory_root=factory_root, settings_path=settings_path,
+            **session_kwargs,
+        )
+    # A test (or alternative) runner: same signature, same concurrency,
+    # none of the shared sandbox state. factory_root rides through so a
+    # stub sees the kwargs a real call would have.
+    if factory_root is not None:
+        session_kwargs.setdefault("factory_root", factory_root)
+    with ThreadPoolExecutor(max_workers=len(specs)) as pool:
+        futures = [
+            pool.submit(runner, seat, prompt, run_dir, profile, **session_kwargs)
+            for seat, prompt in specs
+        ]
+        return [future.result() for future in futures]
+
+
+def _fanout_sandboxed(
+    specs: "Sequence[tuple[str, str]]",
+    run_dir: Path,
+    profile: dict,
+    *,
+    factory_root: Path | None = None,
+    settings_path: Path | None = None,
+    **session_kwargs,
+) -> list[SessionRecord]:
+    """The real-runner fan-out: one shared guard, per-session settings."""
+    token = session_kwargs.get("token")
+    if token is None:
+        token = seat_token()
+        session_kwargs["token"] = token
+    if not token:
+        raise SessionConfigError(
+            "no Z.ai token available: create the keychain item with "
+            f"`security add-generic-password -s {KEYCHAIN_SERVICE} -w <key>` "
+            "(or run where ANTHROPIC_AUTH_TOKEN is set). The factory refuses "
+            "to start a session that cannot authenticate."
+        )
+    # run_session_sandboxed's own defaults, which its callers may omit: the
+    # fan-out hands each session straight to _run_prepared, so it fills
+    # them itself. max_turns and timeout_min stay required on purpose — a
+    # fan-out outside the attempt's budgets must refuse to run.
+    session_kwargs.setdefault("base_url", DEFAULT_BASE_URL)
+    session_kwargs.setdefault("timeout_ms", DEFAULT_TIMEOUT_MS)
+    session_kwargs.setdefault("protected", ())
+    session_kwargs.setdefault("model", None)
+    session_kwargs.setdefault("system_prompt", None)
+    session_kwargs.setdefault("cli_path", None)
+    session_kwargs.setdefault("srt_bin_path", None)
+    session_kwargs.setdefault("teardown_grace_sec", 120.0)
+
+    run_dir = Path(run_dir)
+    factory_root, base = _derive_settings_path(run_dir, factory_root, settings_path)
+    base.parent.mkdir(parents=True, exist_ok=True)
+    # Per-session settings, named by spec order (spec 0 is reviewer 1
+    # whatever the scheduling does): concurrent sessions never share a
+    # spec file or a staged runner.
+    counts: dict[str, int] = {}
+    per_session: list[Path] = []
+    for seat, _ in specs:
+        counts[seat] = counts.get(seat, 0) + 1
+        suffix = ("r" if seat == "reviewer" else "v") + str(counts[seat])
+        per_session.append(base.with_name(f"{base.name}-{suffix}.json"))
+
+    # ONE scratch + ONE baseline before any session starts: the symlinks
+    # exist before the baseline (their presence can never look like a
+    # mutation), and every session shares the same writable scratch —
+    # concurrent reviewers writing $HOME through one link, each into its
+    # own session state under it.
+    reviewer_writable = _reviewer_scratch(base, run_dir)
+    baseline = _git_state(run_dir)
+    records: list[SessionRecord | None] = [None] * len(specs)
+    try:
+        def run_one(index: int, seat: str, prompt: str) -> SessionRecord:
+            return _run_prepared(
+                seat, prompt, run_dir, profile, per_session[index],
+                factory_root=factory_root,
+                read_only=True, writable_roots=reviewer_writable,
+                **session_kwargs,
+            )
+
+        with ThreadPoolExecutor(max_workers=len(specs)) as pool:
+            futures = [pool.submit(run_one, i, seat, prompt)
+                       for i, (seat, prompt) in enumerate(specs)]
+            for i, future in enumerate(futures):
+                records[i] = future.result()
+    finally:
+        try:
+            # The integrity backstop spans the WHOLE fan-out: whatever any
+            # session did, the workspace must be exactly what it was before
+            # the fan-out. A mutation fails every record (see the docstring
+            # for why none of them is trusted) and is undone, so nothing a
+            # reviewer wrote can ride the branch F-10 pushes.
+            if baseline is not None and _git_state(run_dir) != baseline:
+                _restore_workspace(run_dir, baseline)
+                for record in records:
+                    if record is not None:
+                        record.status = "failed"
+                        record.reason = REVIEWER_MUTATION
+        finally:
+            _teardown_reviewer_scratch(run_dir)
+            for settings in per_session:
+                settings.unlink(missing_ok=True)
+                shutil.rmtree(settings.with_name(settings.name + "-runner"),
+                              ignore_errors=True)
+    return [record for record in records if record is not None]
 
 
 def _run_prepared(

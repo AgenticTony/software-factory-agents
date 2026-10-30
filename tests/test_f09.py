@@ -32,6 +32,7 @@ from factory.prompts import (
     PromptError,
     assemble_implementer_prompt,
     assemble_reviewer_prompt,
+    assemble_verifier_prompt,
     prompt_hash,
     prompt_versions,
 )
@@ -501,11 +502,15 @@ def test_implementer_prompt_carries_project_specifics_but_no_standards(tmp_path)
 def test_prompt_versions_hash_the_assembled_prompts(tmp_path):
     profile = _fixture_profile(tmp_path, standards=("docs/STANDARDS.md",))
     versions = prompt_versions(profile)
-    assert set(versions) == {"implementer", "reviewer"}
+    # F-38: one entry per fan-out session — reviewer-1/reviewer-2 share the
+    # assembled reviewer prompt — plus the verifier's own.
+    assert set(versions) == {"implementer", "reviewer-1", "reviewer-2", "verifier"}
     for seat, digest in versions.items():
         assert re.fullmatch(r"[0-9a-f]{64}", digest)
     assert versions["implementer"] == prompt_hash(assemble_implementer_prompt(profile))
-    assert versions["reviewer"] == prompt_hash(assemble_reviewer_prompt(profile))
+    assert versions["reviewer-1"] == prompt_hash(assemble_reviewer_prompt(profile))
+    assert versions["reviewer-2"] == versions["reviewer-1"]
+    assert versions["verifier"] == prompt_hash(assemble_verifier_prompt(profile))
 
 
 # ----------------------------------------------------------- red_reason --

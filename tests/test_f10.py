@@ -24,6 +24,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -224,7 +225,10 @@ class Seats:
     """Stub seats with ``run_session_sandboxed``'s signature.
 
     The implementer writes ``impl.py`` (returning ``answer``) plus the
-    contract test into the run dir; the reviewer answers ``review``.
+    contract test into the run dir; every review seat of the F-38 fan-out
+    (two reviewer sessions, and a verifier when findings need voting)
+    answers ``review`` — for the verifier that text is an invalid vote
+    shape, which by design drops nothing.
     """
 
     def __init__(self, answer=42, result="Implemented answer().", review=REVIEW_PASS,
@@ -234,6 +238,7 @@ class Seats:
         self.review = review
         self.extra_files = extra_files or {}
         self.implementer = implementer
+        self.lock = threading.Lock()
         self.calls: list[tuple[str, str, Path, dict]] = []
 
     def prompts(self, seat: str) -> list[str]:
@@ -241,7 +246,8 @@ class Seats:
 
     def __call__(self, seat, prompt, run_dir, profile, **kwargs):
         run_dir = Path(run_dir)
-        self.calls.append((seat, prompt, run_dir, kwargs))
+        with self.lock:
+            self.calls.append((seat, prompt, run_dir, kwargs))
         if seat == "implementer":
             if self.implementer is not None:
                 return self.implementer(prompt, run_dir, kwargs)
@@ -254,6 +260,11 @@ class Seats:
             return SessionRecord(
                 seat=seat, status="completed", num_turns=3, model="stub-model",
                 tokens={"input_tokens": 120, "output_tokens": 40}, result=self.result,
+            )
+        if seat == "verifier":
+            return SessionRecord(
+                seat=seat, status="completed", num_turns=1, model="stub-model",
+                tokens={"input_tokens": 55, "output_tokens": 5}, result=self.review,
             )
         return SessionRecord(
             seat=seat, status="completed", num_turns=1, model="stub-model",
@@ -292,8 +303,10 @@ def test_ac_1(tmp_path: Path):
     shown = _git(env.remote, "show", f"refs/heads/{pr.head}:impl.py")
     assert "return 42" in shown
     assert pr.base == "main"
-    # Each seat ran exactly once: implementer then reviewer.
-    assert [c[0] for c in seats.calls] == ["implementer", "reviewer"]
+    # Each seat ran as configured: the implementer once, then the F-38
+    # fan-out's two reviewer sessions (the verdict carries no findings,
+    # so no verifier session starts).
+    assert [c[0] for c in seats.calls] == ["implementer", "reviewer", "reviewer"]
     # The validator report is stored outside the run dirs, and every gate passed.
     report = json.loads(Path(attempt["validator_report"]).read_text())
     assert [report[k]["verdict"] for k in ("L0", "L1", "L2")] == ["pass", "pass", "pass"]
@@ -358,14 +371,20 @@ def test_reviewer_fail_is_retried_then_exhausted(tmp_path: Path):
     round so the review delta is real, and the findings name impl.py —
     the common file-named-retry path, in the delta, exercised as such
     (an identical round-2 finding on the untouched file would rightly
-    escalate review_not_converging instead: F-23)."""
+    escalate review_not_converging instead: F-23). The F-38 fan-out runs
+    two reviewer sessions per round; both script the same per-ROUND
+    verdict (indexed by implementer round — a raw reviewer-call count is
+    racy under the concurrent fan-out), and the round's two findings
+    merge into one union entry."""
     env = Env(tmp_path)
     seats = Seats()
+    lock = threading.Lock()
 
     def varying(seat, prompt, run_dir, profile, **kwargs):
         if seat == "implementer":
-            seats.calls.append((seat, prompt, Path(run_dir), kwargs))
-            round_no = sum(1 for s, *_ in seats.calls if s == "implementer")
+            with lock:
+                seats.calls.append((seat, prompt, Path(run_dir), kwargs))
+                round_no = sum(1 for s, *_ in seats.calls if s == "implementer")
             (Path(run_dir) / "impl.py").write_text(
                 f"def answer():\n    return 42  # fix round {round_no}\n")
             (Path(run_dir) / "tests" / "test_feature.py").write_text(TEST_SOURCE)
@@ -374,19 +393,22 @@ def test_reviewer_fail_is_retried_then_exhausted(tmp_path: Path):
                 tokens={"input_tokens": 120, "output_tokens": 40},
                 result="Implemented answer().",
             )
-        seats.calls.append((seat, prompt, Path(run_dir), kwargs))
-        call_no = sum(1 for s, *_ in seats.calls if s == "reviewer")
+        with lock:
+            seats.calls.append((seat, prompt, Path(run_dir), kwargs))
+            round_no = sum(1 for s, *_ in seats.calls if s == "implementer")
         return SessionRecord(
             seat=seat, status="completed", num_turns=1, model="stub-model",
             tokens={"input_tokens": 60, "output_tokens": 10},
             result=json.dumps({"verdict": "fail", "findings": [
                 {"id": "R1", "axis": "spec", "severity": "blocking",
-                 "file": "impl.py", "text": f"scope creep {call_no}"}]}),
+                 "file": "impl.py", "text": f"scope creep {round_no}"}]}),
         )
 
     result = env.run(varying)
     assert result.outcome == "needs_human"
-    assert [c[0] for c in seats.calls] == ["implementer", "reviewer"] * 3
+    assert [c[0] for c in seats.calls] == (
+        ["implementer", "reviewer", "reviewer", "verifier"] * 3
+    )
     assert "scope creep 1" in seats.prompts("implementer")[1]
     assert env.task()["attempts"][-1]["escalation"] == "attempts_exhausted"
     assert env.prs == []
@@ -575,7 +597,11 @@ def test_ac_6(tmp_path: Path):
     assert len(attempts) == 4
     for attempt in attempts:
         assert attempt["prompt_versions"] == prompt_versions(profile)
-        assert set(attempt["prompt_versions"]) == {"implementer", "reviewer"}
+        # F-38: one hash per fan-out session (reviewer-1/reviewer-2 share
+        # the assembled reviewer prompt; the verifier has its own).
+        assert set(attempt["prompt_versions"]) == {
+            "implementer", "reviewer-1", "reviewer-2", "verifier",
+        }
         assert attempt["skills"] == []  # setting_sources=[]: no skills are loaded
 
     # Without either field an attempt is a schema error, refused on write.
@@ -1226,7 +1252,9 @@ def test_default_seat_runner_signature_matches(tmp_path: Path, monkeypatch):
                       pr_state=lambda u: "open",
                       now=lambda: OFF_PEAK)
     assert result.outcome == "pr_opened"
-    assert [c[0] for c in seats.calls] == ["implementer", "reviewer"]
+    # F-38: the passing review is a two-session fan-out (verdict carries
+    # no findings, so no verifier session starts).
+    assert [c[0] for c in seats.calls] == ["implementer", "reviewer", "reviewer"]
 
 
 def test_huge_output_still_fits_a_pr_body(tmp_path: Path):
@@ -1518,7 +1546,9 @@ def test_review5_bookkeeping_failure_after_pr_never_opens_a_second_pr(
     result = env.run(seats)
 
     assert len(env.prs) == 1, "a second PR was opened for the same task"
-    assert len(seats.calls) == 2, "the seats ran again after the PR was open"
+    # F-38: one run = implementer + two reviewer sessions (no findings,
+    # no verifier); the second run runs nothing — the PR was already open.
+    assert len(seats.calls) == 3, "the seats ran again after the PR was open"
     assert result.outcome == "pr_opened"
     assert result.pr == first_url
     task = env.task()
@@ -1547,7 +1577,7 @@ def test_review6_push_fence_refusal_escalates_immediately(tmp_path, monkeypatch)
     assert task["status"] == "needs_human"
     assert [a["escalation"] for a in task["attempts"]] == ["publish_refused"]
     assert "fence" in task["attempts"][0]["note"]
-    assert len(seats.calls) == 2
+    assert len(seats.calls) == 3  # implementer + the two-session fan-out
 
 
 def test_review6_pr_body_refusal_escalates_immediately(tmp_path, monkeypatch):
