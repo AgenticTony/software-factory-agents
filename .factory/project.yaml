@@ -167,4 +167,15 @@ network_allowlist:
   # the sandboxed gate runner and fetches from the npm registry.
   - registry.npmjs.org
 
+# F-31 attempt 3 (owner-directed, review decision on #76): this repo's own
+# test suite starts real loopback servers (the F-31 dashboard tests bind
+# 127.0.0.1), and without the bind every gate run fails them on the
+# environment, not the code (3 attempts lost that way). GATE RUNNER ONLY:
+# srt's macOS rules also grant outbound connect to every host loopback
+# port (DevTools of a logged-in browser, local DBs, dev/MCP servers) —
+# reach the implementer/reviewer sessions must never have, so the opt-in
+# applies to the gate's settings alone (schema/project.schema.json).
+sandbox:
+  allow_local_binding: true
+
 cross_repo: []

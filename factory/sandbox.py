@@ -387,12 +387,14 @@ def build_settings(
     allow_read: "Sequence[Path]" = (),
     read_only: bool = False,
     writable_roots: "Sequence[Path]" = (),
+    local_binding: bool = False,
 ) -> dict:
     """Build the srt settings dict for one run from the project profile.
 
     Args:
         profile: The loaded ``project.yaml`` (``docs_allowlist`` /
-            ``network_allowlist`` keys are read; both optional here).
+            ``network_allowlist`` / ``sandbox`` keys are read; all
+            optional here).
         run_dir: The session's run dir — the only writable, self-readable
             path inside the sandbox.
         model_endpoint: The seat's model endpoint (Z.ai base URL or bare
@@ -419,6 +421,13 @@ def build_settings(
             (``python -m factory.session``) imports it. Deliberately narrow:
             the wider repo (prompts, schemas, validator docs) stays
             unreadable to the session.
+        local_binding: The caller's explicit request for srt's
+            ``network.allowLocalBinding`` — granted only when the profile
+            also opts in (``sandbox.allow_local_binding: true``). The GATE
+            RUNNER's settings alone may pass it (review decision on #76);
+            the session seats (implementer, reviewer, the importer's
+            reviewer seat) and the SDK probe must never ask, whatever the
+            profile says — see below for why.
 
     Returns:
         A settings dict accepted by ``srt --settings``.
@@ -426,6 +435,37 @@ def build_settings(
     Raises:
         SandboxError: ``run_dir`` doesn't follow the canonical layout and no
             explicit ``factory_root`` was given.
+
+    ``network.allowLocalBinding`` is granted only by the profile opt-in
+    AND the caller's explicit request — two hands on one switch, because
+    the flag is broader than it sounds. What it actually permits, read
+    from the pinned srt source (node_modules/@anthropic-ai/sandbox-
+    runtime/dist/sandbox/macos-sandbox-utils.js):
+
+    - macOS (Seatbelt), three added rules:
+      ``(allow network-bind (local ip "*:*"))`` — bind() on ANY local
+      address/port, not loopback-only. The ``*`` is forced: Seatbelt
+      cannot express "localhost" for IPv4-mapped IPv6 sockets
+      (::ffff:127.0.0.1), so ``*:*`` is the only token that admits them.
+      ``(allow network-inbound (local ip "*:*"))`` — inbound accepted on
+      any local address/port; Seatbelt matches the local endpoint only,
+      so the ORIGIN is unrestricted (host processes, and off-host hosts
+      if the sandboxed code binds a non-loopback interface).
+      ``(allow network-outbound (remote ip "localhost:*"))`` — connect()
+      to 127.0.0.1/::1 on ANY port: every host loopback service becomes
+      reachable (a logged-in browser's DevTools ports, local databases,
+      dev and MCP servers). External-domain egress stays allowlisted
+      through the proxy in all cases.
+    - Linux (bubblewrap): the flag is never read — a no-op. The sandbox
+      is its own network namespace; TCP bind inside it already works and
+      nothing outside the namespace can reach those sockets.
+
+    That outbound-to-loopback reach is why the scope is the gate runner
+    only: gate commands are the profile's fixed commands, run after L0's
+    diff policy, while the session seats execute model-written code with
+    a model-chosen goal — they must not be able to touch the owner's
+    loopback services even when the project's tests need port binding at
+    the gate.
     """
     run_dir = Path(run_dir).resolve()
     runs_root = run_dir.parent.parent
@@ -469,8 +509,15 @@ def build_settings(
     toolchain_reads = sorted(
         _toolchain_allowread(home, toolchain), key=str
     )
+    network: dict = {"allowedDomains": allowed_domains, "deniedDomains": []}
+    if local_binding and (profile.get("sandbox") or {}).get("allow_local_binding"):
+        # Two hands on one switch (review decision on #76): the profile
+        # opts in AND the caller explicitly asks — only the gate runner's
+        # settings ever ask, so the session seats keep srt's default deny
+        # (see the docstring for exactly what the flag permits).
+        network["allowLocalBinding"] = True
     return {
-        "network": {"allowedDomains": allowed_domains, "deniedDomains": []},
+        "network": network,
         "filesystem": {
             "denyRead": [
                 str(home),

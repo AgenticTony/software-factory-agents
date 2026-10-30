@@ -106,6 +106,18 @@
     "docs_allowlist": { "type": "array", "items": { "type": "string" } },
     "standards": { "type": "array", "items": { "type": "string" }, "description": "Repo-relative paths of the project's coding-standards docs. Read by the L2 reviewer only, never pushed to the implementer (VALIDATOR-SPEC L2)." },
     "network_allowlist": { "type": "array", "items": { "type": "string" }, "description": "Extra domains (package registries) beyond docs_allowlist and the model endpoint" },
+    "sandbox": {
+      "type": "object",
+      "description": "Sandbox capability opt-ins (factory.sandbox.build_settings). Absent means the defaults: nothing extra is granted.",
+      "additionalProperties": false,
+      "properties": {
+        "allow_local_binding": {
+          "type": "boolean",
+          "default": false,
+          "description": "Authorize srt's network.allowLocalBinding for the GATE RUNNER's settings only (L0/L1 commands and the stale-base re-validation clone — the project's fixed test suite, run after L0's diff policy): its tests bind sockets. The session seats (implementer, reviewer, importer) never receive it whatever this says — srt's macOS rules grant bind on ANY local address/port (not loopback-only), inbound from ANY origin, AND outbound connect to 127.0.0.1/::1 on any port (every host loopback service: a logged-in browser's DevTools ports, local databases, dev/MCP servers), reach model-written session code must not have. External-domain egress stays allowlisted. Linux: no-op (bwrap netns already allows in-namespace binds; nothing outside can reach them). Off unless a human sets it."
+        }
+      }
+    },
     "cross_repo": {
       "type": "array",
       "items": {

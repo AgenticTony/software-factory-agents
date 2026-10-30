@@ -97,6 +97,9 @@ should change is review's decision, in review.
 - Never weaken a test to make it pass: no deleted tests, no skipped or
   xfailing tests, no deleted assertions. The contract's tests are locked
   at approval.
+- Tests that bind local ports (a server on 127.0.0.1) cannot run inside
+  your session by design — the sandbox denies the bind; they run at the
+  gate. Do not weaken, skip or rework them because they fail in-session.
 - End with a short factual summary of what changed and which acceptance
   items you believe are met. Claims are not evidence — the validator
   re-runs everything — but an honest summary helps the reviewer navigate.

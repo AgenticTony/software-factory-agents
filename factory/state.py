@@ -37,6 +37,7 @@ by an orchestrator transition, so it has no outgoing edges here.
 import contextlib
 import copy
 import fcntl
+import getpass
 import json
 import os
 import uuid
@@ -229,6 +230,61 @@ def credential_recovery_eligible(task: dict) -> bool:
             and attempts[-1].get("escalation") in CREDENTIAL_RECOVERY_ESCALATIONS)
 
 
+ATTEMPTS_RESET_ESCALATIONS = ("attempts_exhausted",)
+
+
+def attempts_reset_eligible(task: dict) -> bool:
+    """Whether the owner's budget-reset word may move this task.
+
+    True only for a ``needs_human`` task whose last attempt escalated
+    ``attempts_exhausted``. Before the F-31 fix round that escalation had
+    no exit at all — the attempts are genuinely spent, so a plain re-queue
+    would park the task straight back; the only honest exit is a human
+    granting a fresh budget with evidence (three F-31 attempts died to a
+    sandbox bug the tasks could never fix). The sweep never consults this
+    predicate: it is `factory recover --reset-attempts`'s gate alone.
+    """
+    attempts = task.get("attempts") or []
+    return (task.get("status") == "needs_human"
+            and bool(attempts)
+            and attempts[-1].get("escalation") in ATTEMPTS_RESET_ESCALATIONS)
+
+
+def attempt_budget_floor(task: dict, slice_id: str) -> int:
+    """The position in ``task['attempts']`` the slice's budget counts from.
+
+    The latest ``attempt_resets`` marker for ``slice_id`` names how many
+    attempts existed when the budget was reset; attempts are append-only,
+    so that position stays valid. 0 (the whole log counts) when the slice
+    was never reset.
+    """
+    floor = 0
+    for marker in task.get("attempt_resets") or []:
+        if marker.get("slice_id") == slice_id:
+            floor = max(floor, int(marker.get("prior_attempts") or 0))
+    return floor
+
+
+def attempt_budget_used(task: dict, slice_id: str) -> int:
+    """How many attempts of ``slice_id``'s budget are spent.
+
+    The orchestrator's one budget filter: same-slice attempts, not
+    aborted, not session-less sweep escalations (round-5 finding 1), and
+    — after a reset — only those at or after the reset floor. Every
+    budget-relative number downstream (the run's attempt numbering, the
+    implementer prompt's "attempt N of M", the PR body's attempt line)
+    flows from this count.
+    """
+    floor = attempt_budget_floor(task, slice_id)
+    return sum(
+        1 for i, a in enumerate(task.get("attempts") or [])
+        if i >= floor
+        and a.get("slice_id") == slice_id
+        and a.get("outcome") != "aborted"
+        and a.get("escalation") not in RECOVERY_ESCALATIONS
+    )
+
+
 def check_recovery_transition(task: dict, new: str) -> str:
     """Validate one F-26 recovery transition for this specific task.
 
@@ -249,7 +305,8 @@ def check_recovery_transition(task: dict, new: str) -> str:
             f"recovery transition {task.get('status')} -> {new} needs a "
             "stale_base/pr_closed escalation and a PR link (F-26; a "
             "credential_added task moves only through "
-            "TaskQueue.recover_credential)"
+            "TaskQueue.recover_credential, and an attempts_exhausted task "
+            "only through TaskQueue.recover_attempts)"
         )
     return reason
 
@@ -414,43 +471,52 @@ def _atomic_write_json(path: Path, doc: dict) -> None:
 
 
 def _check_attempts_append_only(old_doc: dict, new_doc: dict) -> None:
-    """Refuse any change to ``attempts`` other than appending (§2).
+    """Refuse any change to ``attempts``/``attempt_resets`` other than
+    appending (§2).
 
-    Every task present in both documents must keep its old attempts as an
-    exact prefix of the new list; a task that disappears must have had no
-    attempts, or its log would be lost.
+    Every task present in both documents must keep its old attempts (and
+    reset markers) as an exact prefix of the new list; a task that
+    disappears must have had none, or its log would be lost.
 
     Args:
         old_doc: The queue as it currently is on disk.
         new_doc: The queue about to be written.
 
     Raises:
-        StateError: If an existing attempt entry would be modified,
-            removed, or dropped along with its task.
+        StateError: If an existing attempt or reset entry would be
+            modified, removed, or dropped along with its task.
     """
-    old_attempts = {
-        task.get("id"): task.get("attempts", [])
+    old_logs = {
+        task.get("id"): {
+            "attempts": task.get("attempts", []),
+            "attempt_resets": task.get("attempt_resets", []),
+        }
         for task in old_doc.get("tasks", [])
         if isinstance(task, dict)
     }
     for task in new_doc.get("tasks", []):
         if not isinstance(task, dict):
             continue
-        old = old_attempts.pop(task.get("id"), None)
+        old = old_logs.pop(task.get("id"), None)
         if old is None:
             continue
-        new = task.get("attempts", [])
-        if new[: len(old)] != old:
-            raise StateError(
-                f"{task.get('id')}: attempts is append-only; existing entries "
-                "cannot be modified or removed (TASK-CONTRACT §2)"
-            )
-    for task_id, attempts in old_attempts.items():
-        if attempts:
-            raise StateError(
-                f"{task_id}: task removed from the queue, which would drop "
-                "its append-only attempts log"
-            )
+        for field in ("attempts", "attempt_resets"):
+            kept, grown = old[field], task.get(field, [])
+            if grown[: len(kept)] != kept:
+                why = ("(TASK-CONTRACT §2)" if field == "attempts" else
+                       "— a removed reset marker would silently re-spend a "
+                       "budget the owner granted")
+                raise StateError(
+                    f"{task.get('id')}: {field} is append-only; existing "
+                    f"entries cannot be modified or removed {why}"
+                )
+    for task_id, logs in old_logs.items():
+        for field in ("attempts", "attempt_resets"):
+            if logs[field]:
+                raise StateError(
+                    f"{task_id}: task removed from the queue, which would "
+                    f"drop its append-only {field} log"
+                )
 
 
 def _check_slice_rules(task: dict, new_status: str) -> None:
@@ -746,6 +812,68 @@ class TaskQueue:
         _check_slice_rules(task, new_status)
         _check_owner_step_rules(task, new_status)
         task["status"] = new_status
+        self.save()
+        return new_status
+
+    def recover_attempts(self, task_id: str, evidence: str, *,
+                         done_by: str | None = None) -> str:
+        """Re-queue an ``attempts_exhausted`` task with a fresh budget:
+        the one writer of that edge, and the only writer of
+        ``attempt_resets`` markers.
+
+        Like the credential exit, the gate lives HERE, not in the command:
+        the generic :meth:`transition` refuses an attempts_exhausted task,
+        so no other writer can move it or spend a budget the owner never
+        granted. Evidence is demanded again at this layer. History is
+        never deleted — the marker records how many attempts existed
+        (``prior_attempts``), and :func:`attempt_budget_used` counts only
+        attempts at or after that position, so the fresh budget starts at
+        zero while every old attempt record stays in the log and in the
+        F-11 measures. Routing matches every recovery writer: ``blocked``
+        when a dependency is open, else ``ready``.
+
+        Args:
+            task_id: Task parked on an ``attempts_exhausted`` escalation.
+            evidence: What the owner checked; must not be blank.
+            done_by: Who granted the reset; recorded in the marker.
+
+        Returns:
+            The new status: ``ready`` or ``blocked``.
+
+        Raises:
+            StateError: Unknown task, or blank evidence.
+            TransitionError: The task isn't parked on
+                ``attempts_exhausted`` (including via the generic
+                transition, which never moves one).
+            ContractError: If the resulting queue wouldn't validate.
+            ConcurrentWriteError: If another writer changed the file.
+        """
+        if not (evidence or "").strip():
+            raise StateError(f"{task_id}: attempt reset requires evidence")
+        task = self.get(task_id)
+        if not attempts_reset_eligible(task):
+            raise TransitionError(
+                f"{task_id}: attempt reset needs a needs_human task whose "
+                "last attempt escalated attempts_exhausted"
+            )
+        slice_id = task["attempts"][-1].get("slice_id") or task_id
+        new_status = (
+            "blocked" if unmet_dependencies(task, self.doc.get("tasks", []))
+            else "ready"
+        )
+        reason = RECOVERY_TRANSITIONS.get((task.get("status"), new_status))
+        assert reason is not None  # needs_human → ready/blocked is in the table
+        _check_kind_rules(task, task.get("status"), new_status)
+        _check_slice_rules(task, new_status)
+        _check_owner_step_rules(task, new_status)
+        task["status"] = new_status
+        task.setdefault("attempt_resets", []).append({
+            "at": now_iso(),
+            "evidence": evidence.strip(),
+            "done_by": (done_by or "").strip() or getpass.getuser(),
+            "slice_id": slice_id,
+            "prior_attempts": len(task.get("attempts") or []),
+        })
         self.save()
         return new_status
 

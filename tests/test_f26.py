@@ -1397,13 +1397,13 @@ def test_credential_added_recover_refusals(tmp_path: Path):
     """The credential edge is deliberately human-paced: no --yes (the
     point is that a human looked), evidence is required and must say
     something, a declined prompt writes nothing — and every other
-    needs_human reason (attempts budget, protected paths, risk paths)
-    still refuses: only credential_added has an owner word."""
+    needs_human reason (protected paths, risk paths) still refuses:
+    only credential_added and attempts_exhausted (its own gated reset,
+    test_attempts_exhausted_recover_refusals) have an owner word."""
     from factory.approve import ApprovalDeclined, ApprovalError, recover_task
     from factory.cli import main
 
-    others = [("T-4", "attempts_exhausted"),
-              ("T-5", "protected_path_touched"),
+    others = [("T-5", "protected_path_touched"),
               ("T-6", "risk_path_touched")]
     # fresh tasks per escalation: attempts are append-only, so each
     # refusal parks its own task
@@ -1536,6 +1536,246 @@ def test_credential_edge_is_state_gated_not_command_gated(tmp_path: Path):
     assert recover_task(TaskQueue(env.queue_path), "T-1", evidence="rotated",
                         confirm=lambda question: True,
                         factory_root=env.root) == "ready"
+
+
+# --- F-31 attempt 3: evidence-gated reset for attempts_exhausted -------------
+
+
+class _FailingSeats:
+    """Seats that never fix the bug: the contract test exists but stays
+    red every round, so the run burns its whole attempt budget and
+    escalates attempts_exhausted (the f10 test_ac_2 stub shape, inlined
+    here so T-1's budget is the only variable under test)."""
+
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def __call__(self, seat, prompt, run_dir, profile, **kwargs):
+        from pathlib import Path
+
+        self.calls.append(seat)
+        if seat == "implementer":
+            run_dir = Path(run_dir)
+            (run_dir / "impl.py").write_text("def answer():\n    return 41\n")
+            (run_dir / "tests").mkdir(exist_ok=True)
+            (run_dir / "tests" / "test_feature.py").write_text(TEST_SOURCE)
+        return SessionRecord(seat=seat, status="completed", num_turns=1,
+                             model="stub-model", result="no fix")
+
+
+def _park_exhausted(env, task_id: str, *, attempts: int = 2) -> None:
+    """Park a task on attempts_exhausted with `attempts` spent rounds."""
+    q = TaskQueue(env.queue_path)
+    task = q.get(task_id)
+    task["status"] = "needs_human"
+    task["attempts"] = [
+        {"run_id": f"r{i}", "slice_id": task_id,
+         "started": f"2026-10-29T10:0{i}:00Z", "ended": f"2026-10-29T11:0{i}:00Z",
+         "outcome": "fail", "rounds": i + 1, "prompt_versions": {}, "skills": []}
+        for i in range(attempts)
+    ] + [{
+        "run_id": "rX", "slice_id": task_id,
+        "started": "2026-10-29T12:00:00Z", "ended": "2026-10-29T12:01:00Z",
+        "outcome": "escalated", "escalation": "attempts_exhausted",
+        "rounds": attempts + 1, "prompt_versions": {}, "skills": [],
+    }]
+    q.save()
+
+
+def test_attempts_exhausted_recover_refusals(tmp_path: Path):
+    """The reset is deliberately human-paced, exactly like the credential
+    exit: --evidence required, --reset-attempts required (without it the
+    command must refuse AND say why — a plain re-queue would leave the
+    budget spent and the next run would park straight back), interactive
+    y/N with no --yes, a decline writes nothing, and every other
+    escalation still has no owner word."""
+    from factory.approve import ApprovalDeclined, ApprovalError, recover_task
+    from factory.cli import main
+
+    others = [("T-4", "quota_exhausted"), ("T-5", "protected_path_touched")]
+    env = Env(tmp_path, tasks=[_task("T-1")]
+              + [_task(tid) for tid, _ in others])
+    _park_exhausted(env, "T-1")
+    for task_id, escalation in others:
+        _park_escalated(env, task_id, escalation)
+    queue = lambda: TaskQueue(env.queue_path)  # noqa: E731
+
+    # without --reset-attempts: refused, and the message must say why
+    with pytest.raises(ApprovalError, match="reset-attempts"):
+        recover_task(queue(), "T-1", evidence="environment bug, now fixed",
+                     confirm=lambda question: True)
+    # without evidence: refused
+    with pytest.raises(ApprovalError, match="evidence"):
+        recover_task(queue(), "T-1", reset_attempts=True,
+                     confirm=lambda question: True)
+    with pytest.raises(ApprovalError, match="evidence"):
+        recover_task(queue(), "T-1", reset_attempts=True, evidence="  ",
+                     confirm=lambda question: True)
+    # --yes: refused — the confirmation IS the gate
+    with pytest.raises(ApprovalError, match="interactive"):
+        recover_task(queue(), "T-1", reset_attempts=True, assume_yes=True,
+                     evidence="environment bug, now fixed")
+    assert main(["recover", "T-1", "--queue", str(env.queue_path),
+                 "--reset-attempts", "--yes",
+                 "--evidence", "x"]) == 1
+    # a decline writes nothing: status, history, no marker, no log entry
+    before_log = len(env.log("T-1").entries())
+    with pytest.raises(ApprovalDeclined):
+        recover_task(queue(), "T-1", reset_attempts=True,
+                     evidence="environment bug, now fixed",
+                     confirm=lambda question: False)
+    task = env.task("T-1")
+    assert task["status"] == "needs_human"
+    assert not task.get("attempt_resets"), "a decline wrote a reset marker"
+    assert len(task["attempts"]) == 3
+    assert len(env.log("T-1").entries()) == before_log
+
+    # every other escalation still refuses
+    for task_id, _ in others:
+        with pytest.raises(ApprovalError, match="not recoverable"):
+            recover_task(queue(), task_id, reset_attempts=True,
+                         evidence="looks fine", confirm=lambda question: True)
+        assert env.task(task_id)["status"] == "needs_human", task_id
+
+
+def test_attempts_reset_restores_budget_and_keeps_history(tmp_path: Path):
+    """The full story, end to end: a task burns max_attempts=2 and parks on
+    attempts_exhausted; the owner recovers it with evidence + --reset-attempts;
+    the next run actually RUNS (the budget counts only attempts after the
+    reset marker) and every pre-reset attempt record is still there."""
+    from factory.approve import recover_task
+    from factory.state import attempt_budget_used
+
+    env = Env(tmp_path, tasks=[_task(
+        "T-1", budget={"size": "S", "max_attempts": 2, "max_turns": 20,
+                       "wall_clock_min": 10})])
+    assert env.run(_FailingSeats()).outcome == "needs_human"
+    task = env.task("T-1")
+    assert task["attempts"][-1]["escalation"] == "attempts_exhausted"
+    spent = len(task["attempts"])
+    assert attempt_budget_used(task, "T-1") == spent  # the filter this fixes
+
+    assert recover_task(
+        TaskQueue(env.queue_path), "T-1", reset_attempts=True,
+        evidence="all 3 attempts died to the sandbox bind bug (PR #NN)",
+        confirm=lambda question: True, done_by="owner", factory_root=env.root,
+    ) == "ready"
+
+    task = env.task("T-1")
+    marker = task["attempt_resets"][-1]
+    assert marker["prior_attempts"] == spent
+    assert marker["evidence"] == "all 3 attempts died to the sandbox bind bug (PR #NN)"
+    assert marker["done_by"] == "owner"
+    assert marker["slice_id"] == "T-1"
+    assert len(task["attempts"]) == spent, "history was deleted"
+    assert attempt_budget_used(task, "T-1") == 0, "budget not restored"
+
+    # the audit trail: the progress log records evidence + who + how many
+    entry = [e for e in env.log("T-1").entries()
+             if e.get("outcome") == "recovered"][-1]
+    assert entry["escalation"] == "attempts_exhausted"
+    assert entry["attempts_reset"] == spent
+
+    # and the run loop proves it: the task runs again instead of parking
+    # on "attempt budget already spent before this run"
+    result = env.run(Seats())
+    assert result.outcome == "pr_opened", result
+    task = env.task("T-1")
+    assert len(task["attempts"]) == spent + 1  # history kept, one new attempt
+    assert task["attempts"][-1]["rounds"] == 1  # numbering restarted
+
+
+def test_attempts_reset_routes_blocked_and_is_state_gated(tmp_path: Path):
+    """The reset edge lives at the state layer, not the command: the
+    generic transition refuses an attempts_exhausted task, the dedicated
+    TaskQueue method is its only writer (blank evidence refused there
+    too), and routing matches every recovery writer (blocked on an open
+    dependency). The reset marker is append-only like attempts — a save
+    that would delete one is refused."""
+    from factory.state import TransitionError
+
+    env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2", depends_on=["T-3"]),
+                               _task("T-3")])
+    for task_id in ("T-1", "T-2"):
+        _park_exhausted(env, task_id)
+
+    with pytest.raises(TransitionError):
+        TaskQueue(env.queue_path).transition("T-1", "ready")
+
+    queue = TaskQueue(env.queue_path)
+    with pytest.raises(Exception, match="evidence"):
+        queue.recover_attempts("T-1", "   ")
+    assert env.task("T-1")["status"] == "needs_human", "blank evidence wrote"
+
+    assert TaskQueue(env.queue_path).recover_attempts(
+        "T-1", "env bug fixed", done_by="owner") == "ready"
+    assert env.task("T-1")["status"] == "ready"
+    # open dependency routes blocked, same rule as every recovery writer
+    assert TaskQueue(env.queue_path).recover_attempts(
+        "T-2", "env bug fixed", done_by="owner") == "blocked"
+    assert env.task("T-2")["status"] == "blocked"
+
+    # the marker is append-only: removing it (a budget-stealing rewrite)
+    # is refused exactly like editing an attempt record
+    q = TaskQueue(env.queue_path)
+    q.get("T-1")["attempt_resets"] = []
+    from factory.state import StateError
+    with pytest.raises(StateError, match="append-only"):
+        q.save()
+
+    # the ineligible still refuse at the state layer
+    _park_escalated(env, "T-3", "protected_path_touched")
+    with pytest.raises(TransitionError):
+        TaskQueue(env.queue_path).recover_attempts("T-3", "no")
+
+
+def test_attempt_resets_marker_schema(tmp_path: Path):
+    """Red-first schema addition: the marker is a first-class task field —
+    a well-formed marker loads through F-02, a malformed one (missing
+    evidence, or a stray key) refuses the whole queue."""
+    env = Env(tmp_path, tasks=[_task("T-1")])
+    _park_exhausted(env, "T-1")
+
+    marker = {"at": "2026-10-29T22:00:00Z", "evidence": "env bug fixed",
+              "done_by": "owner", "slice_id": "T-1", "prior_attempts": 3}
+    q = TaskQueue(env.queue_path)
+    q.get("T-1")["attempt_resets"] = [marker]
+    q.save()  # validates: a legal marker persists
+
+    from factory.contract import ContractError, load_tasks
+    bad = json.loads(env.queue_path.read_text())
+    bad["tasks"][0]["attempt_resets"] = [{**marker, "evidence": ""}]
+    env.queue_path.write_text(json.dumps(bad))
+    with pytest.raises(ContractError):
+        load_tasks(env.queue_path)
+    bad["tasks"][0]["attempt_resets"] = [{**marker, "surprise": 1}]
+    env.queue_path.write_text(json.dumps(bad))
+    with pytest.raises(ContractError):
+        load_tasks(env.queue_path)
+
+
+def test_status_counts_attempts_across_a_reset(tmp_path: Path):
+    """F-11's measures are spend and history, not budget: a reset restores
+    attempts without hiding them — every pre-reset attempt still counts in
+    interventions, rounds and the raw attempt count."""
+    from factory.status import compute_metrics
+
+    env = Env(tmp_path, tasks=[_task("T-1")])
+    _park_exhausted(env, "T-1")
+    q = TaskQueue(env.queue_path)
+    task = q.get("T-1")
+    task["status"] = "ready"
+    task["attempt_resets"] = [{
+        "at": "2026-10-29T22:00:00Z", "evidence": "env bug fixed",
+        "done_by": "owner", "slice_id": "T-1",
+        "prior_attempts": len(task["attempts"]),
+    }]
+    q.save()
+
+    metrics = compute_metrics({"tasks": [env.task("T-1")]})
+    assert metrics["attempts"] == 3
+    assert metrics["rounds"] == sum(
+        a.get("rounds") or 0 for a in env.task("T-1")["attempts"])
 
 
 def test_review35_a_merged_escalated_pr_returns_to_review(tmp_path: Path):

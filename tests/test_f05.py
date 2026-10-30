@@ -2014,3 +2014,215 @@ def test_a_venv_interpreter_imports_from_its_own_site_packages(
         f"a sibling file in the denied home was readable\n"
         f"{proc.stdout}{proc.stderr}"
     )
+
+
+# --- F-31 run blocker: sandbox.allow_local_binding, GATE RUNNER only ---------
+#
+# F-31's dashboard tests bind 127.0.0.1 in the gate sandbox and every bind
+# died at EPERM (Errno 1) — srt's Seatbelt profile denies network-bind by
+# default. The pinned srt supports network.allowLocalBinding, but its macOS
+# rules grant more than loopback binds: bind on ANY interface, inbound from
+# ANY origin, and outbound connect to every host loopback port (DevTools
+# ports of a logged-in browser, local databases, dev and MCP servers). So
+# the profile opt-in is scoped to the gate runner's settings alone (review
+# decision on #76): gate commands run the project's fixed commands after
+# L0's diff policy, while the implementer/reviewer sessions (and the
+# importer, which is a reviewer seat) run model-written code with a
+# model-chosen goal — they never get the reach, whatever the profile says.
+
+
+def test_allow_local_binding_is_absent_by_default(tmp_path: Path):
+    """The opt-in is deny-by-default: a profile that says nothing must
+    produce settings whose network block carries NO allowLocalBinding key
+    (absent, not false — srt treats the key's presence as its own signal),
+    gate or session alike."""
+    run, _, _ = _make_run(tmp_path)
+    settings = build_settings({}, run.root, model_endpoint=MODEL_ENDPOINT)
+    assert "allowLocalBinding" not in settings["network"], settings["network"]
+
+
+def test_local_binding_needs_the_explicit_gate_request(tmp_path: Path):
+    """The profile opt-in alone is NOT enough — that is the whole review
+    decision. The session seats (implementer, reviewer, the importer's
+    reviewer seat, the SDK probe) call build_settings without
+    ``local_binding``; with the profile opted in their settings must still
+    carry no key. Only the explicit request (the gate path, _gate_settings)
+    turns the opt-in into srt's allowLocalBinding."""
+    run, _, _ = _make_run(tmp_path)
+    opted_in = {"sandbox": {"allow_local_binding": True}}
+
+    # the session shape: exactly how factory/session.py calls it
+    settings = build_settings(opted_in, run.root, model_endpoint=MODEL_ENDPOINT)
+    assert "allowLocalBinding" not in settings["network"], (
+        "a session seat would get host-loopback reach from the profile alone"
+    )
+
+    # the gate shape: the explicit request the opt-in authorizes
+    settings = build_settings(opted_in, run.root, model_endpoint=MODEL_ENDPOINT,
+                              local_binding=True)
+    assert settings["network"]["allowLocalBinding"] is True
+
+    # the request without the opt-in grants nothing, and the other
+    # spellings must not smuggle the key in either way
+    for profile in ({"sandbox": {"allow_local_binding": False}},
+                    {"sandbox": {}},
+                    {"allow_local_binding": True}):
+        for kwargs in ({}, {"local_binding": True}):
+            settings = build_settings(profile, run.root,
+                                      model_endpoint=MODEL_ENDPOINT, **kwargs)
+            assert "allowLocalBinding" not in settings["network"], (profile, kwargs)
+
+
+def test_session_and_importer_sources_never_request_local_binding():
+    """A mechanical tripwire on the review decision: the session module
+    (every session seat, the importer's reviewer seat included) must never
+    pass local_binding, whatever the profile says. The seats run
+    model-written code with a model-chosen goal; host-loopback reach
+    (browsers' DevTools ports, databases, dev/MCP servers) is the gate
+    runner's alone."""
+    for name in ("factory/session.py", "factory/importer.py"):
+        source = (REPO_ROOT / name).read_text()
+        assert "local_binding" not in source, (
+            f"{name} requests local binding — session seats must never get "
+            "it (review decision on #76); see test_local_binding_needs_the_"
+            "explicit_gate_request"
+        )
+
+
+def test_gate_settings_carry_allow_local_binding(tmp_path: Path):
+    """The gate runner is the seat that lost F-31: _gate_settings feeds the
+    L0/L1 commands' sandbox (the stale-base re-validation clone uses the
+    same settings), so the profile opt-in must survive that path — and
+    ONLY that path (review decision on #76)."""
+    import factory.orchestrator as orch
+    from factory.runs import RunDir
+
+    run, root, _ = _make_run(tmp_path)
+    clean = RunDir(project="fixture", run_id=run.root.name, root=run.root,
+                   settings_path=run.settings_path)
+    orch._gate_settings(
+        {"sandbox": {"allow_local_binding": True}}, clean, root
+    )
+    gate_settings = json.loads(run.settings_path.read_text())
+    assert gate_settings["network"]["allowLocalBinding"] is True
+
+    # and the gate grants nothing without the opt-in
+    orch._gate_settings({"sandbox": {"allow_local_binding": False}}, clean, root)
+    gate_settings = json.loads(run.settings_path.read_text())
+    assert "allowLocalBinding" not in gate_settings["network"]
+
+
+_BIND_CONNECT_SCRIPT = textwrap.dedent(
+    """
+    import socket, sys
+    port = int(sys.argv[1])
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        srv.bind(("127.0.0.1", 0))
+        print("bind:ok", flush=True)
+    except PermissionError as exc:
+        print(f"bind:EPERM {exc.errno}", flush=True)
+    srv.close()
+    cli = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    cli.settimeout(10)
+    try:
+        cli.connect(("127.0.0.1", port))
+        print("conn:ok", flush=True)
+    except PermissionError as exc:
+        print(f"conn:EPERM {exc.errno}", flush=True)
+    except OSError as exc:
+        print(f"conn:{type(exc).__name__} {exc.errno}", flush=True)
+    """
+)
+
+
+def test_local_binding_session_denied_gate_allowed_real_srt(tmp_path: Path):
+    """The real-srt proof of the review decision, on both axes srt's
+    allowLocalBinding actually grants (bind AND outbound connect to a host
+    loopback port — the reach a session seat must never get):
+
+    - session-shaped settings (factory/session.py's exact build_settings
+      call, profile opted in, no local_binding): binding 127.0.0.1:0 fails
+      EPERM and connecting to a HOST listener on 127.0.0.1 fails.
+    - gate-shaped settings (same profile, local_binding=True — what
+      _gate_settings writes): both succeed — F-31's dashboard tests bind,
+      and only the gate runs them.
+
+    The host listener is bound by the test process itself (outside the
+    sandbox) and left listening on its backlog, so connect() has a real
+    target: on macOS that is exactly the DevTools-port/local-database
+    reach the review is withholding from sessions.
+
+    Linux (pinned srt source): bwrap never reads allowLocalBinding — the
+    sandbox is its own network namespace. Bind inside it works under both
+    shapes (nothing outside can reach it), and the host listener is in
+    ANOTHER namespace, so connect fails under both shapes. The test pins
+    that asymmetry; macOS is where both decisions are observable."""
+    import socket as _socket
+
+    listener = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    host_port = listener.getsockname()[1]
+
+    run, _, _ = _make_run(tmp_path)  # session-shaped: profile says nothing
+    src2 = tmp_path / "src2"
+    src2.mkdir()
+    root2 = tmp_path / "root2"
+    gate_run = create_run("fixture", _fixture_repo(src2), factory_root=root2)
+    opted_in = {"sandbox": {"allow_local_binding": True}}
+    write_settings(
+        # the session shape: the profile opts in, the seat never asks —
+        # exactly factory/session.py's build_settings call
+        build_settings(opted_in, gate_run.root, model_endpoint=MODEL_ENDPOINT),
+        gate_run.settings_path,
+    )
+    session_proc = run_sandboxed(
+        _child(_BIND_CONNECT_SCRIPT, [str(host_port)]),
+        gate_run.root, gate_run.settings_path, timeout=120,
+    )
+
+    gate_settings = build_settings(opted_in, run.root,
+                                   model_endpoint=MODEL_ENDPOINT,
+                                   local_binding=True)
+    write_settings(gate_settings, run.settings_path)
+    gate_proc = run_sandboxed(
+        _child(_BIND_CONNECT_SCRIPT, [str(host_port)]),
+        run.root, run.settings_path, timeout=120,
+    )
+
+    def legs(proc):
+        return dict(
+            line.split(":", 1) for line in proc.stdout.splitlines()
+            if line.startswith(("bind:", "conn:"))
+        )
+
+    session, gate = legs(session_proc), legs(gate_proc)
+    if sys.platform == "darwin":
+        assert session["bind"].startswith("EPERM"), (
+            f"a session seat could bind: {session}\n{session_proc.stdout}"
+            f"{session_proc.stderr}"
+        )
+        assert session["conn"].startswith("EPERM"), (
+            f"a session seat could reach a host loopback port: {session}\n"
+            f"{session_proc.stdout}{session_proc.stderr}"
+        )
+        assert gate["bind"] == "ok", (
+            f"the gate could not bind: {gate}\n{gate_proc.stdout}"
+            f"{gate_proc.stderr}"
+        )
+        assert gate["conn"] == "ok", (
+            f"the gate could not connect to the host listener: {gate}\n"
+            f"{gate_proc.stdout}{gate_proc.stderr}"
+        )
+    else:
+        # Linux netns: bind is namespace-local and works under both shapes;
+        # the host listener is unreachable from inside the namespace under
+        # both shapes (ECONNREFUSED — nothing answers inside the netns).
+        assert session["bind"] == "ok" and gate["bind"] == "ok", (
+            session, gate, session_proc.stdout, gate_proc.stdout
+        )
+        assert session["conn"] != "ok" and gate["conn"] != "ok", (
+            "the host loopback listener must be unreachable from inside "
+            f"the Linux netns: {session} / {gate}"
+        )

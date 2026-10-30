@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-29T15:25:42Z",
+  "updated_at": "2026-10-29T21:14:05Z",
   "tasks": [
     {
       "id": "F-00",
@@ -2360,6 +2360,48 @@
               "name": "credential_added",
               "kind": "builtin",
               "verdict": "fail"
+            },
+            {
+              "name": "lint_suppression_added",
+              "kind": "builtin",
+              "verdict": "pass",
+              "detail": "no risk path touched"
+            },
+            {
+              "name": "skip_marker_added",
+              "kind": "builtin",
+              "verdict": "pass"
+            }
+          ]
+        },
+        {
+          "run_id": "20261029T203213Z-9c95a5",
+          "slice_id": "F-31",
+          "started": "2026-10-29T20:32:15Z",
+          "ended": "2026-10-29T21:14:05Z",
+          "outcome": "escalated",
+          "rounds": 3,
+          "turns": 109,
+          "input_tokens": 153940,
+          "output_tokens": 72878,
+          "prompt_versions": {
+            "implementer": "944cbbf3b8822b3a9986e3325fa3011fa9d8ba455b3cc5c3fab61e76507511f5",
+            "reviewer": "c6d9f701b82dc9d79e90786f62b21f1dde6a0f8476835232efae32bb48f423c1"
+          },
+          "skills": [],
+          "model": "implementer=claude-opus-5-5",
+          "validator_report": "/Users/anthonyforan/factory/reports/software-factory/F-31/20261029T203213Z-9c95a5-a3.json",
+          "escalation": "attempts_exhausted",
+          "sentinels": [
+            {
+              "name": "assertion_removed",
+              "kind": "builtin",
+              "verdict": "pass"
+            },
+            {
+              "name": "credential_added",
+              "kind": "builtin",
+              "verdict": "pass"
             },
             {
               "name": "lint_suppression_added",

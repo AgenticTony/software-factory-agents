@@ -122,4 +122,11 @@ network_allowlist:
   - fonts.googleapis.com   # next/font/google fetches at build time
   - fonts.gstatic.com
 
+# Off until a JobFinderOS readiness run inside the sandbox shows a gate
+# test actually binds a port (FastAPI's TestClient runs ASGI in-process;
+# F-31's failure mode is not presumed here). Gate runner only either way:
+# the session seats never get host-loopback reach (review decision on #76).
+sandbox:
+  allow_local_binding: false
+
 cross_repo: []

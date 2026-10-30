@@ -87,21 +87,29 @@ def build_parser() -> argparse.ArgumentParser:
         "recover", help="queue a fix round for a parked F-26 escalation")
     recover.add_argument(
         "task_id",
-        help="task id to recover (stale_base/pr_closed, or "
-             "credential_added with --evidence)")
+        help="task id to recover (stale_base/pr_closed, "
+             "credential_added with --evidence, or attempts_exhausted "
+             "with --evidence and --reset-attempts)")
     recover.add_argument(
         "--yes", action="store_true",
         help="non-interactive confirmation (never allowed for "
-             "credential_added)",
+             "credential_added or attempts_exhausted)",
     )
     recover.add_argument(
         "--evidence", default=None,
-        help="required for credential_added: what you checked (e.g. "
-             "'test fixture, not a real credential' or 'rotated')",
+        help="required for credential_added/attempts_exhausted: what you "
+             "checked (e.g. 'test fixture, not a real credential' or "
+             "'all attempts died to the sandbox bind bug, fixed in PR #NN')",
+    )
+    recover.add_argument(
+        "--reset-attempts", action="store_true",
+        help="required for attempts_exhausted: grant a fresh attempt "
+             "budget (history is kept; the budget counts only attempts "
+             "after the reset marker)",
     )
     recover.add_argument(
         "--done-by", default=None,
-        help="your name for the credential-recovery log entry "
+        help="your name for the recovery log entry "
              "(default: git user.name)",
     )
     recover.add_argument(
@@ -239,7 +247,8 @@ def _run_recover(args: argparse.Namespace) -> int:
     try:
         status = recover_task(
             TaskQueue(args.queue), args.task_id, assume_yes=args.yes,
-            evidence=args.evidence, done_by=args.done_by,
+            evidence=args.evidence, reset_attempts=args.reset_attempts,
+            done_by=args.done_by,
             factory_root=(Path(args.factory_root) if args.factory_root
                           else None),
         )
