@@ -82,6 +82,7 @@ from factory.l2 import (
     L2Finding,
     apply_convergence,
     apply_vote,
+    final_review_verdict,
     merge_reviews,
     parse_verdict,
     parse_verifier_vote,
@@ -477,7 +478,10 @@ def _numbered_findings(reports: dict, extra: list[str],
     human's read.
     """
     lines: list[str] = list(extra)
-    for layer in ("L0", "L1", "L2"):
+    # F-41: a round that ran the final review stores its delta review as
+    # "L2-delta" (empty findings by then — it passed — but its drops are
+    # the record's to keep, exactly like the L2 list).
+    for layer in ("L0", "L1", "L2", "L2-delta"):
         report = reports.get(layer) or {}
         for finding in report.get("findings") or []:
             where = ""
@@ -524,6 +528,25 @@ def _review_drops(l2) -> list | None:
                 drop[key] = finding[key]
         drops.append(drop)
     return drops
+
+
+def _final_review_field(l2, repeat: bool) -> dict:
+    """The attempt record's ``final_review`` summary (F-41 AC-5): the
+    final full review's verdict, its findings, and whether it was a
+    repeat after a failed one — the attempt record's own proof the final
+    review ran, alongside the trace's ``L2-final`` phase. Absent fields
+    are omitted (the schema has no nullable keys); a parse-error round
+    carries its verdict with no findings, the parse_error naming why."""
+    findings = []
+    for finding in l2.findings:
+        if not isinstance(finding, L2Finding):
+            continue
+        entry = {"text": finding.text}
+        for key in ("id", "axis", "severity", "file", "line", "reported_by"):
+            if getattr(finding, key, None) is not None:
+                entry[key] = getattr(finding, key)
+        findings.append(entry)
+    return {"verdict": l2.verdict, "repeat": repeat, "findings": findings}
 
 
 def _fix_findings(reports: dict, extra: list[str], l2, reviewed: bool,
@@ -1771,6 +1794,15 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
     last_reviewed: str | None = None  # the head sha L2 last saw
     last_valid_l2: dict | None = None  # the last parseable verdict's report
     prev_findings: list[str] | None = None  # the failed round's fix list
+    # F-41: the final full review's state. ``final_repeats_left`` bounds
+    # how often a failed final review may send its findings to one more
+    # implementer round and repeat (config, default 1); when it is spent
+    # the task escalates ``review_not_converging`` — nothing publishes
+    # with an unresolved blocking or major finding. ``final_pending``
+    # marks the round that owes the repeat: its review IS the repeat,
+    # over the full diff, not another delta pass.
+    final_repeats_left = ctx.config.final_review_repeats
+    final_pending = False
     round_no = 0
 
     work = create_run(project, source, factory_root=ctx.factory_root, ref=default_branch)
@@ -1885,6 +1917,9 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
             opened = False
             round_keys: list = []  # this round's L2 finding keys (F-23)
             reviewed = False  # did this round's review produce a verdict?
+            delta = None  # this round's review delta (None = full diff)
+            final_field = None  # the final review's attempt-record summary
+            final_exhausted = False  # a failed final review, repeats spent
             try:
                 # ---- implementer
                 # The fix block below carries the newest entry's findings,
@@ -1967,7 +2002,11 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                             runner=runner, timeout_sec=ctx.gate_timeout_sec)
                                 reports["L1"] = l1.to_dict()
                                 trace.gate_checks(reports["L1"])  # F-30 AC-3
-                        if l1 is not None and l1.verdict == "pass":
+                        # A round that owes a final-review repeat (F-41 AC-3)
+                        # skips its regular review entirely: the repeat is
+                        # the round's review, over the full diff.
+                        if (l1 is not None and l1.verdict == "pass"
+                                and not final_pending):
                             # ---- reviewer (a session start: the checks apply)
                             with trace.phase("L2") as review_spend:
                                 if in_peak_window(ctx.now(), ctx.config.peak_window):
@@ -2260,6 +2299,304 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                     for key in round_keys:
                                         prior[key] = head_sha
                                     last_reviewed = head_sha
+                        # ---- F-41: the final full review ----
+                        # A fix round's review scopes to the delta (F-23), so
+                        # a defect in a file the fix rounds never touched —
+                        # flagged by nobody in round one, invisible to L0/L1
+                        # because nothing tests it — can ride a passing delta
+                        # review all the way to publish (F-16's run did).
+                        # When this attempt has already reviewed once and the
+                        # round's delta review passed, ONE more full review
+                        # runs before anything publishes (AC-1); a round that
+                        # owes a repeat (AC-3) runs it as its only review. A
+                        # round whose review was already full — the attempt's
+                        # first, or the history-rewrite fallback — needs no
+                        # second one.
+                        if final_pending or (
+                            reviewed and l2 is not None
+                            and l2.verdict == "pass" and delta is not None
+                        ):
+                            with trace.phase("L2-final") as final_spend:
+                                if in_peak_window(ctx.now(), ctx.config.peak_window):
+                                    # Same rule as the regular review: the
+                                    # window stops the next session start, the
+                                    # attempt is recorded (aborted — the
+                                    # window is nobody's fault) and the next
+                                    # session is told the change existed and
+                                    # was discarded with the run.
+                                    path = _store(reports_dir, work.run_id,
+                                                  attempt_no, reports)
+                                    attempt = attempt_record(
+                                        attempt_no, started, "aborted", records,
+                                        path,
+                                        note=(f"peak window before the final review; "
+                                              f"the change (head {head_sha[:12]}, "
+                                              f"passed L0, L1 and the delta review) "
+                                              f"was discarded with the run"),
+                                    )
+                                    finish(attempt, "ready", [
+                                        f"1. peak window stopped attempt "
+                                        f"{attempt_no} before the final review: its "
+                                        f"change (head {head_sha[:12]}) had passed "
+                                        f"L0, L1 and the delta review and was "
+                                        f"discarded with the run — redo it",
+                                    ])
+                                    return RunResult("peak_window", task_id,
+                                                     reports=reports)
+                                remaining_final = (
+                                    budget["wall_clock_min"]
+                                    - session_seconds / 60.0
+                                )
+                                if remaining_final <= 0:
+                                    # AC-4: a run never skips the final review
+                                    # to publish in time — the budget that
+                                    # cannot fit it ends the task instead.
+                                    path = _store(reports_dir, work.run_id,
+                                                  attempt_no, reports)
+                                    attempt = attempt_record(
+                                        attempt_no, started, "escalated", records,
+                                        path, escalation="budget_exhausted",
+                                        note="wall-clock budget spent before the "
+                                             "final review",
+                                    )
+                                    finish(attempt, "needs_human", [
+                                        "1. wall-clock budget spent before the "
+                                        "final review",
+                                    ])
+                                    return RunResult("needs_human", task_id,
+                                                     escalation="budget_exhausted",
+                                                     reports=reports)
+                                diff = hardened_git(clean.root, "diff", "--no-color",
+                                                     "--no-ext-diff",
+                                                     f"{base_sha}...{head_sha}")
+                                # AC-1: the complete diff is the scope — no
+                                # delta section, no carried-findings
+                                # suppression. This is the round-one prompt
+                                # shape, in fresh contexts, at the end.
+                                final_prompt = _review_prompt(
+                                    task, diff, reports["L0"], reports["L1"])
+                                remaining_turns = (
+                                    budget["max_turns"] - _turns_spent(records)
+                                )
+                                reviewer_share = (
+                                    remaining_turns // ctx.config.reviewers
+                                )
+                                if reviewer_share < _REVIEW_TURN_FLOOR:
+                                    path = _store(reports_dir, work.run_id,
+                                                  attempt_no, reports)
+                                    attempt = attempt_record(
+                                        attempt_no, started, "escalated", records,
+                                        path, escalation="budget_exhausted",
+                                        note=(f"turn budget spent before the final "
+                                              f"review fan-out: {remaining_turns} "
+                                              f"of {budget['max_turns']} turns left, "
+                                              f"{reviewer_share} per reviewer session"),
+                                    )
+                                    finish(attempt, "needs_human", [
+                                        f"1. turn budget spent before the final "
+                                        f"review fan-out ({remaining_turns} turns "
+                                        f"left for {ctx.config.reviewers} reviewer "
+                                        f"sessions)",
+                                    ])
+                                    return RunResult(
+                                        "needs_human", task_id,
+                                        escalation="budget_exhausted",
+                                        reports=reports,
+                                    )
+                                t0 = time.monotonic()
+                                final_reviews = run_sessions_parallel(
+                                    [("reviewer", final_prompt)]
+                                    * ctx.config.reviewers,
+                                    clean.root, profile,
+                                    runner=ctx.session_runner,
+                                    factory_root=ctx.factory_root,
+                                    max_turns=reviewer_share,
+                                    timeout_min=remaining_final,
+                                    protected=protected,
+                                    system_prompt=reviewer_system,
+                                    srt_bin_path=ctx.srt_bin_path,
+                                    run_id=work.run_id, task_id=task_id,
+                                    trace_sink=trace.append,  # F-30
+                                    toolkit=toolkit_reviewer,  # F-22: narrowed
+                                )
+                                session_seconds += time.monotonic() - t0
+                                records.extend(final_reviews)
+                                for review in final_reviews:
+                                    final_spend.add(review)
+                                    _log_vents(log, review, "reviewer",  # F-27
+                                               work.run_id, task_id)
+                                    trace.session_end(review, "reviewer")  # F-30
+                                quota = next(
+                                    (r for r in final_reviews if _is_quota(r)), None
+                                )
+                                if quota is not None:
+                                    attempt = attempt_record(
+                                        attempt_no, started, "aborted", records, None,
+                                        escalation="quota_exhausted", note=quota.reason,
+                                    )
+                                    finish(attempt, "ready",
+                                           [f"1. quota: {quota.reason}"])
+                                    return RunResult("quota_exhausted", task_id,
+                                                     escalation="quota_exhausted",
+                                                     reports=reports)
+                                for review in final_reviews:
+                                    if review.status != "completed":
+                                        extra_findings.append(
+                                            f"[session {review.status}] a final-review "
+                                            f"session ended: {review.reason}"
+                                        )
+                                union = merge_reviews([
+                                    parse_verdict(
+                                        review.result if review.status == "completed"
+                                        else None)
+                                    for review in final_reviews
+                                ])
+                                l2 = union
+                                if union.parse_error is None and union.findings:
+                                    remaining_verifier = (
+                                        budget["wall_clock_min"]
+                                        - session_seconds / 60.0
+                                    )
+                                    verifier_turns = (
+                                        budget["max_turns"] - _turns_spent(records)
+                                    )
+                                    if remaining_verifier <= 0 or (
+                                        verifier_turns < _REVIEW_TURN_FLOOR
+                                    ):
+                                        spent = (
+                                            "wall-clock" if remaining_verifier <= 0
+                                            else "turn"
+                                        )
+                                        path = _store(reports_dir, work.run_id,
+                                                      attempt_no, reports)
+                                        attempt = attempt_record(
+                                            attempt_no, started, "escalated", records,
+                                            path, escalation="budget_exhausted",
+                                            note=f"{spent} budget spent before the "
+                                                 "final review's verifier pass",
+                                        )
+                                        finish(attempt, "needs_human", [
+                                            f"1. {spent} budget spent before the "
+                                            "final review's verifier pass",
+                                        ])
+                                        return RunResult(
+                                            "needs_human", task_id,
+                                            escalation="budget_exhausted",
+                                            reports=reports,
+                                        )
+                                    verifier_prompt = _verifier_prompt(
+                                        task, diff, union.findings)
+                                    t0 = time.monotonic()
+                                    verifier = ctx.session_runner(
+                                        "verifier", verifier_prompt,
+                                        clean.root, profile,
+                                        factory_root=ctx.factory_root,
+                                        max_turns=verifier_turns,
+                                        timeout_min=remaining_verifier,
+                                        protected=protected,
+                                        system_prompt=verifier_system,
+                                        srt_bin_path=ctx.srt_bin_path,
+                                        run_id=work.run_id, task_id=task_id,
+                                        trace_sink=trace.append,  # F-30
+                                        # The verifier judges the reviewers'
+                                        # findings against the same read-only
+                                        # evidence surface they had (F-22 x
+                                        # F-38): the reviewer's narrowed
+                                        # toolkit, never the implementer's.
+                                        toolkit=toolkit_reviewer,
+                                    )
+                                    session_seconds += time.monotonic() - t0
+                                    records.append(verifier)
+                                    final_spend.add(verifier)
+                                    _log_vents(log, verifier, "verifier",  # F-27
+                                               work.run_id, task_id)
+                                    trace.session_end(verifier, "verifier")  # F-30
+                                    if _is_quota(verifier):
+                                        attempt = attempt_record(
+                                            attempt_no, started, "aborted", records,
+                                            None, escalation="quota_exhausted",
+                                            note=verifier.reason,
+                                        )
+                                        finish(attempt, "ready",
+                                               [f"1. quota: {verifier.reason}"])
+                                        return RunResult(
+                                            "quota_exhausted", task_id,
+                                            escalation="quota_exhausted",
+                                            reports=reports,
+                                        )
+                                    if verifier.status != "completed":
+                                        extra_findings.append(
+                                            f"[session {verifier.status}] the "
+                                            f"final review's verifier session ended: "
+                                            f"{verifier.reason} — nothing was "
+                                            "dropped; every finding stands"
+                                        )
+                                    l2 = apply_vote(
+                                        union,
+                                        parse_verifier_vote(
+                                            verifier.result
+                                            if verifier.status == "completed"
+                                            else None,
+                                            union.findings,
+                                        ),
+                                        reviewers=ctx.config.reviewers,
+                                    )
+                                # AC-2: the F-23 delta rules do not apply —
+                                # the full diff is the scope, nothing is out
+                                # of it and no missed_earlier is owed — so
+                                # convergence runs in full-diff mode; only a
+                                # surviving blocking or major finding fails
+                                # the final review (a declared fail alone
+                                # does not: minors reach the PR body within
+                                # the nit budget).
+                                l2 = final_review_verdict(apply_convergence(
+                                    l2, prior, frozenset(), delta_mode=False))
+                                if reports.get("L2") is not None:
+                                    # The round's delta review stays on the
+                                    # record; the final review is the
+                                    # authoritative L2 from here (AC-5).
+                                    reports["L2-delta"] = reports["L2"]
+                                reports["L2"] = l2.to_dict()
+                                trace.gate_checks(reports["L2"])  # F-30 AC-3
+                                reviewed = (
+                                    all(r.status == "completed"
+                                        for r in final_reviews)
+                                    and l2.parse_error is None
+                                )
+                                final_field = _final_review_field(
+                                    l2, repeat=final_pending)
+                                if reviewed:
+                                    last_valid_l2 = l2.to_dict()
+                                if l2.verdict == "pass":
+                                    final_pending = False
+                                else:
+                                    # The findings are the next round's work
+                                    # (AC-3): seed the convergence state
+                                    # exactly as a failed review round does,
+                                    # and either spend one of the bounded
+                                    # repeats or end the task — a loop of
+                                    # failed final reviews is the F-23
+                                    # bounce, one layer up.
+                                    if reviewed:
+                                        round_keys = [
+                                            f.key for f in l2.findings
+                                            if isinstance(f, L2Finding) and f.key
+                                        ]
+                                        raised = [
+                                            {"key": f.key, "file": f.file,
+                                             "severity": f.severity,
+                                             "text": f.text}
+                                            for f in l2.findings
+                                            if isinstance(f, L2Finding)
+                                        ]
+                                        for key in round_keys:
+                                            prior[key] = head_sha
+                                        last_reviewed = head_sha
+                                    if final_repeats_left > 0:
+                                        final_repeats_left -= 1
+                                        final_pending = True
+                                    else:
+                                        final_exhausted = True
                         changed = [c.path for c in diff_name_status(clean.root, base_sha, head_sha)]
                     finally:
                         cleanup_run(clean)
@@ -2293,7 +2630,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                         opened = True
                         attempt = attempt_record(attempt_no, started, "pass", records, path,
                                                  pr=url, sentinels=list(l0.sentinel_results),
-                                                 review_drops=_review_drops(l2))
+                                                 review_drops=_review_drops(l2),
+                                                 final_review=final_field)
                         queue.append_attempt(task_id, attempt)
                         # A passed round's findings were accepted as non-blocking:
                         # recording their keys would poison a later fix round
@@ -2325,6 +2663,29 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                         escalation="review_not_converging", note=note,
                         sentinels=list(l0.sentinel_results) if l0 is not None else None,
                         review_drops=_review_drops(l2),
+                        final_review=final_field,
+                    )
+                    finish(attempt, "needs_human", findings, finding_keys=round_keys)
+                    return RunResult("needs_human", task_id,
+                                     escalation="review_not_converging", reports=reports)
+
+                # F-41 AC-3: a failed final review whose repeat budget is
+                # spent escalates here — before the attempt accounting,
+                # because another implementer round is exactly what the
+                # bound exists to refuse. Nothing is published with an
+                # unresolved blocking or major finding.
+                if final_exhausted:
+                    attempt = attempt_record(
+                        attempt_no, started, "escalated", records, path,
+                        escalation="review_not_converging",
+                        note=("the final full review failed and its repeat "
+                              "budget is spent (final_review_repeats="
+                              f"{ctx.config.final_review_repeats}): an "
+                              "unresolved blocking or major finding stands, "
+                              "so nothing was published"),
+                        sentinels=list(l0.sentinel_results) if l0 is not None else None,
+                        review_drops=_review_drops(l2),
+                        final_review=final_field,
                     )
                     finish(attempt, "needs_human", findings, finding_keys=round_keys)
                     return RunResult("needs_human", task_id,
@@ -2337,6 +2698,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                         escalation="attempts_exhausted",
                         sentinels=list(l0.sentinel_results) if l0 is not None else None,
                         review_drops=_review_drops(l2),
+                        final_review=final_field,
                     )
                     finish(attempt, "needs_human", findings, finding_keys=round_keys)
                     return RunResult("needs_human", task_id, escalation="attempts_exhausted",
@@ -2345,6 +2707,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                     attempt_no, started, "fail", records, path,
                     sentinels=list(l0.sentinel_results) if l0 is not None else None,
                     review_drops=_review_drops(l2),
+                    final_review=final_field,
                 )
                 finish(attempt, None, findings, finding_keys=round_keys)
                 prev_findings = _fix_findings(

@@ -41,8 +41,11 @@ are dropped (the linter owns style).
 The budget limits noise, not the verdict. The verdict follows the
 reviewer prompt's rules: default FAIL, a `blocking` finding fails, and
 FAIL stands without one when the evidence for an acceptance item isn't
-there. Nits alone never turn a pass into a fail — do not manufacture a
-blocking finding to be thorough, and do not inflate a nit to `major`.
+there. A surviving `major` finding fails the round exactly as a
+`blocking` one does (F-41): no PR opens with one, and a declared pass
+does not override it. Nits alone never turn a pass into a fail — do not
+manufacture a blocking finding to be thorough, and do not inflate a nit
+to `major`.
 
 ## The bug class beats the bug instance
 

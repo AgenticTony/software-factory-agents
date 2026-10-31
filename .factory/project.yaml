@@ -137,6 +137,9 @@ paths:
     # test_f28 precedent) — this PR is the owner-reviewed interactive
     # build, so the file is protected from the day it exists.
     - "tests/test_f38.py"
+    # F-41: same precedent — the final-review contract tests land with
+    # the work order, protected from the day they exist.
+    - "tests/test_f41.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 

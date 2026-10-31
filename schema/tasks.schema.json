@@ -90,6 +90,33 @@
         "prompt_versions": { "type": "object", "description": "seat -> prompt content hash (F-09); used for credit assignment in F-19", "additionalProperties": { "type": "string" } },
         "skills": { "type": "array", "items": { "type": "string" }, "description": "Skills loaded in the session, name@version" },
         "note": { "type": "string" },
+        "final_review": {
+          "type": "object",
+          "required": ["verdict", "findings"],
+          "additionalProperties": false,
+          "description": "F-41: the final full review after fix rounds, when one ran in this attempt — its verdict, its findings, and whether it was a repeat after a failed one. Absent when no final review ran (a first-round pass skips it: that review was already full).",
+          "properties": {
+            "verdict": { "enum": ["pass", "fail"] },
+            "repeat": { "type": "boolean", "description": "True when this final review repeated a failed one (AC-3's bounded repeat)." },
+            "findings": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["text"],
+                "additionalProperties": false,
+                "properties": {
+                  "id": { "type": "string" },
+                  "axis": { "type": "string" },
+                  "severity": { "type": "string" },
+                  "file": { "type": "string" },
+                  "line": { "type": "integer" },
+                  "text": { "type": "string" },
+                  "reported_by": { "type": "array", "items": { "type": "integer" }, "description": "1-based reviewer numbers that reported the finding." }
+                }
+              }
+            }
+          }
+        },
         "review_drops": {
           "type": "array",
           "description": "F-38: findings the L2 verifier voted out or the nit budget capped, each with its drop reason — the reviewer noise the verifier removed, in the attempt record so F-19 can measure it. Deliberately NOT rendered into the PR body (the stored validator report carries the same ledger for audit).",

@@ -53,7 +53,8 @@ def _sha(text: str) -> str:
 # prompt edit can never ride a green run.
 PROMPT_PINS = {
     IMPLEMENTER_FILE: "89170d411e03b941092202cb662e035c75a47468453f9b26fcaf0bdb6c64f2fd",
-    REVIEWER_FILE: "dbab8437904a53e2256ff942167a9c01d689460f05a48384f4fb70f18cf9f6e7",
+    # F-41; re-pinned for AC-6 (a surviving major fails the round).
+    REVIEWER_FILE: "1306ee568d0f09b02aef2c34694d61e343163a1abde54d19001fba9f55acba22",
     # F-38; re-pinned in its review round (the unanimous-rule paragraph).
     VERIFIER_FILE: "d7e5db822401e928ef64d8c032a34b66c3505f0f0fc115ca67fd0d8ea92c694b",
 }

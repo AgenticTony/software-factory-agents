@@ -22,7 +22,11 @@ The rules, enforced here rather than trusted from the model:
   scale the factory doesn't act on.
 * A ``blocking`` finding on **either** axis means FAIL, whatever the other
   axis says and whatever the declared verdict says — neither axis is
-  allowed to mask the other.
+  allowed to mask the other. F-41 AC-6 extends the same weight to
+  ``major``: a surviving major fails a round exactly as a blocking one
+  does, and a declared pass overrides neither — F-31's run (2026-10-30)
+  published with a confirmed major defect because only ``blocking``
+  failed a round.
 * A declared ``fail`` stands even without blocking findings; a declared
   ``pass`` with only non-blocking findings passes.
 * Duplicate JSON keys are invalid: ``json.loads`` silently keeps the last
@@ -55,10 +59,17 @@ pass the reviewer actually declared.
 
 F-38 adds the parallel reviewer fan-out and the verifier vote. N reviewer
 verdicts merge into ONE union (:func:`merge_reviews`): findings two
-reviewers both report — the same stable key F-23 already defined — become
-one entry carrying which reviewers reported it, and one invalid verdict
-fails the whole review exactly as a single invalid one did. A verifier
-session then votes each union finding in or out
+reviewers both report become one entry carrying which reviewers reported
+it, and one invalid verdict fails the whole review exactly as a single
+invalid one did. Duplicates merge on the F-23 stable key — the same
+defect in the same wording — and, since F-41, on **location** too: the
+same file with lines within :data:`_MERGE_LINE_WINDOW` of each other,
+when both findings carry a file and a line and their wording overlaps
+(:func:`_shares_wording`). Text alone keyed apart two
+reviewers describing one bug in different words (F-16's run: every heavy
+finding stayed ``reported_by=[1]``, so the unanimous rule almost never
+fired); location is the defect's identity when the wording isn't. A
+verifier session then votes each union finding in or out
 (:func:`parse_verifier_vote`): a drop needs an explicit vote with a
 reason; everything the verifier failed to vote on, or voted on in a shape
 it wasn't asked for, is KEPT — an unverifiable vote may not remove a
@@ -70,6 +81,13 @@ in ``verifier_dropped`` — the attempt record and the stored report, never
 the PR body — while ``dropped`` stays the F-23 out-of-delta list the PR
 body renders. The declared verdict is fail-closed across the fan-out:
 any reviewer's declared ``fail`` stands.
+
+F-41 adds the final full review after fix rounds: when a fix round's
+delta review passes, one more full-diff review runs before publish.
+:func:`final_review_verdict` is its failure rule — only a surviving
+``blocking`` or ``major`` finding fails it; a declared fail with nothing
+heavier does not (the minors reach the PR body within the nit budget),
+while an unparsable verdict still does.
 
 Running the reviewer sessions themselves is F-10's wiring; everything here is
 pure parsing and judgement over the text sessions produced.
@@ -96,6 +114,21 @@ NIT_BUDGET = 3
 _SEVERITY_RANK = {name: rank for rank, name in enumerate(VALID_SEVERITIES)}
 _TAG_RANK = {name: rank for rank, name in enumerate(VALID_TAGS)}
 
+# The severities that fail a round (F-41 AC-6): a surviving major weighs
+# exactly as much as a blocking finding — a declared pass overrides
+# neither. Kept as a helper because three functions ask the same
+# question (apply_convergence, apply_vote, final_review_verdict) and a
+# fourth (the orchestrator) renders its notes from the same set.
+_ROUND_FAILING_SEVERITIES = ("blocking", "major")
+
+
+def _fails_round(finding) -> bool:
+    """Whether one finding's severity fails a round (blocking or major)."""
+    return (
+        isinstance(finding, L2Finding)
+        and (finding.severity or "").strip().lower() in _ROUND_FAILING_SEVERITIES
+    )
+
 # A fenced block (with or without the json tag) around the verdict object —
 # models habitually wrap their JSON; the fence is extracted before parsing.
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
@@ -106,8 +139,9 @@ class L2Finding:
     """One reviewer finding. Same shape as the deterministic layers'
     :class:`~factory.gates.Finding` plus the L2-only fields: ``axis``
     (``spec`` | ``standards``), ``severity`` (one of the four values
-    the seat prompt documents; only the exact value ``blocking`` carries
-    verdict weight), the F-23 convergence fields — ``key`` (the stable
+    the seat prompt documents; ``blocking`` and ``major`` both carry
+    verdict weight — F-41 AC-6), the F-23 convergence fields — ``key``
+    (the stable
     finding identity, set at parse time), ``missed_earlier`` (the
     reviewer's justification for a new finding outside the delta) and
     ``state`` (``new`` or ``carried``, set by :func:`apply_convergence`)
@@ -427,9 +461,9 @@ def apply_convergence(
 
     * **Prior key from an earlier run → carried.** No diff continuity ever
       existed for it, so a re-raise is always the same finding. It stays
-      in the findings — a carried *blocking* finding still fails the
-      round, because it is an unresolved problem — but is listed
-      ``state: "carried"``, never as new.
+      in the findings — a carried blocking or major finding still fails
+      the round (F-41 AC-6), because it is an unresolved problem — but is
+      listed ``state: "carried"``, never as new.
     * **In-run prior key, provably untouched → carried.** Only a real
       delta can prove "untouched since", and only a named file can be
       shown untouched: the finding's file is one the delta didn't change.
@@ -525,13 +559,12 @@ def apply_convergence(
             )
         else:
             active.append(finding)
-    blocking = any(
-        isinstance(f, L2Finding) and (f.severity or "").strip().lower() == "blocking"
-        for f in active
-    )
+    # F-41 AC-6: a surviving major fails the round exactly as a blocking
+    # one does — a declared pass overrides neither.
+    heavy = any(_fails_round(f) for f in active)
     verdict = (
         "fail"
-        if report.parse_error is not None or report.declared == "fail" or blocking
+        if report.parse_error is not None or report.declared == "fail" or heavy
         else "pass"
     )
     l2_findings = [f for f in active if isinstance(f, L2Finding)]
@@ -584,17 +617,66 @@ def apply_convergence(
 
 # ------------------------------------------------------- F-38: the vote --
 
+# F-41: how far apart two findings' lines may sit on the same file and
+# still be one defect. Two reviewers pinpointing the same bug land within
+# a handful of lines of each other; findings further apart on one file
+# are different defects, however similar the wording.
+_MERGE_LINE_WINDOW = 5
+_MERGE_WORD_OVERLAP = 0.3
+
+
+def _wording(text: str | None) -> set[str]:
+    """The meaningful words of a finding's text, for :func:`_shares_wording`."""
+    return set(re.findall(r"[a-z0-9_]{4,}", (text or "").lower()))
+
+
+def _shares_wording(existing: L2Finding, finding: L2Finding) -> bool:
+    """Whether two nearby findings describe the same thing: at least
+    :data:`_MERGE_WORD_OVERLAP` of the shorter finding's meaningful words
+    appear in the other. Location alone is not identity — two different
+    defects a few lines apart must stay two findings, or one disappears
+    from the verdict and the survivor claims a reviewer who never
+    reported it. Too little wording to compare means no merge: separate
+    findings only cost the verifier a vote."""
+    one, two = _wording(existing.text), _wording(finding.text)
+    if not one or not two:
+        return False
+    return len(one & two) / min(len(one), len(two)) >= _MERGE_WORD_OVERLAP
+
+
+def _same_location(existing: L2Finding, finding: L2Finding) -> bool:
+    """Whether two findings name the same spot: the same file, with
+    integer lines within :data:`_MERGE_LINE_WINDOW` of each other. Both
+    must carry a file AND a line — a finding without a line has no
+    location identity to merge on (its wording is all it has)."""
+    if not existing.file or not finding.file or existing.file != finding.file:
+        return False
+    if not isinstance(existing.line, int) or not isinstance(finding.line, int):
+        return False
+    return abs(existing.line - finding.line) <= _MERGE_LINE_WINDOW
+
+
 def merge_reviews(reports: Sequence[L2Report]) -> L2Report:
     """Merge N reviewer verdicts into the ONE union the verifier votes on.
 
-    Findings key by :func:`finding_key` (the same stable identity F-23
+    Findings merge on :func:`finding_key` (the same stable identity F-23
     uses across rounds), so a defect two reviewers both report — however
     they spaced or cased its text — is one union entry carrying both
-    reviewer numbers in ``reported_by``; a duplicate that one reviewer
-    rated more severely keeps the harsher severity (a fan-out that
-    downgraded a duplicate blocking call to "minor" would hide it).
-    Union ids are regenerated (``U-1`` …) because two reviewers' ``R-1``
-    are different findings, and the verifier votes by id.
+    reviewer numbers in ``reported_by``. Since F-41 they ALSO merge on
+    location: the same file with lines within :data:`_MERGE_LINE_WINDOW`
+    of each other, when both findings carry a file and a line and their
+    wording overlaps (a location merge keeps every reporter's wording) — two
+    reviewers describing one bug in different words keyed apart under
+    text alone, and F-16's run showed the cost (every heavy finding
+    ``reported_by=[1]``, the unanimous rule silent). The exact-text key
+    is tried first; a location match merges into the entry that
+    registered first (proximity is judged against ITS line, so a chain
+    of ever-further findings cannot drift into one entry). A duplicate
+    that one reviewer rated more severely keeps the harsher severity (a
+    fan-out that downgraded a duplicate blocking call to "minor" would
+    hide it). Union ids are regenerated (``U-1`` …) because two
+    reviewers' ``R-1`` are different findings, and the verifier votes by
+    id.
 
     The union's declared verdict is fail-closed: ANY reviewer's declared
     ``fail`` stands — the fan-out adds eyes, it never dilutes a refusal.
@@ -626,28 +708,42 @@ def merge_reviews(reports: Sequence[L2Report]) -> L2Report:
         for finding in report.findings:
             if not isinstance(finding, L2Finding):
                 continue  # an invalid-verdict Finding never reaches here
-            existing = (
-                merged[index_of_key[finding.key]]
-                if finding.key in index_of_key
-                else None
-            )
-            if existing is None:
+            index = index_of_key.get(finding.key)
+            if index is None:
+                # F-41: no exact-text duplicate — try the location key
+                # (same file, nearby line) before registering a new entry.
+                index = next(
+                    (i for i, existing in enumerate(merged)
+                     if number not in existing.reported_by
+                     and _same_location(existing, finding)
+                     and _shares_wording(existing, finding)),
+                    None,
+                )
+            if index is None:
                 union_finding = replace(
                     finding, id=f"U-{len(merged) + 1}", reported_by=[number]
                 )
                 merged.append(union_finding)
                 index_of_key[union_finding.key] = len(merged) - 1
                 continue
+            existing = merged[index]
             if number not in existing.reported_by:
                 existing.reported_by.append(number)
-            if _SEVERITY_RANK.get(existing.severity, 99) < _SEVERITY_RANK.get(
-                finding.severity, 99
-            ):
-                # The duplicate is rated more harshly: keep the harsher
-                # call (replace() to preserve the entry's identity).
-                merged[index_of_key[existing.key]] = replace(
-                    existing, severity=finding.severity, text=finding.text
-                )
+            harsher = _SEVERITY_RANK.get(finding.severity, 99) < _SEVERITY_RANK.get(
+                existing.severity, 99
+            )
+            # The harsher call leads (replace() preserves the entry's
+            # identity). Rank 0 is blocking, so harsher is the SMALLER rank
+            # — the pre-F-41 comparison ran the other way and quietly kept
+            # the softer call on every mixed-severity duplicate.
+            lead, other = (finding, existing) if harsher else (existing, finding)
+            text = lead.text
+            if existing.key != finding.key and other.text not in text:
+                # A location merge is a judgement, not an identity: keep
+                # every reporter's wording, so a wrong merge can never
+                # erase a defect from what the verifier and implementer see.
+                text = f"{text} (also reported: {other.text})"
+            merged[index] = replace(existing, severity=lead.severity, text=text)
 
     declared = (
         "fail"
@@ -813,9 +909,10 @@ def apply_vote(
       ``verifier_dropped`` with reason ``nit_budget``. ``blocking`` and
       ``major`` are never capped.
     * The verdict is recomputed over what survived the vote: a declared
-      fail stands, and so does any surviving blocking finding — the
-      reverse (a declared pass whose only blocking finding the verifier
-      dropped) is the pass the reviewers actually declared.
+      fail stands, and so does any surviving blocking or major finding
+      (F-41 AC-6) — the reverse (a declared pass whose only blocking
+      finding the verifier dropped) is the pass the reviewers actually
+      declared.
 
     Args:
         report: The union report (:func:`merge_reviews` output).
@@ -884,13 +981,12 @@ def apply_vote(
                 continue
         survivors.append(finding)
 
-    blocking = any(
-        isinstance(f, L2Finding) and (f.severity or "").strip().lower() == "blocking"
-        for f in survivors
-    )
+    # F-41 AC-6: a surviving major fails the round exactly as a blocking
+    # one does — a declared pass overrides neither.
+    heavy = any(_fails_round(f) for f in survivors)
     verdict = (
         "fail"
-        if report.parse_error is not None or report.declared == "fail" or blocking
+        if report.parse_error is not None or report.declared == "fail" or heavy
         else "pass"
     )
     return L2Report(
@@ -901,3 +997,36 @@ def apply_vote(
         verifier_dropped=drops,
         verifier_error=outcome.error,
     )
+
+
+def final_review_verdict(report: L2Report) -> L2Report:
+    """The final full review's failure rule (F-41 AC-2): only a
+    surviving ``blocking`` or ``major`` finding fails it.
+
+    The final review runs once the fix rounds have converged, over the
+    complete diff with nothing out of scope (AC-2), so its verdict is
+    about the findings alone: ``minor`` and ``note`` findings never fail
+    it — they reach the PR body within the nit budget — and neither does
+    a declared ``fail`` with nothing heavier standing. A parse error
+    still fails it (a review that cannot speak the verdict protocol has
+    not reviewed anything), and a surviving blocking or major does
+    whatever the declared verdict says (AC-6, applied upstream by
+    :func:`apply_convergence`; this function never softens it).
+
+    Args:
+        report: The converged final-review report (apply_convergence
+            output in full-diff mode, after the verifier vote).
+
+    Returns:
+        The report with the final review's own verdict — the input
+        unchanged when the verdict already agrees.
+    """
+    heavy = any(_fails_round(f) for f in report.findings)
+    fail = report.parse_error is not None or heavy
+    if fail == (report.verdict == "fail"):
+        return report
+    if fail:
+        return replace(report, verdict="fail")
+    # A declared fail with nothing heavier than nits: the round passes,
+    # and no stop may fire on the strength of the verdict it overturned.
+    return replace(report, verdict="pass", no_progress=False, no_progress_reason=None)
