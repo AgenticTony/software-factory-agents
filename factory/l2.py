@@ -64,7 +64,8 @@ it, and one invalid verdict fails the whole review exactly as a single
 invalid one did. Duplicates merge on the F-23 stable key — the same
 defect in the same wording — and, since F-41, on **location** too: the
 same file with lines within :data:`_MERGE_LINE_WINDOW` of each other,
-when both findings carry a file and a line. Text alone keyed apart two
+when both findings carry a file and a line and their wording overlaps
+(:func:`_shares_wording`). Text alone keyed apart two
 reviewers describing one bug in different words (F-16's run: every heavy
 finding stayed ``reported_by=[1]``, so the unanimous rule almost never
 fired); location is the defect's identity when the wording isn't. A
@@ -621,6 +622,26 @@ def apply_convergence(
 # a handful of lines of each other; findings further apart on one file
 # are different defects, however similar the wording.
 _MERGE_LINE_WINDOW = 5
+_MERGE_WORD_OVERLAP = 0.3
+
+
+def _wording(text: str | None) -> set[str]:
+    """The meaningful words of a finding's text, for :func:`_shares_wording`."""
+    return set(re.findall(r"[a-z0-9_]{4,}", (text or "").lower()))
+
+
+def _shares_wording(existing: L2Finding, finding: L2Finding) -> bool:
+    """Whether two nearby findings describe the same thing: at least
+    :data:`_MERGE_WORD_OVERLAP` of the shorter finding's meaningful words
+    appear in the other. Location alone is not identity — two different
+    defects a few lines apart must stay two findings, or one disappears
+    from the verdict and the survivor claims a reviewer who never
+    reported it. Too little wording to compare means no merge: separate
+    findings only cost the verifier a vote."""
+    one, two = _wording(existing.text), _wording(finding.text)
+    if not one or not two:
+        return False
+    return len(one & two) / min(len(one), len(two)) >= _MERGE_WORD_OVERLAP
 
 
 def _same_location(existing: L2Finding, finding: L2Finding) -> bool:
@@ -643,7 +664,8 @@ def merge_reviews(reports: Sequence[L2Report]) -> L2Report:
     they spaced or cased its text — is one union entry carrying both
     reviewer numbers in ``reported_by``. Since F-41 they ALSO merge on
     location: the same file with lines within :data:`_MERGE_LINE_WINDOW`
-    of each other, when both findings carry a file and a line — two
+    of each other, when both findings carry a file and a line and their
+    wording overlaps (a location merge keeps every reporter's wording) — two
     reviewers describing one bug in different words keyed apart under
     text alone, and F-16's run showed the cost (every heavy finding
     ``reported_by=[1]``, the unanimous rule silent). The exact-text key
@@ -693,7 +715,8 @@ def merge_reviews(reports: Sequence[L2Report]) -> L2Report:
                 index = next(
                     (i for i, existing in enumerate(merged)
                      if number not in existing.reported_by
-                     and _same_location(existing, finding)),
+                     and _same_location(existing, finding)
+                     and _shares_wording(existing, finding)),
                     None,
                 )
             if index is None:
@@ -706,17 +729,21 @@ def merge_reviews(reports: Sequence[L2Report]) -> L2Report:
             existing = merged[index]
             if number not in existing.reported_by:
                 existing.reported_by.append(number)
-            if _SEVERITY_RANK.get(finding.severity, 99) < _SEVERITY_RANK.get(
+            harsher = _SEVERITY_RANK.get(finding.severity, 99) < _SEVERITY_RANK.get(
                 existing.severity, 99
-            ):
-                # The duplicate is rated more harshly: keep the harsher
-                # call (replace() to preserve the entry's identity). Rank
-                # 0 is blocking, so harsher is the SMALLER rank — the
-                # pre-F-41 comparison ran the other way and quietly kept
-                # the softer call on every mixed-severity duplicate.
-                merged[index] = replace(
-                    existing, severity=finding.severity, text=finding.text
-                )
+            )
+            # The harsher call leads (replace() preserves the entry's
+            # identity). Rank 0 is blocking, so harsher is the SMALLER rank
+            # — the pre-F-41 comparison ran the other way and quietly kept
+            # the softer call on every mixed-severity duplicate.
+            lead, other = (finding, existing) if harsher else (existing, finding)
+            text = lead.text
+            if existing.key != finding.key and other.text not in text:
+                # A location merge is a judgement, not an identity: keep
+                # every reporter's wording, so a wrong merge can never
+                # erase a defect from what the verifier and implementer see.
+                text = f"{text} (also reported: {other.text})"
+            merged[index] = replace(existing, severity=lead.severity, text=text)
 
     declared = (
         "fail"

@@ -776,6 +776,44 @@ def test_merge_reviews_merges_on_file_and_nearby_line():
     assert voted.verifier_dropped[0]["reason"].startswith("override_refused")
 
 
+def test_merge_reviews_keeps_different_bugs_apart_at_nearby_lines():
+    # Location alone is not identity: two different defects a few lines
+    # apart stay two findings, or one vanishes from the verdict, and the
+    # survivor claims a second reviewer who never reported it.
+    union = merge_reviews([
+        parse_verdict(_verdict(_finding(
+            "SQL injection in the user lookup query", file="app.py",
+            severity="major", line=10))),
+        parse_verdict(_verdict(_finding(
+            "Off-by-one in the pagination limit", file="app.py",
+            severity="major", line=13))),
+    ])
+    assert [f.text for f in union.findings] == [
+        "SQL injection in the user lookup query",
+        "Off-by-one in the pagination limit",
+    ]
+    assert [f.reported_by for f in union.findings] == [[1], [2]]
+
+
+def test_a_location_merge_keeps_every_reporters_wording():
+    # Merged findings stay readable: the implementer and the verifier see
+    # both descriptions, whichever severity won.
+    union = merge_reviews([
+        parse_verdict(_verdict(_finding(
+            "helper returns the wrong half", file="other.py",
+            severity="minor", line=10))),
+        parse_verdict(_verdict(_finding(
+            "the halving in helper is inverted", file="other.py",
+            severity="major", line=13))),
+    ])
+    assert len(union.findings) == 1
+    merged = union.findings[0]
+    assert merged.severity == "major"
+    assert "helper returns the wrong half" in merged.text
+    assert "the halving in helper is inverted" in merged.text
+    assert merged.reported_by == [1, 2]
+
+
 def test_merge_reviews_keeps_the_text_key_otherwise():
     # Same defect, same wording, no location: still one entry.
     one = parse_verdict(_verdict(_finding("scope creep: answer() logs")))
