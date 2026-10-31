@@ -283,7 +283,9 @@ class TraceWriter:
             self.append(event)
 
     def session_end(self, record: Any, seat: str) -> None:
-        """One session's spend and outcome (AC-1's session_end row)."""
+        """One session's spend and outcome (AC-1's session_end row), plus
+        the session's sandbox-bypass denial count (F-42 AC-5: the summary
+        next to the marked ``tool_call`` events, never instead of them)."""
         self.append({
             "type": "session_end",
             "seat": seat,
@@ -294,6 +296,7 @@ class TraceWriter:
             "turns": getattr(record, "num_turns", None),
             "model": getattr(record, "model", None),
             "duration_ms": getattr(record, "duration_ms", None),
+            "sandbox_bypass_denials": getattr(record, "sandbox_bypass_denials", 0) or 0,
         })
 
     def gate_checks(self, report: dict) -> None:
@@ -371,6 +374,19 @@ def gate_checks(report: dict) -> list[dict]:
                     for finding in diff_findings) if diff_findings else ""))
         checks.append({"type": "gate_check", "layer": "L0",
                        "item": "diff_policy", "ok": not diff_findings,
+                       "note": note})
+        # F-42 AC-1: the commit-message scan is its own check, said even
+        # when clean — an owner reading the trace sees it ran.
+        attribution = [
+            finding for finding in report.get("findings") or []
+            if finding.get("id") == "attribution_trailer"
+        ]
+        note = ("commit messages merge-base..head: AI attribution"
+                + ("; " + "; ".join(
+                    finding.get("text") or "" for finding in attribution)
+                   if attribution else ""))
+        checks.append({"type": "gate_check", "layer": "L0",
+                       "item": "commit_messages", "ok": not attribution,
                        "note": note})
     elif layer == "L1":
         red_reasons = report.get("red_reasons") or {}

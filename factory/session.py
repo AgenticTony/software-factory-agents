@@ -35,6 +35,17 @@ Seats:
   reviewer's entire read-only contract (edit tools disallowed, read-only
   sandbox, the same integrity guard).
 
+Every seat's PreToolUse layer also denies a Bash call that sets
+``dangerouslyDisableSandbox`` (F-42): the srt sandbox IS the confinement,
+so the flag asks to skip the one boundary that holds — the deny fires
+under ``bypassPermissions``, names the rule ("the sandbox is not
+negotiable"), and each denial is counted (attempt record, ``factory
+status``'s weekly total) and marked on its F-30 trace event. The CLI's
+own commit/PR attribution is switched off in every seat's settings
+(:data:`ATTRIBUTION_OFF`), and L0/publish refuse the pattern list in
+:mod:`factory.attribution` besides — a trailer cannot leave the factory
+through the branch, the PR text, or the CLI's defaults.
+
 Every seat carries one extra tool (F-27): ``vent(category, text)``, an
 in-process SDK tool (``factory.vent``) the CLI exposes as
 ``mcp__vent__vent``, listed under that name in ``allowed_tools``. The
@@ -125,6 +136,46 @@ KEYCHAIN_SERVICE = "factory-zai"
 # The pinned SDK version (pyproject pins claude-agent-sdk exactly); used
 # in refusal messages so the fix names the pin to reinstall.
 _SDK_VERSION = importlib.metadata.version("claude-agent-sdk")
+
+# F-42 AC-3: the CLI's own attribution default, switched off at the
+# source. The pinned CLI's settings schema reads ``attribution`` (the
+# boolean key ``includeCoAuthoredBy`` is its deprecated form — "Use
+# attribution instead" in the binary's own schema text): resolver order
+# verified in the bundled binary — ``attribution.commitTrailers: false``
+# is the explicit "disabled" verdict that stops the CLI appending a
+# ``Co-Authored-By`` trailer to the session's ``git commit`` calls, and
+# the ``commit``/``pr`` texts ("Empty string hides attribution", per the
+# schema) suppress the commit attribution line and the "Generated with"
+# PR footer. Delivered via the SDK's ``settings`` field (``--settings``
+# inline JSON), which applies with ``setting_sources=[]`` — that flag
+# only shuts filesystem settings discovery off.
+ATTRIBUTION_OFF = {
+    "attribution": {"commitTrailers": False, "commit": "", "pr": ""},
+}
+
+# F-42 AC-4: the reason every seat's Bash bypass denial carries — it
+# tells the session the rule, not just the refusal.
+SANDBOX_DENY_REASON = (
+    "dangerouslyDisableSandbox is not available: the sandbox is not "
+    "negotiable — run the command without it"
+)
+
+
+class BypassDenials:
+    """F-42 AC-5: shared state between the deny hook and the F-30 tap.
+
+    The hook is the authority on what it denied (the tool_use_id it saw,
+    and the running count); the tap marks the denial onto the call's
+    ``tool_call`` trace event — closed or flushed open at stream end — so
+    each denial lands in the F-30 trace instead of being lost in a tool
+    result. ``run_session`` stamps ``count`` onto the
+    :class:`SessionRecord`, and the orchestrator sums it onto the attempt
+    record for ``factory status``'s weekly total.
+    """
+
+    def __init__(self) -> None:
+        self.denied: set[str] = set()
+        self.count: int = 0
 
 _FACTORY_PKG = Path(__file__).resolve().parent
 _REPO_ROOT = _FACTORY_PKG.parent
@@ -780,6 +831,41 @@ def bash_guard_hook(protected: "Sequence[str]" = ()) -> HookMatcher:
     return HookMatcher(matcher="Bash", hooks=[_hook])
 
 
+def sandbox_bypass_hook(denials: BypassDenials | None = None) -> HookMatcher:
+    """PreToolUse hook over Bash: deny any call whose input sets
+    ``dangerouslyDisableSandbox`` (F-42 AC-4).
+
+    Every seat gets it — the implementer and, through the same
+    :func:`build_options`, every fan-out reviewer and the verifier — and
+    it fires under ``bypassPermissions`` (a deny hook still blocks there,
+    F-06's established fact; the sandbox is the confinement, so a flag
+    that asks the CLI to skip ITS sandbox layer is asking to leave the
+    one boundary that holds). The outer srt sandbox confined the F-31
+    attempts anyway (the bind failed with the flag set) — this hook makes
+    the attempt itself visible instead of an invisible habit: each denial
+    increments ``denials`` (F-30 trace + attempt record, AC-5) and the
+    reason states the rule so the session learns it in-turn.
+    """
+
+    state = denials if denials is not None else BypassDenials()
+
+    async def _hook(
+        input: dict[str, Any], tool_use_id: str | None, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        tool_input = input.get("tool_input") or {}
+        # Truthy, not ``is True``: the deny-layer over-matches on purpose
+        # (a stringy "true" is not a legitimate spelling of the flag — the
+        # tool schema says boolean). ``false`` passes: explicitly unset.
+        if not tool_input.get("dangerouslyDisableSandbox"):
+            return {}
+        if tool_use_id is not None:
+            state.denied.add(str(tool_use_id))
+        state.count += 1
+        return _deny(SANDBOX_DENY_REASON)
+
+    return HookMatcher(matcher="Bash", hooks=[_hook])
+
+
 # ----------------------------------------------------------- options/record --
 
 
@@ -904,17 +990,22 @@ def build_options(
     system_prompt: str | None = None,
     vent_collector: VentCollector | None = None,
     toolkit: dict | None = None,
+    bypass_denials: BypassDenials | None = None,
 ) -> ClaudeAgentOptions:
     """Build the per-seat ClaudeAgentOptions (WO F-06 options list).
 
     ``setting_sources=[]`` — no user/project/local Claude settings, so a
-    session can't pick up personal config. ``env`` is exactly the three
-    session names (see :func:`session_env`). Hooks: protected-path +
-    bash-guard PreToolUse callbacks, in-process via HookMatcher.
-    ``system_prompt`` is the assembled seat prompt (F-09's
-    ``factory.prompts``); it overrides the seat's static default, which
-    stays empty because the prompt *files* are unreadable inside the
-    sandbox — the orchestrator assembles them outside and passes the text.
+    session can't pick up personal config — and ``settings`` is exactly
+    :data:`ATTRIBUTION_OFF` (F-42 AC-3): the pinned CLI's own attribution
+    default, switched off through its real settings key. ``env`` is
+    exactly the three session names (see :func:`session_env`). Hooks:
+    protected-path + bash-guard + sandbox-bypass PreToolUse callbacks,
+    in-process via HookMatcher — the bypass deny on EVERY seat, so the
+    fan-out reviewers and the verifier carry it too. ``system_prompt`` is
+    the assembled seat prompt (F-09's ``factory.prompts``); it overrides
+    the seat's static default, which stays empty because the prompt
+    *files* are unreadable inside the sandbox — the orchestrator
+    assembles them outside and passes the text.
 
     ``vent_collector`` (F-27): attach the in-process ``vent`` tool closed
     over this run's collector. Both seats list the tool in
@@ -928,6 +1019,12 @@ def build_options(
     Skills load from the staged read-only copy as one local plugin, MCP
     servers attach with their tools granted one by one; without it a
     session gets exactly the pre-F-22 shape (no skills, no servers).
+
+    ``bypass_denials`` (F-42 AC-5): the shared denial state the hook
+    counts into and the F-30 tap reads; ``run_session`` passes the one it
+    stamps onto the record. ``None`` still denies — the hook makes its
+    own state — but only the count that rides a record reaches the
+    attempt accounting.
     """
     seat_config = _seat(seat)
     options = ClaudeAgentOptions(
@@ -938,6 +1035,7 @@ def build_options(
         if system_prompt is not None
         else seat_config.system_prompt,
         setting_sources=[],
+        settings=json.dumps(ATTRIBUTION_OFF),
         allowed_tools=list(seat_config.allowed_tools),
         disallowed_tools=list(seat_config.disallowed_tools),
         permission_mode=seat_config.permission_mode,
@@ -945,6 +1043,7 @@ def build_options(
             "PreToolUse": [
                 protected_path_hook(protected),
                 bash_guard_hook(protected),
+                sandbox_bypass_hook(bypass_denials),
             ]
         },
     )
@@ -977,6 +1076,12 @@ class SessionRecord:
     the honest maximum, and it is what F-19 attributes failures
     against). Empty when the project declares no toolkit — as every
     record built before F-22 is (``from_dict`` defaults it).
+
+    ``sandbox_bypass_denials`` (F-42 AC-5) counts the Bash calls this
+    session made with ``dangerouslyDisableSandbox`` that the PreToolUse
+    hook denied — the per-session number the orchestrator sums onto the
+    attempt record and ``factory status`` totals for the week. Zero on
+    every record built before F-42 (``from_dict`` defaults it).
     """
 
     seat: str
@@ -996,6 +1101,7 @@ class SessionRecord:
     permission_denials: list[Any] | None = None
     vents: list[dict[str, Any]] = field(default_factory=list)
     skills: list[str] = field(default_factory=list)
+    sandbox_bypass_denials: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1077,6 +1183,7 @@ def _tap_tool_calls(
     seat: str,
     token: str | None,
     sink: Callable[[dict[str, Any]], None],
+    denied: "set[str] | None" = None,
 ) -> None:
     """Turn one SDK stream message into tool_call trace events (F-30).
 
@@ -1086,7 +1193,14 @@ def _tap_tool_calls(
     started/ended. Duck-typed like the vent tap: blocks are identified by
     the fields they carry, not by class, so server tool blocks trace too.
     The sink is never allowed to change the run (AC-5): a raising sink
-    costs the event, never the session."""
+    costs the event, never the session.
+
+    ``denied`` (F-42 AC-5) is the bypass hook's set of denied
+    tool_use_ids: a closed or flushed-open call whose id sits in it is
+    stamped ``denied: "sandbox_bypass"``, so each denial lands in the
+    trace as an explicit fact instead of being lost in a tool result.
+    The id leaves the set as its event is written — one mark per denial.
+    """
     stamp = now_iso()
     for block in getattr(message, "content", None) or []:
         use_id = getattr(block, "tool_use_id", None)
@@ -1095,18 +1209,22 @@ def _tap_tool_calls(
             if use is None:
                 continue
             is_error = bool(getattr(block, "is_error", False))
+            event = {
+                "type": "tool_call",
+                "seat": seat,
+                "tool": use["tool"],
+                "args": use["args"],
+                "result": snippet(
+                    _content_text(getattr(block, "content", None)), token),
+                "ok": not is_error,
+                "started": use["started"],
+                "ended": stamp,
+            }
+            if denied is not None and str(use_id) in denied:
+                event["denied"] = "sandbox_bypass"
+                denied.discard(str(use_id))
             with contextlib.suppress(Exception):
-                sink({
-                    "type": "tool_call",
-                    "seat": seat,
-                    "tool": use["tool"],
-                    "args": use["args"],
-                    "result": snippet(
-                        _content_text(getattr(block, "content", None)), token),
-                    "ok": not is_error,
-                    "started": use["started"],
-                    "ended": stamp,
-                })
+                sink(event)
             continue
         name = getattr(block, "name", None)
         block_id = getattr(block, "id", None)
@@ -1243,6 +1361,10 @@ async def run_session(
         vent_collector = VentCollector(
             run_id=run_id or "", task_id=task_id or "", seat=seat
         )
+    # F-42 AC-5: the denial state shared by the bypass hook (which counts
+    # into it), this tap (which marks each denial onto its trace event)
+    # and the record below (which carries the count out of the sandbox).
+    bypass_denials = BypassDenials()
     options = build_options(
         seat,
         cwd,
@@ -1256,6 +1378,7 @@ async def run_session(
         system_prompt=system_prompt,
         vent_collector=vent_collector,
         toolkit=toolkit,
+        bypass_denials=bypass_denials,
     )
 
     def _carry(record: SessionRecord) -> SessionRecord:
@@ -1269,6 +1392,10 @@ async def run_session(
             f"{item['name']}@{item['content_hash']}"
             for item in (toolkit or {}).get("items") or []
         ]
+        # ...and the bypass-denial count (F-42 AC-5): whatever the
+        # outcome, the attempts the session made to leave the sandbox
+        # reach the attempt record, not only the trace.
+        record.sandbox_bypass_denials = bypass_denials.count
         return record
 
     result_message: ResultMessage | None = None
@@ -1325,9 +1452,12 @@ async def run_session(
                     if trace_sink is not None:
                         # F-30: the stream is tapped as it flows — a
                         # tool_call event is on the wire before the
-                        # stream yields its ResultMessage (AC-2).
+                        # stream yields its ResultMessage (AC-2); a call
+                        # the bypass hook denied is marked as it closes
+                        # (F-42 AC-5).
                         _tap_tool_calls(message, pending_calls, seat,
-                                        token, trace_sink)
+                                        token, trace_sink,
+                                        denied=bypass_denials.denied)
                     if isinstance(message, ResultMessage):
                         result_message = message
             except _WallClock:
@@ -1355,18 +1485,25 @@ async def run_session(
                 # started, no result, ok unknown. An aborted turn's
                 # evidence rides out with everything else.
                 if trace_sink is not None and pending_calls:
-                    for use in pending_calls.values():
+                    for use_id, use in pending_calls.items():
+                        event = {
+                            "type": "tool_call",
+                            "seat": seat,
+                            "tool": use["tool"],
+                            "args": use["args"],
+                            "result": None,
+                            "ok": None,
+                            "started": use["started"],
+                            "ended": None,
+                        }
+                        if use_id in bypass_denials.denied:
+                            # F-42 AC-5: a stream that died before the
+                            # result still traces the denial — the attempt
+                            # is the fact, the result only decorates it.
+                            event["denied"] = "sandbox_bypass"
+                            bypass_denials.denied.discard(use_id)
                         with contextlib.suppress(Exception):
-                            trace_sink({
-                                "type": "tool_call",
-                                "seat": seat,
-                                "tool": use["tool"],
-                                "args": use["args"],
-                                "result": None,
-                                "ok": None,
-                                "started": use["started"],
-                                "ended": None,
-                            })
+                            trace_sink(event)
                 await _close_stream(stream)
         finally:
             os.environ.clear()

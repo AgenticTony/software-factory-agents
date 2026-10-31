@@ -84,6 +84,7 @@
         "turns": { "type": "integer", "minimum": 0 },
         "input_tokens": { "type": "integer", "minimum": 0 },
         "output_tokens": { "type": "integer", "minimum": 0 },
+        "sandbox_bypass_denials": { "type": "integer", "minimum": 0, "description": "F-42: Bash calls this attempt's sessions made with dangerouslyDisableSandbox, denied by the PreToolUse hook — summed off the session records; factory status totals them for the week." },
         "pr": { "type": "string" },
         "validator_report": { "type": "string", "description": "Path to the stored validator report" },
         "escalation": { "$ref": "#/$defs/escalation" },

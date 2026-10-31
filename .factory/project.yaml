@@ -140,6 +140,17 @@ paths:
     # F-41: same precedent — the final-review contract tests land with
     # the work order, protected from the day they exist.
     - "tests/test_f41.py"
+    # F-42: same precedent — the session-hardening contract tests, plus
+    # the attribution pattern list itself (it judges commit messages and
+    # PR text; a session weakening it edits what judges it).
+    - "tests/test_f42.py"
+    - "factory/attribution.py"
+    # F-31's closing invariant, restored here: PR #86 shipped the
+    # dashboard's contract tests but not their protected entry, and the
+    # queue state this change carries (F-31 reconciled to done) trips
+    # tests/test_profile_review until the file is listed — the done task's
+    # tests must be protected from the day the task is done.
+    - "tests/test_f31.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 

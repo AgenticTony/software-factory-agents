@@ -35,6 +35,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from factory.attribution import attribution_match
 from factory.runs import GIT_HARDENING
 
 BRANCH_PREFIX = "factory/"
@@ -173,11 +174,24 @@ def gh_pr_create(pr: PullRequest, *, gh_bin: Path | str | None = None) -> str:
     size limit and shows up in ``ps``).
 
     Raises:
-        PushRefused: ``pr.head`` is not a factory branch or is the base.
+        PushRefused: ``pr.head`` is not a factory branch or is the base, or
+            the title or body carries an AI-attribution pattern (F-42 AC-2:
+            the same ONE list L0 fails branch commits on, so nothing
+            reaches GitHub through either path and a squash commit — whose
+            message GitHub builds from this title and body — cannot inherit
+            a trailer). Refused before gh runs, naming the match.
         PublishError: gh is missing or fails.
     """
     if pr.head == pr.base or not _BRANCH_RE.match(pr.head):
         raise PushRefused(f"refusing to open a PR from {pr.head!r} into {pr.base!r}")
+    match = attribution_match(pr.title, pr.body)
+    if match is not None:
+        name, line = match
+        raise PushRefused(
+            f"refusing to open a PR whose title/body carries an AI "
+            f"attribution ({name}): {line[:200]!r} — remove it; a human "
+            "Co-Authored-By passes, machine attribution does not"
+        )
     gh = str(gh_bin) if gh_bin else shutil.which("gh")
     if not gh:
         raise PublishError("gh is not installed: the factory opens PRs with `gh pr create`")

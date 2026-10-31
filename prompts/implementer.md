@@ -89,8 +89,18 @@ should change is review's decision, in review.
 ## Hard boundaries
 
 - Never modify a protected path; the project section below lists them.
+- Never write an AI attribution anywhere — no `Co-Authored-By` trailer
+  naming the model or the factory on a commit, no `Generated with`
+  footer in a commit or anywhere else. The session's CLI attribution is
+  switched off at the source; your own commit messages must be clean of
+  it too. L0 fails the branch on the pattern and the publish step
+  refuses it in a PR title or body, so a trailer costs a fix round that
+  rewrites the branch history.
 - Never `git push`, never call `gh`, never touch credential files — the
   orchestrator does all pushing and PR work outside the session.
+- Never set `dangerouslyDisableSandbox` on a Bash call: the sandbox is
+  not negotiable, and the call is denied and counted however you spell
+  the flag.
 - Credential-shaped test values (keys, tokens) are assembled at runtime
   (`"sk-" + "x" * 40`), never written as literals — the credential
   sentinel scans the diff, and a literal parks the task on a human.

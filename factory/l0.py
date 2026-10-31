@@ -85,6 +85,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 
+from factory.attribution import attribution_match
 from factory.gates import (
     CommandResult,
     CommandRunner,
@@ -468,6 +469,53 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
     return findings, sorted(escalations), risk_flags_added, matched_flags
 
 
+def attribution_findings(repo: Path, base_ref: str, head_ref: str) -> list:
+    """FAIL findings for AI-attribution trailers in the branch's own
+    commits (F-42 AC-1).
+
+    The commit messages between the merge-base and head are matched
+    against :data:`factory.attribution.ATTRIBUTION_PATTERNS` — the ONE
+    list the publish step refuses PR text with, so a trailer blocked here
+    is also blocked at the PR seam and a squash commit can't inherit one.
+    Only the branch's own commits are scanned: trailers already sitting on
+    the base (this repo's ``main`` carries five) belong to the base's
+    history, which F-42 deliberately does not rewrite (AC-6). A human
+    ``Co-Authored-By`` passes — the patterns name AI authors and AI vendor
+    addresses, not the trailer itself.
+
+    Args:
+        repo: Repository holding ``base_ref`` and ``head_ref``.
+        base_ref: The base the slice branched from.
+        head_ref: The slice's branch ref.
+
+    Returns:
+        One ``attribution_trailer`` finding per offending commit, naming
+        the commit, the matched line and the pattern class.
+    """
+    merge_base = _git(repo, "merge-base", base_ref, head_ref).strip()
+    log = _git(repo, "log", f"{merge_base}..{head_ref}",
+               "--pretty=format:%H%x1f%B%x1e")
+    findings: list[Finding] = []
+    for record in log.split("\x1e"):
+        record = record.removeprefix("\n")
+        if not record.strip():
+            continue
+        sha, _, message = record.partition("\x1f")
+        match = attribution_match(message)
+        if match is not None:
+            name, line = match
+            findings.append(
+                Finding(
+                    "attribution_trailer",
+                    f"commit {sha[:12]}: AI attribution in the commit message "
+                    f"({name}): {line[:200]!r} — rewrite this branch's history "
+                    "without it; a human Co-Authored-By passes, machine "
+                    "attribution does not",
+                )
+            )
+    return findings
+
+
 def _load_baseline(profile: dict, repo: Path, base_ref: str):
     """Load the baseline file named by the profile, as committed at base.
 
@@ -692,6 +740,11 @@ def run_l0(
         profile, changes, task, matched_flags=matched,
         repo=repo, base_ref=base_ref, head_ref=head_ref,
     )
+    # F-42 AC-1: the branch's own commit messages carry no AI attribution
+    # — before anything is pushed, on every round (each round re-runs L0,
+    # and a fix round hands the finding back so the implementer rewrites
+    # its own branch history).
+    findings.extend(attribution_findings(repo, base_ref, head_ref))
     # F-25: the built-in sentinel pass — pure diff scans; a credential hit
     # escalates immediately (nothing is pushed before a passing round, but
     # a passing retry would push the branch whose local history still

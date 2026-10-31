@@ -1843,6 +1843,14 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                     for record in records if record is not None
                     for skill in (record.skills or [])
                 }),
+                # F-42 AC-5: Bash calls this round's sessions made with
+                # dangerouslyDisableSandbox, denied by the PreToolUse hook
+                # — summed off the session records so repeated bypass
+                # attempts count on the attempt, not only in the trace.
+                "sandbox_bypass_denials": sum(
+                    getattr(r, "sandbox_bypass_denials", 0) or 0
+                    for r in records if r is not None
+                ),
             }
             models = [f"{r.seat}={r.model}" for r in records if r and r.model]
             if models:
