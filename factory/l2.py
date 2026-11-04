@@ -388,11 +388,19 @@ def _validated_report(data: Any) -> L2Report:
         if line is not None and not isinstance(line, int):
             raise _InvalidVerdict(f"finding {index} has a non-integer line")
         missed = item.get("missed_earlier")
-        if missed is not None and (not isinstance(missed, str) or not missed.strip()):
+        if missed is not None and not isinstance(missed, str):
             raise _InvalidVerdict(
-                f"finding {index} missed_earlier must be a non-empty string "
+                f"finding {index} missed_earlier must be a string "
                 "explaining why the earlier round missed it"
             )
+        if isinstance(missed, str) and not missed.strip():
+            # The reviewer prompt shows the key in its example JSON, so a
+            # first-round review echoes it back blank. A blank is an absent
+            # reason, not a malformed verdict — voiding the whole review
+            # over it failed clean diffs in the 2026-11-04 seeded eval.
+            # Delta mode is unaffected: apply_convergence treats None and
+            # blank alike (out_of_delta_without_missed_earlier).
+            missed = None
         finding = L2Finding(
             id=str(item.get("id") or f"L2-{index + 1}"),
             text=text,

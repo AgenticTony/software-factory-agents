@@ -1,0 +1,248 @@
+"""Blank ``missed_earlier`` must not void a review (found by the
+2026-11-04 seeded eval: 3 of 8 diffs failed L2 solely on it).
+
+The reviewer prompt (prompts/reviewer.md) shows ``missed_earlier`` in its
+example JSON, so a first-round review echoes the key back blank. The
+parser treated that blank as a shape violation and voided the reviewer's
+entire verdict — an invalid_verdict_json FAIL on correct code, burning a
+fix round. The field only carries meaning in delta mode, where
+apply_convergence already drops an out-of-delta finding without a real
+reason; there a blank must keep behaving exactly like an absent key.
+
+Also here: the eval's per-diff line for a known-clean diff must carry
+L2's verdict and any invalid_verdict_json, so a clean diff whose review
+was voided can never read as clean ("0 blocking finding(s)").
+"""
+
+import json
+
+import pytest
+
+from factory.eval import render_report
+from factory.l2 import apply_convergence, parse_verdict
+
+
+def _verdict(finding: dict, declared: str = "fail") -> str:
+    return json.dumps({"verdict": declared, "findings": [finding]})
+
+
+# --- 1. the parser: blank is an absent reason, not a shape violation ---
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n\t "])
+def test_blank_missed_earlier_is_stored_as_none(blank):
+    output = _verdict(
+        {
+            "id": "R-1",
+            "axis": "spec",
+            "severity": "major",
+            "file": "src/a.py",
+            "line": 3,
+            "text": "the off-by-one survives",
+            "missed_earlier": blank,
+        }
+    )
+    report = parse_verdict(output)
+    assert report.parse_error is None
+    assert report.declared == "fail"
+    assert report.verdict == "fail"
+    assert len(report.findings) == 1
+    finding = report.findings[0]
+    assert finding.missed_earlier is None
+    # The rest of the verdict survives intact.
+    assert finding.id == "R-1"
+    assert finding.axis == "spec"
+    assert finding.severity == "major"
+    assert finding.file == "src/a.py"
+    assert finding.line == 3
+    assert finding.text == "the off-by-one survives"
+
+
+def test_real_missed_earlier_reason_survives():
+    output = _verdict(
+        {
+            "id": "R-1",
+            "axis": "spec",
+            "severity": "major",
+            "file": "src/a.py",
+            "text": "the off-by-one survives",
+            "missed_earlier": "round 1 read the diff, not the called helper",
+        }
+    )
+    report = parse_verdict(output)
+    assert report.parse_error is None
+    assert report.findings[0].missed_earlier == (
+        "round 1 read the diff, not the called helper"
+    )
+
+
+@pytest.mark.parametrize("bad", [3, 1.5, True, ["why"], {"why": "it"}])
+def test_non_string_missed_earlier_is_still_invalid(bad):
+    output = _verdict(
+        {
+            "axis": "spec",
+            "severity": "major",
+            "text": "the off-by-one survives",
+            "missed_earlier": bad,
+        }
+    )
+    report = parse_verdict(output)
+    assert report.verdict == "fail"
+    assert report.parse_error is not None
+    assert "missed_earlier" in report.parse_error
+    assert report.findings[0].id == "invalid_verdict_json"
+
+
+# --- 2. convergence: a blank reason drops exactly like an absent key ---
+
+
+def _out_of_delta_output(missed_earlier: str | None, declared: str = "pass"):
+    finding = {
+        "id": "R-1",
+        "axis": "spec",
+        "severity": "blocking",
+        "file": "src/untouched.py",
+        "line": 2,
+        "text": "a new finding outside the delta",
+    }
+    if missed_earlier is not None:
+        finding["missed_earlier"] = missed_earlier
+    return _verdict(finding, declared=declared)
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_out_of_delta_finding_with_blank_reason_is_dropped(blank):
+    classified = apply_convergence(
+        parse_verdict(_out_of_delta_output(blank)),
+        prior={},
+        delta_files={"src/changed.py"},
+        delta_mode=True,
+    )
+    assert classified.findings == []
+    assert [d["reason"] for d in classified.dropped] == [
+        "out_of_delta_without_missed_earlier"
+    ]
+    # The declared pass was never overridden by the dropped blocking.
+    assert classified.verdict == "pass"
+
+
+def test_blank_and_absent_key_classify_identically():
+    blank = apply_convergence(
+        parse_verdict(_out_of_delta_output("   ")),
+        prior={},
+        delta_files={"src/changed.py"},
+        delta_mode=True,
+    )
+    absent = apply_convergence(
+        parse_verdict(_out_of_delta_output(None)),
+        prior={},
+        delta_files={"src/changed.py"},
+        delta_mode=True,
+    )
+    assert blank.verdict == absent.verdict == "pass"
+    assert blank.dropped == absent.dropped
+    assert blank.findings == absent.findings == []
+
+
+def test_real_reason_keeps_out_of_delta_finding_alive():
+    classified = apply_convergence(
+        parse_verdict(
+            _out_of_delta_output("round 1 never opened this helper")
+        ),
+        prior={},
+        delta_files={"src/changed.py"},
+        delta_mode=True,
+    )
+    assert classified.dropped == []
+    assert len(classified.findings) == 1
+    assert classified.verdict == "fail"
+
+
+# --- 3. the eval report: a clean diff's line shows the L2 verdict ---
+
+
+def _report(clean_record: dict) -> dict:
+    return {
+        "fixture": "soloadventurer",
+        "base_ref": "main",
+        "l2": "sessions",
+        "seeds": [],
+        "clean": [clean_record],
+        "catch_rate": {"L0": 0.0, "L1": 0.0, "L2": 0.0},
+        "caught_counts": {"L0": 0, "L1": 0, "L2": 0},
+    }
+
+
+def _clean_line(clean_record: dict) -> str:
+    rendered = render_report(_report(clean_record))
+    return next(
+        line
+        for line in rendered.splitlines()
+        if line.startswith(f"- clean {clean_record['id']}:")
+    )
+
+
+def test_clean_line_reports_l2_verdict():
+    record = {
+        "id": "clean-new-helper",
+        "title": "New helper, no defect",
+        "blocking_findings": 0,
+        "layers": {"L2": {"verdict": "pass", "parse_error": None,
+                          "findings": []}},
+    }
+    assert _clean_line(record) == (
+        "- clean clean-new-helper: L2 pass, 0 blocking finding(s) "
+        "— New helper, no defect"
+    )
+
+
+def test_clean_line_reports_invalid_verdict_json():
+    # The 2026-11-04 eval shape: verdict fail, parse_error set, the sole
+    # finding the parser's invalid_verdict_json — and 0 blocking.
+    record = {
+        "id": "clean-docstring",
+        "title": "Docstring-only change",
+        "blocking_findings": 0,
+        "layers": {
+            "L2": {
+                "verdict": "fail",
+                "parse_error": (
+                    "reviewer 2: finding 0 missed_earlier must be a "
+                    "non-empty string explaining why the earlier round "
+                    "missed it"
+                ),
+                "findings": [{"id": "invalid_verdict_json",
+                              "severity": None}],
+            }
+        },
+    }
+    line = _clean_line(record)
+    assert line.startswith("- clean clean-docstring: L2 fail")
+    assert "invalid_verdict_json" in line
+    assert line.endswith("— Docstring-only change")
+
+
+def test_clean_line_reports_l2_fail_without_parse_error():
+    record = {
+        "id": "clean-fail",
+        "title": "Clean diff a reviewer flagged",
+        "blocking_findings": 1,
+        "layers": {"L2": {"verdict": "fail", "parse_error": None,
+                          "findings": [{"id": "R-1", "severity": "blocking"}]}},
+    }
+    assert _clean_line(record) == (
+        "- clean clean-fail: L2 fail, 1 blocking finding(s) "
+        "— Clean diff a reviewer flagged"
+    )
+
+
+def test_clean_line_keeps_l2_skipped_wording():
+    record = {
+        "id": "clean-skipped",
+        "title": "No sessions",
+        "blocking_findings": None,
+        "layers": {},
+    }
+    assert _clean_line(record) == (
+        "- clean clean-skipped: n/a (L2 skipped) — No sessions"
+    )

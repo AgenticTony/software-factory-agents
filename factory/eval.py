@@ -665,6 +665,22 @@ def _count_blocking(l2: dict | None) -> int:
     )
 
 
+def _clean_review_summary(record: dict) -> str:
+    """The review outcome half of a clean diff's per-diff line: the L2
+    verdict first, then the blocking count — a fail, above all an
+    invalid_verdict_json fail (whose lone finding carries no severity,
+    so it counts 0 blocking), must never read as a clean review."""
+    blocking = record.get("blocking_findings")
+    if blocking is None:
+        return "n/a (L2 skipped)"
+    l2 = (record.get("layers") or {}).get("L2") or {}
+    verdict = l2.get("verdict") or "unknown"
+    drew = f"{blocking} blocking finding(s)"
+    if l2.get("parse_error") is not None:
+        return f"L2 {verdict} (invalid_verdict_json), {drew}"
+    return f"L2 {verdict}, {drew}"
+
+
 LAYERS = ("L0", "L1", "L2")
 
 
@@ -725,8 +741,8 @@ def caught_counts_by_layer(seed_records: list) -> dict:
 
 def render_report(report: dict) -> str:
     """The owner-facing per-diff report (the AC-3 tick evidence): per
-    seeded bug, which layers caught it; per known-clean diff, how many
-    blocking findings its review drew; then the catch rate per layer."""
+    seeded bug, which layers caught it; per known-clean diff, its L2
+    verdict and blocking-finding count; then the catch rate per layer."""
     lines = [
         f"Seeded-bug validator eval — fixture: {report['fixture']} "
         f"(base {report['base_ref']}, L2: {report['l2']})",
@@ -742,10 +758,10 @@ def render_report(report: dict) -> str:
             f"(expected {expected}) — {record['title']}"
         )
     for record in report["clean"]:
-        blocking = record.get("blocking_findings")
-        drew = ("n/a (L2 skipped)" if blocking is None
-                else f"{blocking} blocking finding(s)")
-        lines.append(f"- clean {record['id']}: {drew} — {record['title']}")
+        lines.append(
+            f"- clean {record['id']}: {_clean_review_summary(record)} "
+            f"— {record['title']}"
+        )
     lines += ["", "## Catch rate per layer", ""]
     counts = report["caught_counts"]
     total = len(report["seeds"])
