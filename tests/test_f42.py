@@ -687,3 +687,32 @@ def test_review4_other_ai_trailer_styles(tmp_path):
     _commit(repo, "feat: x\n\nAssisted-by: Claude <noreply@anthropic.com>\n")
     findings = [f for f in _run_l0(repo).findings if f.id == "attribution_trailer"]
     assert findings and "Assisted-by" in findings[0].text
+
+
+def test_review5_mid_line_footer_and_suffixed_model_names(tmp_path):
+    """Second review of PR #89: a ``Generated with <AI tool>`` phrase
+    mid-line in a commit body is still the attribution (the AI-tool
+    requirement, not a line anchor, is what keeps ordinary prose out);
+    model names with a suffix (``gpt-4o``) and Cursor's current domain
+    (``cursor.com``) are AI authors."""
+    hits = [
+        ("fix: x\n\nThis change was generated with Claude Code.", "generated_with_footer"),
+        ("fix: x\n\nCode generated with Claude's help", "generated_with_footer"),
+        ("Co-authored-by: aider (gpt-4o) <noreply@aider.chat>", "co_author_ai_author"),
+        ("Co-authored-by: GPT-4o-mini <bot@example.com>", "co_author_ai_author"),
+        ("Co-authored-by: cursoragent <cursoragent@cursor.com>", "co_author_ai_vendor_address"),
+    ]
+    for text, name in hits:
+        match = attribution_match(text)
+        assert match is not None and match[0] == name, text
+    # Ordinary prose stays clean whatever its position in the line.
+    for text in [
+        "fix: x\n\nThe client SDK was generated with openapi-generator.",
+        "fix: x\n\nValues generated with gpt2-tokenizer",
+        "Co-authored-by: Kimi Larsson <12345+kimi@users.noreply.github.com>",
+    ]:
+        assert attribution_match(text) is None, text
+    # The gate agrees on the mid-line footer.
+    repo = _repo(tmp_path, "rev5")
+    _commit(repo, "feat: x\n\nThis change was generated with Claude Code.\n")
+    assert [f for f in _run_l0(repo).findings if f.id == "attribution_trailer"]

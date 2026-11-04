@@ -33,7 +33,7 @@ Matching rules (PR #89 review round):
   ``<login>@users.noreply.github.com`` addresses pass.
 * **The ``Generated with`` footer** is the phrase followed (within two
   connecting tokens) by an AI tool or an AI vendor link — anywhere in a
-  line, so a title carrying it mid-line fails too. Ordinary prose
+  line, in every surface (commit message, PR body, title). Ordinary prose
   ("generated with openapi-generator/faker/ruff") names no AI tool and
   passes.
 * A bare ``AI-assisted: yes`` declaration fails on its own: the trailer
@@ -44,7 +44,9 @@ second hand-maintained list): **anchored** — trailers and declarations
 match only at a line start, for commit messages and PR bodies, where
 prose may legitimately *discuss* a trailer mid-sentence; and
 **unanchored**, for a PR TITLE — one line by construction, so a trailer
-anywhere in it is deliberate.
+anywhere in it is deliberate. The footer is the exception
+(:data:`_UNANCHORED`): it matches mid-line in every surface, since its
+AI-tool requirement already keeps ordinary prose out.
 
 A human ``Co-Authored-By`` passes: a human crediting a human is what the
 trailer exists for. Where the classes must choose, they over-match (a
@@ -63,7 +65,7 @@ _TRAILER_NAMES = r"(?:co-authored-by|assisted-by|generated-by|ai[- ]assisted)"
 
 # AI authors that are not human names — they match alone.
 _AI_AUTHORS = (
-    r"claude|anthropic|copilot|chatgpt|gpt-?\d|codex|openai"
+    r"claude|anthropic|copilot|chatgpt|gpt-?\d\w*|codex|openai"
     r"|software factory|factory implementer"
 )
 
@@ -75,7 +77,7 @@ _AMBIGUOUS = r"kimi|gemini|mistral|llama|cursor|qwen|glm|moonshot"
 # GitHub's human noreply addresses are ``<login>@users.noreply.github.com``
 # and must pass.
 _AI_VENDOR_DOMAINS = (
-    r"anthropic\.com|openai\.com|cursor\.sh|character\.ai|moonshot\.ai"
+    r"anthropic\.com|openai\.com|cursor\.(?:sh|com)|character\.ai|moonshot\.ai"
     r"|deepseek\.com|mistral\.ai|claude\.(?:com|ai)"
 )
 
@@ -125,6 +127,12 @@ _PATTERN_CORES: tuple[tuple[str, str], ...] = (
     ),
 )
 
+# Cores that match anywhere in a line, in every surface. The footer's
+# AI-tool requirement is what keeps ordinary prose out, not its position:
+# "This change was generated with Claude Code." mid-body is the
+# attribution all the same (PR #89 second review).
+_UNANCHORED = frozenset({"generated_with_footer"})
+
 # Anchored: trailers and declarations are line-initial. Up to eight
 # non-word, non-newline characters may sit before them — a quote, list
 # bullet, heading mark, or the emoji on the real footer line. (Newline is
@@ -132,7 +140,13 @@ _PATTERN_CORES: tuple[tuple[str, str], ...] = (
 # break; word characters are excluded so ordinary prose still cannot
 # reach the phrase.)
 ATTRIBUTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
-    (name, re.compile(r"^[^\w\n]{0,8}" + core, re.IGNORECASE | re.MULTILINE))
+    (
+        name,
+        re.compile(
+            core if name in _UNANCHORED else r"^[^\w\n]{0,8}" + core,
+            re.IGNORECASE | re.MULTILINE,
+        ),
+    )
     for name, core in _PATTERN_CORES
 )
 
