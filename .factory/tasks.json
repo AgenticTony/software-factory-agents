@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-30T17:04:46Z",
+  "updated_at": "2026-10-31T21:55:46Z",
   "tasks": [
     {
       "id": "F-00",
@@ -2515,7 +2515,7 @@
       "source": "BUILD-ORDER.md#f-31--read-only-dashboard-factory-dashboard",
       "kind": "build",
       "priority": "P2",
-      "status": "in_review",
+      "status": "done",
       "depends_on": [
         "F-11",
         "F-30"
@@ -2829,7 +2829,8 @@
         "revalidated": {
           "pr": "90e61895464fbc04ccddcf2fac27b07041cc5efe",
           "default": "42084cc0293009c7e41d1aca21b312277d4043f1"
-        }
+        },
+        "merged": "https://github.com/AgenticTony/software-factory-agents/pull/86"
       },
       "acceptance_hash": "e656d126458f306bde9c876b6dc8ec179f369b7aa62caacc5c4352a1b4a24084",
       "approved_at": "2026-10-29T09:09:09Z",
@@ -3418,7 +3419,7 @@
       "source": "BUILD-ORDER.md#f-41--final-full-review-after-fix-rounds",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-23",
         "F-38"
@@ -3488,7 +3489,10 @@
         "max_attempts": 3,
         "max_turns": 200,
         "wall_clock_min": 150
-      }
+      },
+      "acceptance_hash": "99bb99e3cd36fd69de5805306769a19942d03a154f6689b0a44f764b4a8ab034",
+      "approved_at": "2026-10-31T21:55:24Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-42",

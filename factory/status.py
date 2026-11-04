@@ -6,6 +6,9 @@ One read-only markdown page per project:
   awaiting owner;
 * the quota used this week (tokens spent by this factory's attempts —
   a spend figure, not a success measure);
+* the week's sandbox-bypass attempts denied (F-42): Bash calls the
+  sessions made with ``dangerouslyDisableSandbox`` and the PreToolUse
+  hook refused — a security signal over the same week window;
 * the week's vents by category, read through the F-27
   :func:`factory.vent.weeks_vents` seam (no second implementation);
 * the outcome measures only (RESEARCH-SOFTWARE-FACTORY §9): interventions
@@ -220,6 +223,16 @@ def _tokens(attempts: list[dict]) -> int:
         (attempt.get("input_tokens") or 0) + (attempt.get("output_tokens") or 0)
         for attempt in attempts
     )
+
+
+def _bypass_denials(attempt: dict) -> int:
+    """One attempt's sandbox-bypass denial count; malformed counts zero
+    (the queue is schema-validated, so a non-int here is a hand edit —
+    shown as absent, never crashed on)."""
+    value = attempt.get("sandbox_bypass_denials")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(value, 0)
 
 
 def compute_metrics(
@@ -536,6 +549,17 @@ def render_status(
     lines.append(
         f"{_tokens(week_attempts):,} tokens across {len(week_attempts)} attempt(s) "
         f"in the trailing {WEEK_DAYS} days (spend, not a success measure)"
+    )
+    # F-42 AC-5: the week's sandbox-bypass attempts, off the same week
+    # window as the quota — repeated attempts to leave the sandbox are a
+    # security signal the owner reads next to the spend they rode on, not
+    # an outcome measure (a high count is never "productivity").
+    bypass = sum(_bypass_denials(a) for a in week_attempts)
+    lines += ["", "## Sandbox bypass attempts this week", ""]
+    lines.append(
+        f"{bypass} Bash call(s) setting dangerouslyDisableSandbox, denied by "
+        "the seats' PreToolUse hook (each lands in the run's trace; the "
+        "sandbox is not negotiable)"
     )
 
     # -- The week's vents (through the F-27 seam) --------------------------

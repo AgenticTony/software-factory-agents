@@ -52,7 +52,8 @@ def _sha(text: str) -> str:
 # with its pin here — test_ac_2 fails until the pin is updated, so a silent
 # prompt edit can never ride a green run.
 PROMPT_PINS = {
-    IMPLEMENTER_FILE: "89170d411e03b941092202cb662e035c75a47468453f9b26fcaf0bdb6c64f2fd",
+    # F-42; re-pinned for AC-3 (the attribution and sandbox-bypass rules).
+    IMPLEMENTER_FILE: "4855e4ba3ed3a9af252690e6913ffceefec5ba2582dc1496c7c08bf1185c6538",
     # F-41; re-pinned for AC-6 (a surviving major fails the round).
     REVIEWER_FILE: "1306ee568d0f09b02aef2c34694d61e343163a1abde54d19001fba9f55acba22",
     # F-38; re-pinned in its review round (the unanimous-rule paragraph).

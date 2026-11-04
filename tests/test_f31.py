@@ -558,10 +558,12 @@ def test_ac_4(tmp_path: Path):
             page.index('id="trace-events">')
             + len('id="trace-events">'):page.index("</script>")])
         # The full fixture trace, in write order: the L0 report renders
-        # one gate_check row per command plus its diff_policy row.
+        # one gate_check row per command plus its diff_policy row and the
+        # commit-message scan's commit_messages row (F-42).
         assert [e["type"] for e in events] == [
             "phase_start", "phase_end", "phase_start", "tool_call",
-            "session_end", "gate_check", "gate_check", "phase_end", "run_end"]
+            "session_end", "gate_check", "gate_check", "gate_check",
+            "phase_end", "run_end"]
 
         # Live: a second run's trace, streamed while it is written.
         writer = _open_trace(root, RUN_ID_2)

@@ -146,7 +146,9 @@ def test_merged_unreconciled_contract_tests_are_protected(path):
 
 
 @pytest.mark.parametrize(
-    "path", ["tests/test_f13.py", "tests/test_f31.py", "tests/test_f99.py"]
+    # tests/test_f31.py left this list with the queue state that marks
+    # F-31 done: its contract tests are protected now, not future.
+    "path", ["tests/test_f13.py", "tests/test_f99.py"]
 )
 def test_future_work_orders_can_create_their_contract_tests(path):
     """No glob over new test files: the hook denies creation too."""
