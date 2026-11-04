@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-10-31T21:55:46Z",
+  "updated_at": "2026-11-04T11:19:32Z",
   "tasks": [
     {
       "id": "F-00",
@@ -3500,7 +3500,7 @@
       "source": "BUILD-ORDER.md#f-42--session-hardening-attribution-and-sandbox-bypass-attempts",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-06",
         "F-07",
@@ -3570,7 +3570,10 @@
         "max_attempts": 3,
         "max_turns": 100,
         "wall_clock_min": 60
-      }
+      },
+      "acceptance_hash": "e1dde3ff49048e51e72ba4f6300d51d24e82b1ca8976b950f69478c98f0a2f09",
+      "approved_at": "2026-11-04T11:19:32Z",
+      "approved_by": "Anthony"
     }
   ]
 }

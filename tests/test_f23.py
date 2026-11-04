@@ -206,6 +206,29 @@ class Scripted:
         self.lock = threading.Lock()
         self.calls: list[tuple[str, str, Path, dict]] = []
         self.round_reviews = 0  # reviewer calls since this round's implementer
+        # PR #90 round 2: rounds whose scripted verdict passes — the F-41
+        # final full review only ever follows a passing round review, so
+        # a call beyond the round's own fan-out routes to `final` only
+        # then. A round whose verdict fails to parse never sets this, so
+        # the seats' ONE re-run each is fed the round script again (the
+        # retry policy's own contract: same seat, same prompt).
+        self.round_passed: dict[int, bool] = {}
+        # PR #90 round 3: every reviewer prompt, bucketed per (round,
+        # fan-out) as this harness ROUTED it — the fan-out contract
+        # (every seat of one fan-out, re-runs included, gets the same
+        # prompt) is asserted over these by _review_rounds.
+        self.fanout_prompts: dict[tuple[int, str], set[str]] = {}
+        self.fanout_order: list[tuple[int, str]] = []
+
+    def note_fanout_prompt(self, round_no: int, prompt: str,
+                           phase: str = "round"):
+        """Record a reviewer prompt into its (round, fan-out) bucket —
+        also the route for scenarios that bypass __call__ (review1b's
+        dead seats), so the fan-out contract still sees them."""
+        key = (round_no, phase)
+        self.fanout_prompts.setdefault(key, set()).add(prompt)
+        if key not in self.fanout_order:
+            self.fanout_order.append(key)
 
     def prompts(self, seat: str) -> list[str]:
         return [prompt for s, prompt, _, _ in self.calls if s == seat]
@@ -227,27 +250,65 @@ class Scripted:
                 seat=seat, status="completed", num_turns=3, model="stub-model",
                 tokens={"input_tokens": 120, "output_tokens": 40}, result=self.result,
             )
-        if self.round_reviews > 2:
+        if self.round_reviews > 2 and self.round_passed.get(round_no):
             # The round's second fan-out: the F-41 final review (the
-            # fan-out is 2 wide in every scenario here).
+            # fan-out is 2 wide in every scenario here). Only reachable
+            # once the round's own review passed — a failing round never
+            # runs one, and an unparseable round's reviewer re-runs stay
+            # on the round script below.
+            if seat == "reviewer":
+                self.note_fanout_prompt(round_no, prompt, phase="final")
             verdict = self.final if self.final is not None else _verdict()
         else:
+            if seat == "reviewer":
+                self.note_fanout_prompt(round_no, prompt)
             verdict = self.reviews[min(round_no - 1, len(self.reviews) - 1)]
+            if seat == "reviewer" and _passes_review(verdict):
+                self.round_passed[round_no] = True
         return SessionRecord(
             seat=seat, status="completed", num_turns=1, model="stub-model",
             tokens={"input_tokens": 60, "output_tokens": 10}, result=verdict,
         )
 
 
+def _passes_review(verdict: str) -> bool:
+    """Whether a scripted round verdict makes the round's review pass —
+    i.e. whether the F-41 final full review may follow it. Every seat
+    returns the same text, so this is a property of the script: a
+    declared ``pass`` passes (the dropped-finding scenarios carry heavy
+    findings on a declared pass, and convergence drops them out of
+    delta — the pipeline's own call), anything else fails or never
+    parses. The optimism is safe: a round whose review really fails
+    never runs the second fan-out this flag would route."""
+    try:
+        data = json.loads(verdict)
+    except ValueError:
+        return False
+    return data.get("verdict") == "pass"
+
+
 def _review_rounds(seats) -> list[str]:
-    """One reviewer prompt per round: the F-38 fan-out runs two reviewer
-    sessions per round over the same diff, so the raw list carries every
-    round's prompt twice. The helper also pins that the two really are
-    identical — that sameness is the fan-out's contract."""
-    prompts = seats.prompts("reviewer")
-    assert len(prompts) % 2 == 0, f"odd reviewer prompt count: {len(prompts)}"
-    assert prompts[::2] == prompts[1::2], "the fan-out reviewers got different prompts"
-    return prompts[::2]
+    """The round reviews' prompts, one per round. Every seat of one
+    fan-out — and each seat's re-run, which carries its prompt verbatim
+    — must receive the SAME prompt: the F-38 contract the old pairwise
+    parity check guarded, asserted here per (round, fan-out) bucket
+    (positional pairing died with retries; the harness routes every
+    reviewer call, so its buckets know the fan-out a prompt belonged
+    to)."""
+    for key in seats.fanout_order:
+        prompts = seats.fanout_prompts[key]
+        assert len(prompts) == 1, (
+            f"fan-out {key} sent its seats different prompts: "
+            f"{sorted(prompts)}"
+        )
+    seen: set[int] = set()
+    rounds: list[str] = []
+    for round_no, phase in seats.fanout_order:
+        if phase != "round" or round_no in seen:
+            continue
+        seen.add(round_no)
+        rounds.append(next(iter(seats.fanout_prompts[(round_no, "round")])))
+    return rounds
 
 
 # --- AC-1: stable finding keys; repeats are carried, not new ---------------
@@ -535,7 +596,11 @@ def test_review1_an_invalid_review_does_not_advance_the_frontier(tmp_path: Path)
 
 def test_review1b_failed_session_variant(tmp_path: Path):
     """Finding 1, the timed-out-review half: a reviewer session that never
-    completed also advances nothing."""
+    completed also advances nothing. PR #90 round 2 gives such a seat ONE
+    re-run — so the scenario kills every round-1 reviewer attempt, the
+    seats and their retries alike: the round's review is void however
+    many seats are re-asked, and the verdict-void round advances
+    nothing."""
     env = Env(tmp_path)
     seats = Scripted(impls=Scripted.MOVING, reviews=(_verdict(),))
     base_call = seats.__call__
@@ -543,8 +608,12 @@ def test_review1b_failed_session_variant(tmp_path: Path):
     def runner(seat, prompt, run_dir, profile, **kwargs):
         if seat != "reviewer":
             return base_call(seat, prompt, run_dir, profile, **kwargs)
-        if not any(c[0] == "reviewer" for c in seats.calls):
-            seats.calls.append((seat, prompt, Path(run_dir), kwargs))
+        with seats.lock:
+            round_no = sum(1 for s, *_ in seats.calls if s == "implementer")
+        if round_no == 1:
+            with seats.lock:
+                seats.calls.append((seat, prompt, Path(run_dir), kwargs))
+                seats.note_fanout_prompt(1, prompt)
             return SessionRecord(seat=seat, status="failed",
                                  reason="error_during_execution")
         return base_call(seat, prompt, run_dir, profile, **kwargs)
@@ -694,10 +763,12 @@ def test_review7_fileless_findings_are_never_dropped(tmp_path: Path):
     )
     result = env.run(seats)
     assert result.outcome == "pr_opened"
-    # Three review fan-outs before F-41's final: round 1, round 2's
-    # (failed) delta review, round 3's (passing) delta review — then the
-    # final full review, scripted clean, that publishes (F-41).
-    assert len(_review_rounds(seats)) == 4
+    # Three round reviews: round 1, round 2's (failed) delta review,
+    # round 3's (passing) delta review — then the final full review,
+    # scripted clean, that publishes (F-41). Since round 3 of the PR #90
+    # harness buckets, the final is its own phase, not a fourth round.
+    assert len(_review_rounds(seats)) == 3
+    assert (3, "final") in seats.fanout_prompts
     second = env.report(2)["L2"]
     assert second["findings"] and second["verdict"] == "fail"
     assert not second["dropped"]
