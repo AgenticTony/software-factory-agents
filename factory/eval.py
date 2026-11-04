@@ -642,10 +642,13 @@ def run_l2_review(
     l1_dict = l1.to_dict() if l1 is not None else {}
     review_prompt = orchestrator._review_prompt(task, diff, l0_dict, l1_dict)
 
-    def _rerun_review_seat():
+    def _rerun_review_seat(seat_no=None, session=None, parse_error=None):
         """One retry of one reviewer seat: the same prompt through the
-        same fan-out machinery — parse_reviews_with_retry drives it and
-        decides whether the retry's verdict is used."""
+        same fan-out machinery — parse_reviews_with_retry drives it (it
+        passes the seat's 1-based position, its original session and the
+        parse failure, none of which the eval needs: it has no attempt
+        budget to fit and no trace to name the seat) and decides whether
+        the retry's verdict is used."""
         return run_sessions_parallel(
             [("reviewer", review_prompt)],
             repo, profile,

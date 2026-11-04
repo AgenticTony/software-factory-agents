@@ -497,10 +497,20 @@ def parse_reviews_with_retry(
 
     Args:
         sessions: The fan-out's session records, in seat order.
-        rerun: Zero-arg callable re-running ONE seat; it performs the
+        rerun: Callable re-running ONE seat, called as ``rerun(seat_no,
+            session, parse_error)`` — the seat's 1-based fan-out
+            position, its original session record and the reason its
+            verdict failed to parse, so the caller can target the same
+            seat and trace the original failure. It performs the
             caller's own bookkeeping (records, spend, trace) and returns
-            the retry's session record, or ``None`` when the caller
-            refuses the re-run (a spent budget) — no retry then.
+            the retry's session record, or ``None`` to REFUSE the
+            re-run: the orchestrator refuses when the attempt's turn or
+            wall-clock budget cannot fit one more seat (the re-run is
+            capped at what remains and floored like the fan-out's own
+            start check). A refused re-run is not counted. A quota hit
+            on the re-run is NOT a refusal — the record comes back (and
+            counts: tokens were spent) and the caller aborts the
+            attempt exactly as its fan-out's own quota branch does.
 
     Returns:
         ``(reports, retries)`` — one :class:`L2Report` per seat, the
@@ -508,12 +518,12 @@ def parse_reviews_with_retry(
     """
     reports: list[L2Report] = []
     retries = 0
-    for session in sessions:
+    for seat_no, session in enumerate(sessions, start=1):
         report = parse_verdict(
             session.result if session.status == "completed" else None
         )
         if report.parse_error is not None and rerun is not None:
-            retry_session = rerun()
+            retry_session = rerun(seat_no, session, report.parse_error)
             if retry_session is not None:
                 retries += 1
                 retried = parse_verdict(

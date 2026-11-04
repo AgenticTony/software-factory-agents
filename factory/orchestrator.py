@@ -459,6 +459,29 @@ def _turns_spent(records: list) -> int:
     return total
 
 
+def _retry_budget(
+    budget: dict, records: list, session_seconds: float, reviewer_share: int
+) -> tuple[int, float] | None:
+    """The turns and wall-clock minutes ONE reviewer re-run may have, or
+    ``None`` when the attempt's budget cannot fit it (PR #90 round 3).
+
+    The fan-out's own invariant is that its sessions' summed turns never
+    exceed ``budget["max_turns"]``; a re-run joins that invariant, so it
+    is capped at ``min(its per-seat share, what actually remains)`` and
+    refused below :data:`_REVIEW_TURN_FLOOR` — the same floor at which
+    the fan-out itself refuses to start. The wall clock is recomputed
+    from ``session_seconds`` per re-run (re-runs are sequential; reusing
+    the pre-fan-out window would let N invalid seats spend N windows)
+    and must be positive, the same fit the review path itself requires.
+    """
+    remaining_turns = budget["max_turns"] - _turns_spent(records)
+    turns = min(reviewer_share, remaining_turns)
+    remaining_wall = budget["wall_clock_min"] - session_seconds / 60.0
+    if turns < _REVIEW_TURN_FLOOR or remaining_wall <= 0:
+        return None
+    return turns, remaining_wall
+
+
 def _compact(report: dict | None, tail: int) -> dict | None:
     """A report dict with each command output cut to its last ``tail`` chars."""
     if report is None:
@@ -1867,39 +1890,75 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
             record.update({k: v for k, v in extra.items() if v is not None})
             return record
 
-        def _rerun_review_seat(prompt, spend, timeout_min):
+        def _rerun_review_seat(prompt, spend, retry_records,
+                               seat_no, session, parse_error):
             """ONE retry of one reviewer seat whose verdict failed to
             parse (PR #90 round 2): the same prompt through the same
             fan-out machinery. :func:`factory.l2.parse_reviews_with_retry`
             drives it and decides whether the retry's verdict is used; a
-            still-invalid retry keeps the fail-closed union FAIL. The
-            retry's session is recorded like any reviewer seat — spend,
-            vents, trace — plus its own ``reviewer_retry`` trace event
-            (the attempt record is schema-locked, so the trace is the
-            retry's ledger)."""
+            still-invalid retry keeps the fail-closed union FAIL.
+
+            Budget-fitted (round 3): the re-run is capped at what the
+            attempt's turn and wall-clock budgets actually have left
+            (:func:`_retry_budget`) and REFUSED — ``None``, counted as
+            no retry — when neither can fit one. A re-run that dies on
+            quota is not a refusal: its record lands in
+            ``retry_records`` (and the caller aborts the attempt exactly
+            like the fan-out's own quota branch — one shared path,
+            :func:`_quota_exhausted` below).
+
+            The retry's session is recorded like any reviewer seat —
+            records, spend, vents, trace — plus its own
+            ``reviewer_retry`` trace event naming the 1-based seat and
+            the original failure (the attempt record is schema-locked,
+            so the trace is the retry's ledger)."""
             nonlocal session_seconds
+            fit = _retry_budget(
+                budget, records, session_seconds, reviewer_share)
+            if fit is None:
+                return None
+            retry_turns, retry_wall = fit
             t0 = time.monotonic()
             record = run_sessions_parallel(
                 [("reviewer", prompt)], clean.root, profile,
                 runner=ctx.session_runner, factory_root=ctx.factory_root,
-                max_turns=reviewer_share, timeout_min=timeout_min,
+                max_turns=retry_turns, timeout_min=retry_wall,
                 protected=protected, system_prompt=reviewer_system,
                 srt_bin_path=ctx.srt_bin_path,
                 run_id=work.run_id, task_id=task_id,
                 trace_sink=trace.append, toolkit=toolkit_reviewer,
             )[0]
             session_seconds += time.monotonic() - t0
+            retry_records.append(record)
             records.append(record)
             spend.add(record)
             _log_vents(log, record, "reviewer", work.run_id, task_id)
             trace.session_end(record, "reviewer")
             trace.append({
                 "type": "reviewer_retry",
-                "seat": "reviewer",
+                "seat": seat_no,
                 "status": record.status,
                 "reason": record.reason,
+                "original_status": session.status,
+                "original_reason": session.reason or parse_error,
             })
             return record
+
+        def _quota_exhausted(quota_record):
+            """The quota abort the fan-out's own sessions take (task
+            back to ready, no attempt burned) — and, since PR #90
+            round 3, the path a QUOTA-HITTING RETRY takes too: a re-run
+            that dies on quota must abort like the fan-out, not void
+            the round as invalid_verdict_json and burn an attempt. One
+            path for the round review, the final review and their
+            retries."""
+            attempt = attempt_record(
+                attempt_no, started, "aborted", records, None,
+                escalation="quota_exhausted", note=quota_record.reason,
+            )
+            finish(attempt, "ready", [f"1. quota: {quota_record.reason}"])
+            return RunResult("quota_exhausted", task_id,
+                             escalation="quota_exhausted", reports=reports)
 
         # F-30: the attempt every trace event of this round is stamped with,
         # and the attempt outcome mapped to --follow's terminal marker.
@@ -2191,32 +2250,35 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                     (r for r in reviews if _is_quota(r)), None
                                 )
                                 if quota is not None:
-                                    attempt = attempt_record(
-                                        attempt_no, started, "aborted", records, None,
-                                        escalation="quota_exhausted", note=quota.reason,
-                                    )
-                                    finish(attempt, "ready", [f"1. quota: {quota.reason}"])
-                                    return RunResult("quota_exhausted", task_id,
-                                                     escalation="quota_exhausted",
-                                                     reports=reports)
-                                for review in reviews:
-                                    if review.status != "completed":
-                                        extra_findings.append(
-                                            f"[session {review.status}] a reviewer "
-                                            f"session ended: {review.reason}"
-                                        )
+                                    return _quota_exhausted(quota)
                                 # F-38: merge the verdicts into the union,
                                 # vote it, then converge — in that order. A
                                 # verdict still invalid after its one retry
                                 # fails the whole review (the single-reviewer
                                 # rule, unchanged), and the verifier only
                                 # runs when there are findings to vote on.
+                                retry_records: list = []
                                 verdicts, _ = parse_reviews_with_retry(
                                     reviews,
-                                    lambda: _rerun_review_seat(
-                                        review_prompt, review_spend,
-                                        remaining_review),
+                                    lambda seat_no, session, parse_error:
+                                        _rerun_review_seat(
+                                            review_prompt, review_spend,
+                                            retry_records, seat_no, session,
+                                            parse_error),
                                 )
+                                retry_quota = next(
+                                    (r for r in retry_records
+                                     if _is_quota(r)), None
+                                )
+                                if retry_quota is not None:
+                                    return _quota_exhausted(retry_quota)
+                                for review, verdict in zip(reviews, verdicts):
+                                    if (review.status != "completed"
+                                            and verdict.parse_error is not None):
+                                        extra_findings.append(
+                                            f"[session {review.status}] a reviewer "
+                                            f"session ended: {review.reason}"
+                                        )
                                 union = merge_reviews(verdicts)
                                 l2 = union
                                 if union.parse_error is None and union.findings:
@@ -2480,27 +2542,29 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                     (r for r in final_reviews if _is_quota(r)), None
                                 )
                                 if quota is not None:
-                                    attempt = attempt_record(
-                                        attempt_no, started, "aborted", records, None,
-                                        escalation="quota_exhausted", note=quota.reason,
-                                    )
-                                    finish(attempt, "ready",
-                                           [f"1. quota: {quota.reason}"])
-                                    return RunResult("quota_exhausted", task_id,
-                                                     escalation="quota_exhausted",
-                                                     reports=reports)
-                                for review in final_reviews:
-                                    if review.status != "completed":
+                                    return _quota_exhausted(quota)
+                                retry_records: list = []
+                                verdicts, _ = parse_reviews_with_retry(
+                                    final_reviews,
+                                    lambda seat_no, session, parse_error:
+                                        _rerun_review_seat(
+                                            final_prompt, final_spend,
+                                            retry_records, seat_no, session,
+                                            parse_error),
+                                )
+                                retry_quota = next(
+                                    (r for r in retry_records
+                                     if _is_quota(r)), None
+                                )
+                                if retry_quota is not None:
+                                    return _quota_exhausted(retry_quota)
+                                for review, verdict in zip(final_reviews, verdicts):
+                                    if (review.status != "completed"
+                                            and verdict.parse_error is not None):
                                         extra_findings.append(
                                             f"[session {review.status}] a final-review "
                                             f"session ended: {review.reason}"
                                         )
-                                verdicts, _ = parse_reviews_with_retry(
-                                    final_reviews,
-                                    lambda: _rerun_review_seat(
-                                        final_prompt, final_spend,
-                                        remaining_final),
-                                )
                                 union = merge_reviews(verdicts)
                                 l2 = union
                                 if union.parse_error is None and union.findings:

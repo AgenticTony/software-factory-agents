@@ -63,15 +63,18 @@ def _session(result, seat="reviewer", status="completed"):
 def test_invalid_then_valid_uses_the_retry_and_counts_it():
     reruns = []
 
-    def rerun():
-        reruns.append("called")
+    def rerun(seat_no, session, parse_error):
+        reruns.append((seat_no, session.status, parse_error))
         return _session(VALID_FAIL)
 
     reports, retries = parse_reviews_with_retry(
         [_session(GARBAGE), _session(VALID_PASS)], rerun=rerun
     )
     assert retries == 1
-    assert reruns == ["called"]  # exactly one re-run, not a loop
+    # exactly one re-run, not a loop — told WHICH seat slipped and why
+    assert [r[0] for r in reruns] == [1]
+    assert reruns[0][1] == "completed"
+    assert reruns[0][2] and "no valid verdict JSON" in reruns[0][2]
     assert len(reports) == 2  # never fewer reviewers than configured
     assert all(r.parse_error is None for r in reports)
     assert reports[0].verdict == "fail"  # the retry's verdict is the seat's
@@ -81,14 +84,16 @@ def test_invalid_then_valid_uses_the_retry_and_counts_it():
 
 def test_invalid_twice_still_fails_closed():
     reports, retries = parse_reviews_with_retry(
-        [_session(GARBAGE)], rerun=lambda: _session(GARBAGE + " Again.")
+        [_session(GARBAGE)],
+        rerun=lambda seat_no, session, parse_error: _session(
+            GARBAGE + " Again."),
     )
     assert retries == 1
     assert reports[0].parse_error is not None
 
 
 def test_all_valid_never_retries():
-    def explode():
+    def explode(seat_no, session, parse_error):
         raise AssertionError("no seat needed a retry")
 
     reports, retries = parse_reviews_with_retry(
@@ -103,7 +108,8 @@ def test_a_seat_that_produced_no_text_is_retried_once():
     """An aborted/failed session fails to parse like garbage does — one
     retry, then the seat's report stays invalid."""
     reports, retries = parse_reviews_with_retry(
-        [_session(None, status="aborted")], rerun=lambda: _session(VALID_PASS)
+        [_session(None, status="aborted")],
+        rerun=lambda seat_no, session, parse_error: _session(VALID_PASS),
     )
     assert retries == 1
     assert reports[0].parse_error is None
