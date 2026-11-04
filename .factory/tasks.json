@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-04T11:19:32Z",
+  "updated_at": "2026-11-04T22:40:34Z",
   "tasks": [
     {
       "id": "F-00",
@@ -1261,7 +1261,7 @@
       "source": "BUILD-ORDER.md#f-16--seeded-bug-validator-eval",
       "kind": "build",
       "priority": "P2",
-      "status": "awaiting_owner",
+      "status": "done",
       "depends_on": [
         "F-07",
         "F-08",
@@ -1575,7 +1575,10 @@
       "owner_steps": [
         {
           "text": "Run the AC-3 eval once on demand after F-16 merges and record its per-diff report (seeded bug caught or not; blocking findings per known-clean diff) as the tick evidence.",
-          "done": false
+          "done": true,
+          "done_at": "2026-11-04T22:40:34Z",
+          "done_by": "Anthony",
+          "evidence": "factory eval report ~/factory/eval/seeded-eval-20261104T222828Z.json (main 2927cae): L0 67% (4/6), L1 17% (1/6), L2 100% (6/6); every seed caught at its expected layer; L2 false-fail on clean diffs 0 of 2; quota-voided 0; 0 reviewer retries"
         }
       ],
       "acceptance_hash": "4c263cadb68bfe326f84db5b7bdf05e94eb7289d2adccd16260ded6bd9c7933d",
