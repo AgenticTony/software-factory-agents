@@ -36,6 +36,17 @@ concept — the session's job, never a keyword matcher here — and a match
 is only ever *listed* for you to confirm: the task is still proposed,
 still ``draft``, never dropped or rejected on its own.
 
+The queue's project name is known before the session runs (the existing
+queue's, or the profile's for a fresh project): the prompt states it
+literally in the output contract — the session proposes for *this*
+queue, never a spelling guessed from the repository directory. And a
+proposal refused at parse or plan time is not lost with the run dir:
+the real session's raw output is kept (credential-redacted, mode 0600)
+under ``<factory-root>/import/``, and the refusal names the file, so
+the fix is an edit plus ``factory import --proposal <file>`` — not
+another session. Injected sessions keep nothing unless the caller gave
+a factory root: a stub is free to re-run.
+
 The session sits behind one injected callable (the F-06 pattern):
 ``session(prompt) -> text``. Tests pass a stub returning a fixed
 proposal; the default, :func:`sdk_import_session`, runs the reviewer
@@ -52,9 +63,11 @@ import contextlib
 import copy
 import difflib
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -67,6 +80,7 @@ from factory.contract import (
 )
 from factory.runs import FACTORY_ROOT_DEFAULT, RunError, cleanup_run, create_run
 from factory.sandbox import SandboxError
+from factory.sentinels import redact_credentials
 from factory.session import SessionConfigError, run_session_sandboxed, seat_token
 from factory.state import TaskQueue, _atomic_write_json, now_iso
 
@@ -191,9 +205,27 @@ def read_out_of_scope(repo: Path | str) -> list[dict[str, str]]:
 # ------------------------------------------------------------------ prompt --
 
 
-def build_import_prompt(repo: Path, docs_dir: str, records: list[dict]) -> str:
+def build_import_prompt(
+    repo: Path, docs_dir: str, records: list[dict], *, project: str | None = None
+) -> str:
     """The importer session's prompt: which docs to read, the register
-    to match against, and the exact output contract."""
+    to match against, and the exact output contract.
+
+    Args:
+        repo: The project repo root.
+        docs_dir: Repo-relative planning-docs directory.
+        records: The out-of-scope register (see :func:`read_out_of_scope`).
+        project: The queue's project name — the one the proposal must
+            carry exactly. With it the output contract states the name
+            literally; without it (the pre-name contract arm, kept for
+            direct calls) the placeholder stays and the session is back
+            to guessing — :func:`run_import` always passes it.
+
+    The name is stated, not described: a placeholder like
+    ``"<project name>"`` left the session to guess from the repository
+    directory's spelling, and a one-letter-case guess was refused by
+    :func:`plan_import` after a full session had already been spent.
+    """
     repo = Path(repo)
     docs = repo / docs_dir
     files: list[str] = []
@@ -220,10 +252,20 @@ def build_import_prompt(repo: Path, docs_dir: str, records: list[dict]) -> str:
             lines += [f"### {record['path']}", record["text"].strip(), ""]
     else:
         lines.append("(the register is empty or missing)")
+    if project is not None:
+        contract = f'  {{"project": "{project}", "tasks": [...]}}'
+        naming_rule = [
+            f"- project must be exactly {project} — the queue's name as",
+            "  given here, not the repository directory's spelling or a",
+            "  variant casing; a proposal naming anything else is refused.",
+        ]
+    else:
+        contract = '  {"project": "<project name>", "tasks": [...]}'
+        naming_rule = []
     lines += [
         "",
         "Output — and output nothing else — one JSON object:",
-        '  {"project": "<project name>", "tasks": [...]}',
+        contract,
         "Each task carries: id, title, source (repo-relative path of the doc",
         "that owns the spec, with #heading when useful), kind (build | docs |",
         "decision | research | owner_only), priority (P1 | P2 | P3),",
@@ -232,6 +274,7 @@ def build_import_prompt(repo: Path, docs_dir: str, records: list[dict]) -> str:
         "max_turns, wall_clock_min}, and owner_steps / slices when the doc",
         "defines them.",
         "Rules:",
+        *naming_rule,
         "- Never set status, acceptance_hash, approved_at, approved_by,",
         "  attempts, links or out_of_scope. Every task is imported as draft;",
         "  approval is the owner's act (factory approve).",
@@ -617,6 +660,73 @@ def apply_import(
     return True
 
 
+# ------------------------------------------------- refused output kept --
+
+
+def _refusal_suffix(text: str) -> str:
+    """``.json`` when the session's output is JSON (fence stripped, as
+    :func:`parse_proposal` reads it), ``.txt`` when it is not — the
+    extension says what there is to fix."""
+    stripped = text.strip()
+    match = _FENCE.search(stripped)
+    if match:
+        stripped = match.group(1).strip()
+    try:
+        json.loads(stripped)
+    except json.JSONDecodeError:
+        return ".txt"
+    return ".json"
+
+
+def _save_refused_output(
+    text: str, project: str, factory_root: Path | str | None
+) -> Path:
+    """Keep the importer session's raw output for a proposal that was
+    refused at parse or plan time.
+
+    The sandboxed session's run dir is deleted on every exit path, so
+    without this a refused proposal cost the whole session and left
+    nothing to fix and re-review with ``factory import --proposal``.
+    The copy is credential-redacted
+    (:func:`factory.sentinels.redact_credentials` — the same scrubber
+    sentinel output goes through; no secrets are *expected* in a
+    proposal, but the session writes the text, not us) and written with
+    mode 0600 under ``<factory-root>/import/`` as
+    ``<project>-<UTC stamp>.proposal.json`` (``.txt`` when the output is
+    not JSON), never overwriting an earlier refusal.
+
+    Raises:
+        OSError: The factory root is unwritable — the caller keeps the
+            original refusal; the save never masks it.
+    """
+    root = Path(factory_root) if factory_root is not None else FACTORY_ROOT_DEFAULT
+    directory = root / "import"
+    directory.mkdir(parents=True, exist_ok=True)
+    # Schema names are slugs (^[a-z0-9-]+$); the sanitiser is defence in
+    # depth for a hand-edited queue, whose project still reaches here.
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", project)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    suffix = _refusal_suffix(text)
+    payload = redact_credentials(text)
+    for attempt in range(1, 100):
+        name = (
+            f"{safe}-{stamp}.proposal{suffix}" if attempt == 1
+            else f"{safe}-{stamp}-{attempt}.proposal{suffix}"
+        )
+        path = directory / name
+        try:
+            # O_EXCL: create-only, so two refusals in the same second
+            # (parallel runs) never overwrite each other; the mode is
+            # set at creation, not by a later chmod.
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        return path
+    raise OSError(f"{directory}: too many refusals saved this second")
+
+
 # ------------------------------------------------------------------- entry --
 
 
@@ -657,7 +767,8 @@ def run_import(
             :func:`sdk_import_session` (sandboxed, in a disposable clone).
         confirm: ``summary -> bool``; asked before the one and only write.
         factory_root: Factory root for the default session's run dir and
-            sandbox settings (default ``~/factory``).
+            sandbox settings, and for the refused-output copies a
+            parse/plan refusal keeps (default ``~/factory``).
 
     Returns:
         The :class:`ImportResult` — plan, summary, resolved queue path,
@@ -665,7 +776,11 @@ def run_import(
 
     Raises:
         ImportRefused: No session output could be parsed or merged into a
-            schema-valid, all-draft proposal (AC-1/AC-2).
+            schema-valid, all-draft proposal (AC-1/AC-2). When the output
+            came from the real session (``session=None``) or the caller
+            passed ``factory_root`` explicitly, the raw output is saved
+            (redacted, 0600) under ``<factory-root>/import/`` and the
+            message names the file for ``factory import --proposal``.
     """
     repo = Path(repo)
     if queue_path is None:
@@ -679,7 +794,7 @@ def run_import(
     else:
         profile = load_profile(repo / ".factory" / "project.yaml")
         project = profile["name"]
-    prompt = build_import_prompt(repo, docs_dir, records)
+    prompt = build_import_prompt(repo, docs_dir, records, project=project)
     if session is not None:
         text = session(prompt)
     else:
@@ -691,7 +806,29 @@ def run_import(
             prompt, repo, profile=profile, queue_path=queue_path,
             factory_root=factory_root,
         )
-    plan = plan_import(existing_doc, parse_proposal(text), records, project=project)
+    try:
+        proposal = parse_proposal(text)
+        plan = plan_import(existing_doc, proposal, records, project=project)
+    except ImportRefused as exc:
+        # The session's output is the expensive part (a real run's clone
+        # is already deleted by now) — keep it, redacted, and say where,
+        # so the fix is a file edit plus `factory import --proposal`.
+        # Only when the output was expensive: the real session
+        # (session=None) or an explicitly given factory root. An injected
+        # stub with the default root is free to re-run — nothing is kept
+        # and nothing is written under ~/factory.
+        if session is None or factory_root is not None:
+            try:
+                saved = _save_refused_output(text, project, factory_root)
+            except OSError as save_exc:
+                raise ImportRefused(
+                    f"{exc} (the raw output could not be saved: {save_exc})"
+                ) from exc
+            raise ImportRefused(
+                f"{exc}; saved to {saved}; fix it and review with "
+                f"factory import --proposal {saved}"
+            ) from exc
+        raise
     summary = render_summary(plan)
     applied = False
     if confirm is not None:
