@@ -23,6 +23,7 @@ from pathlib import Path
 from factory.eval import (
     CLEAN_DIFFS,
     build_soloadventurer_fixture,
+    catch_rate_by_layer,
     render_report,
     run_seed,
     run_seeded_eval,
@@ -255,6 +256,64 @@ def test_orchestrator_wires_the_retry_into_both_fan_outs():
     # import + the two fan-out sites
     assert source.count("parse_reviews_with_retry") >= 3
     assert '"reviewer_retry"' in source
+
+
+# --- round 5: quota voids render honestly ------------------------------------
+
+
+def _voided_report() -> dict:
+    """Both seeds quota-voided on L2 (one caught by L0 anyway, one
+    judged by nothing): the render must say so and never invent a
+    verdict, a catch or a rate."""
+    return {
+        "fixture": "soloadventurer", "base_ref": "main", "l2": "sessions",
+        "seeds": [
+            {
+                "id": "phantom-table", "title": "A phantom table",
+                "expected_layer": "L0", "caught_by": ["L0"],
+                "layers": {"L2": {"quota_voided": True,
+                                  "review_retries": 1}},
+            },
+            {
+                "id": "mocks-what-it-tests", "title": "A self-mocking test",
+                "expected_layer": "L2", "caught_by": [],
+                "layers": {"L2": {"quota_voided": True,
+                                  "review_retries": 0}},
+            },
+        ],
+        "clean": [],
+        "l2_false_fail_on_clean": None,
+        "l2_quota_voided": 2,
+        "catch_rate": {"L0": 1.0, "L1": 0.0, "L2": None},
+        "caught_counts": {"L0": 1, "L1": 0, "L2": 0},
+    }
+
+
+def test_a_quota_voided_seed_never_reads_not_caught():
+    text = render_report(_voided_report())
+    assert "NOT CAUGHT" not in text
+    # Caught by another layer: the void is a parenthetical, not a miss.
+    assert ("- seed phantom-table: caught by L0 (L2 quota-voided) "
+            "(expected L0)") in text
+    # Judged by nothing: the void IS the story.
+    assert ("- seed mocks-what-it-tests: L2 quota-voided, not judged "
+            "(expected L2)") in text
+
+
+def test_a_layer_with_no_judged_seeds_is_na_not_a_zero_percent():
+    rates = catch_rate_by_layer([
+        {"caught_by": ["L0"],
+         "layers": {"L0": {"verdict": "fail"},
+                    "L2": {"quota_voided": True}}},
+        {"caught_by": [],
+         "layers": {"L0": {"verdict": "pass"},
+                    "L2": {"quota_voided": True}}},
+    ])
+    assert rates["L2"] is None  # no denominator, not a 0% clean bill
+    assert rates["L0"] == 0.5  # caught 1 of the 2 it judged
+    text = render_report(_voided_report())
+    assert "L2: n/a (0 judged)" in text
+    assert "L2: 0%" not in text
 
 
 # --- round 4 / finding 7: a quota-hit review is void, never a verdict ------

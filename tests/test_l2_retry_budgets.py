@@ -48,7 +48,7 @@ def test_retry_budget_caps_at_share_and_remaining_and_floors():
     records = [SessionRecord(seat="implementer", status="completed",
                              num_turns=30)]
     # min(share 8, remaining 10) turns; the wall clock left after spend.
-    assert _retry_budget(budget, records, 5.0 * 60, 8) == (8, 5.0)
+    assert _retry_budget(budget, records, 5.0 * 60, 8) == (8, 5.0, None)
 
 
 def test_retry_budget_reserves_the_verifiers_turn_floor():
@@ -60,24 +60,28 @@ def test_retry_budget_reserves_the_verifiers_turn_floor():
     records = [SessionRecord(seat="implementer", status="completed",
                              num_turns=36)]
     # remaining 4: min(share 8, 4 - 2 reserved) = 2, exactly the floor
-    assert _retry_budget(budget, records, 0.0, 8) == (2, 10.0)
+    assert _retry_budget(budget, records, 0.0, 8) == (2, 10.0, None)
     # remaining 3: min(8, 3 - 2) = 1, below the floor — the verifier's
-    # floor wins, the re-run is refused and the round fails normally.
+    # floor wins; the refusal names its refuser (round 5: the fit and
+    # the name come from ONE function).
     records.append(SessionRecord(seat="reviewer", status="completed",
                                  num_turns=1))
-    assert _retry_budget(budget, records, 0.0, 8) is None
+    assert _retry_budget(budget, records, 0.0, 8) == (
+        None, None, "turn budget")
     # … and the share still caps: remaining 20, share 5 → 5.
     records.clear()
     records.append(SessionRecord(seat="implementer", status="completed",
                                  num_turns=20))
-    assert _retry_budget(budget, records, 0.0, 5) == (5, 10.0)
+    assert _retry_budget(budget, records, 0.0, 5) == (5, 10.0, None)
 
 
 def test_retry_budget_refused_without_wall_clock():
     budget = {"max_turns": 40, "wall_clock_min": 10.0}
     records = []
-    assert _retry_budget(budget, records, 10.0 * 60, 8) is None
-    assert _retry_budget(budget, records, 10.5 * 60, 8) is None
+    assert _retry_budget(budget, records, 10.0 * 60, 8) == (
+        None, None, "wall-clock budget")
+    assert _retry_budget(budget, records, 10.5 * 60, 8) == (
+        None, None, "wall-clock budget")
 
 
 def test_three_invalid_seats_spend_at_most_the_window():
@@ -91,12 +95,11 @@ def test_three_invalid_seats_spend_at_most_the_window():
 
     def rerun(seat_no, session, parse_error):
         fit = _retry_budget(budget, spent["records"], spent["seconds"], 10)
-        if fit is None:
+        if fit.refusal is not None:
             return None
-        turns, wall = fit
-        granted.append(wall)
+        granted.append(fit.wall)
         # the retry consumes its whole granted window (worst case)
-        spent["seconds"] += wall * 60.0
+        spent["seconds"] += fit.wall * 60.0
         spent["records"].append(SessionRecord(
             seat="reviewer", status="completed", num_turns=1))
         return _session(GARBAGE)

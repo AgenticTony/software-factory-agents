@@ -830,10 +830,14 @@ def catch_rate_by_layer(seed_records: list) -> dict:
     """The share of seeds each layer caught (a failing layer whose own
     evidence names the seed — see :func:`_catches`), over the seeds the
     layer actually judged: a quota-voided review is no verdict and no
-    miss."""
+    miss — and a layer that judged NOTHING has no rate at all
+    (``None``, rendered n/a), never a false 0%."""
     counts = caught_counts_by_layer(seed_records)
     totals = _layer_totals(seed_records)
-    return {layer: counts[layer] / (totals[layer] or 1) for layer in LAYERS}
+    return {
+        layer: (counts[layer] / totals[layer]) if totals[layer] else None
+        for layer in LAYERS
+    }
 
 
 def caught_counts_by_layer(seed_records: list) -> dict:
@@ -865,10 +869,22 @@ def render_report(report: dict) -> str:
         "",
     ]
     for record in report["seeds"]:
-        caught = ", ".join(record["caught_by"]) or "NOT CAUGHT"
+        caught_layers = list(record.get("caught_by") or [])
+        voided = ((record.get("layers") or {}).get("L2") or {}).get(
+            "quota_voided")
+        if caught_layers:
+            # Another layer's catch still counts; the void is a
+            # parenthetical, never a miss (round 5).
+            middle = "caught by " + ", ".join(caught_layers)
+            if voided:
+                middle += " (L2 quota-voided)"
+        elif voided:
+            middle = "L2 quota-voided, not judged"
+        else:
+            middle = "caught by NOT CAUGHT"
         expected = record.get("expected_layer") or "-"
         lines.append(
-            f"- seed {record['id']}: caught by {caught} "
+            f"- seed {record['id']}: {middle} "
             f"(expected {expected}) — {record['title']}"
         )
     for record in report["clean"]:
@@ -880,10 +896,16 @@ def render_report(report: dict) -> str:
     counts = report["caught_counts"]
     totals = _layer_totals(report["seeds"])
     for layer in LAYERS:
-        lines.append(
-            f"- {layer}: {report['catch_rate'][layer]:.0%} "
-            f"({counts[layer]} of {totals[layer]} seeds)"
-        )
+        rate = report["catch_rate"][layer]
+        if rate is None:
+            # No denominator (every seed quota-voided): n/a, the same
+            # rule the false-fail line follows — never a false 0%.
+            lines.append(f"- {layer}: n/a (0 judged)")
+        else:
+            lines.append(
+                f"- {layer}: {rate:.0%} "
+                f"({counts[layer]} of {totals[layer]} seeds)"
+            )
     # PR #90 round 2: the catch-rate table covers seeds only — this is
     # its false-positive counterpart over the known-clean diffs. n/a
     # (not 0) when L2 never ran.

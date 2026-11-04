@@ -70,7 +70,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NamedTuple
 
 from factory.config import CONFIG_FILE, FactoryConfig, in_peak_window, load_config
 from factory.contract import load_profile
@@ -459,11 +459,24 @@ def _turns_spent(records: list) -> int:
     return total
 
 
+class RetryFit(NamedTuple):
+    """One reviewer re-run's budget fit: the turns and wall-clock
+    minutes it may have, or — when the attempt's budget cannot fit one —
+    ``refusal`` naming WHICH budget refused (the note a refused seat
+    gets must name its refuser). Exactly one of the two shapes is
+    meaningful: a fit carries no refusal, a refusal no numbers."""
+
+    turns: int | None
+    wall: float | None
+    refusal: str | None = None
+
+
 def _retry_budget(
     budget: dict, records: list, session_seconds: float, reviewer_share: int
-) -> tuple[int, float] | None:
+) -> RetryFit:
     """The turns and wall-clock minutes ONE reviewer re-run may have, or
-    ``None`` when the attempt's budget cannot fit it (PR #90 rounds 3-4).
+    the refusal that denies it (PR #90 rounds 3-5: ONE source of truth
+    for the fit and the refusal's name — the two can never drift).
 
     The fan-out's own invariant is that its sessions' summed turns never
     exceed ``budget["max_turns"]``; a re-run joins that invariant, so it
@@ -484,24 +497,11 @@ def _retry_budget(
     remaining_turns = budget["max_turns"] - _turns_spent(records)
     turns = min(reviewer_share, remaining_turns - _REVIEW_TURN_FLOOR)
     remaining_wall = budget["wall_clock_min"] - session_seconds / 60.0
-    if turns < _REVIEW_TURN_FLOOR or remaining_wall <= 0:
-        return None
-    return turns, remaining_wall
-
-
-def _retry_refusal(
-    budget: dict, records: list, session_seconds: float, reviewer_share: int
-) -> str | None:
-    """WHICH budget refused a reviewer re-run (``"turn budget"`` /
-    ``"wall-clock budget"``), or ``None`` when one fits — the note a
-    refused seat gets must name its refuser. Pure, and mirrors
-    :func:`_retry_budget`'s conditions (wall first, then turns)."""
-    if budget["wall_clock_min"] - session_seconds / 60.0 <= 0:
-        return "wall-clock budget"
-    remaining_turns = budget["max_turns"] - _turns_spent(records)
-    if min(reviewer_share, remaining_turns - _REVIEW_TURN_FLOOR) < _REVIEW_TURN_FLOOR:
-        return "turn budget"
-    return None
+    if remaining_wall <= 0:
+        return RetryFit(None, None, "wall-clock budget")
+    if turns < _REVIEW_TURN_FLOOR:
+        return RetryFit(None, None, "turn budget")
+    return RetryFit(turns, remaining_wall)
 
 
 def _compact(report: dict | None, tail: int) -> dict | None:
@@ -1939,11 +1939,10 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
             nonlocal session_seconds
             fit = _retry_budget(
                 budget, records, session_seconds, reviewer_share)
-            if fit is None:
-                outcomes[seat_no] = {"refused": _retry_refusal(
-                    budget, records, session_seconds, reviewer_share)}
+            if fit.refusal is not None:
+                outcomes[seat_no] = {"refused": fit.refusal}
                 return None
-            retry_turns, retry_wall = fit
+            retry_turns, retry_wall = fit.turns, fit.wall
             t0 = time.monotonic()
             record = run_sessions_parallel(
                 [("reviewer", prompt)], clean.root, profile,
