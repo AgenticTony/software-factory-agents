@@ -84,7 +84,7 @@ from factory.l2 import (
     apply_vote,
     final_review_verdict,
     merge_reviews,
-    parse_verdict,
+    parse_reviews_with_retry,
     parse_verifier_vote,
 )
 from factory.mergeorder import admission, gh_branch_protection, gh_pr_state
@@ -1867,6 +1867,40 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
             record.update({k: v for k, v in extra.items() if v is not None})
             return record
 
+        def _rerun_review_seat(prompt, spend, timeout_min):
+            """ONE retry of one reviewer seat whose verdict failed to
+            parse (PR #90 round 2): the same prompt through the same
+            fan-out machinery. :func:`factory.l2.parse_reviews_with_retry`
+            drives it and decides whether the retry's verdict is used; a
+            still-invalid retry keeps the fail-closed union FAIL. The
+            retry's session is recorded like any reviewer seat — spend,
+            vents, trace — plus its own ``reviewer_retry`` trace event
+            (the attempt record is schema-locked, so the trace is the
+            retry's ledger)."""
+            nonlocal session_seconds
+            t0 = time.monotonic()
+            record = run_sessions_parallel(
+                [("reviewer", prompt)], clean.root, profile,
+                runner=ctx.session_runner, factory_root=ctx.factory_root,
+                max_turns=reviewer_share, timeout_min=timeout_min,
+                protected=protected, system_prompt=reviewer_system,
+                srt_bin_path=ctx.srt_bin_path,
+                run_id=work.run_id, task_id=task_id,
+                trace_sink=trace.append, toolkit=toolkit_reviewer,
+            )[0]
+            session_seconds += time.monotonic() - t0
+            records.append(record)
+            spend.add(record)
+            _log_vents(log, record, "reviewer", work.run_id, task_id)
+            trace.session_end(record, "reviewer")
+            trace.append({
+                "type": "reviewer_retry",
+                "seat": "reviewer",
+                "status": record.status,
+                "reason": record.reason,
+            })
+            return record
+
         # F-30: the attempt every trace event of this round is stamped with,
         # and the attempt outcome mapped to --follow's terminal marker.
         _RUN_END = {"pass": "published", "fail": "failed",
@@ -2172,17 +2206,18 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                             f"session ended: {review.reason}"
                                         )
                                 # F-38: merge the verdicts into the union,
-                                # vote it, then converge — in that order. One
-                                # invalid verdict fails the whole review (the
-                                # single-reviewer rule, unchanged), and the
-                                # verifier only runs when there are findings
-                                # to vote on.
-                                union = merge_reviews([
-                                    parse_verdict(
-                                        review.result if review.status == "completed"
-                                        else None)
-                                    for review in reviews
-                                ])
+                                # vote it, then converge — in that order. A
+                                # verdict still invalid after its one retry
+                                # fails the whole review (the single-reviewer
+                                # rule, unchanged), and the verifier only
+                                # runs when there are findings to vote on.
+                                verdicts, _ = parse_reviews_with_retry(
+                                    reviews,
+                                    lambda: _rerun_review_seat(
+                                        review_prompt, review_spend,
+                                        remaining_review),
+                                )
+                                union = merge_reviews(verdicts)
                                 l2 = union
                                 if union.parse_error is None and union.findings:
                                     remaining_verifier = (
@@ -2460,12 +2495,13 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                             f"[session {review.status}] a final-review "
                                             f"session ended: {review.reason}"
                                         )
-                                union = merge_reviews([
-                                    parse_verdict(
-                                        review.result if review.status == "completed"
-                                        else None)
-                                    for review in final_reviews
-                                ])
+                                verdicts, _ = parse_reviews_with_retry(
+                                    final_reviews,
+                                    lambda: _rerun_review_seat(
+                                        final_prompt, final_spend,
+                                        remaining_final),
+                                )
+                                union = merge_reviews(verdicts)
                                 l2 = union
                                 if union.parse_error is None and union.findings:
                                     remaining_verifier = (

@@ -14,12 +14,17 @@ The rules, enforced here rather than trusted from the model:
   includes a session that produced no text at all (``result=None`` from a
   failed or timed-out reviewer): the orchestrator must stop the change,
   not crash on it.
-* Every finding carries ``axis`` — exactly ``spec`` or ``standards`` — and
-  ``severity`` — exactly ``blocking``, ``major``, ``minor`` or ``note``
-  (the four values the seat prompt documents). A finding without either
-  makes the whole output invalid (the AC-1 rule): the two axes are the
-  review's structure, and an unlisted severity is the model inventing a
-  scale the factory doesn't act on.
+* Every finding carries ``axis`` — ``spec`` or ``standards`` — and
+  ``severity`` — one of ``blocking``, ``major``, ``minor`` or ``note``
+  (the four values the seat prompt documents). Both are matched the way
+  severity always was — trimmed, case-insensitive — and the canonical
+  value stored, so "Spec" is the review's structure, not a protocol
+  fault. Anything else after normalising still makes the whole output
+  invalid (the AC-1 rule): the two axes are the review's structure, and
+  an unlisted severity is the model inventing a scale the factory
+  doesn't act on. A ``line`` is an int or a quoted int ("42" is the same
+  place as 42); a bool, a negative, a float or a range string is not a
+  place.
 * A ``blocking`` finding on **either** axis means FAIL, whatever the other
   axis says and whatever the declared verdict says — neither axis is
   allowed to mask the other. F-41 AC-6 extends the same weight to
@@ -61,7 +66,11 @@ F-38 adds the parallel reviewer fan-out and the verifier vote. N reviewer
 verdicts merge into ONE union (:func:`merge_reviews`): findings two
 reviewers both report become one entry carrying which reviewers reported
 it, and one invalid verdict fails the whole review exactly as a single
-invalid one did. Duplicates merge on the F-23 stable key — the same
+invalid one did — after :func:`parse_reviews_with_retry` has given that
+seat ONE re-run with the same prompt (PR #90 round 2: a formatting slip
+by one reviewer no longer voids every reviewer's findings; a
+still-invalid retry keeps the fail-closed union FAIL). Duplicates merge
+on the F-23 stable key — the same
 defect in the same wording — and, since F-41, on **location** too: the
 same file with lines within :data:`_MERGE_LINE_WINDOW` of each other,
 when both findings carry a file and a line and their wording overlaps
@@ -99,7 +108,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field, replace
-from typing import Any, ClassVar, NamedTuple, Sequence
+from typing import Any, Callable, ClassVar, NamedTuple, Sequence
 
 from factory.gates import Finding, GateReport
 
@@ -367,11 +376,19 @@ def _validated_report(data: Any) -> L2Report:
         if not isinstance(item, dict):
             raise _InvalidVerdict(f"finding {index} is not an object")
         axis = item.get("axis")
-        if axis not in VALID_AXES:
+        if (
+            not isinstance(axis, str)
+            or axis.strip().lower() not in VALID_AXES
+        ):
             raise _InvalidVerdict(
                 f"finding {index} carries no valid axis ('spec' or "
                 f"'standards'): {axis!r}"
             )
+        # The same tolerance severity has always had, and the canonical
+        # value is stored: "Spec" is the review's structure, not a
+        # protocol fault (PR #90 round 2 — an exact match voided whole
+        # reviews over casing).
+        axis = axis.strip().lower()
         text = item.get("text")
         if not isinstance(text, str) or not text.strip():
             raise _InvalidVerdict(f"finding {index} carries no text")
@@ -385,7 +402,18 @@ def _validated_report(data: Any) -> L2Report:
                 f"got {severity!r}"
             )
         line = item.get("line")
-        if line is not None and not isinstance(line, int):
+        if isinstance(line, bool):
+            # bool IS int in Python; a true/false line is a slip, and
+            # True would reach the ±5-line location merge as line 1.
+            raise _InvalidVerdict(f"finding {index} has a non-integer line")
+        if isinstance(line, int):
+            if line < 0:
+                raise _InvalidVerdict(f"finding {index} has a non-integer line")
+        elif isinstance(line, str) and line.strip().isdigit():
+            # A quoted line number names the same place as the int
+            # (PR #90 round 2 — "42" used to void the whole verdict).
+            line = int(line.strip())
+        elif line is not None:
             raise _InvalidVerdict(f"finding {index} has a non-integer line")
         missed = item.get("missed_earlier")
         if missed is not None and not isinstance(missed, str):
@@ -447,6 +475,56 @@ def parse_verdict(output: Any) -> L2Report:
         return _validated_report(_extract_json(output))
     except _InvalidVerdict as exc:
         return _invalid(str(exc))
+
+
+def parse_reviews_with_retry(
+    sessions: Sequence[Any],
+    rerun: Callable[[], Any] | None = None,
+) -> tuple[list[L2Report], int]:
+    """Parse the fan-out's reviewer seats, retrying a seat that could not
+    speak the verdict protocol exactly once (PR #90 round 2).
+
+    One reviewer's formatting slip — garbage instead of JSON, or a
+    session that died before producing text — used to void every
+    reviewer's findings. That seat now gets ONE re-run via ``rerun`` (the
+    caller's closure re-running the same seat with the same prompt
+    through the same fan-out machinery); if the retry parses, it IS the
+    seat's verdict. Fail-closed throughout: a still-invalid retry leaves
+    the seat's report invalid and :func:`merge_reviews` then fails the
+    union exactly as before, no seat is ever dropped, a fan-out never
+    passes with fewer reviewers than configured — and a retry is never a
+    loop, because it spends tokens.
+
+    Args:
+        sessions: The fan-out's session records, in seat order.
+        rerun: Zero-arg callable re-running ONE seat; it performs the
+            caller's own bookkeeping (records, spend, trace) and returns
+            the retry's session record, or ``None`` when the caller
+            refuses the re-run (a spent budget) — no retry then.
+
+    Returns:
+        ``(reports, retries)`` — one :class:`L2Report` per seat, the
+        retry's when it parses, and how many re-runs were spent.
+    """
+    reports: list[L2Report] = []
+    retries = 0
+    for session in sessions:
+        report = parse_verdict(
+            session.result if session.status == "completed" else None
+        )
+        if report.parse_error is not None and rerun is not None:
+            retry_session = rerun()
+            if retry_session is not None:
+                retries += 1
+                retried = parse_verdict(
+                    retry_session.result
+                    if retry_session.status == "completed"
+                    else None
+                )
+                if retried.parse_error is None:
+                    report = retried
+        reports.append(report)
+    return reports, retries
 
 
 def apply_convergence(

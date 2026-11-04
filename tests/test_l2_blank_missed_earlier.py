@@ -1,13 +1,20 @@
-"""Blank ``missed_earlier`` must not void a review (found by the
-2026-11-04 seeded eval: 3 of 8 diffs failed L2 solely on it).
+"""A reviewer's harmless formatting slip must not void a review.
 
-The reviewer prompt (prompts/reviewer.md) shows ``missed_earlier`` in its
+Round 1 (found by the 2026-11-04 seeded eval: 3 of 8 diffs failed L2
+solely on it): the reviewer prompt shows ``missed_earlier`` in its
 example JSON, so a first-round review echoes the key back blank. The
 parser treated that blank as a shape violation and voided the reviewer's
 entire verdict — an invalid_verdict_json FAIL on correct code, burning a
 fix round. The field only carries meaning in delta mode, where
 apply_convergence already drops an out-of-delta finding without a real
 reason; there a blank must keep behaving exactly like an absent key.
+
+Round 2 (PR #90 review): the same class of slip in two more fields.
+``axis`` was exact-matched, so "Spec" or " spec" voided the verdict; it
+is normalised exactly as severity is, and the canonical value stored. A
+quoted line number ("42") voided the verdict, and a JSON ``true`` line
+passed as int 1 (bool IS int in Python) — reaching the ±5-line location
+merge as a real place; both are refused now, negatives included.
 
 Also here: the eval's per-diff line for a known-clean diff must carry
 L2's verdict and any invalid_verdict_json, so a clean diff whose review
@@ -19,7 +26,7 @@ import json
 import pytest
 
 from factory.eval import render_report
-from factory.l2 import apply_convergence, parse_verdict
+from factory.l2 import apply_convergence, merge_reviews, parse_verdict
 
 
 def _verdict(finding: dict, declared: str = "fail") -> str:
@@ -91,6 +98,116 @@ def test_non_string_missed_earlier_is_still_invalid(bad):
     assert report.parse_error is not None
     assert "missed_earlier" in report.parse_error
     assert report.findings[0].id == "invalid_verdict_json"
+
+
+# --- round 2: axis casing and a quoted line are slips, not violations ---
+
+
+@pytest.mark.parametrize("axis", ["Spec", "STANDARDS", " spec ", "Standards"])
+def test_axis_casing_is_normalised_to_canonical(axis):
+    """Severity is already matched case-insensitively (.strip().lower());
+    axis must not be stricter than its own sibling field. The finding
+    stores the canonical value, so finding_key and every downstream
+    consumer see one spelling."""
+    output = _verdict(
+        {
+            "axis": axis,
+            "severity": "Major",  # severity's own tolerance, unchanged
+            "file": "src/a.py",
+            "text": "the off-by-one survives",
+        }
+    )
+    report = parse_verdict(output)
+    assert report.parse_error is None
+    assert report.findings[0].axis == axis.strip().lower()
+    assert report.findings[0].axis in ("spec", "standards")
+
+
+@pytest.mark.parametrize("axis", ["performance", "", "   ", 5, ["spec"], None])
+def test_unknown_axis_is_still_invalid(axis):
+    output = _verdict(
+        {"axis": axis, "severity": "major", "text": "something"}
+    )
+    report = parse_verdict(output)
+    assert report.verdict == "fail"
+    assert report.parse_error is not None
+    assert "axis" in report.parse_error
+    assert report.findings[0].id == "invalid_verdict_json"
+
+
+@pytest.mark.parametrize("line,expected", [("42", 42), (" 7 ", 7), ("0", 0)])
+def test_quoted_line_number_is_stored_as_int(line, expected):
+    """Models quote line numbers; "42" is the same place as 42 and the
+    location merge needs the int."""
+    output = _verdict(
+        {
+            "axis": "spec",
+            "severity": "major",
+            "file": "src/a.py",
+            "line": line,
+            "text": "the off-by-one survives",
+        }
+    )
+    report = parse_verdict(output)
+    assert report.parse_error is None
+    assert report.findings[0].line == expected
+    assert isinstance(report.findings[0].line, int)
+
+
+@pytest.mark.parametrize(
+    "line", [True, False, 1.5, "12-15", "abc", "-3", -3, [12], {"n": 1}]
+)
+def test_bad_line_values_are_still_invalid(line):
+    output = _verdict(
+        {
+            "axis": "spec",
+            "severity": "major",
+            "file": "src/a.py",
+            "line": line,
+            "text": "the off-by-one survives",
+        }
+    )
+    report = parse_verdict(output)
+    assert report.verdict == "fail"
+    assert report.parse_error is not None
+    assert "line" in report.parse_error
+    assert report.findings[0].id == "invalid_verdict_json"
+
+
+def test_bool_line_never_reaches_the_location_merge():
+    """A JSON ``true`` line is bool, and bool IS int in Python: accepted,
+    it would enter the ±5-line location merge as line 1 and could swallow
+    a neighbouring finding into its reporter's entry. The parser must
+    void it before any L2Finding exists."""
+    bool_line = _verdict(
+        {
+            "axis": "spec",
+            "severity": "major",
+            "file": "src/a.py",
+            "line": True,
+            "text": "the off-by-one survives",
+        }
+    )
+    report = parse_verdict(bool_line)
+    assert report.parse_error is not None
+    assert report.findings[0].id == "invalid_verdict_json"
+    # Fail-closed at the union too: a second, valid seat cannot rescue
+    # the seat that could not speak a place — the bool line never
+    # becomes an L2Finding the merge could locate.
+    valid = parse_verdict(
+        _verdict(
+            {
+                "axis": "spec",
+                "severity": "major",
+                "file": "src/a.py",
+                "line": 1,
+                "text": "the off-by-one survives",
+            }
+        )
+    )
+    union = merge_reviews([report, valid])
+    assert union.verdict == "fail"
+    assert union.parse_error is not None
 
 
 # --- 2. convergence: a blank reason drops exactly like an absent key ---
