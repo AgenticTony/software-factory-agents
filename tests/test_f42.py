@@ -421,9 +421,11 @@ class _Env:
     """The F-10 harness shape, trimmed to one passing run: a fixture repo
     with a bare remote, a queue, and the real run_once pipeline."""
 
-    def __init__(self, tmp_path: Path):
+    def __init__(self, tmp_path: Path, *, title: str = "Make answer() return 42",
+                 seam_check=None):
+        self.seam_check = seam_check
         self.root = tmp_path / "factory"
-        self.root.mkdir()
+        self.root.mkdir(parents=True)
         self.repo = tmp_path / "proj"
         self.remote = tmp_path / "remote.git"
         self.repo.mkdir()
@@ -451,7 +453,7 @@ class _Env:
         acceptance = [{"id": "AC-1", "text": "answer() returns 42",
                        "check": {"type": "test", "ref": REF}}]
         task = {
-            "id": "T-1", "title": "Make answer() return 42", "source": "docs/T-1.md",
+            "id": "T-1", "title": title, "source": "docs/T-1.md",
             "kind": "build", "priority": "P1", "status": "ready", "depends_on": [],
             "risk": [], "gates": {"spec_approval": True, "merge": "human",
                                   "deploy": "human"},
@@ -473,8 +475,16 @@ class _Env:
         self.prs: list[PullRequest] = []
 
     def open_pr(self, pr: PullRequest) -> str:
+        # The real seam's refusal rule, where the run under test wants it
+        # exercised (review finding 2): raise before recording on a hit.
+        if self.seam_check is not None:
+            self.seam_check(pr.title, pr.body)
         self.prs.append(pr)
         return f"https://github.com/fixture/fixture/pull/{len(self.prs)}"
+
+    def remote_branches(self) -> set[str]:
+        out = _git(self.remote, "for-each-ref", "--format=%(refname)", "refs/heads")
+        return set(out.split())
 
     def task(self) -> dict:
         return TaskQueue(self.queue_path).get("T-1")
@@ -494,7 +504,8 @@ class _Seats:
     """Stub seats: a correct implementer whose session denied two bypass
     attempts, and a passing review fan-out."""
 
-    def __init__(self):
+    def __init__(self, review: str = REVIEW_PASS):
+        self.review = review
         self.lock = __import__("threading").Lock()
         self.calls: list[str] = []
 
@@ -515,5 +526,164 @@ class _Seats:
             )
         return SessionRecord(
             seat=seat, status="completed", num_turns=1, model="stub-model",
-            tokens={"input_tokens": 60, "output_tokens": 10}, result=REVIEW_PASS,
+            tokens={"input_tokens": 60, "output_tokens": 10}, result=self.review,
         )
+
+
+# ---------------------- review round (PR #89, four findings) -----------------
+#
+# Red-first on the pre-fix tree (head bb87c84): each test failed on the
+# behaviour its finding names — the probes under review1/3/4 hit (or
+# passed) the wrong way through attribution_match, and review2 failed on
+# the missing check_pr_text surface with the branch already pushed.
+
+
+def test_review1_generated_with_footer_is_anchored_to_the_ai_shape(tmp_path):
+    """Finding 1: 'generated with <ordinary tool>' prose is not the AI
+    footer. Only a line-shaped footer naming an AI tool (or an AI vendor
+    link) fails; the review's probed lines pass."""
+    ordinary = [
+        "docs: client SDK generated with openapi-generator",
+        "Fixture data generated with faker",
+        "report generated with ruff",
+        "generated with openapi-typescript",
+        "The snapshot fixtures were generated with faker v2.3",
+    ]
+    for line in ordinary:
+        assert attribution_match(line) is None, line
+    footers = [
+        GENERATED_WITH,  # 🤖 Generated with [Claude Code](https://claude.com/claude-code)
+        "Generated with Claude Code",
+        "Generated with GitHub Copilot",
+        "- Generated with [Claude Code](https://claude.com/claude-code)",
+        "Generated with https://claude.com/claude-code",
+    ]
+    for line in footers:
+        assert attribution_match(line) == ("generated_with_footer", line.strip()), line
+    # The gate agrees: the ordinary prose as a real commit subject passes
+    # L0; the real footer in a commit body fails it.
+    repo = _repo(tmp_path, "rev1a")
+    _commit(repo, "docs: client SDK generated with openapi-generator\n")
+    assert not [f for f in _run_l0(repo).findings if f.id == "attribution_trailer"]
+    repo = _repo(tmp_path, "rev1b")
+    _commit(repo, f"feat: x\n\n{GENERATED_WITH}\n")
+    assert [f for f in _run_l0(repo).findings if f.id == "attribution_trailer"]
+
+
+def test_review2_pr_text_refusal_precedes_the_push_and_skips_fences(tmp_path):
+    """Finding 2: the PR-text refusal fires BEFORE push_branch (no orphan
+    remote branch, publish_refused — not pr_create_failed with one), and
+    fenced blocks, which legitimately quote a trailer, are not scanned."""
+    from factory.publish import check_pr_text
+
+    fenced_body = (
+        "## Summary\n\nsome words\n\n```json\n"
+        '{"findings": [{"text": "quotes '
+        "Co-Authored-By: Claude <noreply@anthropic.com> here"
+        '"}]}\n```\n'
+    )
+    # The seam rule: a fenced quote is evidence, not attribution; the
+    # title and the body's free text are the PR's own words.
+    check_pr_text("T-1: fine", fenced_body)
+    with pytest.raises(PushRefused):
+        check_pr_text("T-1: fine", f"## Summary\n\n{AI_CO_AUTHOR_CLAUDE}\n")
+    with pytest.raises(PushRefused):
+        check_pr_text(f"T-1: add {AI_CO_AUTHOR_CLAUDE} support", fenced_body)
+
+    # The gh wrapper keeps the same rule as its backstop (AC-2's seam).
+    fake, log = _fake_gh(tmp_path, "rev2-gh")
+    pr = dict(remote="https://github.com/AgenticTony/x.git", base="main",
+              head="factory/t-1-x")
+    from factory.publish import gh_pr_create as _create
+    assert _create(PullRequest(title="T-1: thing", body=fenced_body, **pr),
+                   gh_bin=fake).endswith("/pull/7")
+    log.unlink()
+    with pytest.raises(PushRefused):
+        _create(PullRequest(title="T-1: thing",
+                            body=f"## Summary\n\n{AI_CO_AUTHOR_CLAUDE}\n", **pr),
+                gh_bin=fake)
+    assert not log.exists()
+
+    # Orchestrator: a reviewer finding quoting the trailer inside the
+    # fenced validator report still publishes.
+    quoting_review = json.dumps({"verdict": "pass", "findings": [
+        {"id": "R-1", "axis": "spec", "severity": "minor", "file": "impl.py",
+         "line": 1,
+         "text": f"the branch commit carries '{AI_CO_AUTHOR_CLAUDE}' — strip it"},
+    ]})
+    env = _Env(tmp_path / "a", seam_check=lambda t, b: check_pr_text(t, b))
+    result = env.run(_Seats(review=quoting_review))
+    assert result.outcome == "pr_opened", result
+    assert AI_CO_AUTHOR_CLAUDE in env.prs[0].body  # the quote rode the fence
+    assert f"refs/heads/{env.prs[0].head}" in env.remote_branches()
+
+    # Orchestrator: a trailer in the PR title is refused BEFORE the push —
+    # nothing reaches the remote, no PR opens, publish_refused (not
+    # pr_create_failed with a stranded branch).
+    env2 = _Env(tmp_path / "b", title=f"Add {AI_CO_AUTHOR_CLAUDE} support",
+                seam_check=lambda t, b: check_pr_text(t, b))
+    result2 = env2.run(_Seats())
+    assert result2.outcome == "needs_human", result2
+    assert result2.escalation == "publish_refused"
+    assert env2.prs == []
+    assert env2.remote_branches() == {"refs/heads/main"}
+
+
+def test_review3_ambiguous_ai_names_need_an_ai_shape(tmp_path):
+    """Finding 3: names that are also human names (Kimi, Gemini, Cursor,
+    Mistral, Llama, Qwen, GLM) flag only with an AI shape beside them —
+    a bot/noreply address, an AI vendor address, or the product's
+    compound name. A human colleague passes; unambiguous product names
+    still match alone."""
+    humans = [
+        "Co-authored-by: Kimi Larsson <kimi@acme.se>",
+        "Co-authored-by: Gemini Larsson <gemini@acme.se>",
+        "Co-authored-by: Mistral Ek <mistral@acme.se>",
+        "Co-authored-by: Cursor Redlund <cursor@acme.se>",
+        "Co-authored-by: Llama Nurk <llama@acme.se>",
+        "Co-authored-by: Qwen Zhang <qwen@acme.se>",
+    ]
+    for line in humans:
+        assert attribution_match(line) is None, line
+    bots = [
+        "Co-authored-by: Kimi <bot@moonshot.ai>",
+        "Co-authored-by: Kimi <kimi@moonshot.ai>",
+        "Co-authored-by: Cursor Agent <dev@acme.se>",
+        "Co-authored-by: Gemini Code Assist <dev@acme.se>",
+        "Co-authored-by: GLM <noreply@zhipu.ai>",
+        "Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>",
+    ]
+    for line in bots:
+        assert attribution_match(line) is not None, line
+    # The gate agrees on a real commit either way.
+    repo = _repo(tmp_path, "rev3a")
+    _commit(repo, "feat: x\n\nCo-authored-by: Kimi Larsson <kimi@acme.se>\n")
+    assert _run_l0(repo).verdict == "pass"
+    repo = _repo(tmp_path, "rev3b")
+    _commit(repo, "feat: x\n\nCo-authored-by: Kimi <bot@moonshot.ai>\n")
+    assert [f for f in _run_l0(repo).findings if f.id == "attribution_trailer"]
+
+
+def test_review4_other_ai_trailer_styles(tmp_path):
+    """Finding 4: Assisted-by, Generated-by and AI-assisted trailers follow
+    the same AI-name/vendor-address rules as Co-Authored-By; the bare
+    AI-assisted declaration fails on its own."""
+    fails = [
+        "Assisted-by: Claude <noreply@anthropic.com>",
+        "Generated-by: GitHub Copilot <copilot@github.com>",
+        "Assisted-by: Kimi <bot@moonshot.ai>",
+        "AI-assisted: yes",
+    ]
+    for line in fails:
+        assert attribution_match(line) is not None, line
+    passes = [
+        "Assisted-by: Jane Doe <jane@acme.se>",
+        "Assisted-by: Kimi Larsson <kimi@acme.se>",
+        "Generated-by: openapi-generator",
+    ]
+    for line in passes:
+        assert attribution_match(line) is None, line
+    repo = _repo(tmp_path, "rev4")
+    _commit(repo, "feat: x\n\nAssisted-by: Claude <noreply@anthropic.com>\n")
+    findings = [f for f in _run_l0(repo).findings if f.id == "attribution_trailer"]
+    assert findings and "Assisted-by" in findings[0].text

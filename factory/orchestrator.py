@@ -96,7 +96,14 @@ from factory.prompts import (
     assemble_verifier_prompt,
     prompt_versions,
 )
-from factory.publish import PublishError, PullRequest, PushRefused, gh_pr_create, push_branch
+from factory.publish import (
+    PublishError,
+    PullRequest,
+    PushRefused,
+    check_pr_text,
+    gh_pr_create,
+    push_branch,
+)
 from factory.runs import (
     FACTORY_ROOT_DEFAULT,
     GIT_HARDENING,
@@ -2628,12 +2635,21 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                             if len(body) <= _PR_BODY_LIMIT:
                                 break
                         check_pr_body(body)  # no PR without every section
+                        # F-42 review finding 2: the attribution refusal
+                        # belongs BEFORE the push — raised after it, the
+                        # branch is already public and the task escalates
+                        # pr_create_failed with a stranded branch. Free
+                        # text only (fences skipped): quoted trailers in
+                        # the validator report are evidence, not
+                        # attribution.
+                        pr_title = f"{task_id}: {task.get('title', '')}"
+                        check_pr_text(pr_title, body)
                         push_branch(work.root, repo_cfg["remote"], branch, sha=head_sha,
                                     created=created, default_branch=default_branch)
                         pushed = True
                         url = ctx.open_pr(PullRequest(
                             remote=repo_cfg["remote"], base=default_branch, head=branch,
-                            title=f"{task_id}: {task.get('title', '')}", body=body,
+                            title=pr_title, body=body,
                         ))
                         opened = True
                         attempt = attempt_record(attempt_no, started, "pass", records, path,

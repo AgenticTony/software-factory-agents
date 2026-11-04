@@ -35,7 +35,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from factory.attribution import attribution_match
+from factory.attribution import attribution_match, title_attribution_match
 from factory.runs import GIT_HARDENING
 
 BRANCH_PREFIX = "factory/"
@@ -45,6 +45,42 @@ _GITHUB_REMOTE = re.compile(
     r"^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
     r"(?P<slug>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
 )
+# Fenced code blocks in a PR body (:func:`factory.prbody.fence` output —
+# a fence line of N backticks closed by another of exactly N). The
+# implementer's notes and the validator report's JSON ride inside them
+# and may legitimately QUOTE a trailer — a reviewer finding that quotes
+# "Co-Authored-By: Claude …" is evidence, not attribution. An unclosed
+# fence never matches, so its content stays scanned (fail closed).
+_FENCE_RE = re.compile(r"^(`{3,})[^\n]*\n[\s\S]*?^\1[ \t]*$", re.M)
+
+
+def check_pr_text(title: str, body: str) -> None:
+    """Refuse a PR whose title or body FREE TEXT carries an AI attribution
+    (F-42 AC-2; PR #89 review finding 2).
+
+    Fenced blocks are skipped (quoted material is evidence, not
+    attribution); the title and every unfenced line are the PR's own
+    words and may not carry :data:`factory.attribution.ATTRIBUTION_PATTERNS`.
+    A squash commit builds its message from this title and the branch's
+    commits — L0 already gates the commits — so refusing the free text
+    closes the inheritance path. The orchestrator calls this BEFORE
+    :func:`push_branch`; :func:`gh_pr_create` calls it again as the seam's
+    backstop.
+
+    Raises:
+        PushRefused: The title or the body's free text matched, naming
+            the match. Raised before any gh process starts.
+    """
+    match = title_attribution_match(title) or attribution_match(
+        _FENCE_RE.sub("", body)
+    )
+    if match is not None:
+        name, line = match
+        raise PushRefused(
+            f"refusing to open a PR whose title/body carries an AI "
+            f"attribution ({name}): {line[:200]!r} — remove it; a human "
+            "Co-Authored-By passes, machine attribution does not"
+        )
 
 
 class PushRefused(Exception):
@@ -175,23 +211,16 @@ def gh_pr_create(pr: PullRequest, *, gh_bin: Path | str | None = None) -> str:
 
     Raises:
         PushRefused: ``pr.head`` is not a factory branch or is the base, or
-            the title or body carries an AI-attribution pattern (F-42 AC-2:
-            the same ONE list L0 fails branch commits on, so nothing
-            reaches GitHub through either path and a squash commit — whose
-            message GitHub builds from this title and body — cannot inherit
-            a trailer). Refused before gh runs, naming the match.
+            the title or body's free text carries an AI-attribution
+            pattern (:func:`check_pr_text` — F-42 AC-2, review finding 2:
+            fenced blocks are skipped, and the orchestrator already
+            refused before the push; this is the seam's backstop, before
+            gh runs).
         PublishError: gh is missing or fails.
     """
     if pr.head == pr.base or not _BRANCH_RE.match(pr.head):
         raise PushRefused(f"refusing to open a PR from {pr.head!r} into {pr.base!r}")
-    match = attribution_match(pr.title, pr.body)
-    if match is not None:
-        name, line = match
-        raise PushRefused(
-            f"refusing to open a PR whose title/body carries an AI "
-            f"attribution ({name}): {line[:200]!r} — remove it; a human "
-            "Co-Authored-By passes, machine attribution does not"
-        )
+    check_pr_text(pr.title, pr.body)
     gh = str(gh_bin) if gh_bin else shutil.which("gh")
     if not gh:
         raise PublishError("gh is not installed: the factory opens PRs with `gh pr create`")
