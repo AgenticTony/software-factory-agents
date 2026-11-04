@@ -1,12 +1,19 @@
-"""The reviewer retry's budgets and abort paths (PR #90 round 3).
+"""The reviewer retry's budgets and abort paths (PR #90 rounds 3-4).
 
-The round-2 retry re-ran a seat unconditionally: it could exceed the
-fan-out's own turn invariant (sessions' summed turns never exceed
-``budget.max_turns``), spend a stale pre-fan-out wall-clock window once
-per invalid seat, turn a quota hit into an invalid_verdict_json FAIL
-(the fan-out's own quota sessions abort the attempt, task ready, no
-attempt burned), and leave "[session <status>]" notes in the PR body for
-seats its retry had already rescued.
+Round 3: the retry re-ran a seat unconditionally — it could exceed the
+fan-out's own turn invariant, spend a stale pre-fan-out wall-clock
+window once per invalid seat, turn a quota hit into an
+invalid_verdict_json FAIL, and leave failure notes for seats its retry
+had already rescued.
+
+Round 4: a quota'd re-run stops the fan-out's remaining re-runs (the
+attempt is aborting — more re-runs only burn tokens); a re-run reserves
+the verifier's turn floor (a flaky reviewer must never escalate a task
+that would otherwise fail a normal round); every still-invalid seat gets
+ONE note naming the original failure, whether a re-run happened or was
+refused (and by which budget), and the re-run's outcome; the trace event
+carries seat:"reviewer" plus a 1-based seat_no; and the orchestrator's
+two collection blocks are one shared closure.
 
 Unit half: the budget-fit policy and the helper's refusal semantics.
 Integration half: the orchestrator's wiring, driven through the F-23
@@ -16,10 +23,10 @@ Env/Scripted harness (same fake session runners, no real model).
 import json
 from pathlib import Path
 
-from test_f23 import Env, Scripted, _review_rounds, _verdict
+from test_f23 import Env, Scripted, _finding, _review_rounds, _verdict
 
 from factory.l2 import parse_reviews_with_retry
-from factory.orchestrator import _retry_budget
+from factory.orchestrator import _is_quota, _retry_budget
 from factory.session import SessionRecord
 
 GARBAGE = "Reviewer notes: the diff looks fine (no JSON)."
@@ -44,21 +51,26 @@ def test_retry_budget_caps_at_share_and_remaining_and_floors():
     assert _retry_budget(budget, records, 5.0 * 60, 8) == (8, 5.0)
 
 
-def test_retry_budget_refused_below_the_turn_floor():
+def test_retry_budget_reserves_the_verifiers_turn_floor():
+    """Round 4 finding 2: a re-run may only take turns that leave the
+    verifier's floor for the pass after it — min(share, remaining -
+    floor), refused below the floor. Both numbers are the existing
+    _REVIEW_TURN_FLOOR; nothing new is invented."""
     budget = {"max_turns": 40, "wall_clock_min": 10.0}
     records = [SessionRecord(seat="implementer", status="completed",
-                             num_turns=37)]
-    # min(share 8, remaining 3) is above the floor of 2: allowed …
-    assert _retry_budget(budget, records, 0.0, 8) == (3, 10.0)
-    # … and one more turn spent leaves 2 (still the floor) …
-    records.append(SessionRecord(seat="reviewer", status="completed",
-                                 num_turns=1))
+                             num_turns=36)]
+    # remaining 4: min(share 8, 4 - 2 reserved) = 2, exactly the floor
     assert _retry_budget(budget, records, 0.0, 8) == (2, 10.0)
-    # … but below it: refused — a review that cannot take a tool turn
-    # and answer is not a review (the fan-out's own start rule).
+    # remaining 3: min(8, 3 - 2) = 1, below the floor — the verifier's
+    # floor wins, the re-run is refused and the round fails normally.
     records.append(SessionRecord(seat="reviewer", status="completed",
                                  num_turns=1))
     assert _retry_budget(budget, records, 0.0, 8) is None
+    # … and the share still caps: remaining 20, share 5 → 5.
+    records.clear()
+    records.append(SessionRecord(seat="implementer", status="completed",
+                                 num_turns=20))
+    assert _retry_budget(budget, records, 0.0, 5) == (5, 10.0)
 
 
 def test_retry_budget_refused_without_wall_clock():
@@ -120,6 +132,29 @@ def test_a_refused_rerun_is_not_counted_as_a_retry():
     assert all(r.parse_error is not None for r in reports)
 
 
+# --- round 4 / finding 1: a quota'd re-run stops the re-runs ---------------
+
+
+def test_a_quota_re_run_stops_the_fanouts_retries():
+    """After one re-run comes back quota-limited, no further seat is
+    re-run: the attempt is aborting on it, and every later re-run would
+    only burn tokens against a dead quota."""
+    quota_record = SessionRecord(seat="reviewer", status="failed",
+                                 reason="usage limit reached (429)")
+    reruns = []
+
+    def rerun(seat_no, session, parse_error):
+        reruns.append(seat_no)
+        return quota_record if seat_no == 1 else _session(GARBAGE + " more")
+
+    reports, retries = parse_reviews_with_retry(
+        [_session(GARBAGE)] * 3, rerun, stop=_is_quota
+    )
+    assert reruns == [1]  # seats 2 and 3 are never re-run
+    assert retries == 1   # the quota re-run ran, and counts
+    assert all(r.parse_error is not None for r in reports)
+
+
 # --- 3. a quota hit on the retry aborts like the fan-out ------------------
 
 
@@ -153,7 +188,9 @@ def test_quota_on_the_retry_aborts_like_the_fanout(tmp_path):
         return base_call(seat, prompt, run_dir, profile, **kwargs)
 
     result = env.run(runner)
-    assert retried["n"] == 2  # each invalid seat got its one re-run
+    # The FIRST quota'd re-run stops the re-runs (round 4): seat 2 is
+    # never re-run — the attempt aborts on quota instead.
+    assert retried["n"] == 1
     # NOT an invalid_verdict_json round that burns an attempt: the same
     # abort the fan-out's own quota branch takes.
     assert result.outcome == "quota_exhausted"
@@ -194,6 +231,44 @@ def test_turn_refused_retry_never_runs_a_third_seat(tmp_path):
     assert len(reviewer_calls) == 6
 
 
+# --- round 4 / finding 2: a re-run never starves the verifier -------------
+
+
+def test_a_retry_never_starves_the_verifier(tmp_path):
+    """The fan-out leaves 3 turns: an unreserved re-run would take them
+    (min(share, 3) on the round-3 code), its rescue would hand the union
+    findings, and the verifier fit check would then escalate
+    budget_exhausted -> needs_human. The re-run must reserve the
+    verifier's floor instead: refused, the round fails as a NORMAL
+    invalid-verdict round and the next attempt ships the PR."""
+    env = Env(tmp_path)
+    seats = Scripted(impls=Scripted.MOVING,
+                     reviews=(_verdict(_finding()), _verdict(), _verdict()))
+    base_call = seats.__call__
+
+    def runner(seat, prompt, run_dir, profile, **kwargs):
+        if seat == "reviewer":
+            with seats.lock:
+                seen = sum(1 for s, *_ in seats.calls if s == "reviewer")
+            if seen < 2:
+                # The seats die, 7 turns each; with the implementer's 3
+                # that drains 17 of the 20-turn budget — 3 remain.
+                with seats.lock:
+                    seats.calls.append((seat, prompt, Path(run_dir), kwargs))
+                    seats.round_reviews += 1
+                    seats.note_fanout_prompt(_current_round(seats), prompt)
+                return SessionRecord(seat=seat, status="aborted",
+                                     reason=ABORT_REASON, num_turns=7)
+            record = base_call(seat, prompt, run_dir, profile, **kwargs)
+            record.num_turns = 3  # re-runs and later fan-outs
+            return record
+        return base_call(seat, prompt, run_dir, profile, **kwargs)
+
+    result = env.run(runner)
+    assert result.outcome == "pr_opened"  # NOT needs_human/budget_exhausted
+    assert result.escalation is None
+
+
 # --- 6. the session-ended note: only for seats the retry did not rescue ---
 
 
@@ -227,13 +302,14 @@ def test_a_rescued_seat_leaves_no_session_ended_note(tmp_path):
 
     result = env.run(runner)
     assert result.outcome == "pr_opened"  # both seats rescued
-    assert "[session aborted]" not in _pr_body(env)
-    # The retry is traceable to the seat that slipped: 1-based seat,
-    # the original failure status and reason in the trace event.
+    assert "[L2 reviewer seat" not in _pr_body(env)  # no note at all
+    # The retry is traceable to the seat that slipped: the role string,
+    # a 1-based seat_no, and the original failure status and reason.
     events = _trace_events(env)
     retries = [e for e in events if e.get("type") == "reviewer_retry"]
     assert len(retries) == 2
-    assert {e.get("seat") for e in retries} == {1, 2}
+    assert all(e.get("seat") == "reviewer" for e in retries)
+    assert {e.get("seat_no") for e in retries} == {1, 2}
     assert all(e.get("original_status") == "aborted" for e in retries)
     assert all(e.get("original_reason") == ABORT_REASON for e in retries)
 
@@ -279,9 +355,138 @@ def test_an_unrescued_seat_still_gets_its_note(tmp_path):
     assert result.outcome == "pr_opened"
     # The failed attempt never publishes, so the note rides the next
     # attempt's fix list — exactly once, for the seat that stayed
-    # broken (round 2's pre-retry code noted both dead seats).
+    # broken, naming BOTH failures (original and re-run).
     fix2 = seats.prompts("implementer")[1]
-    assert fix2.count("[session aborted]") == 1
+    assert fix2.count("[L2 reviewer seat") == 1
+    assert "[L2 reviewer seat 2]" in fix2
+    assert "session aborted (error_during_execution)" in fix2
+    assert "re-run ended: session aborted" in fix2
+
+
+def test_a_completed_garbage_seat_with_a_dying_retry_gets_its_note(tmp_path):
+    """Finding 3a: a seat that COMPLETED with unparseable text and whose
+    re-run then died used to get no note at all (the note was keyed on
+    the original session's status). It gets one note, and the note says
+    what the re-run returned."""
+    env = Env(tmp_path)
+    seats = Scripted(impls=Scripted.MOVING,
+                     reviews=("not verdict json at all", _verdict(),
+                              _verdict()))
+    base_call = seats.__call__
+
+    def runner(seat, prompt, run_dir, profile, **kwargs):
+        if seat != "reviewer":
+            return base_call(seat, prompt, run_dir, profile, **kwargs)
+        with seats.lock:
+            seen = sum(1 for s, *_ in seats.calls if s == "reviewer")
+        if seen in (2, 3):
+            # Both re-runs die (the seats themselves completed fine —
+            # their output was garbage, not their sessions).
+            with seats.lock:
+                seats.calls.append((seat, prompt, Path(run_dir), kwargs))
+                seats.round_reviews += 1
+                seats.note_fanout_prompt(_current_round(seats), prompt)
+            return SessionRecord(seat=seat, status="failed",
+                                 reason="timeout_during_execution")
+        return base_call(seat, prompt, run_dir, profile, **kwargs)
+
+    result = env.run(runner)
+    assert result.outcome == "pr_opened"
+    fix2 = seats.prompts("implementer")[1]
+    assert fix2.count("[L2 reviewer seat") == 2
+    assert "unparseable verdict output" in fix2  # the original failure
+    assert fix2.count("re-run ended: session failed "
+                      "(timeout_during_execution)") == 2
+
+
+def test_an_aborted_seat_with_a_timed_out_retry_names_both(tmp_path):
+    """Finding 3b: the aborted original AND the timed-out re-run, both
+    in the one note."""
+    env = Env(tmp_path)
+    seats = Scripted(impls=Scripted.MOVING,
+                     reviews=("not verdict json at all", _verdict(),
+                              _verdict()))
+    base_call = seats.__call__
+
+    def runner(seat, prompt, run_dir, profile, **kwargs):
+        if seat != "reviewer":
+            return base_call(seat, prompt, run_dir, profile, **kwargs)
+        with seats.lock:
+            seen = sum(1 for s, *_ in seats.calls if s == "reviewer")
+        if seen < 2:
+            with seats.lock:
+                seats.calls.append((seat, prompt, Path(run_dir), kwargs))
+                seats.round_reviews += 1
+                seats.note_fanout_prompt(_current_round(seats), prompt)
+            return _session(None, status="aborted")
+        if seen in (2, 3):
+            with seats.lock:
+                seats.calls.append((seat, prompt, Path(run_dir), kwargs))
+                seats.round_reviews += 1
+                seats.note_fanout_prompt(_current_round(seats), prompt)
+            return SessionRecord(seat=seat, status="failed",
+                                 reason="timeout_during_execution")
+        return base_call(seat, prompt, run_dir, profile, **kwargs)
+
+    result = env.run(runner)
+    assert result.outcome == "pr_opened"
+    fix2 = seats.prompts("implementer")[1]
+    assert fix2.count("[L2 reviewer seat") == 2
+    assert "session aborted (error_during_execution)" in fix2
+    assert fix2.count("re-run ended: session failed "
+                      "(timeout_during_execution)") == 2
+
+
+# --- round 4 / finding 4: the real wall-clock accounting drives refusals ---
+
+
+class _StepClock:
+    """A monotonic clock the scripted reviewer arms per session (f38's
+    _FakeTime pattern, steerable per call): each armed step advances the
+    clock exactly once — the next monotonic() call — so a session's
+    measured duration is whatever its runner armed, capped by the
+    timeout it was granted."""
+
+    def __init__(self):
+        self._now = 1000.0
+        self._step = 0.0
+
+    def monotonic(self) -> float:
+        self._now += self._step
+        self._step = 0.0
+        return self._now
+
+    def arm(self, seconds: float) -> None:
+        self._step = seconds
+
+
+def test_the_real_session_seconds_refuses_later_re_runs(
+        tmp_path, monkeypatch):
+    """Round 1 seats and their re-runs each "take" four minutes of the
+    10-minute window, capped by the wall each was granted. The grants
+    must shrink with the REAL accounting — 10 for the fan-out, 6 for
+    the first re-run, 2 for the second — which only holds if
+    session_seconds grows inside the re-run, not after the loop."""
+    env = Env(tmp_path)
+    clock = _StepClock()
+    monkeypatch.setattr("factory.orchestrator.time", clock)
+    seats = Scripted(impls=Scripted.MOVING,
+                     reviews=("not verdict json at all",))
+    base_call = seats.__call__
+
+    def runner(seat, prompt, run_dir, profile, **kwargs):
+        record = base_call(seat, prompt, run_dir, profile, **kwargs)
+        if seat == "reviewer":
+            # Four minutes, never past the granted timeout.
+            clock.arm(min(240.0, float(kwargs["timeout_min"]) * 60))
+        return record
+
+    env.run(runner)
+    timeouts = [
+        c[3]["timeout_min"] for c in seats.calls if c[0] == "reviewer"
+    ]
+    # fan-out (2 seats), then the two re-runs — attempt 1's sequence.
+    assert timeouts[:4] == [10.0, 10.0, 6.0, 2.0]
 
 
 def _trace_events(env) -> list[dict]:

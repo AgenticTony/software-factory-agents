@@ -479,7 +479,8 @@ def parse_verdict(output: Any) -> L2Report:
 
 def parse_reviews_with_retry(
     sessions: Sequence[Any],
-    rerun: Callable[[], Any] | None = None,
+    rerun: Callable[..., Any] | None = None,
+    stop: Callable[[Any], bool] | None = None,
 ) -> tuple[list[L2Report], int]:
     """Parse the fan-out's reviewer seats, retrying a seat that could not
     speak the verdict protocol exactly once (PR #90 round 2).
@@ -506,11 +507,18 @@ def parse_reviews_with_retry(
             the retry's session record, or ``None`` to REFUSE the
             re-run: the orchestrator refuses when the attempt's turn or
             wall-clock budget cannot fit one more seat (the re-run is
-            capped at what remains and floored like the fan-out's own
-            start check). A refused re-run is not counted. A quota hit
-            on the re-run is NOT a refusal — the record comes back (and
-            counts: tokens were spent) and the caller aborts the
-            attempt exactly as its fan-out's own quota branch does.
+            capped at what remains, the verifier's turn floor reserved,
+            and floored like the fan-out's own start check). A refused
+            re-run is not counted. A quota hit on the re-run is NOT a
+            refusal — the record comes back (and counts: tokens were
+            spent) and the caller aborts the attempt exactly as its
+            fan-out's own quota branch does.
+        stop: Predicate over a re-run's session record; when it fires
+            (the orchestrator passes its quota test) NO further seat is
+            re-run in this fan-out — the caller is aborting on that
+            record, and every later re-run would only burn tokens
+            against a dead quota. The reports list may then be short;
+            the caller never merges it.
 
     Returns:
         ``(reports, retries)`` — one :class:`L2Report` per seat, the
@@ -522,18 +530,24 @@ def parse_reviews_with_retry(
         report = parse_verdict(
             session.result if session.status == "completed" else None
         )
+        stopped = False
         if report.parse_error is not None and rerun is not None:
             retry_session = rerun(seat_no, session, report.parse_error)
             if retry_session is not None:
                 retries += 1
-                retried = parse_verdict(
-                    retry_session.result
-                    if retry_session.status == "completed"
-                    else None
-                )
-                if retried.parse_error is None:
-                    report = retried
+                if stop is not None and stop(retry_session):
+                    stopped = True
+                else:
+                    retried = parse_verdict(
+                        retry_session.result
+                        if retry_session.status == "completed"
+                        else None
+                    )
+                    if retried.parse_error is None:
+                        report = retried
         reports.append(report)
+        if stopped:
+            break
     return reports, retries
 
 

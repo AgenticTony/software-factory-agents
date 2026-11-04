@@ -133,10 +133,12 @@ class Seats:
     FIRST reviewer call for a contract unparseable (the retry then sees
     the same prompt); ``always_garbage`` every call."""
 
-    def __init__(self, findings=None, garbage_contracts=(), always_garbage=()):
+    def __init__(self, findings=None, garbage_contracts=(), always_garbage=(),
+                 quota_contracts=()):
         self.findings = dict(findings or {})
         self.garbage_contracts = set(garbage_contracts)
         self.always_garbage = set(always_garbage)
+        self.quota_contracts = set(quota_contracts)
         self.calls: list[tuple[str, str]] = []
         self.prompts: list[str] = []
         self.seen: dict[str, int] = {}
@@ -150,6 +152,11 @@ class Seats:
         if seat == "reviewer":
             seen = self.seen.get(contract, 0) + 1
             self.seen[contract] = seen
+            if contract in self.quota_contracts:
+                return SessionRecord(
+                    seat=seat, status="failed",
+                    reason="usage limit reached (429)",
+                )
             if contract in self.always_garbage or (
                 contract in self.garbage_contracts and seen == 1
             ):
@@ -248,6 +255,71 @@ def test_orchestrator_wires_the_retry_into_both_fan_outs():
     # import + the two fan-out sites
     assert source.count("parse_reviews_with_retry") >= 3
     assert '"reviewer_retry"' in source
+
+
+# --- round 4 / finding 7: a quota-hit review is void, never a verdict ------
+
+
+def test_eval_reports_a_quota_hit_review_as_void(tmp_path):
+    """A diff whose reviewer seats (or re-runs) hit quota is VOID for
+    L2: no verdict, excluded from the catch-rate and false-fail
+    denominators, counted on its own line — F-16's tick evidence must
+    not carry quota noise."""
+    repo = _repo(tmp_path)
+    seats = Seats(quota_contracts={"EVAL-clean-docstring"})
+    record = run_seed(
+        repo, _clean_spec("clean-docstring"), session_runner=seats,
+        reviewers=1,
+    )
+    l2 = record["layers"]["L2"]
+    assert l2.get("quota_voided") is True
+    assert "verdict" not in l2  # never a verdict
+    assert record["blocking_findings"] is None
+    text = render_report(_report_with(record))
+    assert "L2 quota-voided" in text
+
+
+def _report_with(record: dict) -> dict:
+    """A renderable report carrying one real run_seed record."""
+    others = [
+        {
+            "id": "clean-new-helper", "title": "New helper",
+            "blocking_findings": 0,
+            "layers": {"L2": {"verdict": "pass", "parse_error": None,
+                              "findings": [], "review_retries": 0}},
+        }
+    ]
+    report = {
+        "fixture": "soloadventurer", "base_ref": "main",
+        "l2": "sessions", "seeds": [],
+        "clean": [record, *others],
+        "catch_rate": {"L0": 0.0, "L1": 0.0, "L2": 0.0},
+        "caught_counts": {"L0": 0, "L1": 0, "L2": 0},
+    }
+    return report
+
+
+def test_seeded_eval_excludes_quota_voids_from_its_rates(tmp_path):
+    """One seed and one clean diff hit quota: the seed leaves L2's catch
+    denominator (0 of 5, not 0 of 6), the clean diff leaves the
+    false-fail count (0 of 1, not 0 of 2), and both are counted on the
+    quota-voided line instead — never as verdicts."""
+    repo = _repo(tmp_path)
+    report = run_seeded_eval(
+        repo,
+        session_runner=Seats(quota_contracts={
+            "EVAL-tautological-test", "EVAL-clean-docstring"}),
+    )
+    assert report["l2_quota_voided"] == 2
+    text = render_report(report)
+    assert "L2 quota-voided: 2" in text
+    assert "(0 of 5 seeds)" in text      # L2's rate over non-void seeds
+    assert "L2 false-fail on clean diffs: 0 of 1" in text
+    # The voided records themselves carry no verdict.
+    voided = [r for r in report["seeds"] + report["clean"]
+              if (r.get("layers") or {}).get("L2", {}).get("quota_voided")]
+    assert len(voided) == 2
+    assert all("verdict" not in r["layers"]["L2"] for r in voided)
 
 
 # --- issue 4: the false-fail aggregate on clean diffs --------------------

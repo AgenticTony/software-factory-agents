@@ -504,10 +504,17 @@ def run_seed(
             session_runner=session_runner, reviewers=reviewers,
             l0=l0, l1=l1, factory_root=factory_root,
         )
-        layers["L2"] = report.to_dict()
-        # The fan-out's retry ledger for this diff (0 when every seat
-        # parsed first time).
-        layers["L2"]["review_retries"] = retries
+        if report is None:
+            # Quota-voided (PR #90 round 4): never a verdict — excluded
+            # from the catch and false-fail denominators, counted on
+            # the report's own quota-voided line instead.
+            layers["L2"] = {"quota_voided": True,
+                            "review_retries": retries}
+        else:
+            layers["L2"] = report.to_dict()
+            # The fan-out's retry ledger for this diff (0 when every
+            # seat parsed first time).
+            layers["L2"]["review_retries"] = retries
     record = {
         "id": seed.id,
         "title": seed.title,
@@ -520,8 +527,10 @@ def run_seed(
             if _catches(report, seed.markers)
         ]
     else:
+        l2 = layers.get("L2") or {}
         record["blocking_findings"] = (
-            _count_blocking(layers.get("L2")) if "L2" in layers else None
+            None if l2.get("quota_voided")
+            else (_count_blocking(l2) if "L2" in layers else None)
         )
     return record
 
@@ -621,7 +630,9 @@ def run_l2_review(
     is a single round. A reviewer seat whose verdict fails to parse gets
     exactly ONE re-run with the same prompt
     (:func:`factory.l2.parse_reviews_with_retry`); a still-invalid retry
-    fails the union as always.
+    fails the union as always. A seat or re-run that dies on QUOTA voids
+    the diff's review (PR #90 round 4): the report is ``None`` — quota
+    noise never becomes a verdict, a catch rate or a false fail.
 
     Args:
         l0 / l1: The layer reports the reviewers see alongside the diff
@@ -629,9 +640,9 @@ def run_l2_review(
             the report dicts already on the record when re-reviewing.
 
     Returns:
-        ``(report, retries)`` — the L2 report, and how many reviewer
-        re-runs the retry policy spent on seats whose first verdict
-        failed to parse.
+        ``(report, retries)`` — the L2 report (``None`` when the review
+        was quota-voided), and how many reviewer re-runs the retry
+        policy spent on seats whose first verdict failed to parse.
     """
     from factory import orchestrator
     from factory.prompts import assemble_reviewer_prompt, assemble_verifier_prompt
@@ -641,6 +652,7 @@ def run_l2_review(
     l0_dict = l0.to_dict() if l0 is not None else {}
     l1_dict = l1.to_dict() if l1 is not None else {}
     review_prompt = orchestrator._review_prompt(task, diff, l0_dict, l1_dict)
+    retry_records: list = []
 
     def _rerun_review_seat(seat_no=None, session=None, parse_error=None):
         """One retry of one reviewer seat: the same prompt through the
@@ -649,7 +661,7 @@ def run_l2_review(
         parse failure, none of which the eval needs: it has no attempt
         budget to fit and no trace to name the seat) and decides whether
         the retry's verdict is used."""
-        return run_sessions_parallel(
+        record = run_sessions_parallel(
             [("reviewer", review_prompt)],
             repo, profile,
             runner=session_runner,
@@ -659,6 +671,8 @@ def run_l2_review(
             protected=list((profile.get("paths") or {}).get("protected") or []),
             system_prompt=assemble_reviewer_prompt(profile),
         )[0]
+        retry_records.append(record)
+        return record
 
     reviews = run_sessions_parallel(
         [("reviewer", review_prompt)] * reviewers,
@@ -670,7 +684,11 @@ def run_l2_review(
         protected=list((profile.get("paths") or {}).get("protected") or []),
         system_prompt=assemble_reviewer_prompt(profile),
     )
-    reports, retries = parse_reviews_with_retry(reviews, _rerun_review_seat)
+    reports, retries = parse_reviews_with_retry(
+        reviews, _rerun_review_seat, stop=orchestrator._is_quota)
+    if any(orchestrator._is_quota(r)
+           for r in list(reviews) + retry_records):
+        return None, retries
     union = merge_reviews(reports)
     if union.parse_error is not None or not union.findings:
         return union, retries
@@ -703,9 +721,10 @@ def _clean_false_fail(clean_records: list) -> tuple[int, int] | None:
     """How many known-clean diffs drew an L2 FAIL for any reason — a
     blocking finding or an invalid verdict — over how many ran L2
     (PR #90 round 2: the false-positive aggregate the catch-rate table
-    lacks). ``None`` when no clean diff ran L2: an unmeasured rate is
-    n/a in the report, never a clean bill of 0."""
-    with_l2 = [r for r in clean_records if (r.get("layers") or {}).get("L2")]
+    lacks). A quota-voided review is no verdict (round 4): it leaves
+    both numbers. ``None`` when no clean diff ran L2: an unmeasured
+    rate is n/a in the report, never a clean bill of 0."""
+    with_l2 = [r for r in clean_records if _layer_ran(r, "L2")]
     if not with_l2:
         return None
     failed = sum(1 for r in with_l2 if r["layers"]["L2"].get("verdict") == "fail")
@@ -726,11 +745,14 @@ def _clean_review_summary(record: dict) -> str:
     """The review outcome half of a clean diff's per-diff line: the L2
     verdict first, then the blocking count — a fail, above all an
     invalid_verdict_json fail (whose lone finding carries no severity,
-    so it counts 0 blocking), must never read as a clean review."""
+    so it counts 0 blocking), must never read as a clean review. A
+    quota-voided review says so: it produced no verdict at all."""
+    l2 = (record.get("layers") or {}).get("L2") or {}
+    if l2.get("quota_voided"):
+        return "L2 quota-voided (no verdict)"
     blocking = record.get("blocking_findings")
     if blocking is None:
         return "n/a (L2 skipped)"
-    l2 = (record.get("layers") or {}).get("L2") or {}
     verdict = l2.get("verdict") or "unknown"
     drew = f"{blocking} blocking finding(s)"
     if l2.get("parse_error") is not None:
@@ -770,6 +792,10 @@ def run_seeded_eval(
     seeds = [run_seed(repo, seed, **common) for seed in SOLOADVENTURER_SEEDS]
     clean = [run_seed(repo, diff, **common) for diff in CLEAN_DIFFS]
     false_fail = _clean_false_fail(clean)
+    voided = sum(
+        1 for r in seeds + clean
+        if ((r.get("layers") or {}).get("L2") or {}).get("quota_voided")
+    )
     return {
         "fixture": "soloadventurer",
         "base_ref": base_ref,
@@ -779,17 +805,35 @@ def run_seeded_eval(
         # How many clean diffs drew an L2 fail for ANY reason (None when
         # L2 never ran) — rendered as the false-fail line.
         "l2_false_fail_on_clean": false_fail[0] if false_fail else None,
+        # How many reviews died on quota (round 4): never a verdict, so
+        # they leave the rates above and are counted here instead.
+        "l2_quota_voided": voided,
         "catch_rate": catch_rate_by_layer(seeds),
         "caught_counts": caught_counts_by_layer(seeds),
     }
 
 
+def _layer_ran(record: dict, layer: str) -> bool:
+    """Whether a layer actually produced a verdict for a diff — a
+    quota-voided L2 (PR #90 round 4) produced none, so it leaves the
+    catch-rate denominator instead of counting as a miss."""
+    layer_dict = (record.get("layers") or {}).get(layer)
+    return bool(layer_dict) and not layer_dict.get("quota_voided")
+
+
+def _layer_totals(seed_records: list) -> dict:
+    return {layer: sum(1 for r in seed_records if _layer_ran(r, layer))
+            for layer in LAYERS}
+
+
 def catch_rate_by_layer(seed_records: list) -> dict:
     """The share of seeds each layer caught (a failing layer whose own
-    evidence names the seed — see :func:`_catches`)."""
+    evidence names the seed — see :func:`_catches`), over the seeds the
+    layer actually judged: a quota-voided review is no verdict and no
+    miss."""
     counts = caught_counts_by_layer(seed_records)
-    total = len(seed_records) or 1
-    return {layer: counts[layer] / total for layer in LAYERS}
+    totals = _layer_totals(seed_records)
+    return {layer: counts[layer] / (totals[layer] or 1) for layer in LAYERS}
 
 
 def caught_counts_by_layer(seed_records: list) -> dict:
@@ -834,11 +878,11 @@ def render_report(report: dict) -> str:
         )
     lines += ["", "## Catch rate per layer", ""]
     counts = report["caught_counts"]
-    total = len(report["seeds"])
+    totals = _layer_totals(report["seeds"])
     for layer in LAYERS:
         lines.append(
             f"- {layer}: {report['catch_rate'][layer]:.0%} "
-            f"({counts[layer]} of {total} seeds)"
+            f"({counts[layer]} of {totals[layer]} seeds)"
         )
     # PR #90 round 2: the catch-rate table covers seeds only — this is
     # its false-positive counterpart over the known-clean diffs. n/a
@@ -850,6 +894,9 @@ def render_report(report: dict) -> str:
         lines.append(
             f"L2 false-fail on clean diffs: {false_fail[0]} of {false_fail[1]}"
         )
+    # PR #90 round 4: quota noise is quarantined here, out of the tick
+    # evidence above — a quota-voided review is no verdict.
+    lines.append(f"L2 quota-voided: {report.get('l2_quota_voided', 0)}")
     lines.append("")
     return "\n".join(lines)
 
