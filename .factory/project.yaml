@@ -146,11 +146,15 @@ paths:
     - "tests/test_f42.py"
     - "factory/attribution.py"
     # F-31's closing invariant, restored here: PR #86 shipped the
-    # dashboard's contract tests but not their protected entry, and the
+    # dashboard's contract tests but not its protected entry, and the
     # queue state this change carries (F-31 reconciled to done) trips
     # tests/test_profile_review until the file is listed — the done task's
     # tests must be protected from the day the task is done.
     - "tests/test_f31.py"
+    # F-16: same invariant — #91 ticked F-16 done without listing its
+    # contract test, and test_done_tasks_contract_tests_are_protected
+    # failed every gate on main until this entry landed.
+    - "tests/test_f16.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 
