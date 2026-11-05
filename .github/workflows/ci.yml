@@ -14,6 +14,9 @@ jobs:
     # every sandbox test failed. 24.04 is the verified sandbox host.
     runs-on: ubuntu-24.04
     strategy:
+      # Both interpreters always report in full: with fail-fast on, one
+      # job's failure cancels the other mid-run and hides its result.
+      fail-fast: false
       matrix:
         # 3.11 = declared floor (requires-python); 3.13 = local dev version
         python-version: ["3.11", "3.13"]
