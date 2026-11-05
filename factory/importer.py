@@ -71,6 +71,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -137,6 +138,13 @@ MAX_DOC_FILES = 200
 # defect class.
 MAX_SHOWN_VIOLATIONS = 50
 TASKS_SCHEMA = SCHEMA_DIR / "tasks.schema.json"
+# The staged proposal schema's file name: the prompt names it under the
+# session's writable scratch ($TMPDIR — the target repo has no schema/
+# dir of its own), run_session_sandboxed stages it there before the
+# session starts, and sdk_import_session derives its content. One name,
+# three seams.
+PROPOSAL_SCHEMA_NAME = "proposal.schema.json"
+PROPOSAL_OUTPUT_NAME = "proposal.json"
 
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
@@ -236,6 +244,80 @@ def _load_tasks_schema() -> dict:
     return json.loads(TASKS_SCHEMA.read_text(encoding="utf-8"))
 
 
+def build_proposal_schema(schema: dict) -> dict:
+    """Derive the staged self-check schema from the queue schema.
+
+    The importer session runs in a clone of the *target* repo, which has
+    no ``schema/`` dir — and the queue schema itself would refuse a
+    VALID proposal (it requires top-level ``version`` and per-task
+    ``status``, both written by the importer, never proposed). This
+    narrows the loaded queue schema to exactly what a proposal may
+    carry, so the session's self-check judges the same shapes
+    :func:`plan_import` will judge:
+
+    * top level: ``{"project", "tasks"}`` only — no ``version``,
+      nothing else;
+    * per task: ``id`` and the spec fields plus ``out_of_scope_match``;
+      ``status`` and every forbidden field (:data:`FORBIDDEN_FIELDS`)
+      are absent properties, so carrying one is a shape error the check
+      names — not a ~31-violation wall about fields the prompt forbids
+      setting;
+    * ``id`` gains ``minLength: 1`` (an unreadable id is refused by
+      :func:`plan_import` too);
+    * every enum, pattern, bound and object shape is the queue schema's
+      own — derived, never re-typed;
+    * of the task's conditional rules, the risk⇒human-merge rule rides
+      along (:func:`plan_import` enforces it on the merged document
+      too); the status-gated rules do not. They cannot fire honestly
+      here (status is not a proposal field), and copying them verbatim
+      backfires: their ``if`` clauses lack ``required: [status]``, so on
+      a status-less task they pass *vacuously* and their ``then`` fires
+      — demanding ``acceptance_hash``/``approved_at`` and rebuilding,
+      inside the self-check, the very ~31-violation wall of required
+      fields the prompt forbids setting.
+
+    Agreement (:func:`plan_import` versus this schema): a proposal that
+    passes the staged check is never refused for *shape*. What the
+    staged check cannot see, and ``plan_import`` still refuses — the
+    semantic-only checks: the project name spelled exactly as the prompt
+    states, unique task ids, non-blank task ids, and
+    ``out_of_scope_match`` naming a real register record.
+    """
+    proposal = copy.deepcopy(schema)
+    proposal["title"] = "Importer proposal (factory import self-check)"
+    proposal["required"] = ["project", "tasks"]
+    proposal["additionalProperties"] = False
+    proposal["properties"] = {
+        "project": proposal["properties"]["project"],
+        "tasks": proposal["properties"]["tasks"],
+    }
+    task = proposal["$defs"]["task"]
+    keep = {"id", *SPEC_FIELDS, "out_of_scope_match"}
+    task["properties"] = {
+        name: prop for name, prop in task["properties"].items() if name in keep
+    }
+    task["properties"]["out_of_scope_match"] = {
+        "type": "string",
+        "description": (
+            "The out-of-scope record this task resembles — the register "
+            "path; the owner confirms the match."
+        ),
+    }
+    task["properties"]["id"] = {
+        **task["properties"]["id"], "minLength": 1,
+    }
+    task["required"] = [
+        name for name in task["required"]
+        if name != "status" and name not in FORBIDDEN_FIELDS
+    ]
+    task["additionalProperties"] = False
+    task["allOf"] = [
+        rule for rule in task.get("allOf", [])
+        if "status" not in json.dumps(rule)
+    ]
+    return proposal
+
+
 def _resolve_ref(prop: dict, schema: dict) -> dict:
     """Resolve a local ``$ref`` (``#/$defs/<name>``) to its definition."""
     if "$ref" not in prop:
@@ -294,7 +376,7 @@ def _schema_contract_lines(schema: dict) -> list[str]:
     lines = [
         "Each task carries: id, title, source (repo-relative path of the doc",
         "that owns the spec, with #heading when useful) — plus exactly these",
-        "field shapes, generated from the repo's schema/tasks.schema.json",
+        "field shapes, generated from the factory's tasks schema",
         "(a proposal outside them is refused, however plausible it reads):",
     ]
     for name in SPEC_FIELDS:
@@ -332,11 +414,17 @@ def build_import_prompt(
     The field shapes are stated, not named: the contract lines come from
     :func:`_schema_contract_lines` over the loaded schema, so the prompt
     always says what the validator will enforce. And the session is told
-    to check its own output before answering (parse, then schema — both
-    possible inside its sandbox: ``jsonschema`` imports there, the schema
-    is in the clone, the writable scratch is ``$TMPDIR``; the repo cwd
-    is read-only) — the 2026-11-05 import died on hand-written JSON and
-    shape guesses both, and every one of them was checkable in-session.
+    to check its own output before answering — parse, then shape, with
+    the absolute pinned interpreter (``jsonschema`` is importable there;
+    a bare ``python3`` inside the session resolves to whatever the
+    sandbox PATH finds, not the factory's venv) and against the proposal
+    schema *staged into its writable scratch* by
+    :func:`sdk_import_session` (``$TMPDIR/proposal.schema.json`` — the
+    session's clone is the *target* repo and has no schema/ of its own,
+    and the queue schema would refuse a valid proposal for the version
+    and status the importer itself writes; see
+    :func:`build_proposal_schema`). The repo cwd is read-only, so both
+    the proposal and the check outputs live under ``$TMPDIR``.
     """
     repo = Path(repo)
     docs = repo / docs_dir
@@ -374,6 +462,19 @@ def build_import_prompt(
     else:
         contract = '  {"project": "<project name>", "tasks": [...]}'
         naming_rule = []
+    interpreter = shlex.quote(sys.executable)
+    proposal_ref = f"$TMPDIR/{PROPOSAL_OUTPUT_NAME}"
+    schema_ref = f"$TMPDIR/{PROPOSAL_SCHEMA_NAME}"
+    parse_cmd = (
+        f"{interpreter} -c \"import json; json.load(open('{proposal_ref}'))\""
+    )
+    shape_cmd = (
+        f"{interpreter} -c \"import json, jsonschema; "
+        f"d=json.load(open('{proposal_ref}')); "
+        f"s=json.load(open('{schema_ref}')); "
+        f"[print(e.json_path + ': ' + e.message) for e in "
+        f"jsonschema.Draft202012Validator(s).iter_errors(d)]\""
+    )
     lines += [
         "",
         "Output — and output nothing else — one JSON object:",
@@ -401,20 +502,24 @@ def build_import_prompt(
         "- Propose every task the documents define, including tasks already",
         "  in the queue; unchanged tasks produce no diff.",
         "",
-        "Before you answer, check your own output:",
-        "- Write the finished JSON to a file in your writable scratch (the",
-        "  repo cwd is read-only), e.g. $TMPDIR/proposal.json.",
-        '- Parse check: python3 -c "import json;',
-        "  json.load(open('$TMPDIR/proposal.json'))\"",
-        "- Schema check — jsonschema is importable in your sandbox and the",
-        "  schema is in the repo at schema/tasks.schema.json:",
-        '  python3 -c "import json, jsonschema;',
-        "  d=json.load(open('$TMPDIR/proposal.json'));",
-        "  s=json.load(open('schema/tasks.schema.json'));",
-        "  [print(e.json_path + ': ' + e.message) for e in",
-        "  jsonschema.Draft202012Validator(s).iter_errors(d)]\"",
+        "Before you answer, check your own output (the interpreter named",
+        "below is the pinned one your sandbox already runs, and jsonschema",
+        "is importable there):",
+        f"- Write the finished JSON to {proposal_ref}, in your writable",
+        "  scratch (the repo cwd is read-only).",
+        "- Parse check:",
+        f"  {parse_cmd}",
+        f"- Shape check against {schema_ref} — the factory's tasks schema,",
+        "  staged for you before this session and already narrowed to a",
+        "  proposal's own fields (no version, no status, none of the owner",
+        "  or orchestrator keys):",
+        f"  {shape_cmd}",
         "- Fix everything those print, re-check, and only then answer.",
         "  Your final answer is the JSON object itself, and nothing else.",
+        "- What the shape check cannot see, and is still refused after you",
+        "  answer: the project name spelled exactly as stated above, task",
+        "  ids unique and non-blank, and out_of_scope_match naming a real",
+        "  record from the register.",
     ]
     return "\n".join(lines)
 
@@ -1093,6 +1198,13 @@ def sdk_import_session(
     the orchestrator's reclaim never deletes the clone mid-session, and
     an import refuses instead of racing a live run.
 
+    The prompt's self-check schema is staged into the session's writable
+    scratch before the session starts (``scratch_files`` —
+    :func:`build_proposal_schema` rendered as
+    ``$TMPDIR/proposal.schema.json``): the session's clone is the target
+    repo, which has no schema/ of its own, and the narrowed schema is
+    what its own output is judged against.
+
     Args:
         prompt: The importer prompt (:func:`build_import_prompt`).
         repo: The project repo root (cloned, never used as the cwd).
@@ -1135,6 +1247,11 @@ def sdk_import_session(
                 max_turns=max_turns, timeout_min=timeout_min,
                 protected=list((profile.get("paths") or {}).get("protected") or []),
                 token=token, run_id=run.run_id,
+                scratch_files={
+                    PROPOSAL_SCHEMA_NAME: json.dumps(
+                        build_proposal_schema(_load_tasks_schema()), indent=2
+                    )
+                },
             )
         except (SessionConfigError, SandboxError, RunError) as exc:
             # Runner setup errors: no bundled CLI / token (SessionConfigError),

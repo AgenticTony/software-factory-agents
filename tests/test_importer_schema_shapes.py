@@ -16,20 +16,27 @@ a refusal enumerates every violation class in one pass.
 from __future__ import annotations
 
 import builtins
+import copy
 import json
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 from typing import Any
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from factory.cli import main
 from factory.importer import (
+    FORBIDDEN_FIELDS,
     SPEC_FIELDS,
     ImportRefused,
+    _load_tasks_schema,
     build_import_prompt,
+    build_proposal_schema,
     plan_import,
+    run_import,
 )
 from factory.session import (
     SessionConfigError,
@@ -209,13 +216,23 @@ def test_prompt_carries_the_hard_rules(tmp_path: Path):
 
 def test_prompt_carries_the_self_check_instruction(tmp_path: Path):
     """The session must parse- and schema-check its own output before
-    answering; the final answer stays the JSON object."""
+    answering; the final answer stays the JSON object.
+
+    Round 2: the check names the absolute pinned interpreter (the one
+    proven to import jsonschema inside the sandbox — a bare ``python3``
+    resolves to whatever the sandbox PATH finds, which is not the
+    factory's venv) and the STAGED proposal schema under $TMPDIR (the
+    target repo has no schema/ dir of its own, and the queue schema
+    would flag a valid proposal's missing status/version)."""
     prompt = build_import_prompt(tmp_path, "docs", [], project="proj")
-    assert "python3 -c" in prompt
-    assert "json.load" in prompt
-    assert "schema/tasks.schema.json" in prompt
+    assert sys.executable in prompt  # named, never bare
+    assert "python3" not in prompt
+    assert "$TMPDIR/proposal.json" in prompt
+    assert "$TMPDIR/proposal.schema.json" in prompt  # staged before the session
+    assert "schema/tasks.schema.json" not in prompt  # not the target repo's
     assert "jsonschema" in prompt
     assert "final answer" in prompt
+    assert "json.load" in prompt
 
 
 # ------------------------------------------- 3: every violation, one refusal --
@@ -372,3 +389,227 @@ def test_entry_final_print_flushes(tmp_path: Path, monkeypatch):
     ]
     assert record_prints, "the entry never printed its record"
     assert all(kwargs.get("flush") is True for _, kwargs in record_prints)
+
+
+# ================= round 2: the self-check works on its real target =========
+#
+# The round-1 instruction told the session to validate against the
+# clone's schema/tasks.schema.json — wrong twice: the importer runs in a
+# clone of the TARGET repo (JobFinderOS has no schema/ dir), and the
+# queue schema requires version + per-task status, so a VALID proposal
+# would print ~31 violations the prompt forbids satisfying. The staged
+# schema is the queue schema narrowed to a proposal's own fields.
+
+
+def test_proposal_schema_derives_from_the_queue_schema():
+    """build_proposal_schema: same task shapes, no version, no status
+    (forbidden like every other never-set field), out_of_scope_match
+    allowed, the risk⇒human-merge rule kept."""
+    queue = _load_tasks_schema()
+    staged = build_proposal_schema(queue)
+    assert staged["required"] == ["project", "tasks"]  # version gone
+    assert set(staged["properties"]) == {"project", "tasks"}
+    task = staged["$defs"]["task"]
+    assert "status" not in task["required"]
+    for banned in ("status", *FORBIDDEN_FIELDS):
+        assert banned not in task["properties"], banned
+    for field in ("id", *SPEC_FIELDS, "out_of_scope_match"):
+        assert field in task["properties"], field
+    # the shapes are the queue's own, not a hand-copy: enums identical
+    for field in ("kind", "priority"):
+        assert (task["properties"][field]["enum"]
+                == queue["$defs"]["task"]["properties"][field]["enum"])
+    assert task["properties"]["id"].get("minLength") == 1  # blank id refused
+    # the one allOf rule that can fire without status rides along…
+    assert any('"human"' in json.dumps(rule)
+               for rule in task.get("allOf", []))
+    # …and the status-gated ones are dropped: their `if` lacks
+    # `required: [status]`, so on a status-less task they pass vacuously
+    # and demand approval fields — the ~31-violation wall, rebuilt.
+    assert all("status" not in json.dumps(rule)
+               for rule in task.get("allOf", []))
+
+
+def test_staged_check_agrees_with_plan_import(tmp_path: Path):
+    """A proposal that passes the staged check is not refused for shape
+    — and every incident-class shape error is caught by BOTH checks."""
+    staged = build_proposal_schema(_load_tasks_schema())
+    validator = Draft202012Validator(staged)
+
+    valid = {"project": "proj", "tasks": [_wo()]}
+    assert not list(validator.iter_errors(valid))
+    plan_import(None, copy.deepcopy(valid), [], project="proj")
+
+    breaks = {
+        "priority P0": {"priority": "P0"},
+        "acceptance id AC1": {"acceptance": [{
+            "id": "AC1", "text": "t",
+            "check": {"type": "test", "ref": "tests/x.py"}}]},
+        "invented check type": {"acceptance": [{
+            "id": "AC-1", "text": "t",
+            "check": {"type": "grep", "ref": "app"}}]},
+        "boolean merge gate": {"gates": {"spec_approval": True,
+                                         "merge": True, "deploy": "human"}},
+        "risk as a string": {"risk": "spills across modules"},
+        "owner_steps as strings": {"owner_steps": ["confirm with Paddle"]},
+        "slices as strings": {"slices": ["phase one"]},
+        "size L": {"budget": {"size": "L", "max_attempts": 2,
+                              "max_turns": 40, "wall_clock_min": 600}},
+        "status handed over": {"status": "ready"},
+        "approval field": {"approved_by": "owner"},
+    }
+    for name, override in breaks.items():
+        proposal = {"project": "proj", "tasks": [_wo("WO-9", **override)]}
+        errors = list(validator.iter_errors(proposal))
+        assert errors, f"{name}: the staged check missed it"
+        with pytest.raises(ImportRefused):
+            plan_import(None, copy.deepcopy(proposal), [], project="proj")
+
+
+def test_scratch_files_land_in_the_session_tmp(tmp_path: Path, monkeypatch):
+    """run_session_sandboxed(scratch_files=...) stages files into the
+    session's TMPDIR — the reviewer scratch, reachable from its cwd."""
+    run_dir = _git_repo(tmp_path / "run")
+    settings_path = tmp_path / "sandbox" / "probe.json"
+    settings_path.parent.mkdir(parents=True)
+    seen: dict[str, str] = {}
+
+    def fake_run_sandboxed(cmd, cwd, settings, **kwargs):
+        staged = Path(cwd) / ".tmp" / "proposal.schema.json"
+        seen["content"] = staged.read_text(encoding="utf-8")
+        record = SessionRecord(seat="reviewer", status="completed")
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps(record.to_dict()), stderr="")
+
+    monkeypatch.setattr("factory.session.run_sandboxed", fake_run_sandboxed)
+    run_session_sandboxed(
+        "reviewer", "the prompt", run_dir,
+        {"docs_allowlist": [], "network_allowlist": []},
+        factory_root=tmp_path / "root", settings_path=settings_path,
+        max_turns=1, timeout_min=0.05, token="tok",
+        cli_path=tmp_path / "claude", protected=(),
+        scratch_files={"proposal.schema.json": '{"type": "object"}'},
+    )
+    assert seen["content"] == '{"type": "object"}'
+
+
+def test_scratch_file_names_must_be_bare(tmp_path: Path, monkeypatch):
+    """A scratch file name with a path in it refuses before anything
+    runs — staging must never write outside the session's tmp."""
+    run_dir = _git_repo(tmp_path / "run")
+    monkeypatch.setattr(
+        "factory.session.run_sandboxed",
+        lambda *a, **kw: pytest.fail("the session must never start"),
+    )
+    with pytest.raises(SessionConfigError):
+        run_session_sandboxed(
+            "reviewer", "p", run_dir,
+            {"docs_allowlist": [], "network_allowlist": []},
+            factory_root=tmp_path / "root",
+            settings_path=tmp_path / "sandbox" / "s.json",
+            max_turns=1, timeout_min=0.05, token="tok",
+            cli_path=tmp_path / "claude", protected=(),
+            scratch_files={"../escape.txt": "x"},
+        )
+
+
+def test_real_import_session_stages_the_proposal_schema(
+    tmp_path: Path, monkeypatch
+):
+    """The real session path (session=None) hands run_session_sandboxed
+    the derived proposal schema to stage — the prompt's named file and
+    the staged file are the same shapes, by construction."""
+    repo = _git_repo(_repo(tmp_path))
+    captured: dict = {}
+
+    def fake(seat, prompt, run_dir, profile, **kwargs):
+        captured.update(kwargs)
+        return SessionRecord(
+            seat=seat, status="completed",
+            result=json.dumps({"project": "proj", "tasks": [_wo()]}),
+        )
+
+    monkeypatch.setattr("factory.importer.run_session_sandboxed", fake)
+    monkeypatch.setattr("factory.importer.seat_token", lambda: "tok")
+    result = run_import(repo, factory_root=tmp_path / "froot")
+    assert result.plan.project == "proj"
+    staged = json.loads(captured["scratch_files"]["proposal.schema.json"])
+    assert staged == build_proposal_schema(_load_tasks_schema())
+
+
+def test_self_check_commands_run_in_the_real_sandbox(tmp_path: Path):
+    """Behavior, not text: the prompt's check commands, extracted and
+    run under srt with the importer seat's real settings, stay silent on
+    a valid proposal and name all three violations on a broken one. The
+    fixture repo has NO schema/ dir — the target-repo reality."""
+    from factory.runs import cleanup_run, create_run
+    from factory.sandbox import (
+        build_settings,
+        default_toolchain,
+        run_sandboxed,
+        write_settings,
+    )
+
+    repo = _repo(tmp_path)
+    assert not (repo / "schema").exists()
+    prompt = build_import_prompt(repo, "docs", [], project="proj")
+    # each check command starts at the named interpreter — cut the line
+    # there so bash receives exactly the command, not its bullet
+    commands = [
+        line.strip()[line.strip().index(sys.executable):]
+        for line in prompt.splitlines()
+        if ' -c "' in line
+    ]
+    assert len(commands) == 2  # the parse check and the shape check
+    shape_check = next(c for c in commands if "proposal.schema.json" in c)
+
+    run = create_run("fixture", _git_repo(tmp_path / "src"),
+                     factory_root=tmp_path / "froot")
+    try:
+        settings = build_settings(
+            {"docs_allowlist": [], "network_allowlist": []}, run.root,
+            model_endpoint="api.z.ai", toolchain=default_toolchain(),
+            allow_read=[tmp_path / "runner"], read_only=True,
+        )
+        write_settings(settings, run.settings_path)
+        # Stage into the session's TMPDIR the way
+        # run_session_sandboxed(scratch_files=...) does (production
+        # writes through the .tmp symlink into the scratch outside the
+        # clone; same path from inside the sandbox); run_sandboxed
+        # prefixes TMPDIR=<run>/.tmp onto the command itself.
+        stage = run.root / ".tmp"
+        stage.mkdir(exist_ok=True)
+        (stage / "proposal.schema.json").write_text(
+            json.dumps(build_proposal_schema(_load_tasks_schema())))
+
+        def run_line(line: str):
+            # bash -c: the session's own shell shape, so $TMPDIR expands
+            # exactly as it will inside the session (probed under srt).
+            return run_sandboxed(["/bin/bash", "-c", line], run.root,
+                                 run.settings_path, timeout=120)
+
+        valid = json.dumps({"project": "proj", "tasks": [_wo()]}, indent=2)
+        (stage / "proposal.json").write_text(valid)
+        for line in commands:
+            proc = run_line(line)
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            assert not proc.stdout.strip(), (
+                f"a valid proposal printed: {proc.stdout}"
+            )
+
+        broken = json.dumps({
+            "project": "proj",
+            "tasks": [_wo("WO-9", status="ready", priority="P0",
+                          acceptance=[{"id": "AC1", "text": "t",
+                                       "check": {"type": "test",
+                                                 "ref": "tests/x.py"}}])],
+        })
+        (stage / "proposal.json").write_text(broken)
+        proc = run_line(shape_check)
+        assert proc.returncode == 0, proc.stderr
+        out = proc.stdout
+        assert "priority" in out and "is not one of" in out
+        assert "AC1" in out and "does not match" in out
+        assert "status" in out and "Additional properties" in out
+    finally:
+        cleanup_run(run)

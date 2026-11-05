@@ -102,7 +102,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, NamedTuple, Sequence
+from typing import Any, Callable, Mapping, NamedTuple, Sequence
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -1649,6 +1649,7 @@ def run_session_sandboxed(
     task_id: str | None = None,
     trace_sink: Callable[[dict[str, Any]], None] | None = None,
     toolkit: dict | None = None,
+    scratch_files: "Mapping[str, str] | None" = None,
 ) -> SessionRecord:
     """Run one session with the whole runner process inside the F-05 sandbox.
 
@@ -1693,6 +1694,13 @@ def run_session_sandboxed(
             read-only copy next to the settings (outside the clone, the
             runner-staging pattern) and carried in the spec; None gives
             the pre-F-22 session shape (no skills, no MCP servers).
+        scratch_files: ``{bare filename: text}`` staged into the
+            session's writable scratch — its ``$TMPDIR`` — before the
+            session starts (F-12 round 2: the importer stages the
+            narrowed proposal schema there, because the session's clone
+            is the target repo and has no schema/ of its own). The
+            scratch is cleaned with the run; names must be bare
+            filenames (no path), or the session refuses to start.
 
     Returns:
         The session's record (any status — completed/failed/aborted are
@@ -1735,6 +1743,12 @@ def run_session_sandboxed(
     reviewer_writable: tuple[Path, Path] = ()
     baseline: _GitState | None = None
     record: SessionRecord | None = None
+    if scratch_files and any(Path(name).name != name for name in scratch_files):
+        raise SessionConfigError(
+            f"scratch file names must be bare filenames, got "
+            f"{sorted(scratch_files)!r} — staging must never write outside "
+            "the session's tmp."
+        )
     # Everything from the scratch symlinks on sits inside try/finally (review
     # round 4): a setup failure must still tear the links down, and the
     # integrity backstop must run on EVERY exit path, timeouts and missing
@@ -1743,6 +1757,9 @@ def run_session_sandboxed(
         if review_guard:
             reviewer_writable = _reviewer_scratch(Path(settings_path), run_dir)
             baseline = _git_state(run_dir)
+            _stage_scratch_files(scratch_files, reviewer_writable[1])
+        elif scratch_files:
+            _stage_scratch_files(scratch_files, run_dir / ".tmp")
         record = _run_prepared(
             seat, prompt, run_dir, profile, settings_path,
             factory_root=factory_root, max_turns=max_turns,
@@ -1771,6 +1788,29 @@ def run_session_sandboxed(
             if review_guard:
                 _teardown_reviewer_scratch(run_dir)
     return record
+
+
+def _stage_scratch_files(
+    files: "Mapping[str, str] | None", tmp: Path
+) -> None:
+    """Stage orchestrator-side files into the session's writable scratch.
+
+    The session's ``$TMPDIR`` (run_sandboxed prefixes it onto its
+    command) is the reviewer scratch — outside the clone, so nothing
+    staged here can trip the workspace-integrity guard, and cleaned with
+    the run. The importer stages its narrowed proposal schema here
+    (F-12 round 2): the session's clone is the *target* repo and has no
+    schema/ of its own, and the self-check the prompt commands must
+    read the file from where the prompt says it is.
+
+    Names are validated bare by the caller; the write is plain text —
+    staging runs before the sandbox exists, orchestrator-side.
+    """
+    if not files:
+        return
+    tmp.mkdir(parents=True, exist_ok=True)
+    for name, content in files.items():
+        (tmp / name).write_text(content, encoding="utf-8")
 
 
 def _derive_settings_path(
