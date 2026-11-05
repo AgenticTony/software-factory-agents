@@ -102,7 +102,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, NamedTuple, Sequence
+from typing import Any, Callable, Mapping, NamedTuple, Sequence
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -113,13 +113,14 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk import query as sdk_query
 
-from factory.runs import GIT_HARDENING, RunError
+from factory.runs import FACTORY_ROOT_DEFAULT, GIT_HARDENING, RunError, new_run_id
 from factory.sandbox import (
     build_settings,
     default_toolchain,
     run_sandboxed,
     write_settings,
 )
+from factory.sentinels import redact_credentials
 from factory.state import now_iso
 from factory.toolkit import (
     ENV_SCRUB,
@@ -1648,6 +1649,7 @@ def run_session_sandboxed(
     task_id: str | None = None,
     trace_sink: Callable[[dict[str, Any]], None] | None = None,
     toolkit: dict | None = None,
+    scratch_files: "Mapping[str, str] | None" = None,
 ) -> SessionRecord:
     """Run one session with the whole runner process inside the F-05 sandbox.
 
@@ -1692,6 +1694,16 @@ def run_session_sandboxed(
             read-only copy next to the settings (outside the clone, the
             runner-staging pattern) and carried in the spec; None gives
             the pre-F-22 session shape (no skills, no MCP servers).
+        scratch_files: ``{bare filename: text}`` staged into the
+            session's writable scratch — its ``$TMPDIR`` — before the
+            session starts (F-12 round 2: the importer stages the
+            narrowed proposal schema there, because the session's clone
+            is the target repo and has no schema/ of its own). Guard
+            seats only (reviewer/verifier): without the guard the
+            writable scratch is the clone's own ``run/.tmp``, and a
+            staged file could ride that seat's diff — refused. The
+            scratch is cleaned with the run; names must be bare
+            filenames (no path), or the session refuses to start.
 
     Returns:
         The session's record (any status — completed/failed/aborted are
@@ -1734,6 +1746,22 @@ def run_session_sandboxed(
     reviewer_writable: tuple[Path, Path] = ()
     baseline: _GitState | None = None
     record: SessionRecord | None = None
+    if scratch_files and any(Path(name).name != name for name in scratch_files):
+        raise SessionConfigError(
+            f"scratch file names must be bare filenames, got "
+            f"{sorted(scratch_files)!r} — staging must never write outside "
+            "the session's tmp."
+        )
+    if scratch_files and not review_guard:
+        # Round-3 review nit: staging into run/.tmp — the clone itself —
+        # for a non-guard seat would put orchestrator files inside that
+        # seat's workspace, where they could ride its diff. No caller
+        # does this today; refuse so the path never exists.
+        raise SessionConfigError(
+            "scratch_files needs the reviewer/verifier guard: without it "
+            "the writable scratch is the clone's own run/.tmp, and a "
+            "staged file could ride that seat's diff."
+        )
     # Everything from the scratch symlinks on sits inside try/finally (review
     # round 4): a setup failure must still tear the links down, and the
     # integrity backstop must run on EVERY exit path, timeouts and missing
@@ -1742,6 +1770,7 @@ def run_session_sandboxed(
         if review_guard:
             reviewer_writable = _reviewer_scratch(Path(settings_path), run_dir)
             baseline = _git_state(run_dir)
+            _stage_scratch_files(scratch_files, reviewer_writable[1])
         record = _run_prepared(
             seat, prompt, run_dir, profile, settings_path,
             factory_root=factory_root, max_turns=max_turns,
@@ -1770,6 +1799,29 @@ def run_session_sandboxed(
             if review_guard:
                 _teardown_reviewer_scratch(run_dir)
     return record
+
+
+def _stage_scratch_files(
+    files: "Mapping[str, str] | None", tmp: Path
+) -> None:
+    """Stage orchestrator-side files into the session's writable scratch.
+
+    The session's ``$TMPDIR`` (run_sandboxed prefixes it onto its
+    command) is the reviewer scratch — outside the clone, so nothing
+    staged here can trip the workspace-integrity guard, and cleaned with
+    the run. The importer stages its narrowed proposal schema here
+    (F-12 round 2): the session's clone is the *target* repo and has no
+    schema/ of its own, and the self-check the prompt commands must
+    read the file from where the prompt says it is.
+
+    Names are validated bare by the caller; the write is plain text —
+    staging runs before the sandbox exists, orchestrator-side.
+    """
+    if not files:
+        return
+    tmp.mkdir(parents=True, exist_ok=True)
+    for name, content in files.items():
+        (tmp / name).write_text(content, encoding="utf-8")
 
 
 def _derive_settings_path(
@@ -2132,10 +2184,44 @@ def _run_prepared(
     except (json.JSONDecodeError, TypeError) as exc:
         raise SessionConfigError(
             "the sandboxed session entry produced an unparsable record "
-            f"({exc}): {record_line[:500]}"
+            f"({exc}); record line length {len(record_line)}; full stdout "
+            f"saved to {_save_session_stdout(proc.stdout, run_dir, factory_root)}"
         ) from exc
 
     return record
+
+
+def _save_session_stdout(
+    stdout: str, run_dir: Path, factory_root: Path | None
+) -> str:
+    """Keep the full raw stdout of a session whose record would not parse.
+
+    The once-observed "Unterminated string" record (2026-11-01, 56 turns
+    lost) left nothing to diagnose: the run dir is deleted on every exit
+    path, and the truncated tail in the error message said nothing about
+    what the whole stream looked like. The copy is credential-redacted
+    (:func:`factory.sentinels.redact_credentials`), written with mode
+    0600, create-only (O_EXCL), under ``<factory-root>/sessions/`` —
+    beside the runs, outside the clone that is about to disappear.
+
+    Returns the saved path as text, or ``<not saved: …>`` — the save is
+    diagnostics for a SessionConfigError already on its way out, and a
+    failed save must never mask it.
+    """
+    try:
+        root = Path(factory_root) if factory_root is not None else None
+        if root is None:
+            runs_root = run_dir.parent.parent
+            root = runs_root.parent if runs_root.name == "runs" else FACTORY_ROOT_DEFAULT
+        directory = root / "sessions"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"unparsable-record-{new_run_id()}.stdout.txt"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(redact_credentials(stdout))
+        return str(path)
+    except OSError as exc:
+        return f"<not saved: {exc}>"
 
 
 # python -c <bootstrap> <spec.json> — the in-sandbox entry point (see
@@ -2182,7 +2268,12 @@ def _main(argv: list[str] | None = None) -> int:
     except (OSError, json.JSONDecodeError, KeyError, SessionConfigError) as exc:
         print(f"factory.session: {exc}", file=sys.stderr)
         return 2
-    print(json.dumps(record.to_dict()))
+    # flush=True: this line IS the session's record — the orchestrator
+    # parses it off our stdout. An unflushed buffer torn by teardown is
+    # the truncated-record failure mode (_save_session_stdout guards the
+    # orchestrator side); the explicit flush makes the write land before
+    # anything else can happen to this process.
+    print(json.dumps(record.to_dict()), flush=True)
     return 0
 
 
