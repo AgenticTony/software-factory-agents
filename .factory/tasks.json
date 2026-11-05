@@ -1117,7 +1117,12 @@
         "F-27",
         "F-28",
         "F-41",
-        "F-42"
+        "F-42",
+        "F-43",
+        "F-44",
+        "F-45",
+        "F-46",
+        "F-47"
       ],
       "risk": [
         "cross_repo"
@@ -1150,6 +1155,10 @@
           "done": false
         },
         {
+          "text": "Decide in writing whether client source may be sent to the Z.ai endpoint: for an EU client that means a data processing agreement or the client's written consent, recorded per repo. Until then, onboard only repos you own.",
+          "done": false
+        },
+        {
           "text": "Approve 2–3 self-contained build WOs, not WO-13/16/17 (payments), WO-27 (decision) or WO-29/30 (research-gated).",
           "done": false
         },
@@ -1167,7 +1176,8 @@
       "priority": "P2",
       "status": "draft",
       "depends_on": [
-        "F-10"
+        "F-10",
+        "F-54"
       ],
       "risk": [
         "deploy"
@@ -1220,7 +1230,8 @@
       "priority": "P2",
       "status": "draft",
       "depends_on": [
-        "F-10"
+        "F-10",
+        "F-54"
       ],
       "risk": [],
       "gates": {
@@ -3577,6 +3588,940 @@
       "acceptance_hash": "e1dde3ff49048e51e72ba4f6300d51d24e82b1ca8976b950f69478c98f0a2f09",
       "approved_at": "2026-11-04T11:19:32Z",
       "approved_by": "Anthony"
+    },
+    {
+      "id": "F-43",
+      "title": "Egress redaction seam",
+      "source": "BUILD-ORDER.md#f-43--egress-redaction-seam",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-30",
+        "F-42"
+      ],
+      "risk": [
+        "factory_control",
+        "privacy"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "(C-1) The implementer notes, every L2 finding text and the L2 verdict JSON pass the seam before `build_pr_body`. A test plants the literal seat token and a bare `ANTHROPIC_AUTH_TOKEN=<value>` echo in each input and asserts neither reaches the rendered body.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f43.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "(C-1) `check_pr_text` refuses a PR title or body that carries the literal seat token, naming the refusal without echoing the token — a second, independent fence before the push.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f43.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "(M-8) Vent text and `sessions/unparsable-record-*.stdout.txt` dumps pass the same seam; a test plants the token in each and asserts it is absent on disk.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f43.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "(m-16) Vent text, `factory status` output and trace lines printed to a terminal have ANSI/OSC/C0 control sequences stripped; a test covers screen-clear, OSC-8 link and cursor-move sequences.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f43.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "(I-10) `redact_credentials` and the credential sentinel catch JWTs, `Bearer <token>` literals and unquoted YAML `password:` values: one F-33 attack diff per shape, and the F-33 benign corpus stays clean.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f43.py::test_ac_5"
+          }
+        },
+        {
+          "id": "AC-6",
+          "text": "A test enumerates every orchestrator path that writes session-derived text off the machine or to the owner's terminal and asserts each calls the seam, so a new channel cannot skip it.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f43.py::test_ac_6"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-44",
+      "title": "Verdict integrity",
+      "source": "BUILD-ORDER.md#f-44--verdict-integrity",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-38",
+        "F-41"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "(M-1) Severity is canonicalized once at parse (`strip().lower()`, beside the axis canonicalization). A test merges `\"Blocking\"` with `\"minor\"` in both orders and asserts the merged finding is blocking and the verdict fail; `eval._count_blocking` is case-insensitive.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f44.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "(m-10) `_extract_json` refuses output carrying more than one valid verdict object with differing verdicts, as an invalid verdict that takes the retry path. Tests cover FAIL-then-example-PASS and the reverse.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f44.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "(m-8) `parse_test_count` reads the count from the runner's final summary line, not the maximum anywhere in the output; a test whose test prints `999999 passed` does not clear the floor.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f44.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "(I-11) Removing a `pytest.raises` block counts as an assertion removal, with an F-33 attack diff and a clean benign corpus.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f44.py::test_ac_4"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-45",
+      "title": "Pre-lease, publish and crash-window robustness",
+      "source": "BUILD-ORDER.md#f-45--pre-lease-publish-and-crash-window-robustness",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-10",
+        "F-26"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "(M-5) The stale-PR sweep runs under `queue.idle_lease()`. A test races a sweep against `reclaim_runs` and asserts no live run dir is deleted.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f45.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "(M-6) A failing progress-log append in `_sweep_escalation` no longer leaves the task in `in_review`: a test injects the failure and asserts the task reaches `needs_human` and the next run proceeds.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f45.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "(M-7) Publish-side `git push`, `ls-remote` and `gh pr create` run with `GIT_TERMINAL_PROMPT=0` and a timeout through the same wrapper as `_fetch_sha`; a test with a hanging fake remote asserts a timed-out `PublishError`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f45.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "(m-13) A `finish()` failure between `append_attempt` and the transition records exactly one attempt; a test injects the failure.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f45.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "(m-14) `gh pr view` exiting 0 with non-object JSON (`null`) maps to the documented unresolvable PR state, not an `AttributeError`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f45.py::test_ac_5"
+          }
+        },
+        {
+          "id": "AC-6",
+          "text": "(I-3) Atomic queue writes fsync the parent directory after the rename; a test asserts the directory fsync call.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f45.py::test_ac_6"
+          }
+        },
+        {
+          "id": "AC-7",
+          "text": "(I-4) The run-lease error names the holder only when that holder is alive and says the lock is stale otherwise; a test covers both.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f45.py::test_ac_7"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-46",
+      "title": "Gate evasion hardening (L0/L1)",
+      "source": "BUILD-ORDER.md#f-46--gate-evasion-hardening-l0l1",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-08",
+        "F-25",
+        "F-42"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "(M-2) The attribution scan reads each commit's message separately (per sha), not by splitting one log on `\\x1e`; a commit whose body embeds `\\x1e` before a trailer is flagged.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f46.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "(m-17) Attribution matching runs on NFKC-normalized text with zero-width characters removed and any number of connecting tokens; tests cover U+2010, a fullwidth colon and a zero-width space inside \"claude\".",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f46.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "(m-9) `lint_suppression_added` checks both the old and new path of a rename; a test renames `payments/x.py` to `utils/x.py` with an added `# noqa` and asserts the finding.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f46.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "(M-4) Test-runner configuration (`**/conftest.py`, `pytest.ini`, `pyproject.toml`'s pytest table, `setup.cfg`'s pytest section) is protected by a schema-level default that a profile can only widen; every profile in the repo still validates.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f46.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "(M-4) L1 treats a contract test that was not collected as a failure at both the red and the green end; a test using a conftest that sets `collect_ignore` asserts L1 fails.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f46.py::test_ac_5"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-47",
+      "title": "Sandbox read boundary and toolkit staging",
+      "source": "BUILD-ORDER.md#f-47--sandbox-read-boundary-and-toolkit-staging",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-05",
+        "F-22"
+      ],
+      "risk": [
+        "factory_control",
+        "privacy"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "(M-9) `denyRead` covers the factory root itself with explicit carve-outs for the run's own dir and srt; a test with `--factory-root` outside `$HOME` asserts a session cannot read `trace/`, `progress/` or `sessions/`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f47.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "(I-9) A drain that force-closes a `setsid` escapee writes an event to the trace and counts in `factory status`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f47.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "(I-2) The index-load MCP domain check validates against the vetted allowlist, not against itself; a test uses an index entry with an unvetted domain.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f47.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "(I-19) MCP descriptor staging copies its files explicitly; a test asserts the staged set without relying on a copytree side effect.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f47.py::test_ac_4"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 100,
+        "wall_clock_min": 60
+      }
+    },
+    {
+      "id": "F-48",
+      "title": "Eval parity and variance",
+      "source": "BUILD-ORDER.md#f-48--eval-parity-and-variance",
+      "kind": "build",
+      "priority": "P2",
+      "status": "draft",
+      "depends_on": [
+        "F-16",
+        "F-44"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "(M-3) The eval's L2 path runs `apply_convergence` exactly as production does, through one shared function; a test asserts the eval and the orchestrator call the same symbol.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f48.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "(m-12) The eval checks quota before parsing seats, as production does; a test asserts zero re-runs for a quota-hit seat.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f48.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "(m-11) The clean-diff report line shows L0 and L1 as well as L2, so a clean diff that failed L0 renders as an L0 false positive.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f48.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "(I-12) `factory eval --repeats N` runs each seed N times and reports mean and spread per metric (default N=3; the owner confirms the default and cadence at approval).",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f48.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "(manual) The F-16 seeded eval is re-run on the fixed pipeline and the new baseline is recorded as tick evidence; the old numbers were measured without convergence.",
+          "check": {
+            "type": "manual",
+            "expect": "owner tick evidence: the re-run baseline report"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-49",
+      "title": "Contract and importer hardening",
+      "source": "BUILD-ORDER.md#f-49--contract-and-importer-hardening",
+      "kind": "build",
+      "priority": "P2",
+      "status": "draft",
+      "depends_on": [
+        "F-02",
+        "F-12"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "(M-10) A CI test resolves every acceptance ref on every non-draft task to a real test function, using F-01's AST resolution; a typo'd ref on a `ready` task fails.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f49.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "(m-3) Schema validation enforces `format: date-time`; a malformed timestamp is rejected.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f49.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "(m-4) A planning-doc listing over 200 files ends with `+N more` and the proposal names the truncated docs.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f49.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "(m-6) The fresh-queue import write holds the queue lock across the check and the write.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f49.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "(m-7) A proposal that raises `RecursionError` takes the keep-refused-output path; the session output is saved.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f49.py::test_ac_5"
+          }
+        },
+        {
+          "id": "AC-6",
+          "text": "(I-18) A proposal without a `project` key is refused.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f49.py::test_ac_6"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-50",
+      "title": "CLI and dashboard robustness",
+      "source": "BUILD-ORDER.md#f-50--cli-and-dashboard-robustness",
+      "kind": "build",
+      "priority": "P2",
+      "status": "draft",
+      "depends_on": [
+        "F-11",
+        "F-31"
+      ],
+      "risk": [],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "(m-1) The dashboard `/metrics` page expands `~` in the profile's repo path; a test uses a `~`-relative profile.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f50.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "(m-2) `factory status` survives a non-UTF-8 commit subject.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f50.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "(m-5) An explicit `--config <path>` that does not exist is an error; only the default config path may be absent.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f50.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "(m-15) `factory sentinels replay` exits non-zero on any benign hit or missed attack.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f50.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "(I-5) A trace line that parses to a non-dict renders as an error row on the run page, not a 500.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f50.py::test_ac_5"
+          }
+        },
+        {
+          "id": "AC-6",
+          "text": "(I-6) An `OSError` reading `rendered_path` in `_run_eval` exits 2 with a message.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f50.py::test_ac_6"
+          }
+        },
+        {
+          "id": "AC-7",
+          "text": "(I-7, I-8) The `cli.py` module docstring lists the current commands and the dead HEAD suppression in `dashboard.py` is gone; a test asserts the docstring names every registered subcommand.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f50.py::test_ac_7"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-51",
+      "title": "Test suite and CI hygiene",
+      "source": "BUILD-ORDER.md#f-51--test-suite-and-ci-hygiene",
+      "kind": "build",
+      "priority": "P2",
+      "status": "draft",
+      "depends_on": [
+        "F-01",
+        "F-05"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "(M-11) The importer prompt test checks for no bare `python3` outside the quoted interpreter path and passes under conda, pyenv and system Python.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f51.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "(m-20) Live-endpoint assertions (Z.ai reachability, the raw-socket deny to a public IP) run in a separately named CI job; the sandbox-deny assertions stay mandatory in the main job.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f51.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "(m-21) Live session tests run only on an explicit opt-in (`FACTORY_LIVE_TESTS=1`), never inferred from a credential being present.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f51.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "(m-22) `pytest` and `ruff` carry exact pins and CI's Node version meets srt's `>=22.12.0` floor.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f51.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "(m-23) `re.split` passes `maxsplit` by keyword and the suite runs with `-W error::DeprecationWarning`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f51.py::test_ac_5"
+          }
+        },
+        {
+          "id": "AC-6",
+          "text": "(I-16) The `test_f05` fixed sleeps become condition waits with a timeout.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f51.py::test_ac_6"
+          }
+        },
+        {
+          "id": "AC-7",
+          "text": "(I-17) The cross-test-module import moves into a shared `tests/` helper.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f51.py::test_ac_7"
+          }
+        },
+        {
+          "id": "AC-8",
+          "text": "(I-1) A wheel install works — schema and toolkit ship as package data read via `importlib.resources` — proven by a CI step that installs the built wheel and loads the contract.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f51.py::test_ac_8"
+          }
+        },
+        {
+          "id": "AC-9",
+          "text": "(A-7) `pyright` in basic mode runs in CI and is clean.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f51.py::test_ac_9"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-52",
+      "title": "Docs truth pass",
+      "source": "BUILD-ORDER.md#f-52--docs-truth-pass",
+      "kind": "docs",
+      "priority": "P2",
+      "status": "draft",
+      "depends_on": [
+        "F-11"
+      ],
+      "risk": [],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "(M-12) TASK-CONTRACT's queue-marker regeneration claim is removed (`tasks.json` plus `factory status` is the one source; the owner may instead choose to implement it at approval).",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f52.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "(M-13) VALIDATOR-SPEC's done rule names the no-deploy close-out and marks L3/L4 as not yet built until F-14/F-15 land.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f52.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "(M-14) `docs/proposals-2026-10-30-borrowings.md` is deleted or re-baselined with ids from F-56 up; no doc assigns a live WO id a second meaning.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f52.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "(m-18) README names the INC-007 skip exception, says the eval runs L0–L2, carries a current WO range, and BOOTSTRAP.md's header matches its use.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f52.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "(m-19) VALIDATOR-SPEC names `prompts/reviewer.md` as the L2 base prompt.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f52.py::test_ac_5"
+          }
+        },
+        {
+          "id": "AC-6",
+          "text": "(I-13, I-14, I-15) BUILD-ORDER's build-order narrative is current, F-13 step 2 names the right file, and DESIGN's vendored-skills list matches what is vendored.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f52.py::test_ac_6"
+          }
+        },
+        {
+          "id": "AC-7",
+          "text": "(A-8) Review-provenance comments (\"round-N finding M\") each cite a PR number; a lint enforces it.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f52.py::test_ac_7"
+          }
+        },
+        {
+          "id": "AC-8",
+          "text": "A cross-doc test asserts every `factory` subcommand and repo path named in README, VALIDATOR-SPEC and TASK-CONTRACT exists.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f52.py::test_ac_8"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 100,
+        "wall_clock_min": 60
+      }
+    },
+    {
+      "id": "F-53",
+      "title": "Split `_run_task` into phase functions",
+      "source": "BUILD-ORDER.md#f-53--split-_run_task-into-phase-functions",
+      "kind": "build",
+      "priority": "P2",
+      "status": "draft",
+      "depends_on": [
+        "F-43",
+        "F-44",
+        "F-45",
+        "F-46",
+        "F-47"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "(A-1) `_run_task` becomes phase functions over `_Ctx` (prepare, implement, gates, review, publish); no function in `orchestrator.py` exceeds 150 lines, enforced by a test.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f53.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "(A-1) The existing test suite passes with no test file changed in this WO's diff.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f53.py::test_ac_2"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-54",
+      "title": "Validation-pipeline seam",
+      "source": "BUILD-ORDER.md#f-54--validation-pipeline-seam",
+      "kind": "build",
+      "priority": "P2",
+      "status": "draft",
+      "depends_on": [
+        "F-53",
+        "F-48"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "(A-2) The per-round gate sequence is a data list of `(name, callable)`; a test registers a dummy layer and sees it run, record and render in the PR body without editing the orchestrator.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f54.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "(A-6) `eval.py` imports only public orchestrator functions; a test asserts no `orchestrator._*` import in `eval.py`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f54.py::test_ac_2"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-55",
+      "title": "Module hygiene",
+      "source": "BUILD-ORDER.md#f-55--module-hygiene",
+      "kind": "build",
+      "priority": "P3",
+      "status": "draft",
+      "depends_on": [
+        "F-54"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "(A-3) Venv creation, the prompt builders and `reclaim_runs` move out of `orchestrator.py`; `now_iso()` moves to `runs.py`; `importer.py` no longer imports `_atomic_write_json` privately.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f55.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "(A-4) The `contract`/`toolkit` import cycle is broken and an import-graph test asserts the package layering is acyclic.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f55.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "(A-5) One git wrapper; a test asserts no direct `subprocess` git call outside it.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f55.py::test_ac_3"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
     }
   ]
 }

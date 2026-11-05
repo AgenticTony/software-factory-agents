@@ -25,9 +25,9 @@ The factory's own build plan, written in the format the factory will consume: on
 | **F-10** | `factory run` / `factory loop` + PR creation | 1 | F-03, F-04, F-06, F-07, F-08, F-09 | deploy | M |
 | **F-11** | `factory status`: daily summary + metrics | 1 | F-03, F-23, F-24, F-25, F-26 | — | S |
 | **F-12** | Importer (`factory import`) | 1 | F-06, F-02, F-23, F-24, F-25, F-26 | — | M |
-| **F-13** | Onboard JobFinderOS (pilot) | 1 | F-00, F-11, F-12, F-16, F-22, F-27, F-28, F-41, F-42 | cross_repo | owner |
-| **F-14** | L4 `verify-live` + merged/deployed tracking | 2 | F-10 | deploy | M |
-| **F-15** | L3 holdout runner | 2 | F-10 | — | M |
+| **F-13** | Onboard JobFinderOS (pilot) | 1 | F-00, F-11, F-12, F-16, F-22, F-27, F-28, F-41, F-42, F-43, F-44, F-45, F-46, F-47 | cross_repo | owner |
+| **F-14** | L4 `verify-live` + merged/deployed tracking | 2 | F-10, F-54 | deploy | M |
+| **F-15** | L3 holdout runner | 2 | F-10, F-54 | — | M |
 | **F-16** | Seeded-bug validator eval | 2 | F-07, F-08, F-09, F-38 | — | M |
 | **F-17** | Onboard SoloAdventurer Web | 3 | F-13, F-14, F-15 | cross_repo | owner |
 | **F-18** | Triage quarantine + first watcher | 3 | F-14 | external_service | M |
@@ -54,8 +54,21 @@ The factory's own build plan, written in the format the factory will consume: on
 | **F-40** | Profile-declared toolchain | 1b | F-05 | factory_control | S |
 | **F-41** | Final full review after fix rounds | 1b | F-23, F-38 | factory_control | M |
 | **F-42** | Session hardening: attribution and sandbox-bypass attempts | 1b | F-06, F-07, F-30 | factory_control | S |
+| **F-43** | Egress redaction seam | 1r | F-30, F-42 | factory_control, privacy | M |
+| **F-44** | Verdict integrity | 1r | F-38, F-41 | factory_control | M |
+| **F-45** | Pre-lease, publish and crash-window robustness | 1r | F-10, F-26 | factory_control | M |
+| **F-46** | Gate evasion hardening (L0/L1) | 1r | F-08, F-25, F-42 | factory_control | M |
+| **F-47** | Sandbox read boundary and toolkit staging | 1r | F-05, F-22 | factory_control, privacy | S |
+| **F-48** | Eval parity and variance | 1r | F-16, F-44 | factory_control | M |
+| **F-49** | Contract and importer hardening | 1r | F-02, F-12 | factory_control | M |
+| **F-50** | CLI and dashboard robustness | 1r | F-11, F-31 | — | M |
+| **F-51** | Test suite and CI hygiene | 1r | F-01, F-05 | factory_control | M |
+| **F-52** | Docs truth pass | 1r | F-11 | — | S |
+| **F-53** | Split `_run_task` into phase functions | 1r | F-43, F-44, F-45, F-46, F-47 | factory_control | M |
+| **F-54** | Validation-pipeline seam | 1r | F-53, F-48 | factory_control | M |
+| **F-55** | Module hygiene | 1r | F-54 | factory_control | M |
 
-Order to build in: **F-00 (in parallel) → F-01 → F-02 → F-03 → F-04 → F-07 → F-08 → F-05 → F-06 → F-09 → F-10 → F-29** (done), **then F-24 → F-23 → F-25 → F-26 → F-27 → F-30 → F-33 → F-28 → F-11 → F-12 → F-31 → F-34 → F-35 → F-37 → F-38 → F-16 → F-32 → F-22 → F-41 → F-42 → F-13**; F-39 follows F-22 whenever its admission path is chosen at spec approval — it gates nothing else. The deterministic core (F-02–F-04, F-07, F-08) went first: it's pure Python and testable without any model. F-29 went right after them because nothing else could close without it: F-00 and F-06 were stuck on owner steps no command could tick, and F-09/F-10 can't reconcile until F-06 is done. Hardening comes next, rehearsal fixture first so every later change is checked against a realistic repo. F-30 lands before F-28 so the first unattended loop is traceable while it runs, not only afterwards. F-33 lands before F-28 too: a credential hit escalates with no retry, so the sentinels' false-positive rate is measured before an unattended loop depends on them. F-28 then runs the factory on its own F-11 and F-12. F-31 (dashboard) only reads, but it serves trace content to the browser and owns the Host check that F-34, F-35 and F-37 lean on, so it is risk-flagged `privacy` — its Door is one-way under F-10 AC-9 — while remaining the next WO the factory can build for itself: it touches no protected path, and the flag routes its PR through the fuller Merge Danger review. F-34, F-35 and F-37: all three are built interactively (factory_control: they change what reaches the queue and how — F-34 and F-35 carry approvals to it, F-37 adds draft work orders to it from a seat with a security-sensitive read-plus-fetch surface), never by the factory itself. F-34 and F-37 also carry `privacy` — operator transcripts and client briefs are personal data at rest — so their Doors are one-way under F-10 AC-9 too. F-32 changes how retries spend tokens, so it waits until F-30 and F-28 give a baseline to compare against. Neither F-31 nor F-32 blocks F-13. F-38 lands before F-16 (F-16 depends on it) so the seeded-bug eval measures the parallel reviewer the queue will actually run, not the single reviewer it replaces — the F-28 baseline (independent review 8 findings, L2 2) is the case for not waiting. F-16 measures how much each layer catches before any outside project depends on it.
+Order to build in: **F-00 (in parallel) → F-01 → F-02 → F-03 → F-04 → F-07 → F-08 → F-05 → F-06 → F-09 → F-10 → F-29** (done), **then F-24 → F-23 → F-25 → F-26 → F-27 → F-30 → F-33 → F-28 → F-11 → F-12 → F-31 → F-34 → F-35 → F-37 → F-38 → F-16 → F-32 → F-22 → F-41 → F-42 → F-13**; F-39 follows F-22 whenever its admission path is chosen at spec approval — it gates nothing else. The deterministic core (F-02–F-04, F-07, F-08) went first: it's pure Python and testable without any model. F-29 went right after them because nothing else could close without it: F-00 and F-06 were stuck on owner steps no command could tick, and F-09/F-10 can't reconcile until F-06 is done. Hardening comes next, rehearsal fixture first so every later change is checked against a realistic repo. F-30 lands before F-28 so the first unattended loop is traceable while it runs, not only afterwards. F-33 lands before F-28 too: a credential hit escalates with no retry, so the sentinels' false-positive rate is measured before an unattended loop depends on them. F-28 then runs the factory on its own F-11 and F-12. F-31 (dashboard) only reads, but it serves trace content to the browser and owns the Host check that F-34, F-35 and F-37 lean on, so it is risk-flagged `privacy` — its Door is one-way under F-10 AC-9 — while remaining the next WO the factory can build for itself: it touches no protected path, and the flag routes its PR through the fuller Merge Danger review. F-34, F-35 and F-37: all three are built interactively (factory_control: they change what reaches the queue and how — F-34 and F-35 carry approvals to it, F-37 adds draft work orders to it from a seat with a security-sensitive read-plus-fetch surface), never by the factory itself. F-34 and F-37 also carry `privacy` — operator transcripts and client briefs are personal data at rest — so their Doors are one-way under F-10 AC-9 too. F-32 changes how retries spend tokens, so it waits until F-30 and F-28 give a baseline to compare against. Neither F-31 nor F-32 blocks F-13. F-38 lands before F-16 (F-16 depends on it) so the seeded-bug eval measures the parallel reviewer the queue will actually run, not the single reviewer it replaces — the F-28 baseline (independent review 8 findings, L2 2) is the case for not waiting. F-16 measures how much each layer catches before any outside project depends on it. **Review remediation (Phase 1r, from CODE-REVIEW-2026-11-05):** F-43 → F-44 → F-45 → F-46 → F-47 before F-13's first `factory run` on JobFinderOS; F-48 → F-49 → F-51 alongside F-13, with F-50 and F-52 as factory-built candidates; then F-53 → F-54 → F-55, and F-14/F-15 build on F-54's seam.
 
 F-14 (live checks) and F-15 (holdouts) need a deployed project with real users, which the factory itself is not, so they arrive with the first outside project (Phase 2). F-21 stays last: it unlocks only on numbers F-11, F-14, F-16 and F-38 produce from real merges, so all four are in its `depends_on`. Trigger evidence, for when the numbers arrive: Anthropic's code-review record (Oct 2026; linked under F-38 below, summarized in RESEARCH-SOFTWARE-FACTORY.md §15) saw revert share fall >40% while merged volume doubled with classifier-set risk tiers and no human on the low tier — dial the low tier on first when F-16 and F-38 give us our own numbers.
 
@@ -417,6 +430,143 @@ F-25 AC-3 proves each built-in sentinel on one seeded diff and one clean diff. T
 - AC-4 `factory sentinels replay [--corpus benign|attack] [<patch> ...]` runs the built-in sentinels over corpus diffs and prints one line per sentinel per diff. It reads only: a test asserts no file under the factory root changes.
 - AC-5 The corpus directory is added to `paths.protected` in this repo's `.factory/project.yaml` (in the same PR), so a session can't edit the evidence that judges its sentinels.
 
+## Phase 1r — Review remediation
+
+Every finding in [`CODE-REVIEW-2026-11-05.md`](CODE-REVIEW-2026-11-05.md) — 1 critical, 14 major, 23 minor, 19 info, 8 architecture — maps to exactly one WO below; the map is in [`docs/remediation-plan-2026-11-05.md`](docs/remediation-plan-2026-11-05.md). Tier 1 (F-43 to F-47) gates F-13's first real run on an outside repo. Tier 2 (F-48 to F-52) runs alongside F-13. Tier 3 (F-53 to F-55) lands before L3/L4 (F-14, F-15) so they arrive on a seam, not inside one function. All except F-50 and F-52 change what judges agents, so they are built interactively, one WO per session; F-50 and F-52 may be built by the factory once Tier 1 has landed.
+
+### F-43 — Egress redaction seam
+CODE-REVIEW-2026-11-05.md C-1: the implementer's final text goes into the PR body with no redaction, the seat env holds the Z.ai token, and the orchestrator does the push — so the sandbox's network deny never applies. Traces scrub the literal token; vents and unparsable-record dumps get pattern redaction only (M-8). This WO makes one seam that everything leaving a session passes: literal-token scrub, then `redact_credentials`, then terminal control-sequence stripping.
+
+Acceptance:
+- AC-1 (C-1) The implementer notes, every L2 finding text and the L2 verdict JSON pass the seam before `build_pr_body`. A test plants the literal seat token and a bare `ANTHROPIC_AUTH_TOKEN=<value>` echo in each input and asserts neither reaches the rendered body.
+- AC-2 (C-1) `check_pr_text` refuses a PR title or body that carries the literal seat token, naming the refusal without echoing the token — a second, independent fence before the push.
+- AC-3 (M-8) Vent text and `sessions/unparsable-record-*.stdout.txt` dumps pass the same seam; a test plants the token in each and asserts it is absent on disk.
+- AC-4 (m-16) Vent text, `factory status` output and trace lines printed to a terminal have ANSI/OSC/C0 control sequences stripped; a test covers screen-clear, OSC-8 link and cursor-move sequences.
+- AC-5 (I-10) `redact_credentials` and the credential sentinel catch JWTs, `Bearer <token>` literals and unquoted YAML `password:` values: one F-33 attack diff per shape, and the F-33 benign corpus stays clean.
+- AC-6 A test enumerates every orchestrator path that writes session-derived text off the machine or to the owner's terminal and asserts each calls the seam, so a new channel cannot skip it.
+
+### F-44 — Verdict integrity
+CODE-REVIEW-2026-11-05.md M-1, m-10, m-8, I-11: four ways a defect passes the validator without a signal — a capitalized severity softens a blocking finding in `merge_reviews`, a FAIL followed by a quoted example pass-JSON parses as PASS, a printed fake test count beats the min-tests floor, and removing `pytest.raises` isn't counted as an assertion removal.
+
+Acceptance:
+- AC-1 (M-1) Severity is canonicalized once at parse (`strip().lower()`, beside the axis canonicalization). A test merges `"Blocking"` with `"minor"` in both orders and asserts the merged finding is blocking and the verdict fail; `eval._count_blocking` is case-insensitive.
+- AC-2 (m-10) `_extract_json` refuses output carrying more than one valid verdict object with differing verdicts, as an invalid verdict that takes the retry path. Tests cover FAIL-then-example-PASS and the reverse.
+- AC-3 (m-8) `parse_test_count` reads the count from the runner's final summary line, not the maximum anywhere in the output; a test whose test prints `999999 passed` does not clear the floor.
+- AC-4 (I-11) Removing a `pytest.raises` block counts as an assertion removal, with an F-33 attack diff and a clean benign corpus.
+
+### F-45 — Pre-lease, publish and crash-window robustness
+CODE-REVIEW-2026-11-05.md M-5, M-6, M-7, m-13, m-14, I-3, I-4: the stale-PR sweep creates run dirs before the run lease is held, a failing progress-log append in `_sweep_escalation` wedges the queue in an unbudgeted crash loop, and the publish phase calls the remote with no prompt-disable or timeout while holding the lease.
+
+Acceptance:
+- AC-1 (M-5) The stale-PR sweep runs under `queue.idle_lease()`. A test races a sweep against `reclaim_runs` and asserts no live run dir is deleted.
+- AC-2 (M-6) A failing progress-log append in `_sweep_escalation` no longer leaves the task in `in_review`: a test injects the failure and asserts the task reaches `needs_human` and the next run proceeds.
+- AC-3 (M-7) Publish-side `git push`, `ls-remote` and `gh pr create` run with `GIT_TERMINAL_PROMPT=0` and a timeout through the same wrapper as `_fetch_sha`; a test with a hanging fake remote asserts a timed-out `PublishError`.
+- AC-4 (m-13) A `finish()` failure between `append_attempt` and the transition records exactly one attempt; a test injects the failure.
+- AC-5 (m-14) `gh pr view` exiting 0 with non-object JSON (`null`) maps to the documented unresolvable PR state, not an `AttributeError`.
+- AC-6 (I-3) Atomic queue writes fsync the parent directory after the rename; a test asserts the directory fsync call.
+- AC-7 (I-4) The run-lease error names the holder only when that holder is alive and says the lock is stale otherwise; a test covers both.
+
+### F-46 — Gate evasion hardening (L0/L1)
+CODE-REVIEW-2026-11-05.md M-2, M-4, m-9, m-17: one `\x1e` byte in a commit body hides an attribution trailer from L0; Unicode look-alikes evade the attribution patterns; a rename evades `lint_suppression_added`; and L1's red-first proof accepts a conftest that conditionally hides the contract tests, while only this repo's profile protects conftest.
+
+Acceptance:
+- AC-1 (M-2) The attribution scan reads each commit's message separately (per sha), not by splitting one log on `\x1e`; a commit whose body embeds `\x1e` before a trailer is flagged.
+- AC-2 (m-17) Attribution matching runs on NFKC-normalized text with zero-width characters removed and any number of connecting tokens; tests cover U+2010, a fullwidth colon and a zero-width space inside "claude".
+- AC-3 (m-9) `lint_suppression_added` checks both the old and new path of a rename; a test renames `payments/x.py` to `utils/x.py` with an added `# noqa` and asserts the finding.
+- AC-4 (M-4) Test-runner configuration (`**/conftest.py`, `pytest.ini`, `pyproject.toml`'s pytest table, `setup.cfg`'s pytest section) is protected by a schema-level default that a profile can only widen; every profile in the repo still validates.
+- AC-5 (M-4) L1 treats a contract test that was not collected as a failure at both the red and the green end; a test using a conftest that sets `collect_ignore` asserts L1 fails.
+
+### F-47 — Sandbox read boundary and toolkit staging
+CODE-REVIEW-2026-11-05.md M-9, I-2, I-9, I-19: `denyRead` protects the factory root's `trace/`, `progress/` and `sessions/` only because the default root lives under `$HOME`; `--factory-root` elsewhere exposes them to every session. Plus three toolkit/sandbox loose ends.
+
+Acceptance:
+- AC-1 (M-9) `denyRead` covers the factory root itself with explicit carve-outs for the run's own dir and srt; a test with `--factory-root` outside `$HOME` asserts a session cannot read `trace/`, `progress/` or `sessions/`.
+- AC-2 (I-9) A drain that force-closes a `setsid` escapee writes an event to the trace and counts in `factory status`.
+- AC-3 (I-2) The index-load MCP domain check validates against the vetted allowlist, not against itself; a test uses an index entry with an unvetted domain.
+- AC-4 (I-19) MCP descriptor staging copies its files explicitly; a test asserts the staged set without relying on a copytree side effect.
+
+### F-48 — Eval parity and variance
+CODE-REVIEW-2026-11-05.md M-3, m-11, m-12, I-12: the eval's L2 path stops at `apply_vote` while production always runs `apply_convergence`, so the eval measures a pipeline the queue doesn't run. It also parses seats before the quota check, hides L0 false positives on clean diffs, and runs each seed once.
+
+Acceptance:
+- AC-1 (M-3) The eval's L2 path runs `apply_convergence` exactly as production does, through one shared function; a test asserts the eval and the orchestrator call the same symbol.
+- AC-2 (m-12) The eval checks quota before parsing seats, as production does; a test asserts zero re-runs for a quota-hit seat.
+- AC-3 (m-11) The clean-diff report line shows L0 and L1 as well as L2, so a clean diff that failed L0 renders as an L0 false positive.
+- AC-4 (I-12) `factory eval --repeats N` runs each seed N times and reports mean and spread per metric (default N=3; the owner confirms the default and cadence at approval).
+- AC-5 (manual) The F-16 seeded eval is re-run on the fixed pipeline and the new baseline is recorded as tick evidence; the old numbers were measured without convergence.
+
+### F-49 — Contract and importer hardening
+CODE-REVIEW-2026-11-05.md M-10, m-3, m-4, m-6, m-7, I-18: nothing enforces that acceptance refs on non-draft tasks resolve to real tests, `format: date-time` is annotation-only, and the importer truncates, races, loses output on deep JSON and accepts a proposal with no `project`.
+
+Acceptance:
+- AC-1 (M-10) A CI test resolves every acceptance ref on every non-draft task to a real test function, using F-01's AST resolution; a typo'd ref on a `ready` task fails.
+- AC-2 (m-3) Schema validation enforces `format: date-time`; a malformed timestamp is rejected.
+- AC-3 (m-4) A planning-doc listing over 200 files ends with `+N more` and the proposal names the truncated docs.
+- AC-4 (m-6) The fresh-queue import write holds the queue lock across the check and the write.
+- AC-5 (m-7) A proposal that raises `RecursionError` takes the keep-refused-output path; the session output is saved.
+- AC-6 (I-18) A proposal without a `project` key is refused.
+
+### F-50 — CLI and dashboard robustness
+CODE-REVIEW-2026-11-05.md m-1, m-2, m-5, m-15, I-5, I-6, I-7, I-8: owner-facing commands that degrade silently, traceback, or exit 0 on failure.
+
+Acceptance:
+- AC-1 (m-1) The dashboard `/metrics` page expands `~` in the profile's repo path; a test uses a `~`-relative profile.
+- AC-2 (m-2) `factory status` survives a non-UTF-8 commit subject.
+- AC-3 (m-5) An explicit `--config <path>` that does not exist is an error; only the default config path may be absent.
+- AC-4 (m-15) `factory sentinels replay` exits non-zero on any benign hit or missed attack.
+- AC-5 (I-5) A trace line that parses to a non-dict renders as an error row on the run page, not a 500.
+- AC-6 (I-6) An `OSError` reading `rendered_path` in `_run_eval` exits 2 with a message.
+- AC-7 (I-7, I-8) The `cli.py` module docstring lists the current commands and the dead HEAD suppression in `dashboard.py` is gone; a test asserts the docstring names every registered subcommand.
+
+### F-51 — Test suite and CI hygiene
+CODE-REVIEW-2026-11-05.md M-11, m-20 to m-23, I-1, I-16, I-17, A-7: the local suite is red on any interpreter whose path contains `python3`, CI depends on live endpoints, live tests switch on by inference, pins are inconsistent, and wheel installs don't work.
+
+Acceptance:
+- AC-1 (M-11) The importer prompt test checks for no bare `python3` outside the quoted interpreter path and passes under conda, pyenv and system Python.
+- AC-2 (m-20) Live-endpoint assertions (Z.ai reachability, the raw-socket deny to a public IP) run in a separately named CI job; the sandbox-deny assertions stay mandatory in the main job.
+- AC-3 (m-21) Live session tests run only on an explicit opt-in (`FACTORY_LIVE_TESTS=1`), never inferred from a credential being present.
+- AC-4 (m-22) `pytest` and `ruff` carry exact pins and CI's Node version meets srt's `>=22.12.0` floor.
+- AC-5 (m-23) `re.split` passes `maxsplit` by keyword and the suite runs with `-W error::DeprecationWarning`.
+- AC-6 (I-16) The `test_f05` fixed sleeps become condition waits with a timeout.
+- AC-7 (I-17) The cross-test-module import moves into a shared `tests/` helper.
+- AC-8 (I-1) A wheel install works — schema and toolkit ship as package data read via `importlib.resources` — proven by a CI step that installs the built wheel and loads the contract.
+- AC-9 (A-7) `pyright` in basic mode runs in CI and is clean.
+
+### F-52 — Docs truth pass
+CODE-REVIEW-2026-11-05.md M-12, M-13, M-14, m-18, m-19, I-13 to I-15, A-8: destination-state prose that no WO shipped, plus stale counts and names. Applies the repo's own rule — mechanical claims are tests — to the docs.
+
+Acceptance:
+- AC-1 (M-12) TASK-CONTRACT's queue-marker regeneration claim is removed (`tasks.json` plus `factory status` is the one source; the owner may instead choose to implement it at approval).
+- AC-2 (M-13) VALIDATOR-SPEC's done rule names the no-deploy close-out and marks L3/L4 as not yet built until F-14/F-15 land.
+- AC-3 (M-14) `docs/proposals-2026-10-30-borrowings.md` is deleted or re-baselined with ids from F-56 up; no doc assigns a live WO id a second meaning.
+- AC-4 (m-18) README names the INC-007 skip exception, says the eval runs L0–L2, carries a current WO range, and BOOTSTRAP.md's header matches its use.
+- AC-5 (m-19) VALIDATOR-SPEC names `prompts/reviewer.md` as the L2 base prompt.
+- AC-6 (I-13, I-14, I-15) BUILD-ORDER's build-order narrative is current, F-13 step 2 names the right file, and DESIGN's vendored-skills list matches what is vendored.
+- AC-7 (A-8) Review-provenance comments ("round-N finding M") each cite a PR number; a lint enforces it.
+- AC-8 A cross-doc test asserts every `factory` subcommand and repo path named in README, VALIDATOR-SPEC and TASK-CONTRACT exists.
+
+### F-53 — Split `_run_task` into phase functions
+CODE-REVIEW-2026-11-05.md §5.2, A-1: `_run_task` is one 1,136-line function with five nested closures, and L3/L4 must thread through it. Pure extraction: no behavior change, the existing suite stays green unchanged. Lands after Tier 1 so the fixes' tests guard the refactor.
+
+Acceptance:
+- AC-1 (A-1) `_run_task` becomes phase functions over `_Ctx` (prepare, implement, gates, review, publish); no function in `orchestrator.py` exceeds 150 lines, enforced by a test.
+- AC-2 (A-1) The existing test suite passes with no test file changed in this WO's diff.
+
+### F-54 — Validation-pipeline seam
+CODE-REVIEW-2026-11-05.md §5.2 OCP, A-2, A-6: adding a validator layer means editing an inline sequence plus prbody, state and cli; the eval reaches into orchestrator privates, which is where M-3 crept in.
+
+Acceptance:
+- AC-1 (A-2) The per-round gate sequence is a data list of `(name, callable)`; a test registers a dummy layer and sees it run, record and render in the PR body without editing the orchestrator.
+- AC-2 (A-6) `eval.py` imports only public orchestrator functions; a test asserts no `orchestrator._*` import in `eval.py`.
+
+### F-55 — Module hygiene
+CODE-REVIEW-2026-11-05.md §5.1, A-3 to A-5: misplaced primitives, one import cycle, and six git wrappers on a security-relevant surface.
+
+Acceptance:
+- AC-1 (A-3) Venv creation, the prompt builders and `reclaim_runs` move out of `orchestrator.py`; `now_iso()` moves to `runs.py`; `importer.py` no longer imports `_atomic_write_json` privately.
+- AC-2 (A-4) The `contract`/`toolkit` import cycle is broken and an import-graph test asserts the package layering is acyclic.
+- AC-3 (A-5) One git wrapper; a test asserts no direct `subprocess` git call outside it.
+
 ## Phase 1c — First outside project
 
 ### F-13 — Onboard JobFinderOS (pilot)
@@ -426,8 +576,9 @@ Owner steps:
 1. Readiness run: every `project.yaml` command passes unattended on a clean clone.
 2. Resolve every `TODO(verify)` in `projects/jobfinderos.project.yaml`; commit it as `JobFinderOS/.factory/project.yaml`.
 3. Run `factory import`; read the full diff line by line; commit.
-4. Approve 2–3 self-contained build WOs, not WO-13/16/17 (payments), WO-27 (decision) or WO-29/30 (research-gated).
-5. Run `factory run` once, watching. Merge or reject the PR yourself.
+4. Decide in writing whether client source may be sent to the Z.ai endpoint: for an EU client that means a data processing agreement or the client's written consent, recorded per repo. Until then, onboard only repos you own.
+5. Approve 2–3 self-contained build WOs, not WO-13/16/17 (payments), WO-27 (decision) or WO-29/30 (research-gated).
+6. Run `factory run` once, watching. Merge or reject the PR yourself.
 
 ---
 
