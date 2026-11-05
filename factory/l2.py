@@ -117,10 +117,6 @@ from typing import Any, Callable, ClassVar, NamedTuple, Sequence
 
 from factory.gates import Finding, GateReport
 
-# The one quoted-span blanker (sentinels owns it): prose that QUOTES a
-# keyword — a reviewer citing code — states nothing.
-from factory.sentinels import _outside_strings
-
 VALID_AXES = ("spec", "standards")
 VALID_SEVERITIES = ("blocking", "major", "minor", "note")
 
@@ -165,16 +161,23 @@ _FENCE = re.compile(r"```(?:json)?(?![\w-])[^\S\n]*(.*?)[^\S\n]*```", re.DOTALL)
 # ("verdict must be pass or fail", "pass|fail") is the protocol echo and
 # states neither.
 _MD_NOISE = re.compile(r"[*_`#>~]+")
+# Double-quoted spans only, on prose lines (round 4): the code blanker's
+# single-quote spans ate English apostrophes and reopened closed shapes.
+_DQ_SPAN = re.compile(r'"[^"\n]*"')
 
 
 def _stated_verdicts(fragment: str) -> set[str]:
     """The verdicts the fragment STATES: every line whose pass/fail
-    keyword tokens — quoted spans blanked first (a reviewer quoting code
-    like ``if verdict == "pass":`` states nothing), then markdown noise
-    stripped — name exactly one verdict."""
+    keyword tokens — DOUBLE-quoted spans blanked first (a reviewer
+    citing code like ``if verdict == "pass":`` states nothing), then
+    markdown noise stripped — name exactly one verdict. Single
+    quotes/apostrophes are prose, not code: an English apostrophe is not
+    a quote mark here, so "It's a FAIL — the reviewer's call" states
+    FAIL (round 4: the code blanker's single-quote spans blanked exactly
+    that shape and published the example's PASS)."""
     stated: set[str] = set()
     for line in fragment.splitlines():
-        low = _MD_NOISE.sub(" ", _outside_strings(line)).casefold()
+        low = _MD_NOISE.sub(" ", _DQ_SPAN.sub(" ", line)).casefold()
         words = {w for w in ("pass", "fail") if re.search(rf"\b{w}\b", low)}
         if len(words) == 1:
             stated |= words

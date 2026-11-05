@@ -391,7 +391,7 @@ def _is_code_line(text: str) -> bool:
     return bool(stripped) and not stripped.startswith(_COMMENT_OPENERS)
 
 # (required comment syntax, pattern) — a suppression is real only where
-# that syntax introduces a comment in the changed file: "# noqa" inside
+# that syntax introduces a comment in the changed file: a noqa inside
 # JSON or markdown prose QUOTES the pattern, it cannot silence a linter
 # there (F-33 corpus: PRs #25 and #37 documenting these sentinels
 # tripped the unfiltered scan).

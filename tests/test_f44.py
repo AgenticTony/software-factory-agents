@@ -1407,3 +1407,94 @@ def test_review21_js_runner_shapes_flag():
         assert {f.id for f in builtin_sentinel_findings([change], {})} == {
             "runner_exit_forgery"
         }, line
+
+
+# --------------------- review round 4 (PR #100): the regression ---------
+
+R4_FORGES = {
+    # (a) pyfunc_call short-circuits every test call: nothing runs
+    "a": (
+        "def pytest_pyfunc_call(pyfuncitem):\n"
+        "    return True\n"
+    ),
+    # (b) runtest_call hookwrapper swallows the failure's result
+    "b": (
+        "import pytest\n"
+        "\n"
+        "\n"
+        "@pytest.hookimpl(hookwrapper=True)\n"
+        "def pytest_runtest_call(item):\n"
+        "    outcome = yield\n"
+        "    outcome.force_result(None)\n"
+    ),
+    # (c) collection_modifyitems drops the failing test; pytest prints
+    # no "deselected" count, so the drop is invisible in the output
+    "c": (
+        "def pytest_collection_modifyitems(config, items):\n"
+        '    items[:] = [i for i in items if i.name != "test_a"]\n'
+    ),
+}
+
+
+def test_review22_apostrophe_prose_states_its_verdict():
+    """Round 4, the regression: round 3's quote-blanking used the CODE
+    blanker, whose quote pattern treats English apostrophes as quotes —
+    a FAIL between two apostrophes was blanked and published the
+    example's PASS, reopening shapes round 2 had closed (invalid at
+    1f59ad6). Prose blanking now covers DOUBLE quotes only: a cited
+    ``"pass"`` states nothing, an apostrophe is just an apostrophe."""
+    for line in (
+        "It's a FAIL — the reviewer's call stands.",
+        "I can't approve this: FAIL, it's missing tests.",
+        "This doesn't meet the spec. Verdict: FAIL. That's final.",
+    ):
+        report = parse_verdict(f"{PASS_EXAMPLE}\n{line}")
+        assert report.parse_error is not None, line
+        assert report.verdict == "fail", line
+
+    # the shapes round 2/3 closed stay closed
+    for tail in ("**FAIL** — the migration drops a column", "Overall: FAIL",
+                 "## FAIL", "`FAIL`"):
+        assert parse_verdict(f"{PASS_EXAMPLE}\n{tail}").parse_error is not None
+    assert parse_verdict(
+        f"**FAIL** — tests removed.\n{PASS_EXAMPLE}"
+    ).parse_error is not None
+
+    # and the honest shapes stay clean — the agreeing restatement and the
+    # double-quoted cited code are pinned in review19/review18; the false
+    # fires ("No tests fail.") are recorded as known limits in the ledger
+    # (the nonce work order exists to remove them), deliberately not
+    # asserted green here: pinning them would freeze the wrong behavior.
+
+
+def test_review23_known_limit_conftest_forges_unflagged(tmp_path: Path):
+    """Round 4's goal-(b) gap, pinned EXECUTABLY so F-46 cannot land
+    without flipping this test: three conftest forges (A: pyfunc_call,
+    B: runtest_call force_result, C: collection_modifyitems dropping the
+    failing test) each turn a failing suite into a passing one against
+    REAL pytest, and the sentinel flags none of them. F-46 M-4 (protect
+    conftest.py and the pytest config surface by default) owns the
+    class; when it lands, invert this test."""
+    for name, source in R4_FORGES.items():
+        project = tmp_path / name
+        (project / "tests").mkdir(parents=True)
+        (project / "conftest.py").write_text(source)
+        (project / "tests" / "test_x.py").write_text(
+            "def test_a():\n    assert 1 == 2\n"
+            "\n"
+            "\ndef test_b():\n    assert True\n"
+        )
+        proc = _run_pytest_in(project, "-q", "tests")
+        output = proc.stdout + proc.stderr
+        assert proc.returncode == 0, (name, output[-200:])
+        assert "failed" not in output, (name, output[-200:])  # the forge held
+        assert "passed" in output
+
+        change = FileChange(
+            "conftest.py", "A",
+            added_lines=[
+                (i + 1, t) for i, t in enumerate(source.splitlines())
+            ],
+        )
+        # the KNOWN LIMIT, executable: nothing flags it today (F-46 M-4)
+        assert builtin_sentinel_findings([change], {}) == [], name
