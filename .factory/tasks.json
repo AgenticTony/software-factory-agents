@@ -1706,7 +1706,8 @@
       "status": "draft",
       "depends_on": [
         "F-11",
-        "F-16"
+        "F-16",
+        "F-60"
       ],
       "risk": [],
       "gates": {
@@ -4822,6 +4823,119 @@
           "check": {
             "type": "manual",
             "expect": "owner tick evidence: the real session's record (provider, region, token usage) and its egress log"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-60",
+      "title": "Project memory store",
+      "source": "BUILD-ORDER.md#f-60--project-memory-store",
+      "kind": "build",
+      "priority": "P2",
+      "status": "draft",
+      "depends_on": [
+        "F-13",
+        "F-30",
+        "F-43",
+        "F-59"
+      ],
+      "risk": [
+        "factory_control",
+        "privacy"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "Each project has one store at `<factory_root>/memory/<project>/entries.jsonl`, validated against `schema/memory.schema.json` on load (F-02); an invalid store refuses the run with the line named. An entry has `id`, `kind` (`repo_fact` | `finding_pattern` | `reviewer_calibration` | `attempt_note`), `text`, `sources` (run ids, with turn where one applies), `model` (the seat model it was learned under, from the F-59 provider record), `created`, `last_confirmed`, and optional `supersedes`. The file is append-only: a change is a new entry that supersedes the old one, and retiring an entry appends a retirement. A test rewrites a past line and asserts the load refuses.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f60.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Only the owner's `factory memory add | retire | confirm | redact` commands write the store, each under the store lock and only if the store's content hash still matches the one the command read, so two writes never clobber each other (the optimistic-write pattern Anthropic's memory stores use). No seat, tool, route or session writes it, it is outside every sandbox write allowlist, and a scripted session of each seat leaves the file byte-identical (the F-37 AC-4 pattern). F-19 and AC-6 produce drafts under `drafts/`, which are never served.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f60.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "Each seat gets its own slice, built into its prompt by the orchestrator, never read from a path the session can reach. Implementer: `repo_fact`, `finding_pattern`, `attempt_note`. Reviewer and verifier: `repo_fact`, `finding_pattern`, `reviewer_calibration`, and never an `attempt_note` or any text an implementer session wrote. A session for one project never gets another project's entries. Tests assert each seat's built prompt and the cross-project refusal.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f60.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "An entry is served only while it is fresh: its `model` matches the seat's resolved model and `last_confirmed` is within `memory.max_age_days` (`project.yaml`, default 30). A stale entry is withheld, never served with a warning, and `factory status` lists it as needing `factory memory confirm`. Tests cover a model change, an aged entry and a confirmed one.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f60.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "The served slice has a size cap per seat (`memory.max_chars`, schema field, default 8000). A store whose fresh slice exceeds it refuses the run with the overflow named, so curation happens before the run, never by silent truncation. A test covers the refusal.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f60.py::test_ac_5"
+          }
+        },
+        {
+          "id": "AC-6",
+          "text": "`factory memory seed <project>` drafts a repo map (layout, entry points, where tests live) from a read-only session with no repo write access and no GitHub token, and writes it to `drafts/` for the owner to read and add. A test asserts the seat's sandbox settings and that nothing is served until `add`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f60.py::test_ac_6"
+          }
+        },
+        {
+          "id": "AC-7",
+          "text": "`factory memory calibrate <run-id> --finding <n> --agree | --disagree --note <text>` records a `reviewer_calibration` entry that cites the run and the finding, so the reviewer's reference examples are the owner's own past judgements. The reviewer slice carries the most recent entries up to the AC-5 cap. A test asserts the entry and its place in the reviewer prompt.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f60.py::test_ac_7"
+          }
+        },
+        {
+          "id": "AC-8",
+          "text": "Every session record lists the entry ids it was served and the store's content hash, and the F-30 trace carries both, so F-19 can attribute failures to entries the way it attributes them to `prompt_versions`. A test covers the record.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f60.py::test_ac_8"
+          }
+        },
+        {
+          "id": "AC-9",
+          "text": "Memory text passes the F-43 egress redaction seam before it reaches a provider, like any other prompt content. A test seeds an entry with a credential-shaped string and asserts it never reaches the session's built input.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f60.py::test_ac_9"
+          }
+        },
+        {
+          "id": "AC-10",
+          "text": "`factory memory redact <id>` replaces an entry's `text` with `[redacted]` and records when and why, keeping its id, sources and place in the file. It is the one permitted in-place change: a client's erasure request, or a secret that slipped in, must be removable, and the record that something was there must stay. A test asserts the redacted text is gone from the file and from every built prompt, and that the AC-1 append-only check still passes.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f60.py::test_ac_10"
           }
         }
       ],
