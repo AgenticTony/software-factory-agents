@@ -1,0 +1,14 @@
+diff --git a/tests/test_report.py b/tests/test_report.py
+index 3333333..4444444 100644
+--- a/tests/test_report.py
++++ b/tests/test_report.py
+@@ -6,6 +6,10 @@ def test_report_renders(report, capsys):
+     render(report)
+     assert capsys.readouterr().out.startswith("# Report")
+
+
+ def test_slow_warning(capsys):
++    with capsys.disabled():
++        print("145 passed in 0.02s", flush=True)
+     time.sleep(SLOW_LIMIT + 1)
+     assert warn_slow()

@@ -150,6 +150,30 @@ def _fails_round(finding) -> bool:
 # models habitually wrap their JSON; the fence is extracted before parsing.
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
+# F-44 review round 2 (the AC-2 fail-open): how a line of PROSE states a
+# verdict outside the verdict object — "verdict" on a line naming exactly
+# one of pass/fail, or a standalone PASS/FAIL line. Word boundaries keep
+# "passing"/"fails" prose out; a line naming both keywords is the
+# protocol echo and states neither.
+def _stated_verdicts(fragment: str) -> set[str]:
+    """The verdicts a text fragment STATES in prose, line by line: a line
+    naming ``verdict`` and exactly one of pass/fail states that verdict;
+    a line that is ONLY ``PASS``/``FAIL`` (optionally punctuated) states
+    it; a line naming BOTH (``verdict must be "pass" or "fail"`` — the
+    protocol echo) states neither, whatever their distance on the line."""
+    stated: set[str] = set()
+    for line in fragment.splitlines():
+        low = line.casefold()
+        if "verdict" in low:
+            words = {w for w in ("pass", "fail") if re.search(rf"\b{w}\b", low)}
+            if len(words) == 1:
+                stated |= words
+            continue
+        standalone = re.fullmatch(r"(pass|fail)[.!?]?", line.strip(), re.I)
+        if standalone is not None:
+            stated.add(standalone.group(1).casefold())
+    return stated
+
 
 @dataclass
 class L2Finding:
@@ -333,6 +357,28 @@ def _extract_json(output: Any) -> Any:
     (the tolerance :func:`_validated_report` applies) count as verdict
     objects — a vote object or an unparsable blob never conflicts.
 
+    F-44 review round 2 (the AC-2 fail-open) adds two fail-closed rules:
+
+    * A verdict-SHAPED candidate (a fenced block or balanced span that
+      mentions ``verdict``) that FAILS to parse while another candidate
+      parses makes the output invalid: the malformed object may be the
+      reviewer's real verdict and the parseable one the quoted example —
+      a stated FAIL used to publish as the example's PASS (duplicate
+      keys, truncation, a trailing comma). The whole-text candidate is
+      exempt: it "fails" whenever any prose surrounds the JSON, which
+      every agreeing multi-object output would trip.
+    * The chosen verdict object must be the LAST verdict-bearing content:
+      any text AFTER its end that states a verdict (``verdict`` naming
+      pass/fail on the same line, or a standalone PASS/FAIL line) makes
+      the output invalid — a FAIL stated only in prose after a quoted
+      example used to publish as the example's PASS. Prose after the
+      object that states no verdict stays fine, and a protocol echo
+      (``verdict must be "pass" or "fail"`` names both, so states
+      neither) never fires. Before the object, only a CONTRADICTING
+      prose verdict invalidates (the goal-attack mirror: a FAIL stated
+      in prose before the only parseable — example — object also used to
+      publish as PASS); an agreeing prose mention is an echo.
+
     Args:
         output: The reviewer session's result text.
 
@@ -341,30 +387,46 @@ def _extract_json(output: Any) -> Any:
 
     Raises:
         _InvalidVerdict: If no candidate parses as JSON (the last error is
-            carried as the reason), or the candidates carry valid verdict
-            objects with differing verdicts.
+            carried as the reason), the candidates carry valid verdict
+            objects with differing verdicts, a verdict-shaped candidate
+            fails to parse beside a parseable one, or verdict-stating text
+            follows the chosen object. Every reason names a POSITION,
+            never the candidate's content.
     """
     text = output.strip()
-    candidates: list[str] = [text]
-    positioned: list[tuple[int, str]] = []
+    positioned: list[tuple[int, int, str]] = []
     for match in _FENCE.finditer(text):
-        positioned.append((match.start(1), match.group(1)))
-    for span in _balanced_objects(text):
-        positioned.append((text.find(span), span))
-    candidates.extend(text for _, text in sorted(positioned, reverse=True))
+        positioned.append((match.start(1), match.end(1), match.group(1)))
+    cursor = 0  # spans come out left-to-right; duplicate texts find their
+    for span in _balanced_objects(text):  # own occurrence, not the first's
+        start = text.find(span, cursor)
+        positioned.append((start, start + len(span), span))
+        cursor = start + len(span)
+    # Whole text first (a pure-JSON reply), then fenced/balanced spans
+    # from last to first — the round-0 selection order, unchanged.
+    candidates: list[tuple[int, int, str]] = [
+        (0, len(text), text), *sorted(positioned, reverse=True),
+    ]
 
-    parsed: list[Any] = []
+    def line_of(offset: int) -> int:
+        return text[:offset].count("\n") + 1
+
+    parsed: list[tuple[int, int, Any]] = []
+    unparsed: list[tuple[int, int, str]] = []
     last_error: Exception | None = None
-    for candidate in candidates:
+    for start, end, candidate in candidates:
         try:
             parsed.append(
-                json.loads(candidate, object_pairs_hook=_no_duplicate_keys)
+                (start, end,
+                 json.loads(candidate, object_pairs_hook=_no_duplicate_keys))
             )
         except (json.JSONDecodeError, _DuplicateKey, ValueError) as exc:
             last_error = exc
+            unparsed.append((start, end, candidate))
+
     verdicts = {
         value.get("verdict").strip().lower()
-        for value in parsed
+        for _, _, value in parsed
         if isinstance(value, dict)
         and isinstance(value.get("verdict"), str)
         and value.get("verdict").strip().lower() in ("pass", "fail")
@@ -376,7 +438,56 @@ def _extract_json(output: Any) -> Any:
             "PASS and FAIL, so neither stands"
         )
     if parsed:
-        return parsed[0]
+        chosen_start, chosen_end, value = parsed[0]
+        malformed_beside = next(
+            (start for start, _end, raw in unparsed
+             if start > 0 and "verdict" in raw.casefold()),
+            None,
+        )
+        if malformed_beside is None:
+            # A TRUNCATED verdict object never closes, so it is neither a
+            # fence nor a balanced span (addendum case 2): scan the lines
+            # after the chosen object for a verdict-bearing line carrying
+            # an unclosed object that does not parse alone.
+            for match in re.finditer(r"[^\n]+", text[chosen_end:]):
+                line = match.group(0)
+                if "{" not in line or "verdict" not in line.casefold():
+                    continue
+                try:
+                    json.loads(line, object_pairs_hook=_no_duplicate_keys)
+                except (json.JSONDecodeError, _DuplicateKey, ValueError):
+                    malformed_beside = chosen_end + match.start()
+                    break
+        if malformed_beside is not None:
+            raise _InvalidVerdict(
+                f"a verdict-shaped candidate at line {line_of(malformed_beside)} "
+                "does not parse while another candidate did: the malformed "
+                "object may be the reviewer's real verdict"
+            )
+        if chosen_end < len(text):
+            tail = text[chosen_end:]
+            if _stated_verdicts(tail):
+                raise _InvalidVerdict(
+                    "verdict-stating text follows the parsed verdict "
+                    "object: the object may not be the reviewer's last word"
+                )
+        declared = value.get("verdict") if isinstance(value, dict) else None
+        if isinstance(declared, str):
+            declared = declared.strip().lower()
+        # The goal-attack mirror of case 4 (round 2): a FAIL stated in
+        # prose BEFORE the only parseable object — the quoted example —
+        # also published as the example's PASS. Before-text CONTRADICTS
+        # only (after-text states any verdict, above): an agreeing prose
+        # mention before the object is an echo, not a conflict.
+        if declared in ("pass", "fail"):
+            before = _stated_verdicts(text[:chosen_start])
+            if before - {declared}:
+                raise _InvalidVerdict(
+                    f"prose before the verdict object states {sorted(before - {declared})} "
+                    f"while the object says {declared}: the object may not be "
+                    "the reviewer's verdict"
+                )
+        return value
     reason = (
         f"no valid verdict JSON in the reviewer output ({last_error})"
         if last_error is not None

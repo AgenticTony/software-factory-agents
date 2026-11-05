@@ -6,7 +6,7 @@ there. This module is L0's standing set of "security sentinel" invariants
 sentinel's name, so a human merge sees exactly what was checked, pass or
 fail.
 
-All four built-in scanners live here — each sentinel's scanner and its
+All five built-in scanners live here — each sentinel's scanner and its
 result are produced together, so renaming a finding id can no longer
 silently orphan a sentinel result behind an always-``pass`` row:
 
@@ -47,6 +47,18 @@ silently orphan a sentinel result behind an always-``pass`` row:
   a one-line conditional, ``pytest.param`` marks, the JS forms) while
   marker text inside a string fixture stays inert — fixture data, not
   a marker (F-33 corpus, PR #8).
+- ``runner_exit_forgery`` — an ADDED line in a test file (conftest
+  included) that can forge the runner's own result line: a hard
+  exit/kill, an output-capture escape, or a runner session hook defined
+  in test code (F-44 review round 2 — test code runs inside the
+  runner's process and can print a result-shaped line then exit before
+  the real one; a line scan is the only layer that sees the diff, so it
+  flags the enablers and a human decides). Self-kill
+  (``os.kill(os.getpid(), …)``) is deliberately not matched: it is the
+  honest crash-simulation shape this repo's own corpus carries (PR #22).
+  Evadable by construction (``getattr(os, "_e" + "xit")``, importlib,
+  exec) — that remainder is L2's diff review to judge; the real fix is
+  an out-of-band result file (drafted as a new F-46 acceptance).
 
 Projects extend the set per risk flag in ``project.yaml``::
 
@@ -290,6 +302,54 @@ def _is_replacement_assertion(text: str) -> bool:
     code = _outside_strings(line).split("#", 1)[0]
     return any(p.search(code) for p in _ASSERTION_STATEMENT)
 
+# F-44 review round 2: ADDED lines in test files (conftest included —
+# TEST_GLOBS lists it) that can forge the runner's own result line. Test
+# code runs inside the runner's process: it can print a result-shaped
+# line and hard-exit before the runner prints the real one, and the
+# forgery is then the only result line parse_test_count sees (the
+# round-2 probe: a FAILING suite read as 999999 passing, exit 0). No
+# stdout parser can close that, so the line scan flags the shapes that
+# make it possible; the finding escalates exactly as assertion_removed
+# does (an L0 finding and a failed sentinel row — a human decides). Each
+# entry says why it is here; the evadable remainder is L2's to judge
+# (the ledger's known limit).
+RUNNER_EXIT_FORGERY_PATTERNS = (
+    # --- hard exit / kill: no terminal result line is ever printed ---
+    re.compile(r"\bos\._exit\s*\("),   # exits without cleanup or summary
+    # killing ANOTHER process (the runner itself — getppid — or any pid
+    # but self): self-kill (`os.kill(os.getpid(), …)`) is the honest
+    # crash-simulation shape this repo's own corpus carries (PR #22's
+    # killed-mid-session seat), so it is deliberately not matched
+    re.compile(r"\bos\.kill\s*\(\s*(?!os\.getpid\()"),
+    re.compile(r"\bos\.abort\s*\("),   # C-level abort, same class
+    # a test exiting the runner is never legitimate in a suite — the
+    # runner owns the exit code
+    re.compile(r"\bsys\.exit\s*\("),
+    re.compile(r"\braise\s+SystemExit\b"),  # sys.exit's exception form
+    # --- escape the output capture: print past pytest's capture ---
+    re.compile(r"\bcapsys\.disabled\s*\("),  # the documented escape hatch
+    re.compile(r"\bcapfd\.disabled\s*\("),   # the fd-level variant
+    re.compile(r"\bsys\.__std(?:out|err)__\b"),  # write to the real streams
+    re.compile(r"\bos\.write\(\s*[12]\s*,"),     # raw fd 1/2 write
+    # suspending the capture manager turns capture off for the session
+    re.compile(r'getplugin\(\s*["\']capturemanager["\']'),
+)
+
+# Runner session hooks defined in a TEST FILE (not conftest). pytest only
+# registers hooks from conftest.py and plugins — a `def pytest_…` in a
+# test module is dead code no legitimate test writes, so it flags as the
+# forgery platform's shape. The SAME hook ADDED to a conftest is the
+# registered, honest plugin surface (F-10's sandbox-probe conftest writes
+# one; a repo's existing conftest is not an ADDED line either) — there
+# the exit/capture patterns above carry the forgery load (the round-2
+# conftest probe flags on its os._exit line), so conftest hooks do not
+# flag on the definition alone.
+_RUNNER_HOOK_PATTERNS = (
+    re.compile(r"^def\s+pytest_sessionfinish\b"),
+    re.compile(r"^def\s+pytest_terminal_summary\b"),
+    re.compile(r"^def\s+pytest_unconfigure\b"),
+)
+
 # Comment openers across the languages the marker and assertion patterns
 # cover: a line starting with one is prose about code, not code — it is
 # neither an assertion nor a replacement for one.
@@ -345,6 +405,7 @@ BUILTIN_SENTINELS = (
     "assertion_removed",
     "credential_added",
     "lint_suppression_added",
+    "runner_exit_forgery",
     "skip_marker_added",
 )
 
@@ -401,9 +462,10 @@ def builtin_sentinel_findings(changes, risk_globs: dict) -> list:
     Returns:
         Findings for ``credential_added`` (any file) and
         ``lint_suppression_added`` (risk-path files only) — those two
-        scanners plus the skip-marker and assertion scanners below, one
-        home for the whole standing set. Credential-bearing lines are
-        never echoed: findings name the shape only.
+        scanners plus the skip-marker, runner-exit-forgery and assertion
+        scanners below, one home for the whole standing set.
+        Credential-bearing lines are never echoed: findings name the
+        shape only.
     """
     findings: list[Finding] = []
     all_risk_globs = [glob for globs in risk_globs.values() for glob in globs]
@@ -453,6 +515,26 @@ def builtin_sentinel_findings(changes, risk_globs: dict) -> list:
                         "lint_suppression_added",
                         f"lint suppression added in {change.path}:{no}: {echo}",
                         file=change.path,
+                        line=no,
+                    )
+                )
+            code_line = _outside_strings(text)
+            # Hooks flag in test files only — a conftest is the
+            # registered plugin surface (see _RUNNER_HOOK_PATTERNS).
+            is_conftest = scan_path.rsplit("/", 1)[-1] == "conftest.py"
+            forgery = any(
+                p.search(code_line) for p in RUNNER_EXIT_FORGERY_PATTERNS
+            ) or (
+                not is_conftest
+                and any(p.search(code_line) for p in _RUNNER_HOOK_PATTERNS)
+            )
+            if test_file and forgery:
+                findings.append(
+                    Finding(
+                        "runner_exit_forgery",
+                        f"runner-exit/capture-escape shape added in "
+                        f"{scan_path}:{no}: {echo}",
+                        file=scan_path,
                         line=no,
                     )
                 )
@@ -520,7 +602,7 @@ def builtin_sentinel_pass(profile: dict, changes, matched: set):
             :func:`matched_risk_flags` computed ONCE by the caller.
 
     Returns:
-        ``(findings, results, escalations)`` — the four built-in scans'
+        ``(findings, results, escalations)`` — the five built-in scans'
         findings, one result dict per built-in sentinel (pass/fail), and
         the ``credential_added`` escalation when a credential was found:
         nothing is pushed before a passing round, but a passing retry

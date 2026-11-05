@@ -693,3 +693,352 @@ def test_review7_agreeing_example_then_real_verdict():
     )
     assert retries == 0 and not reruns
     assert reports[0].verdict == "fail" and reports[0].parse_error is None
+
+
+# --------------- review round 2 (PR #100): the in-process forgery ---------
+
+# The round-2 residual, against real pytest: test code runs inside the
+# runner's process, so it can print a result-shaped line and hard-exit
+# before pytest prints the real one. The forgery is then the ONLY result
+# line, and the exit code is whatever the test picked — a FAILING suite
+# reads as passing. No stdout parser can close that; the sentinel owns it.
+R2_TEST_FORGERY = (
+    "import os\n"
+    "\n"
+    "\n"
+    "def test_real():\n"
+    "    assert False\n"
+    "\n"
+    "\n"
+    "def test_zz_forge(capsys):\n"
+    "    with capsys.disabled():\n"
+    '        print("\\n========== 999999 passed in 0.01s ==========", flush=True)\n'
+    "    os._exit(0)\n"
+)
+R2_CONFTEST_FORGERY = (
+    "import os\n"
+    "\n"
+    "\n"
+    "def pytest_sessionfinish(session, exitstatus):\n"
+    '    print("\\n========== 999999 passed in 0.01s ==========", flush=True)\n'
+    "    os._exit(0)\n"
+)
+
+
+def _run_pytest_in(project: Path, *args: str):
+    return subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", *args],
+        cwd=project, capture_output=True, text=True, timeout=120,
+    )
+
+
+def test_review8_exit_forgery_flagged():
+    """Finding: each attack family (hard-exit, capture escape, session
+    hook) flags `runner_exit_forgery` through the real corpus replay under
+    this repo's real risk globs."""
+    import yaml
+
+    from factory.replay import patch_findings
+
+    real = yaml.safe_load((REPO / ".factory" / "project.yaml").read_text())
+    globs = (real.get("paths") or {}).get("risk") or {}
+    for name, needle in (
+        ("runner_exit_forgery-1", "os._exit"),
+        ("runner_exit_forgery-2", "capsys.disabled"),
+        ("runner_exit_forgery-3", "pytest_sessionfinish"),
+    ):
+        patch = REPO / "corpus" / "attack" / f"{name}.patch"
+        findings = patch_findings(patch.read_text(), globs)
+        ids = {f.id for f in findings}
+        assert "runner_exit_forgery" in ids, f"{name}: {sorted(ids)}"
+        assert needle in patch.read_text()  # the family the file encodes
+
+
+def test_review9_exit_forgery_probe_documented(tmp_path: Path):
+    """Both real-pytest probes run; the parser limit is pinned HONESTLY
+    (parse_test_count still returns the forged 999999 — that is why the
+    sentinel, not the parser, owns this class), and the diff that
+    introduces each probe is flagged by the sentinel: the layer that now
+    catches it."""
+    from factory.l0 import parse_test_count
+
+    # Probe 1 — a test file: capture escape + forged line + hard exit.
+    test_project = tmp_path / "testfile"
+    (test_project / "tests").mkdir(parents=True)
+    probe = test_project / "tests" / "test_x.py"
+    probe.write_text(R2_TEST_FORGERY)
+    proc = _run_pytest_in(test_project, "-q", "tests")
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 0  # the forged exit code, not pytest's
+    assert "999999 passed" in output and "F" in output  # a failing suite
+    assert parse_test_count(output) == 999999  # the limit, pinned
+
+    # Probe 2 — a conftest hook: prints, then hard-exits before the
+    # terminal summary would print.
+    conftest_project = tmp_path / "conftest"
+    (conftest_project / "tests").mkdir(parents=True)
+    (conftest_project / "conftest.py").write_text(R2_CONFTEST_FORGERY)
+    (conftest_project / "tests" / "test_x.py").write_text(
+        "def test_real():\n    assert False\n"
+    )
+    proc2 = _run_pytest_in(conftest_project, "-q", "tests")
+    output2 = proc2.stdout + proc2.stderr
+    assert proc2.returncode == 0
+    assert "999999 passed" in output2 and "F" in output2
+    assert parse_test_count(output2) == 999999  # the limit, pinned
+
+    # And the layer that owns it: the diff introducing each probe flags.
+    def _added_change(path, source):
+        return FileChange(
+            path, "A",
+            added_lines=[(i + 1, t) for i, t in enumerate(source.splitlines())],
+        )
+
+    findings = builtin_sentinel_findings(
+        [_added_change("tests/test_x.py", R2_TEST_FORGERY)], {}
+    )
+    assert {f.id for f in findings} == {"runner_exit_forgery"}
+    conftest_findings = builtin_sentinel_findings(
+        [_added_change("conftest.py", R2_CONFTEST_FORGERY)], {}
+    )
+    assert {f.id for f in conftest_findings} == {"runner_exit_forgery"}
+
+
+def test_review10_benign_quiet():
+    """Honest shapes stay quiet: SystemExit ASSERTED is a test doing its
+    job (the forger's shape is `raise SystemExit`/`sys.exit(` — the call,
+    not the assertion); readouterr is the ordinary capsys API (disabled()
+    is the escape); and a session hook in a repo's EXISTING conftest is
+    not an ADDED line, so an unchanged conftest never flags."""
+    benign = [
+        "def test_cli_exit():",
+        "    with pytest.raises(SystemExit):",
+        "        cli_main(['--help'])",
+        "    assert exc.value.code == 2",
+        "",
+        "",
+        "def test_output(capsys):",
+        "    print('hello')",
+        "    assert capsys.readouterr().out == 'hello\n'",
+    ]
+    change = FileChange(
+        "tests/test_a.py", "M",
+        added_lines=[(i + 1, t) for i, t in enumerate(benign)],
+    )
+    assert builtin_sentinel_findings([change], {}) == []
+
+    # An unchanged conftest is not in the diff: nothing added, no flag —
+    # even when the hook line itself appears as a REMOVED line.
+    removed_only = FileChange(
+        "conftest.py", "M",
+        added_lines=[],
+        removed_lines=[
+            (3, "def pytest_sessionfinish(session, exitstatus):"),
+            (4, "    report_summary()"),
+        ],
+    )
+    assert builtin_sentinel_findings([removed_only], {}) == []
+
+    # And a hook ADDED to a conftest does not flag on the definition
+    # either: conftest is the registered plugin surface (F-10's sandbox
+    # probe writes an honest pytest_terminal_summary there), and the
+    # exit/capture patterns carry the forgery load in that file. The
+    # same hook in a TEST file is dead code no legitimate test writes,
+    # and flags.
+    honest_conftest_hook = FileChange(
+        "tests/conftest.py", "M",
+        added_lines=[
+            (3, "def pytest_terminal_summary(terminalreporter):"),
+            (4, '    terminalreporter.write_line("PROBE " + results())'),
+        ],
+    )
+    assert builtin_sentinel_findings([honest_conftest_hook], {}) == []
+    hook_in_test_file = FileChange(
+        "tests/test_runner.py", "M",
+        added_lines=[(3, "def pytest_sessionfinish(session, exitstatus):")],
+    )
+    assert {f.id for f in builtin_sentinel_findings([hook_in_test_file], {})} == {
+        "runner_exit_forgery"
+    }
+
+    # the honest corpus line that shaped the kill narrowing: self-kill
+    # crash simulation (benign PR #22) stays quiet; killing ANOTHER pid
+    # — the runner — flags.
+    self_kill = FileChange(
+        "tests/test_a.py", "M",
+        added_lines=[(2, "            os.kill(os.getpid(), signal.SIGKILL)  # killed mid-session")],
+    )
+    assert builtin_sentinel_findings([self_kill], {}) == []
+    parent_kill = FileChange(
+        "tests/test_a.py", "M",
+        added_lines=[(2, "    os.kill(os.getppid(), signal.SIGKILL)")],
+    )
+    assert {f.id for f in builtin_sentinel_findings([parent_kill], {})} == {
+        "runner_exit_forgery"
+    }
+
+
+# -------- review round 2 addendum (owner review): the AC-2 fail-open ----
+#
+# The reviewer's REAL verdict object failing to parse left the quoted
+# example as the only parseable candidate — a stated FAIL published as
+# PASS. Round 2 closes it: a verdict-shaped candidate that does not parse
+# while another candidate parses is an invalid verdict; and the chosen
+# verdict object must be the LAST verdict-bearing content in the output.
+
+PASS_EXAMPLE = '{"verdict": "pass", "findings": []}'
+
+MALFORMED_REAL = {
+    "dup key": (
+        "Format:\n"
+        f'```json\n{PASS_EXAMPLE}\n```\n'
+        "My verdict:\n"
+        '{"verdict": "fail", "verdict": "fail", "findings": [{"file": "a.py"}]}'
+    ),
+    "truncated": (
+        "Format:\n"
+        f"{PASS_EXAMPLE}\n"
+        "Verdict:\n"
+        '{"verdict": "fail", "findings": [{"file": "a.py"'
+    ),
+    "trailing comma": (
+        f"Format: {PASS_EXAMPLE}\n"
+        "Verdict: "
+        '{"verdict": "fail", "findings": [],}'
+    ),
+}
+
+
+def test_review11_malformed_real_verdict_fails_closed():
+    """Cases 1-3: the example parses, the real verdict object does not —
+    the output is an INVALID verdict (one retry, then fail-closed), never
+    the example's PASS. The parse_error names the unparsable candidate's
+    POSITION, never its content."""
+    for name, output in MALFORMED_REAL.items():
+        report = parse_verdict(output)
+        assert report.parse_error is not None, name
+        assert report.verdict == "fail", name
+        # the reason names the position, not the content: no echo of the
+        # malformed object, and it says a candidate did not parse
+        assert "does not parse" in report.parse_error, (
+            f"{name}: {report.parse_error}"
+        )
+        assert "line" in report.parse_error, name
+        assert '"verdict"' not in report.parse_error, name
+
+    # through the retry harness: the seat gets its ONE re-run; a retry
+    # that repeats the malformed shape stays invalid (no second mechanism)
+    reruns = []
+
+    def rerun(seat_no, session, parse_error):
+        reruns.append(seat_no)
+        return _session(MALFORMED_REAL["trailing comma"])
+
+    reports, retries = parse_reviews_with_retry(
+        [_session(MALFORMED_REAL["dup key"])], rerun
+    )
+    assert retries == 1 and reruns == [1]
+    assert reports[0].parse_error is not None
+    assert merge_reviews(reports).verdict == "fail"
+
+
+def test_review12_prose_verdict_after_example_fails_closed():
+    """Case 4: the FAIL is stated only in prose AFTER the example object —
+    the example is the only parseable candidate and used to win. Text
+    after the chosen object that states a verdict makes the output
+    invalid."""
+    case4 = (
+        f"Format: {PASS_EXAMPLE}\n"
+        "Verdict: FAIL. a.py:1 has a blocking bug."
+    )
+    report = parse_verdict(case4)
+    assert report.parse_error is not None
+    assert report.verdict == "fail"
+    assert "follows the parsed verdict object" in report.parse_error
+
+    # a standalone FAIL line after the object is the same statement
+    standalone = (
+        "Here is the verdict:\n"
+        f"{PASS_EXAMPLE}\n"
+        "FAIL"
+    )
+    report2 = parse_verdict(standalone)
+    assert report2.parse_error is not None
+    assert report2.verdict == "fail"
+
+
+def test_review13_trailing_prose_without_verdict_is_fine():
+    """Keep it narrow: prose after the JSON that does NOT state a verdict
+    stays fine, and a clean single verdict — or agreeing repeats (round
+    1's review7 / the test_f09 FAIL+FAIL leg) — still parses, no retry."""
+    trailing_prose = (
+        f"{PASS_EXAMPLE}\n"
+        "Overall the change is consistent with the contract; the nits "
+        "above are within the budget."
+    )
+    fine = parse_verdict(trailing_prose)
+    assert fine.parse_error is None and fine.verdict == "pass"
+
+    # words that merely CONTAIN pass/fail never state a verdict
+    containing = (
+        f"{PASS_EXAMPLE}\n"
+        "The suite is passing and nothing fails downstream."
+    )
+    ok = parse_verdict(containing)
+    assert ok.parse_error is None and ok.verdict == "pass"
+
+    # clean single verdict and agreeing repeats: no parse error, no retry
+    clean = parse_verdict(_verdict(_finding("the defect"), declared="fail"))
+    assert clean.parse_error is None and clean.verdict == "fail"
+    assert parse_verdict(AGREEING).parse_error is None  # fail + fail
+    assert parse_verdict(
+        f'```json\n{PASS_EXAMPLE}\n```\nrestated:\n{PASS_EXAMPLE}'
+    ).verdict == "pass"
+
+    # and the protocol echo — "verdict must be pass or fail" names both,
+    # so it states neither — stays fine on either side of the object
+    echo_before = parse_verdict(
+        'The verdict must be "pass" or "fail" exactly.\n'
+        f"{PASS_EXAMPLE}"
+    )
+    assert echo_before.parse_error is None and echo_before.verdict == "pass"
+    echo_after = parse_verdict(
+        f"{PASS_EXAMPLE}\n"
+        'The verdict field must read "pass" or "fail" — nothing else.'
+    )
+    assert echo_after.parse_error is None and echo_after.verdict == "pass"
+
+
+def test_review14_goalattack_prose_fail_before_example():
+    """The goal-attack mirror of case 4, found attacking the AC-2 goal
+    beyond the four named shapes: a FAIL stated in prose BEFORE the only
+    parseable object (the quoted example) also published as the example's
+    PASS. Before-text now invalidates on contradiction — agreeing prose
+    before the object stays an echo."""
+    mirror = (
+        "My verdict: FAIL. a.py:1 has a blocking bug.\n"
+        "Format:\n"
+        f"{PASS_EXAMPLE}"
+    )
+    report = parse_verdict(mirror)
+    assert report.parse_error is not None
+    assert report.verdict == "fail"
+    assert "prose before the verdict object" in report.parse_error
+
+    # agreeing prose before the object is an echo, not a conflict
+    echo = parse_verdict(
+        "My verdict on this diff: pass — clean.\n" f"{PASS_EXAMPLE}"
+    )
+    assert echo.parse_error is None and echo.verdict == "pass"
+
+    # and through the retry harness: the mirror is one retry, then the
+    # seat stays invalid — the same single mechanism as every other rule
+    reruns = []
+
+    def rerun(seat_no, session, parse_error):
+        reruns.append(seat_no)
+        return _session(mirror)
+
+    reports, retries = parse_reviews_with_retry([_session(mirror)], rerun)
+    assert retries == 1 and reruns == [1]
+    assert reports[0].parse_error is not None
