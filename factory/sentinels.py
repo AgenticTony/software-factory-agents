@@ -122,6 +122,19 @@ _CREDENTIAL_SHAPES = (
             r"(?im)^[ \t-]*password:[ \t]*[A-Za-z0-9+/=_-]{16,}[ \t]*(?:#.*)?$"
         ),
     ),
+    # F-43 review round 1 (finding 8): the bare env echo M-8 named —
+    # ``ANTHROPIC_AUTH_TOKEN=<id>.<secret>`` — is not a JWT (the Z.ai key
+    # shape), so no shape caught it. An UPPERCASE env-var name ending in
+    # _TOKEN/_KEY/_SECRET/_PASSWORD, ``=``, and a 16+ unquoted value (the
+    # value alphabet excludes quotes: quoted assignments are the secret
+    # assignment shape's territory).
+    (
+        "environment variable echo",
+        re.compile(
+            r"\b[A-Z][A-Z0-9_]*(?:_TOKEN|_KEY|_SECRET|_PASSWORD)="
+            r"[A-Za-z0-9+/=_.\-]{16,}"
+        ),
+    ),
 )
 
 # An environment READ is the safe way for a secret to travel: the env
@@ -164,16 +177,29 @@ def redact_credentials(text: str) -> str:
     return text
 
 
+def is_scrubbable_secret(secret: str | None) -> bool:
+    """Whether ``secret`` is a real secret worth scrubbing.
+
+    THE one rule (review round 1, finding 10): both :func:`scrub_literal`
+    and the PR-text fence (:func:`factory.publish.check_pr_text`) call it,
+    so F-59's per-provider formats can change what counts as a secret in
+    one place — a fence that silently stops refusing what the seam still
+    scrubs is exactly the drift this prevents.
+    """
+    return bool(secret) and len(secret) >= MIN_SECRET_LEN
+
+
 def scrub_literal(text: str, secret: str | None) -> str:
     """Replace the literal secret (the seat token) with ``[redacted]``.
 
-    Long secrets only: a short literal redacts noise, not secrets. F-30
-    defined this beside the trace writer; F-43 moved it here — beside
-    :func:`redact_credentials`, whose sibling it is — so the egress seam
-    (:mod:`factory.egress`) composes the two scrubbers from one home.
-    :mod:`factory.trace` re-exports it unchanged (one implementation).
+    Long secrets only (:func:`is_scrubbable_secret`): a short literal
+    redacts noise, not secrets. F-30 defined this beside the trace writer;
+    F-43 moved it here — beside :func:`redact_credentials`, whose sibling
+    it is — so the egress seam (:mod:`factory.egress`) composes the two
+    scrubbers from one home. :mod:`factory.trace` re-exports it unchanged
+    (one implementation).
     """
-    if secret and len(secret) >= MIN_SECRET_LEN:
+    if is_scrubbable_secret(secret):
         return text.replace(secret, REDACTED)
     return text
 

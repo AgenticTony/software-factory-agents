@@ -2179,9 +2179,16 @@ def _run_prepared(
         None,
     )
     if record_line is None:
+        # F-43 review round 1 (finding 5): the runner's stderr is session-
+        # text-adjacent (a tool can write to it) and this message is
+        # printed to the owner's terminal and rides into attempt notes —
+        # seam-scrubbed with the session's own token, THEN capped, like
+        # every other boundary (F-56 AC-2 will generalize this to the
+        # abort paths).
         raise SessionConfigError(
             "the sandboxed session entry produced no record "
-            f"(exit {proc.returncode}): {proc.stderr.strip()[:2000]}"
+            f"(exit {proc.returncode}): "
+            f"{scrub_session_text(proc.stderr or '', (token,))[:2000]}"
         )
     try:
         record = SessionRecord.from_dict(json.loads(record_line))

@@ -38,7 +38,7 @@ from typing import Sequence
 
 from factory.attribution import attribution_match, title_attribution_match
 from factory.runs import GIT_HARDENING
-from factory.sentinels import MIN_SECRET_LEN
+from factory.sentinels import is_scrubbable_secret
 
 BRANCH_PREFIX = "factory/"
 _BRANCH_RE = re.compile(r"^factory/[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$")
@@ -86,9 +86,11 @@ def check_pr_text(title: str, body: str, *, secrets: Sequence[str] = ()) -> None
             Raised before any git or gh process starts.
     """
     for secret in secrets:
-        if secret and len(secret) >= MIN_SECRET_LEN and (
-            secret in title or secret in body
-        ):
+        # The ONE rule for what counts as a secret (review round 1,
+        # finding 10): shared with scrub_literal via
+        # :func:`factory.sentinels.is_scrubbable_secret`, so F-59 cannot
+        # change the seam's rule and leave the fence's behind.
+        if is_scrubbable_secret(secret) and (secret in title or secret in body):
             raise PushRefused(
                 "refusing to open a PR whose title or body carries a "
                 "literal session credential (a seat token; not echoed "

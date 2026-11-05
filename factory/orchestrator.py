@@ -2780,24 +2780,33 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                 if passed:
                     with trace.phase("publish"):
                         task = queue.get(task_id)
+                        # F-43 (C-1): the PR body's session-text inputs
+                        # pass the egress seam BEFORE the body is built —
+                        # the implementer's notes and the whole validator
+                        # report (every L2 finding text, the verdict JSON)
+                        # — scrubbed first, THEN capped (redact-then-cap,
+                        # the F-27 invariant: a cap landing inside a
+                        # credential would leak its other half). The stored
+                        # reports are not touched: this is a projection for
+                        # the body. Scrubbed ONCE, before the shrink loop
+                        # (review round 1, finding 9): compaction only
+                        # shortens already-scrubbed text, so re-scrubbing
+                        # per tail walked and regex-scrubbed the whole
+                        # report up to three times for the same result.
+                        scrubbed_reports = {
+                            key: scrub_session_value(value, egress_secrets)
+                            for key, value in reports.items()
+                        }
+                        scrubbed_notes = scrub_session_text(
+                            impl.result or "", egress_secrets)[:_PR_NOTES_CAP]
                         for tail in (_PR_OUTPUT_TAIL, 200, 0):  # shrink outputs to fit GitHub
-                            # F-43 (C-1): the PR body's session-text inputs
-                            # pass the egress seam BEFORE the body is built
-                            # — the implementer's notes and the whole
-                            # validator report (every L2 finding text, the
-                            # verdict JSON) — scrubbed first, THEN capped
-                            # (redact-then-cap, the F-27 invariant: a cap
-                            # landing inside a credential would leak its
-                            # other half). The stored reports are not
-                            # touched: this is a projection for the body.
                             body = build_pr_body(
                                 task, profile, branch=branch, base_sha=base_sha, head_sha=head_sha,
                                 changed_paths=changed,
-                                reports={k: _compact(scrub_session_value(v, egress_secrets), tail)
-                                         for k, v in reports.items()},
+                                reports={k: _compact(v, tail)
+                                         for k, v in scrubbed_reports.items()},
                                 l1_report=l1, extra_flags=l0.risk_flags_added,
-                                implementer_notes=scrub_session_text(
-                                    impl.result or "", egress_secrets)[:_PR_NOTES_CAP],
+                                implementer_notes=scrubbed_notes,
                                 attempt=attempt_no,
                             )
                             if len(body) <= _PR_BODY_LIMIT:

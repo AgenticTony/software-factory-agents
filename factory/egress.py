@@ -66,23 +66,31 @@ from typing import Any, Sequence
 from factory.sentinels import redact_credentials, scrub_literal
 
 # What must never reach a terminal, applied last. Order matters: the OSC
-# pattern consumes its ST terminator before the ESC catch-all can halve
-# it, and the catch-all then takes any other two-byte escape the specific
-# families missed. C0 controls go except tab and newline (a redaction seam
-# that shredded line structure would shred its own evidence); carriage
-# return goes — it is how a line rewrites the one above it — and DEL with
-# them.
+# and DCS patterns consume their ST terminator before the ESC catch-all
+# can halve it, and the catch-all then takes any other two-byte escape
+# the specific families missed. C0 controls go except tab and newline (a
+# redaction seam that shredded line structure would shred its own
+# evidence); carriage return goes — it is how a line rewrites the one
+# above it — DEL with them, and the 8-bit C1 controls (U+0080–U+009F:
+# \u009b CSI, \u009d OSC, \u0090 DCS — review round 1, finding 6), which
+# terminals in several VTE/xterm and Linux-console configurations execute
+# without any ESC byte.
 _CONTROL_SEQUENCES = (
     # OSC, BEL- or ST-terminated — hyperlinks (OSC 8), window titles.
     re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"),
     # CSI — SGR colors, cursor moves, screen clears, mode switches.
     re.compile(r"\x1b\[[0-9;:?]*[ -/]*[@-~]"),
-    # DCS/SOS/PM/APC strings, ST-terminated.
-    re.compile(r"\x1b[PX^_][^\x1b]*(?:\x1b\\)?"),
+    # DCS/SOS/PM/APC strings, ST-terminated — the terminator REQUIRED
+    # (review round 1, finding 7): an optional one made an unterminated
+    # introducer swallow everything to the next ESC or end of text, a way
+    # for a hostile seat to hide the findings after it. Without an ST the
+    # introducer alone falls through to the catch-all below, and the text
+    # after it stays.
+    re.compile(r"\x1b[PX^_][^\x1b]*\x1b\\"),
     # Any other escape sequence (ESC + one byte).
     re.compile(r"\x1b."),
-    # C0 minus tab/newline, plus DEL.
-    re.compile(r"[\x00-\x08\x0b-\x1f\x7f]"),
+    # C0 minus tab/newline, DEL, and the C1 range.
+    re.compile(r"[\x00-\x08\x0b-\x1f\x7f\x80-\x9f]"),
 )
 
 
