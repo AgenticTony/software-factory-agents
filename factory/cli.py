@@ -23,7 +23,12 @@ from factory.contract import ContractError, load_profile, load_tasks, read_file
 from factory.dashboard import DEFAULT_PORT, make_server
 from factory.eval import EvalError, run_on_demand_eval
 from factory.gates import GateError
-from factory.importer import apply_import, run_import
+from factory.importer import (
+    ImportRefused,
+    apply_import,
+    keep_refused_import_output,
+    run_import,
+)
 from factory.orchestrator import run_loop, run_once
 from factory.prbody import PRBodyError
 from factory.progress import ProgressLogError
@@ -458,7 +463,24 @@ def _run_import(args: argparse.Namespace) -> int:
         if answer.strip().lower() != "y":
             print("factory import: nothing written.")
             return 0
-        apply_import(result.plan, result.queue_path, confirm=lambda: True)
+        try:
+            apply_import(result.plan, result.queue_path, confirm=lambda: True)
+        except (ImportRefused, OSError) as exc:
+            # The real session's output is keepable; a --proposal review
+            # already holds its file and keeps nothing (round 2: keying
+            # this on --factory-root re-saved the owner's own file).
+            if session is not None:
+                raise
+            kept = keep_refused_import_output(
+                exc, text=result.raw_output, project=result.plan.project,
+                repo=Path(args.repo), queue_path=result.queue_path,
+                docs_dir=args.docs,
+                factory_root=Path(args.factory_root)
+                if args.factory_root else None,
+            )
+            if kept is not exc:
+                raise kept from exc
+            raise
         print(f"factory import: wrote {result.queue_path}")
         return 0
     except (ContractError, OSError) as exc:
