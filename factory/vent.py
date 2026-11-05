@@ -178,9 +178,10 @@ def clean_text(text: str, secrets: "Sequence[str]" = ()) -> str:
     full seam: the caller's literal secrets (the seat token — pattern
     redaction alone never caught a bare ``ANTHROPIC_AUTH_TOKEN=<jwt>``
     echo) and terminal control sequences (m-16: `factory status` prints
-    this text to the owner's terminal).
+    this text to the owner's terminal). A pure forwarder: the guard lives
+    in :func:`factory.egress.scrub_session_text` (round 3, finding 4) —
+    this always forwards, so it inherits.
     """
-    secrets = check_secrets(secrets)
     text = scrub_session_text(text, secrets)
     if len(text) > VENT_TEXT_CAP:
         text = text[: VENT_TEXT_CAP - len(VENT_TRUNCATED)] + VENT_TRUNCATED

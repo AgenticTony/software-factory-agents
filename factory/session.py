@@ -2221,7 +2221,11 @@ def _save_session_stdout(
 
     Returns the saved path as text, or ``<not saved: …>`` — the save is
     diagnostics for a SessionConfigError already on its way out, and a
-    failed save must never mask it.
+    failed save must never mask it. A :class:`TypeError` from the secrets
+    guard (round 3: a bare ``str`` or a non-str element) is a programming
+    error and deliberately wins — raised while the caller handles the
+    original failure, the original stays reachable as the
+    ``__context__``.
     """
     secrets = check_secrets(secrets)
     try:

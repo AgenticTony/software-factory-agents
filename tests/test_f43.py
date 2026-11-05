@@ -840,22 +840,92 @@ def test_review2(tmp_path, monkeypatch):
 # --- review3: the tripwire sees every module; mutations still trip ----------
 
 
-def _is_secrets_kw_ok(value: ast.AST) -> bool:
-    """A ``secrets=`` keyword that is a real sequence: a tuple/list
-    literal, a name (a pre-built sequence like ``egress_secrets``), or an
-    expression built from one. A parenthesised bare expression — round 2's
-    ``secrets=(seat_token() or "")``, a STRING iterated character by
-    character — is exactly what this refuses."""
-    return isinstance(value, (ast.Tuple, ast.List, ast.Name)) or any(
-        isinstance(n, (ast.Tuple, ast.List)) for n in ast.walk(value)
-    )
+def _module_assignments(tree: ast.AST) -> dict[str, list[ast.AST]]:
+    """name -> every value expression the module assigns it (module-wide;
+    a coarse view, but enough to refuse a name bound to a non-sequence)."""
+    assigned: dict[str, list[ast.AST]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assigned.setdefault(target.id, []).append(node.value)
+    return assigned
+
+
+def _is_secrets_expr_ok(value: ast.AST, assigned: dict) -> bool:
+    """A ``secrets=``/``extra_secrets=`` value that is a real sequence
+    shape (round 3, finding 5 — the round-2 rule accepted any expression
+    with a tuple anywhere in its subtree, and any bare Name):
+
+    * a tuple/list literal;
+    * the guard's own normalization (``check_secrets(...)`` — its return
+      IS a tuple by construction);
+    * an IfExp whose BOTH arms are acceptable;
+    * a Name the same module assigns only from acceptable expressions
+      (``egress_secrets = (seat_token() or "",)``; ``secrets =
+      check_secrets(secrets)`` at a guard), or a parameter pass-through
+      (``secrets=secrets`` — the callee's own guarded parameter; only the
+      names ``secrets``/``extra_secrets``, never a name that could be a
+      bare string like ``token``).
+    """
+    if isinstance(value, (ast.Tuple, ast.List)):
+        return True
+    if isinstance(value, ast.Call) and _callee_name(value) == "check_secrets":
+        return True
+    if isinstance(value, ast.IfExp):
+        return (_is_secrets_expr_ok(value.body, assigned)
+                and _is_secrets_expr_ok(value.orelse, assigned))
+    if isinstance(value, ast.Name):
+        if value.id in ("secrets", "extra_secrets") and value.id not in assigned:
+            return True  # parameter pass-through, guarded at its own entry
+        sources = assigned.get(value.id)
+        return bool(sources) and all(
+            _is_secrets_expr_ok(source, assigned) for source in sources
+        )
+    return False
+
+
+def _secrets_shape_offenders(module: str, source: str | None = None):
+    """Every ``secrets=``/``extra_secrets=`` keyword and every
+    ``egress_secrets =`` assignment in one factory module whose shape is
+    not a sequence, as ``module:line: what``."""
+    text = source if source is not None else (REPO_ROOT / module).read_text()
+    tree = ast.parse(text)
+    assigned = _module_assignments(tree)
+    found = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            for keyword in node.keywords:
+                if keyword.arg in ("secrets", "extra_secrets") and not (
+                    _is_secrets_expr_ok(keyword.value, assigned)
+                ):
+                    found.append(
+                        f"{module}:{node.lineno}: {keyword.arg}= is not a "
+                        "sequence shape (a bare string scrubs nothing)"
+                    )
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "egress_secrets"
+                        for t in node.targets)
+                and not _is_secrets_expr_ok(node.value, assigned)):
+            found.append(
+                f"{module}:{node.lineno}: egress_secrets = is not a "
+                "sequence shape (a bare string scrubs nothing)"
+            )
+    return found
+
+
+_FACTORY_MODULES = sorted(
+    path.name for path in (REPO_ROOT / "factory").glob("*.py")
+)
 
 
 def test_review3():
-    # (a) Channel rules for the new modules: run_import scrubs the
-    # proposal BEFORE plan_import; every refused-output writer gets
-    # secrets — as a SEQUENCE (round 2: a bare parenthesised string is
-    # silent no-scrub); the CLI's keep path too.
+    # (a) Channel rules: run_import scrubs the proposal BEFORE
+    # plan_import, and every secrets=/extra_secrets= keyword and every
+    # egress_secrets assignment in EVERY factory module is a sequence
+    # shape (round 2: the CLI's bare string; round 3: the rule now covers
+    # the whole package and refuses subtree-tuples and str-bound names).
     importer_src = (REPO_ROOT / "factory" / "importer.py").read_text()
     scrub_at = importer_src.index("scrub_session_value")
     plan_at = importer_src.index("plan_import(existing_doc")
@@ -864,43 +934,58 @@ def test_review3():
         "so a redaction cannot produce a schema-valid-looking but different "
         "task without the plan diff showing it"
     )
-    itree = ast.parse(importer_src)
-    for callee in ("_save_refused_output", "keep_refused_import_output"):
-        calls = [n for n in ast.walk(itree)
-                 if isinstance(n, ast.Call) and _callee_name(n) == callee]
-        assert calls, f"{callee} is gone — update this rule"
-        for call in calls:
-            secrets = _kw(call, "secrets")
-            assert secrets is not None, (
-                f"importer.py:{call.lineno}: a {callee} call lost its secrets"
-            )
-            assert _is_secrets_kw_ok(secrets), (
-                f"importer.py:{call.lineno}: {callee}'s secrets is not a "
-                "sequence (a bare string scrubs nothing)"
-            )
-    ctree = ast.parse((REPO_ROOT / "factory" / "cli.py").read_text())
-    keeps = [n for n in ast.walk(ctree)
-             if isinstance(n, ast.Call)
-             and _callee_name(n) == "keep_refused_import_output"]
-    assert keeps, "cli.py: the keep path is gone — update this rule"
-    for call in keeps:
-        secrets = _kw(call, "secrets")
-        assert secrets is not None and _is_secrets_kw_ok(secrets), (
-            f"cli.py:{call.lineno}: the keep path's secrets is missing or "
-            "not a sequence (round 2: secrets=(seat_token() or \"\") is a "
-            "STRING — iterated character by character, the literal scrub "
-            "never ran)"
-        )
+    offenders = [
+        offender
+        for name in _FACTORY_MODULES
+        for offender in _secrets_shape_offenders(f"factory/{name}")
+    ]
+    assert not offenders, "\n".join(offenders)
 
-    # (b) Mutation: a new writer in importer.py or cli.py receiving
-    # session text trips the tripwire (finding 3's regression class).
-    importer_doctored = (REPO_ROOT / "factory" / "importer.py").read_text() + (
+    # (b) Mutations: every bad shape trips the rule, naming file:line.
+    cli = (REPO_ROOT / "factory" / "cli.py").read_text()
+    # round 2's shape: a parenthesised string.
+    round2 = _secrets_shape_offenders(
+        "factory/cli.py",
+        cli.replace('secrets=(seat_token() or "",),',
+                    'secrets=(seat_token() or ""),'),
+    )
+    assert round2 and "factory/cli.py" in round2[0], round2
+    # an IfExp whose true arm is a str (a tuple in the else arm used to
+    # pass the round-2 subtree rule).
+    ifexp = _secrets_shape_offenders(
+        "factory/cli.py",
+        cli.replace('secrets=(seat_token() or "",),',
+                    'secrets=((seat_token() or "") if True else ()),'),
+    )
+    assert ifexp, "a str-valued IfExp with a tuple else-arm passed the rule"
+    # a str-bound Name.
+    importer = importer_src.replace(
+        "secrets=egress_secrets,", "secrets=project,",
+    )
+    name_case = _secrets_shape_offenders("factory/importer.py", importer)
+    assert name_case and "secrets= is not a sequence" in name_case[0], (
+        "a str-bound name passed the rule"
+    )
+    # finding 6's mutation: orchestrator's assignment loses its comma.
+    orch = (REPO_ROOT / "factory" / "orchestrator.py").read_text()
+    comma_drop = _secrets_shape_offenders(
+        "factory/orchestrator.py",
+        orch.replace('egress_secrets = (seat_token() or "",)',
+                     'egress_secrets = (seat_token() or "")'),
+    )
+    assert comma_drop and "orchestrator.py" in comma_drop[0], (
+        "the orchestrator comma-drop mutation did not trip, named"
+    )
+
+    # (c) Tripwire mutations (finding 3 of round 1, unchanged): a new
+    # writer in importer.py or cli.py receiving session text trips it.
+    importer_doctored = importer_src + (
         "\n\ndef _evil(proposal):\n    print(proposal['title'])\n"
     )
     assert any("print" in o for o in _offenders(
         "factory/importer.py", importer_doctored
     )), "a proposal print in importer.py did not trip the tripwire"
-    cli_doctored = (REPO_ROOT / "factory" / "cli.py").read_text() + (
+    cli_doctored = cli + (
         "\n\ndef _evil(result):\n    print(result.raw_output)\n"
     )
     assert any("print" in o for o in _offenders(
@@ -1229,3 +1314,119 @@ def test_review12_str_secrets_refused(tmp_path):
         f"leak {SEAT_TOKEN}", [SEAT_TOKEN]) == "leak [redacted]"
     with pytest.raises(PushRefused):
         check_pr_text("t", f"b {SEAT_TOKEN}", secrets=[SEAT_TOKEN])
+
+
+# ======================= owner review round 3 (PR #98) =======================
+#
+# Six findings on 6b7dea8. The important one: scrub_session_value called
+# check_secrets but DISCARDED its normalised tuple, so a one-shot iterable
+# (a generator, an F-59 lazily-built credential view) was consumed by the
+# guard and every nested scrub saw nothing — silent no-scrub again.
+
+
+def test_review13(tmp_path):
+    """A one-shot secrets iterable scrubs (or refuses) at every entry:
+    the guard's normalised tuple is what the scrub consumes, not the
+    caller's exhausted iterator."""
+    from factory.egress import scrub_session_text, scrub_session_value
+    from factory.importer import _save_refused_output
+    from factory.progress import ProgressLog
+    from factory.publish import check_pr_text
+    from factory.session import _save_session_stdout
+    from factory.trace import TraceWriter
+    from factory.vent import VentCollector, flush_vents
+
+    def gen():
+        return (secret for secret in (SEAT_TOKEN,))
+
+    # The recursive seam over a report-shaped value — round 3's finding:
+    # the guard consumed the generator and the recursion scrubbed nothing.
+    value = scrub_session_value(
+        {"k": f"leak {SEAT_TOKEN}", "l": [f"leak {SEAT_TOKEN}"]}, gen()
+    )
+    dumped = json.dumps(value)
+    assert SEAT_TOKEN not in dumped, "the generator was consumed by the guard"
+    assert "[redacted]" in dumped
+
+    assert SEAT_TOKEN not in scrub_session_text(f"leak {SEAT_TOKEN}", gen())
+    with pytest.raises(PushRefused):
+        check_pr_text("t", f"body {SEAT_TOKEN}", secrets=gen())
+
+    log = ProgressLog(tmp_path / "vents.jsonl")
+    flush_vents(log, [{"category": "other", "text": f"leak {SEAT_TOKEN}",
+                       "at": ""}], secrets=gen())
+    assert SEAT_TOKEN not in (tmp_path / "vents.jsonl").read_text()
+
+    collector = VentCollector("r", "t", "s", secrets=gen())
+    assert SEAT_TOKEN not in collector.record("other", f"leak {SEAT_TOKEN}")["text"]
+
+    writer = TraceWriter(tmp_path, "p", "genrun", "T-1", extra_secrets=gen())
+    writer.append({"type": "tool_call", "note": f"leak {SEAT_TOKEN}"})
+    trace = (tmp_path / "trace" / "p" / "genrun.jsonl").read_text()
+    assert SEAT_TOKEN not in trace and "[redacted]" in trace
+
+    dump = _save_refused_output(f"leak {SEAT_TOKEN}", "p", tmp_path,
+                                secrets=gen())
+    assert SEAT_TOKEN not in Path(dump).read_text()
+    saved = _save_session_stdout(f"leak {SEAT_TOKEN}", tmp_path, tmp_path,
+                                 secrets=gen())
+    assert SEAT_TOKEN not in Path(saved).read_text()
+
+
+@pytest.mark.parametrize("bad", [b"x" * 16, (SEAT_TOKEN,), 16])
+def test_review14(bad):
+    """check_secrets refuses non-str elements (bytes, nested tuples,
+    ints) naming the TYPE — never the value, which may be the secret —
+    and accepts short strings and None (the `if token else ()` shapes)."""
+    from factory.egress import check_secrets
+
+    with pytest.raises(TypeError) as excinfo:
+        check_secrets((bad,))
+    message = str(excinfo.value)
+    assert type(bad).__name__ in message, message
+    assert "xxxx" not in message, "bytes value leaked into the error"
+    assert SEAT_TOKEN not in message, "the nested tuple's value leaked"
+    assert check_secrets(("", None, SEAT_TOKEN)) == ("", None, SEAT_TOKEN)
+
+
+def test_review15(tmp_path):
+    """The never-mask contract: a TypeError from the secrets guard never
+    hides the original diagnostic — keep_refused_import_output chains it
+    explicitly (`__cause__`, it holds the original as a parameter), and
+    the save helpers raised while the original is being handled keep it
+    reachable via `__context__` (documented in their docstrings)."""
+    from factory.importer import _abort_refusal, keep_refused_import_output
+    from factory.session import _save_session_stdout
+
+    original = ValueError("the original diagnostic")
+
+    try:
+        raise original
+    except ValueError:
+        with pytest.raises(TypeError) as guard_error:
+            _save_session_stdout("x", tmp_path, tmp_path, secrets="bad")
+    assert guard_error.value.__context__ is original
+
+    try:
+        raise original
+    except ValueError:
+        with pytest.raises(TypeError) as chained:
+            keep_refused_import_output(
+                original, text="x", project="p", repo=tmp_path,
+                queue_path=tmp_path, docs_dir="docs", factory_root=tmp_path,
+                secrets="bad",
+            )
+    assert chained.value.__cause__ is original, (
+        "the refusal being kept must stay visible under the guard's error"
+    )
+
+    try:
+        raise original
+    except ValueError:
+        with pytest.raises(TypeError) as abort_guard:
+            _abort_refusal(
+                "head", run=SimpleNamespace(settings_path=tmp_path),
+                project="p", factory_root=tmp_path, repo=tmp_path,
+                queue_path=tmp_path, docs_dir="docs", secrets="bad",
+            )
+    assert abort_guard.value.__context__ is original

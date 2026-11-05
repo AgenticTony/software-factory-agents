@@ -96,13 +96,20 @@ _CONTROL_SEQUENCES = (
 
 def check_secrets(secrets: Sequence[str]) -> tuple[str, ...]:
     """The one guard every ``secrets``/``extra_secrets`` entry calls
-    (review round 2): refuse a bare ``str``.
+    (review round 2): refuse a bare ``str`` — and, round 3, any element
+    that is not a ``str`` or ``None``.
 
     A parenthesised string — ``secrets=(token or "")`` — is iterable
     character by character, every character is shorter than the scrub
-    floor, and the literal scrub silently scrubs NOTHING. The mistake
-    must be loud: :class:`TypeError` at the boundary, naming it. Real
-    sequences (tuple, list) pass through as a tuple.
+    floor, and the literal scrub silently scrubs NOTHING. A non-str
+    element (keychain bytes, a nested tuple) dies even deeper, inside
+    ``str.replace``, with an error that never names the real mistake.
+    Both must be loud: :class:`TypeError` at the boundary, naming the
+    shape — the element's TYPE only, never its value (it may be the
+    secret). ``None`` elements pass (the ``(token,) if token else ()``
+    and empty-token fallback shapes); real sequences are returned as a
+    TUPLE, normalised exactly once (a one-shot iterable stays usable by
+    everything downstream).
     """
     if isinstance(secrets, str):
         raise TypeError(
@@ -111,7 +118,15 @@ def check_secrets(secrets: Sequence[str]) -> tuple[str, ...]:
             "is shorter than the scrub floor, so the literal scrub never "
             "runs; pass a tuple/list, e.g. secrets=(token,)"
         )
-    return tuple(secrets)
+    checked = tuple(secrets)
+    for item in checked:
+        if not isinstance(item, (str, type(None))):
+            raise TypeError(
+                f"secrets must be a sequence of str secrets; got a "
+                f"{type(item).__name__} element — the element is not "
+                "printed (it may be the secret); pass str secrets or None"
+            )
+    return checked
 
 
 def strip_control_sequences(text: str) -> str:
@@ -168,18 +183,25 @@ def scrub_session_value(value: Any, secrets: Sequence[str] = ()) -> Any:
     verdict JSON's payloads, parse errors); a hostile finding dict could
     also carry a secret in a KEY, and the PR body renders both. The copy
     is new; the input is never mutated (stored reports keep what the
-    validators produced).
+    validators produced). The secrets are NORMALISED ONCE here and the
+    recursion carries the tuple (round 3, finding 1: the guard's return
+    used to be discarded, so a one-shot iterable was consumed by the
+    check and every nested scrub saw nothing).
     """
-    check_secrets(secrets)
+    return _scrub_value(value, check_secrets(secrets))
+
+
+def _scrub_value(value: Any, secrets: tuple) -> Any:
+    """scrub_session_value's recursion over an already-checked tuple."""
     if isinstance(value, str):
         return scrub_session_text(value, secrets)
     if isinstance(value, dict):
         return {
-            scrub_session_value(key, secrets): scrub_session_value(item, secrets)
+            _scrub_value(key, secrets): _scrub_value(item, secrets)
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [scrub_session_value(item, secrets) for item in value]
+        return [_scrub_value(item, secrets) for item in value]
     if isinstance(value, tuple):
-        return tuple(scrub_session_value(item, secrets) for item in value)
+        return tuple(_scrub_value(item, secrets) for item in value)
     return value

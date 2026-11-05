@@ -1086,6 +1086,10 @@ def _save_refused_output(
     Raises:
         OSError: The factory root is unwritable — the caller keeps the
             original refusal; the save never masks it.
+        TypeError: ``secrets`` is a bare ``str`` or a non-str element
+            (round 3): a programming error that deliberately wins over
+            the diagnostic being saved — raised while the original is
+            being handled, it stays reachable as the ``__context__``.
     """
     secrets = check_secrets(secrets)
     root = Path(factory_root) if factory_root is not None else FACTORY_ROOT_DEFAULT
@@ -1146,9 +1150,16 @@ def keep_refused_import_output(
     the full re-review command in its message. Any other exception (a
     write ``OSError``) keeps its type — its callers already refuse on
     it — and the saved path rides along as a note on the exception; a
-    failed save never masks the original refusal.
+    failed save never masks the original refusal. A :class:`TypeError`
+    from the secrets guard (round 3: a bare str or a bad element) is a
+    programming error and deliberately wins — but CHAINED to ``exc``
+    (``raise … from exc``), so the refusal being kept stays visible as
+    the ``__cause__``.
     """
-    secrets = check_secrets(secrets)
+    try:
+        secrets = check_secrets(secrets)
+    except TypeError as guard_error:
+        raise guard_error from exc
     try:
         saved = _save_refused_output(text, project, factory_root, secrets=secrets)
     except OSError as save_exc:
@@ -1194,7 +1205,10 @@ def _abort_refusal(
     and the message names the file and the full re-review command.
     Without a file, the message says so explicitly — never a bare
     ``aborted`` that leaves the owner guessing what survived. A failed
-    copy never masks the abort."""
+    copy never masks the abort; a :class:`TypeError` from the secrets
+    guard (round 3) is a programming error that deliberately wins, and —
+    raised while the caller handles the original failure — the original
+    stays reachable as the ``__context__``."""
     secrets = check_secrets(secrets)
     proposal = _scratch_proposal_path(run.settings_path)
     try:
