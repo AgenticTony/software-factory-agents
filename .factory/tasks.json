@@ -4725,6 +4725,14 @@
             "type": "test",
             "ref": "tests/test_f58.py::test_ac_6"
           }
+        },
+        {
+          "id": "AC-7",
+          "text": "Nesting is detected on Linux too: a suite run inside the srt sandbox on Linux skips its sandbox-spawning tests through the INC-007 guard instead of failing. The macOS-only skip PR #97 put on `test_nested_suite_skips_instead_of_failing` is removed, and that test passes on ubuntu-24.04, ubuntu-26.04 and macOS.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f58.py::test_ac_7"
+          }
         }
       ],
       "attempts": [],

@@ -599,6 +599,7 @@ Acceptance:
 - AC-4 `factory run` preflights the host: when the sandbox cannot create its nested user namespace, the run refuses before picking a task, with one error naming the missing setting, not a cascade of session failures. A test with a fake srt that exits with the setgroups error asserts the refusal.
 - AC-5 With `repo.branch_protection: unavailable`, the factory self-enforces green CI as it already self-enforces up-to-date: `factory run` refuses to start while the default branch's latest CI run for HEAD failed, and the stale-PR sweep never reports a PR ready whose checks fail. Tests cover a red default branch and a red PR, through the existing `pr_state`/protection seams.
 - AC-6 README's and CLAUDE.md's host table lists exactly the hosts CI verifies; a test asserts every Ubuntu version in that table appears as a CI job.
+- AC-7 Nesting is detected on Linux too: a suite run inside the srt sandbox on Linux skips its sandbox-spawning tests through the INC-007 guard instead of failing. The macOS-only skip PR #97 put on `test_nested_suite_skips_instead_of_failing` is removed, and that test passes on ubuntu-24.04, ubuntu-26.04 and macOS.
 
 ## Phase 1c — First outside project
 

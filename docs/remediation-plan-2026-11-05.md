@@ -141,7 +141,7 @@ Three of four real importer runs on 2026-11-05 lost the session record to a trun
 A `propose_task` tool validates each task as it is written, one repair session replaces a full re-run, and a prose-docs fixture plus `factory eval --importer` measure the importer on a repo whose docs aren't contract-shaped.
 
 **F-58 — Linux sandbox host on Ubuntu 26.04 and red-CI guard** · factory_control · M · interactive · Tier 2 · depends F-05, F-51
-PR #97 pins CI to ubuntu-24.04 because srt's nested user namespace fails on 26.04. F-58 makes 26.04 a verified host, runs CI on both, preflights the host at `factory run`, and self-enforces green CI when `branch_protection: unavailable` — the gap that let `main` stay red for 11 days while PRs #90–#95 merged.
+PR #97 pins CI to ubuntu-24.04 because srt's nested user namespace fails on 26.04. F-58 makes 26.04 a verified host, runs CI on both, preflights the host at `factory run`, self-enforces green CI when `branch_protection: unavailable`, and adds Linux nesting detection (removing PR #97's macOS-only skip on the INC-007 test) — the gap that let `main` stay red for 11 days while PRs #90–#95 merged.
 
 ## 2. Placement in the build order
 
