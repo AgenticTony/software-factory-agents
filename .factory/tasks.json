@@ -1781,7 +1781,8 @@
       "priority": "P3",
       "status": "draft",
       "depends_on": [
-        "F-09"
+        "F-09",
+        "F-59"
       ],
       "risk": [
         "external_service"
@@ -4320,7 +4321,7 @@
         },
         {
           "id": "AC-3",
-          "text": "(M-14) `docs/proposals-2026-10-30-borrowings.md` is deleted or re-baselined with ids from F-59 up; no doc assigns a live WO id a second meaning.",
+          "text": "(M-14) `docs/proposals-2026-10-30-borrowings.md` is deleted or re-baselined with ids from F-60 up; no doc assigns a live WO id a second meaning.",
           "check": {
             "type": "test",
             "ref": "tests/test_f52.py::test_ac_3"
@@ -4732,6 +4733,95 @@
           "check": {
             "type": "test",
             "ref": "tests/test_f58.py::test_ac_7"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-59",
+      "title": "Per-project model provider and provider record",
+      "source": "BUILD-ORDER.md#f-59--per-project-model-provider-and-provider-record",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-05",
+        "F-06",
+        "F-43"
+      ],
+      "risk": [
+        "factory_control",
+        "external_service",
+        "privacy"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "`project.yaml` gains `data_owner` (`self` | `client`) and a `provider` block: `kind` (`zai` | `anthropic` | `bedrock` | `vertex` | `anthropic_compatible`), a `model` per seat (implementer, reviewer, verifier, importer), `region` (required for bedrock/vertex), `base_url` (required for and only allowed with `anthropic_compatible`, https only). Schema-validated on load (F-02). A `client` project with no explicit `provider`, or with `kind: zai`, refuses to load, with the reason named; a `self` project with no block keeps today's Z.ai default. Tests cover every kind, each missing-field case and both refusals.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f59.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Credentials are per provider: one keychain item per kind (`factory-<kind>`), with the env lookup rule `seat_token` applies today generalised. A token is used only with its own provider's endpoint, never sent to another, and a token exported for one provider is refused when the project names another. `session_env` stays literal: for each kind it returns exactly the variable names that provider needs per the Agent SDK docs (for Bedrock a scoped bearer token or short-lived credentials plus the region; never the owner's ambient `~/.aws` profile or files). Tests assert the exact env key set per kind, the cross-provider refusal, and that no ambient `ANTHROPIC_*`/`AWS_*` value leaks in.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f59.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "Session egress follows the provider: the sandbox network allowlist for a session contains the configured provider's inference host(s) (derived from kind, region or base_url) and no other model endpoint. A `client` project's session cannot reach the Z.ai host. Tests read the generated srt settings for each kind.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f59.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "Every session record and attempt carries a provider record: kind, model id, region or endpoint host (never the token), and token usage (input, cache-read, cache-write, output). The task schema gains the fields, and `factory status` shows per-project, per-provider token totals and an estimated cost from an owner-maintained price table in the factory config (a missing price shows `n/a`, never 0). Tests cover the record, the schema, the total, and the missing-price case.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f59.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "Seats may name a different model of the project's provider; a different provider only from the project's own `providers_allowed` list (for F-20's second reviewer). A `client` project never falls back to Z.ai or to any provider outside its list on error, quota or a missing credential: the session fails closed with the reason named. Tests cover the allowed override, the refused override and the no-fallback path.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f59.py::test_ac_5"
+          }
+        },
+        {
+          "id": "AC-6",
+          "text": "The importer and `factory eval` take the same provider resolution as `factory run` (one resolver, no second code path). A test runs the importer's session construction for a `client` project and asserts the resolved provider, env and egress match AC-1 to AC-3.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f59.py::test_ac_6"
+          }
+        },
+        {
+          "id": "AC-7",
+          "text": "One real session per newly supported kind the owner has provisioned (at minimum `bedrock`, EU region, Sonnet 5.5) runs against the rehearsal fixture (F-24); its record shows the provider, region and token usage, and egress logs show no other model host. The owner runs it (paid) and records the evidence.",
+          "check": {
+            "type": "manual",
+            "expect": "owner tick evidence: the real session's record (provider, region, token usage) and its egress log"
           }
         }
       ],
