@@ -420,13 +420,18 @@ def test_proposal_schema_derives_from_the_queue_schema():
         assert (task["properties"][field]["enum"]
                 == queue["$defs"]["task"]["properties"][field]["enum"])
     assert task["properties"]["id"].get("minLength") == 1  # blank id refused
-    # the one allOf rule that can fire without status rides along…
+    # the risk⇒human-merge rule rides along…
     assert any('"human"' in json.dumps(rule)
                for rule in task.get("allOf", []))
-    # …and the status-gated ones are dropped: their `if` lacks
-    # `required: [status]`, so on a status-less task they pass vacuously
-    # and demand approval fields — the ~31-violation wall, rebuilt.
-    assert all("status" not in json.dumps(rule)
+    # …and the rules whose `if` reads status are dropped: their `if`
+    # lacks `required: [status]`, so on a status-less task they pass
+    # vacuously and demand approval fields — the ~31-violation wall,
+    # rebuilt. A rule that only constrains status in its `then`
+    # (harmless: status can never be present) survives.
+    from factory.importer import _if_reads_status
+    assert all(not _if_reads_status(rule)
+               for rule in task.get("allOf", []))
+    assert any("status" in json.dumps(rule.get("then", {}))
                for rule in task.get("allOf", []))
 
 
@@ -613,3 +618,63 @@ def test_self_check_commands_run_in_the_real_sandbox(tmp_path: Path):
         assert "status" in out and "Additional properties" in out
     finally:
         cleanup_run(run)
+
+
+# ============ round 3: review nits — if-matching and guard-only staging ======
+
+
+def test_rule_dropping_reads_the_if_clause_not_the_text():
+    """A rule whose $comment merely mentions status is KEPT (round-3
+    review nit: substring matching would drop it silently); only rules
+    whose `if` actually reads status are dropped."""
+    told = _load_tasks_schema()
+    told = copy.deepcopy(told)
+    told["$defs"]["task"]["allOf"].append({
+        "$comment": "this comment mentions status but reads only risk",
+        "if": {"properties": {"risk": {"minItems": 1}}},
+        "then": {"properties": {"gates": {"properties": {
+            "merge": {"const": "human"}}}}},
+    })
+    staged = build_proposal_schema(told)
+    kept = staged["$defs"]["task"]["allOf"]
+    # the comment-only rule survives...
+    assert any("$comment" in json.dumps(rule) for rule in kept)
+    # ...and no kept rule's `if` reads status (as a key or a required
+    # entry — never as prose)
+    for rule in kept:
+        clause = rule.get("if", {})
+
+        def reads(node: Any) -> bool:
+            if isinstance(node, dict):
+                return "status" in node or any(reads(v) for v in node.values())
+            if isinstance(node, list):
+                return any(reads(item) for item in node)
+            return node == "status"
+
+        assert not reads(clause), json.dumps(rule)
+
+
+def test_scratch_files_refuse_without_the_review_guard(
+    tmp_path: Path, monkeypatch
+):
+    """scratch_files on a seat without the reviewer/verifier guard
+    refuses before anything starts: the scratch would be the clone's own
+    run/.tmp, and a staged file could ride that seat's diff. Nothing
+    uses that path today — it must not exist (round-3 review nit)."""
+    run_dir = _git_repo(tmp_path / "run")
+
+    def never(cmd, *args, **kwargs):
+        pytest.fail("the session must never start without the guard")
+
+    monkeypatch.setattr("factory.session.run_sandboxed", never)
+    with pytest.raises(SessionConfigError) as excinfo:
+        run_session_sandboxed(
+            "implementer", "p", run_dir,
+            {"docs_allowlist": [], "network_allowlist": []},
+            factory_root=tmp_path / "root",
+            settings_path=tmp_path / "sandbox" / "s.json",
+            max_turns=1, timeout_min=0.05, token="tok",
+            cli_path=tmp_path / "claude", protected=(),
+            scratch_files={"proposal.schema.json": "{}"},
+        )
+    assert "guard" in str(excinfo.value)

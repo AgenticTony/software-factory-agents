@@ -1698,7 +1698,10 @@ def run_session_sandboxed(
             session's writable scratch — its ``$TMPDIR`` — before the
             session starts (F-12 round 2: the importer stages the
             narrowed proposal schema there, because the session's clone
-            is the target repo and has no schema/ of its own). The
+            is the target repo and has no schema/ of its own). Guard
+            seats only (reviewer/verifier): without the guard the
+            writable scratch is the clone's own ``run/.tmp``, and a
+            staged file could ride that seat's diff — refused. The
             scratch is cleaned with the run; names must be bare
             filenames (no path), or the session refuses to start.
 
@@ -1749,6 +1752,16 @@ def run_session_sandboxed(
             f"{sorted(scratch_files)!r} — staging must never write outside "
             "the session's tmp."
         )
+    if scratch_files and not review_guard:
+        # Round-3 review nit: staging into run/.tmp — the clone itself —
+        # for a non-guard seat would put orchestrator files inside that
+        # seat's workspace, where they could ride its diff. No caller
+        # does this today; refuse so the path never exists.
+        raise SessionConfigError(
+            "scratch_files needs the reviewer/verifier guard: without it "
+            "the writable scratch is the clone's own run/.tmp, and a "
+            "staged file could ride that seat's diff."
+        )
     # Everything from the scratch symlinks on sits inside try/finally (review
     # round 4): a setup failure must still tear the links down, and the
     # integrity backstop must run on EVERY exit path, timeouts and missing
@@ -1758,8 +1771,6 @@ def run_session_sandboxed(
             reviewer_writable = _reviewer_scratch(Path(settings_path), run_dir)
             baseline = _git_state(run_dir)
             _stage_scratch_files(scratch_files, reviewer_writable[1])
-        elif scratch_files:
-            _stage_scratch_files(scratch_files, run_dir / ".tmp")
         record = _run_prepared(
             seat, prompt, run_dir, profile, settings_path,
             factory_root=factory_root, max_turns=max_turns,

@@ -268,13 +268,19 @@ def build_proposal_schema(schema: dict) -> dict:
       own — derived, never re-typed;
     * of the task's conditional rules, the risk⇒human-merge rule rides
       along (:func:`plan_import` enforces it on the merged document
-      too); the status-gated rules do not. They cannot fire honestly
-      here (status is not a proposal field), and copying them verbatim
-      backfires: their ``if`` clauses lack ``required: [status]``, so on
-      a status-less task they pass *vacuously* and their ``then`` fires
-      — demanding ``acceptance_hash``/``approved_at`` and rebuilding,
-      inside the self-check, the very ~31-violation wall of required
-      fields the prompt forbids setting.
+      too); the rules whose ``if`` clause *reads* status do not. They
+      cannot fire honestly here (status is not a proposal field), and
+      copying them verbatim backfires: their ``if`` clauses lack
+      ``required: [status]``, so on a status-less task they pass
+      *vacuously* and their ``then`` fires — demanding
+      ``acceptance_hash``/``approved_at`` and rebuilding, inside the
+      self-check, the very ~31-violation wall of required fields the
+      prompt forbids setting. "Reads status" is matched on the ``if``
+      clause's structure — ``status`` as an object key (a property
+      read) or an exact ``required`` entry — never on rule text: a rule
+      that only mentions status in a ``$comment`` or constrains it in
+      its ``then`` (harmless here: ``then`` filters values of present
+      keys, and status can never be present) survives.
 
     Agreement (:func:`plan_import` versus this schema): a proposal that
     passes the staged check is never refused for *shape*. What the
@@ -313,9 +319,31 @@ def build_proposal_schema(schema: dict) -> dict:
     task["additionalProperties"] = False
     task["allOf"] = [
         rule for rule in task.get("allOf", [])
-        if "status" not in json.dumps(rule)
+        if not _if_reads_status(rule)
     ]
     return proposal
+
+
+def _if_reads_status(rule: dict) -> bool:
+    """Does the rule's ``if`` clause read the task's ``status``?
+
+    Matched structurally, never by text: ``status`` as an object key
+    anywhere in the ``if`` (a property read, nested in ``properties``,
+    ``not``, combinators) or as an exact ``required`` list entry. A
+    ``$comment``/``description`` string that merely says "status", or a
+    rule that only constrains status in its ``then``, does not read
+    status in its ``if`` and survives — dropping on substring would
+    silently lose such a rule (round-3 review nit).
+    """
+
+    def reads(node: Any) -> bool:
+        if isinstance(node, dict):
+            return "status" in node or any(reads(child) for child in node.values())
+        if isinstance(node, list):
+            return any(reads(item) for item in node)
+        return node == "status"
+
+    return reads(rule.get("if"))
 
 
 def _resolve_ref(prop: dict, schema: dict) -> dict:
