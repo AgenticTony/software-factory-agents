@@ -24,10 +24,13 @@ from factory.dashboard import DEFAULT_PORT, make_server
 from factory.eval import EvalError, run_on_demand_eval
 from factory.gates import GateError
 from factory.importer import (
+    TIMEOUT_MIN_CEILING,
+    TURN_CEILING,
     ImportRefused,
     apply_import,
     keep_refused_import_output,
     run_import,
+    validate_budget,
 )
 from factory.orchestrator import run_loop, run_once
 from factory.prbody import PRBodyError
@@ -270,6 +273,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="factory root for the sandboxed importer session's disposable "
              "clone (default: ~/factory)",
     )
+    import_cmd.add_argument(
+        "--max-turns", type=int, default=None, metavar="N",
+        help=f"importer session turn budget, 1-{TURN_CEILING} (default: "
+             "scaled with the planning docs, from 30)",
+    )
+    import_cmd.add_argument(
+        "--timeout-min", type=float, default=None, metavar="M",
+        help=f"importer session wall-clock budget in minutes, above 0 and "
+             f"at most {TIMEOUT_MIN_CEILING:g} (default: scaled with the "
+             "planning docs, from 20)",
+    )
 
     for name, wo in STUBS.items():
         sub.add_parser(name, help=f"stub — implemented in {wo}")
@@ -426,6 +440,7 @@ def _run_import(args: argparse.Namespace) -> int:
         # reader (contract.read_file, the importer's register read), so
         # the tuple below names no decode error; OSError is for the
         # write path (TaskQueue lock, mkdir, atomic rename).
+        validate_budget(args.max_turns, args.timeout_min)
         session = None
         # `is not None`, not truthiness: --proposal "" (an unset shell
         # variable) is a missing file to refuse, not a request for the
@@ -444,6 +459,7 @@ def _run_import(args: argparse.Namespace) -> int:
         result = run_import(
             Path(args.repo), args.queue, docs_dir=args.docs, session=session,
             factory_root=Path(args.factory_root) if args.factory_root else None,
+            max_turns=args.max_turns, timeout_min=args.timeout_min,
         )
         print(result.summary)
         if not result.plan.diff:

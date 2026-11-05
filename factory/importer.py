@@ -59,6 +59,14 @@ in a disposable clone of the repo's committed HEAD, with the read-only
 reviewer guard (read-only sandbox, no Write/Edit, workspace integrity
 check) — and returns its final message. It never runs in-process on the
 live checkout (DESIGN D3).
+
+The session's budget scales with the work — the number of planning
+docs the prompt lists (:func:`scaled_import_budget`; ``--max-turns`` /
+``--timeout-min`` override) — and a session that does not complete has
+its scratch's last ``$TMPDIR/proposal.json`` copied out before the run
+is cleaned up (:func:`_abort_refusal`): three full jobfinderos sessions
+were lost to fixed budgets and cleanup-deleted proposals before either
+existed.
 """
 
 from __future__ import annotations
@@ -87,6 +95,7 @@ from factory.contract import (
 )
 from factory.runs import (
     FACTORY_ROOT_DEFAULT,
+    RunDir,
     RunError,
     cleanup_run,
     create_run,
@@ -129,6 +138,14 @@ FORBIDDEN_FIELDS = (
 
 DEFAULT_MAX_TURNS = 30
 DEFAULT_TIMEOUT_MIN = 20.0
+# The ceilings for an explicit --max-turns / --timeout-min and for the
+# scaled default alike (one bound, so a flag can never ask for more than
+# the formula could): 200 loop turns is ~35 min of model loop at the
+# observed pace, and 120 min is the outer wall clock of a whole import
+# — past either, an import is wedged, not working, and the salvage
+# copy (below) is the recovery, not more budget.
+TURN_CEILING = 200
+TIMEOUT_MIN_CEILING = 120.0
 # Long planning-doc trees are listed, not inlined; the session reads the
 # files it needs from the repo (it runs with read tools).
 MAX_DOC_FILES = 200
@@ -418,6 +435,85 @@ def _schema_contract_lines(schema: dict) -> list[str]:
     return lines
 
 
+def _list_planning_docs(repo: Path, docs_dir: str) -> list[str]:
+    """The repo-relative planning docs the prompt lists: markdown files
+    under ``docs_dir``, sorted, capped at :data:`MAX_DOC_FILES`.
+
+    One listing for two consumers — the prompt (:func:`build_import_prompt`)
+    and the budget (:func:`scaled_import_budget`) — so the number the
+    budget scales with is by construction the number of docs the session
+    was actually told to read."""
+    docs = Path(repo) / docs_dir
+    if not docs.is_dir():
+        return []
+    return sorted(
+        str(path.relative_to(repo))
+        for path in docs.rglob("*")
+        if path.is_file() and path.suffix in {".md", ".markdown"}
+    )[:MAX_DOC_FILES]
+
+
+def scaled_import_budget(doc_count: int) -> tuple[int, float]:
+    """The default ``(max_turns, timeout_min)`` for an import listing
+    ``doc_count`` planning docs::
+
+        max_turns    = min(30 + doc_count, 200)
+        timeout_min  = min(20 + doc_count / 5, 120)
+
+    Derived from the two runs that bought it, not guessed:
+
+    * run ``20261105T081854Z-1c569f`` (55 docs, 30 tasks, no self-check)
+      **completed** inside the hard ``max_turns`` 30 while reporting
+      ``num_turns`` 56 in 548 s. Those are different counters: the
+      bundled CLI's result ``num_turns`` increments per user-role
+      message row (the prompt, every tool-result batch), while the cap
+      binds on the query loop's own turn count — 56 rows ≈ 55 docs +
+      the prompt, inside ≤30 counted turns. So ~1 row per listed doc,
+      and a 30-turn base covered reading plus proposing for 55 docs.
+    * the post-#94 run (same repo, plus the write/parse/shape
+      self-check) burned past the hard 20 min and aborted with nothing
+      kept: the self-check rounds are work of the same order as the
+      reading, and the fixed budget had no room for them.
+
+    ``30 + docs`` sizes the cap to the observed row count plus the base
+    the 55-doc run proved sufficient without the self-check (85 turns
+    for 55 docs, ~40% over a doubled-base estimate); ``20 + docs/5``
+    gives that repo 31 min — ~3.4× its observed no-self-check wall time
+    and 11 min past the budget the self-check run already exhausted.
+    Small imports stay at today's defaults in practice (3 docs → 33
+    turns / 20.6 min). Explicit flags always win (:func:`run_import`)."""
+    return (
+        min(DEFAULT_MAX_TURNS + doc_count, TURN_CEILING),
+        min(DEFAULT_TIMEOUT_MIN + doc_count / 5, TIMEOUT_MIN_CEILING),
+    )
+
+
+def validate_budget(
+    max_turns: int | None, timeout_min: float | None
+) -> None:
+    """Refuse an impossible explicit budget before any session starts.
+
+    ``max_turns`` must be an integer in ``[1, TURN_CEILING]``;
+    ``timeout_min`` a float in ``(0, TIMEOUT_MIN_CEILING]`` (NaN and inf
+    fail the comparison and are refused with the same message). None
+    means "not given" and passes — the scaled default applies.
+
+    Raises:
+        ImportRefused: A given budget is outside its bounds — naming the
+            flag, the bound and the value, so the fix is a retyping.
+    """
+    if max_turns is not None and not 1 <= max_turns <= TURN_CEILING:
+        raise ImportRefused(
+            f"--max-turns must be an integer from 1 to {TURN_CEILING}, "
+            f"got {max_turns!r}"
+        )
+    if timeout_min is not None and not 0 < timeout_min <= TIMEOUT_MIN_CEILING:
+        raise ImportRefused(
+            f"--timeout-min must be a number above 0 and at most "
+            f"{TIMEOUT_MIN_CEILING:g}, got {timeout_min!r}"
+        )
+
+
 def build_import_prompt(
     repo: Path, docs_dir: str, records: list[dict], *, project: str | None = None
 ) -> str:
@@ -455,14 +551,7 @@ def build_import_prompt(
     the proposal and the check outputs live under ``$TMPDIR``.
     """
     repo = Path(repo)
-    docs = repo / docs_dir
-    files: list[str] = []
-    if docs.is_dir():
-        files = sorted(
-            str(path.relative_to(repo))
-            for path in docs.rglob("*")
-            if path.is_file() and path.suffix in {".md", ".markdown"}
-        )[:MAX_DOC_FILES]
+    files = _list_planning_docs(repo, docs_dir)
     lines = [
         "You are the factory's importer seat. Read the project's planning",
         "documents and propose a tasks.json queue for them.",
@@ -1071,6 +1160,48 @@ def keep_refused_import_output(
     return exc
 
 
+# ------------------------------------------------------- abort salvage --
+
+
+def _scratch_proposal_path(settings_path: Path) -> Path:
+    """The session's ``$TMPDIR/proposal.json``: the writable scratch the
+    #94 self-check prompt tells the session to write its finished JSON
+    to — the ``tmp`` dir under the scratch sibling of the run's srt
+    settings (``<settings>-scratch/tmp``; session._reviewer_scratch /
+    _scratch_dirs layout, cleaned with the run by ``cleanup_run``)."""
+    scratch = settings_path.with_name(settings_path.name + "-scratch")
+    return scratch / "tmp" / PROPOSAL_OUTPUT_NAME
+
+
+def _abort_refusal(
+    head: str, *, run: RunDir, project: str, factory_root: Path,
+    repo: Path, queue_path: Path, docs_dir: str,
+) -> str:
+    """The refusal message for a session that did not complete.
+
+    Before ``cleanup_run`` sweeps the scratch, the proposal the session
+    had written so far — if any — is copied out through the one writer
+    (:func:`_save_refused_output`: redacted, mode 0600, O_EXCL, under
+    ``<factory-root>/import/``), and the message names the file and the
+    full re-review command. Without a file, the message says so
+    explicitly — never a bare ``aborted`` that leaves the owner guessing
+    what survived. A failed copy never masks the abort."""
+    proposal = _scratch_proposal_path(run.settings_path)
+    try:
+        text = proposal.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return f"{head}; no proposal was written before the abort"
+    except (OSError, ValueError) as exc:
+        return f"{head}; (its last proposal could not be read: {exc})"
+    try:
+        saved = _save_refused_output(text, project, factory_root)
+    except OSError as exc:
+        return f"{head}; (its last proposal could not be saved: {exc})"
+    command = _import_fix_command(saved, repo, queue_path, docs_dir)
+    return f"{head}; its last proposal was saved to {saved}; " \
+           f"review it with {command}"
+
+
 # ------------------------------------------------------------------- entry --
 
 
@@ -1100,6 +1231,8 @@ def run_import(
     confirm: Callable[[str], bool] | None = None,
     factory_root: Path | str | None = None,
     keep_refused: bool = False,
+    max_turns: int | None = None,
+    timeout_min: float | None = None,
 ) -> ImportResult:
     """Propose a queue from the project's planning documents.
 
@@ -1125,22 +1258,29 @@ def run_import(
             eval/replay harness), where re-running is not free. The real
             session (``session=None``) always keeps; a plain stub never
             does.
+        max_turns/timeout_min: The real session's budget. None (the
+            default) scales with the docs the prompt lists
+            (:func:`scaled_import_budget`); an explicit value always wins
+            and is bounds-checked before any session starts
+            (:func:`validate_budget`).
 
     Returns:
         The :class:`ImportResult` — plan, summary, resolved queue path,
         whether the queue was written, and the session's raw output.
 
     Raises:
-        ImportRefused: No session output could be parsed or merged into
-            a schema-valid, all-draft proposal (AC-1/AC-2), or the
-            apply was refused (the queue changed while the confirm
-            waited). When the output was expensive (the real session, or
-            ``keep_refused``), the raw output is saved (redacted, 0600)
-            under ``<factory-root>/import/`` and the message names the
-            file and the full re-review command. A write ``OSError``
-            after the session keeps its type — the copy is still saved,
-            noted on the exception.
+        ImportRefused: An explicit budget is outside its bounds (before
+            any session starts); no session output could be parsed or
+            merged into a schema-valid, all-draft proposal (AC-1/AC-2);
+            or the apply was refused (the queue changed while the
+            confirm waited). When the output was expensive (the real
+            session, or ``keep_refused``), the raw output is saved
+            (redacted, 0600) under ``<factory-root>/import/`` and the
+            message names the file and the full re-review command. A
+            write ``OSError`` after the session keeps its type — the
+            copy is still saved, noted on the exception.
     """
+    validate_budget(max_turns, timeout_min)
     repo = Path(repo)
     if queue_path is None:
         queue_path = repo / ".factory" / "tasks.json"
@@ -1161,9 +1301,17 @@ def run_import(
             # The sandbox settings (docs/network allowlists, protected
             # paths) come from the profile; no profile, no session.
             profile = load_profile(repo / ".factory" / "project.yaml")
+        if max_turns is None or timeout_min is None:
+            scaled_turns, scaled_timeout = scaled_import_budget(
+                len(_list_planning_docs(repo, docs_dir))
+            )
         text = sdk_import_session(
             prompt, repo, profile=profile, queue_path=queue_path,
             factory_root=factory_root,
+            max_turns=max_turns if max_turns is not None else scaled_turns,
+            timeout_min=(timeout_min if timeout_min is not None
+                         else scaled_timeout),
+            docs_dir=docs_dir,
         )
     keep = session is None or keep_refused
     try:
@@ -1207,6 +1355,7 @@ def sdk_import_session(
     factory_root: Path | str | None = None,
     max_turns: int = DEFAULT_MAX_TURNS,
     timeout_min: float = DEFAULT_TIMEOUT_MIN,
+    docs_dir: str = DEFAULT_DOCS_DIR,
 ) -> str:
     """The default importer session: the reviewer seat, sandboxed.
 
@@ -1233,6 +1382,15 @@ def sdk_import_session(
     repo, which has no schema/ of its own, and the narrowed schema is
     what its own output is judged against.
 
+    A session that does not complete — ``aborted`` (wall clock, turn
+    cap), ``failed``, or the outer wall clock (``TimeoutExpired``) — has
+    its scratch's ``$TMPDIR/proposal.json`` (the file the self-check
+    prompt tells it to write) copied out through the one refused-output
+    writer BEFORE ``cleanup_run`` sweeps the scratch, and the refusal
+    names the saved file and the re-review command, or says no proposal
+    was written (:func:`_abort_refusal`). The third full jobfinderos
+    session was lost to exactly this gap.
+
     Args:
         prompt: The importer prompt (:func:`build_import_prompt`).
         repo: The project repo root (cloned, never used as the cwd).
@@ -1241,14 +1399,18 @@ def sdk_import_session(
         queue_path: The queue whose run lease to hold; None or a missing
             file holds none (a fresh project has no orchestrator).
         factory_root: Factory root (default ``~/factory``).
-        max_turns/timeout_min: The session's budget.
+        max_turns/timeout_min: The session's budget. :func:`run_import`
+            passes the scaled default or the caller's explicit values.
+        docs_dir: The planning-docs directory, for the re-review command
+            in an abort refusal (rides along only when non-default).
 
     Raises:
         ImportRefused: No model credential (review a prepared proposal
             with ``factory import --proposal`` instead), the clone or the
             sandbox could not be set up, the session timed out, or it
             ended other than ``completed`` (a reviewer that mutated its
-            clone ends ``failed``).
+            clone ends ``failed``) — the last two salvage the scratch's
+            last proposal, when one exists.
     """
     token = seat_token()
     if not token:
@@ -1258,6 +1420,9 @@ def sdk_import_session(
             "review it with `factory import --proposal <file>`"
         )
     root = Path(factory_root) if factory_root else FACTORY_ROOT_DEFAULT
+    repo = Path(repo)
+    if queue_path is None:
+        queue_path = repo / ".factory" / "tasks.json"
     queue = (
         TaskQueue(queue_path)
         if queue_path is not None and Path(queue_path).is_file() else None
@@ -1285,16 +1450,30 @@ def sdk_import_session(
             # Runner setup errors: no bundled CLI / token (SessionConfigError),
             # srt missing or not at the pin (SandboxError, from ensure_srt
             # before anything spawns), a run-dir fault (RunError). Each is
-            # a refusal (exit 1 at the CLI), never a traceback.
+            # a refusal (exit 1 at the CLI), never a traceback. The session
+            # never started, so there is no scratch proposal to salvage.
             raise ImportRefused(f"the importer session could not run: {exc}") from exc
         except subprocess.TimeoutExpired as exc:
-            raise ImportRefused(
-                f"the importer session timed out after {exc.timeout:.0f}s"
-            ) from exc
+            # The outer wall clock (the runner hung past its teardown
+            # grace): salvage before cleanup, exactly like an aborted
+            # record — the scratch is still on disk here.
+            raise ImportRefused(_abort_refusal(
+                f"the importer session timed out after {exc.timeout:.0f}s",
+                run=run, project=profile["name"], factory_root=root,
+                repo=repo, queue_path=Path(queue_path), docs_dir=docs_dir,
+            )) from exc
+        else:
+            if record.status != "completed":
+                # The salvage (inside the raise's argument) runs BEFORE
+                # the finally's cleanup_run sweeps the scratch: any other
+                # placement reads a deleted file. This is the seam the
+                # third lost jobfinderos session exposed.
+                raise ImportRefused(_abort_refusal(
+                    f"the importer session ended {record.status}: "
+                    f"{record.reason}",
+                    run=run, project=profile["name"], factory_root=root,
+                    repo=repo, queue_path=Path(queue_path), docs_dir=docs_dir,
+                ))
         finally:
             cleanup_run(run)
-    if record.status != "completed":
-        raise ImportRefused(
-            f"the importer session ended {record.status}: {record.reason}"
-        )
     return record.result or ""
