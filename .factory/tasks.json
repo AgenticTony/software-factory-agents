@@ -1122,7 +1122,8 @@
         "F-44",
         "F-45",
         "F-46",
-        "F-47"
+        "F-47",
+        "F-56"
       ],
       "risk": [
         "cross_repo"
@@ -4319,7 +4320,7 @@
         },
         {
           "id": "AC-3",
-          "text": "(M-14) `docs/proposals-2026-10-30-borrowings.md` is deleted or re-baselined with ids from F-56 up; no doc assigns a live WO id a second meaning.",
+          "text": "(M-14) `docs/proposals-2026-10-30-borrowings.md` is deleted or re-baselined with ids from F-58 up; no doc assigns a live WO id a second meaning.",
           "check": {
             "type": "test",
             "ref": "tests/test_f52.py::test_ac_3"
@@ -4511,6 +4512,140 @@
           "check": {
             "type": "test",
             "ref": "tests/test_f55.py::test_ac_3"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-56",
+      "title": "Session record transport",
+      "source": "BUILD-ORDER.md#f-56--session-record-transport",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-06",
+        "F-30",
+        "F-43"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "The session entry writes its record to a file the orchestrator names (outside the clone, writable by the sandbox, atomic temp-and-rename) and the orchestrator reads it from there; stdout carries only `factory-trace` lines. A test with a 2 MB record whose stdout is cut mid-line still yields the full record.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f56.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "A missing or unreadable record raises an error naming the srt exit code, the signal if any, and a stderr tail passed through the F-43 seam; full stdout and stderr are saved together under `<factory-root>/sessions/`. A fake sandbox that exits 1 with stderr asserts all three appear.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f56.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "The record's `permission_denials` is bounded: each `tool_input` capped (a documented size), the list capped, and a dropped count recorded. A test with 200 denials of 5 KB each yields a record under the documented bound with the count.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f56.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "The 81,920-byte truncation is reproduced or bounded under real srt (candidate: srt's dead-control-channel kill, `node_modules/@anthropic-ai/sandbox-runtime/dist/cli.js`), and when srt reports killing the command the error says so. The finding is recorded in the WO's ledger entry.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f56.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "When a session completed but its record is unusable, `factory import` salvages `$TMPDIR/proposal.json` exactly as the F-12 abort path does (PR #95), and the refusal names the saved file and the `--proposal` command.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f56.py::test_ac_5"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-57",
+      "title": "Importer robustness: per-task tool, repair turn, prose eval",
+      "source": "BUILD-ORDER.md#f-57--importer-robustness-per-task-tool-repair-turn-prose-eval",
+      "kind": "build",
+      "priority": "P2",
+      "status": "draft",
+      "depends_on": [
+        "F-12",
+        "F-49",
+        "F-56"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "A `propose_task(task)` tool on the importer seat (the vent pattern, `factory/vent.py`) validates one task per call against the staged proposal schema and the import rules, and returns `accepted <id>` or every violation. Re-proposing an id replaces it; the accepted set is the proposal; zero calls falls back to the text answer. Tests cover accept, every-violation, replace, forbidden fields and the fallback.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f57.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "A refused proposal from a real session gets ONE repair session (the saved output, the full violation list and the contract; no doc re-reading; a turn budget well under the import's) instead of a full re-run. Quota stops it, it is a trace event, and a failed repair names both saved files. Scripted-session tests cover success, failure, quota and a stub session (no repair).",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f57.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "A prose-docs fixture repo (three prose work orders with no contract-shaped content, one owner-only, one too big for size M) drives an offline test: a scripted session returning the 2026-11-05 broken shapes (risk as a string, boolean gates, `AC1` ids, check type `grep`, size `L`, `P0`) is refused with every violation and fixed by the repair path.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f57.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "`factory eval --importer` runs one real import against the fixture on demand (never in routine CI) and reports schema validity, task count and whether the oversized work order was split; the owner runs it once and records the report.",
+          "check": {
+            "type": "manual",
+            "expect": "owner tick evidence: the re-run baseline report"
           }
         }
       ],

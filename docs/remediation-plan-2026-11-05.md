@@ -10,7 +10,7 @@ code. Every doc finding closes with a mechanical check where one is possible. Fo
 decisions, not fixes. They're marked **DECIDE** and have a recommendation.
 
 **Ids:** new WOs start at F-43. F-36 stays unused. The untracked
-`docs/proposals-2026-10-30-borrowings.md` reuses F-40/F-41, and F-52 resolves that.
+`docs/proposals-2026-10-30-borrowings.md` reuses F-40/F-41, and F-52 resolves that. F-56 and F-57 come from the F-13 import run, not the review (§1b).
 
 ---
 
@@ -105,7 +105,7 @@ control sequences.
 **F-52 — Docs truth pass** · — · S · factory-built candidate (check protected docs)
 - AC-1 (M-12) **DECIDE:** recommendation is to delete the queue-marker regeneration claim from `TASK-CONTRACT.md` (lines 13 and 144). `tasks.json` plus `factory status` is the one source; a second rendered table is the duplicated truth §7 warns about.
 - AC-2 (M-13) VALIDATOR-SPEC's done rule names the no-deploy carve-out, and marks L3/L4 as not yet built until F-14/F-15 land.
-- AC-3 (M-14) The borrowings proposals doc is deleted, or re-baselined with ids from F-56 up.
+- AC-3 (M-14) The borrowings proposals doc is deleted, or re-baselined with ids from F-58 up.
 - AC-4 (m-18) README: "never skipped" names the INC-007 exception, "every layer" becomes L0–L2, the stale WO range is fixed, and BOOTSTRAP.md's "frozen" header is corrected.
 - AC-5 (m-19) VALIDATOR-SPEC names `prompts/reviewer.md` as the L2 base, not `verifier.md`.
 - AC-6 (I-13, I-14, I-15) BUILD-ORDER's build-order narrative is brought current; F-13 step 2 names the right file; DESIGN's vendored-skills list matches what's vendored.
@@ -130,14 +130,24 @@ Pure extraction: no behavior change. The schema forbids size L, so the old F-53 
 
 ---
 
+### 1b. From the F-13 import run (not review findings)
+
+Both are drafted in `BUILD-ORDER.md` (Phase 1r) and `.factory/tasks.json`; BUILD-ORDER is canonical.
+
+**F-56 — Session record transport** · factory_control · M · interactive · **Tier 1** (gates F-13 step 5)
+Three of four real importer runs on 2026-11-05 lost the session record to a truncated stdout line; the fourth line was exactly 81,920 bytes, cut inside `permission_denials`. Any seat on a real run can hit it. The record moves to a file, failures name the srt exit code and a scrubbed stderr tail, `permission_denials` is bounded, the truncation is reproduced or bounded, and the importer salvages on this path too.
+
+**F-57 — Importer robustness: per-task tool, repair turn, prose eval** · factory_control · M · interactive · Tier 2 · depends F-49, F-56
+A `propose_task` tool validates each task as it is written, one repair session replaces a full re-run, and a prose-docs fixture plus `factory eval --importer` measure the importer on a repo whose docs aren't contract-shaped.
+
 ## 2. Placement in the build order
 
 ```
-now ──► F-43 ─► F-44 ─► F-45 ─► F-46 ─► F-47        (Tier 1, sequential: each touches the judge)
+now ──► F-43 ─► F-44 ─► F-45 ─► F-46 ─► F-47 ─► F-56 (Tier 1, sequential: each touches the judge)
                                    │
         owner: client data step ───┤
                                    ▼
-        F-13 steps 4–5 (first real outside run)   ║  F-48 → F-49 → F-51   (Tier 2, interactive)
+        F-13 steps 4–5 (first real outside run)   ║  F-48 → F-49 → F-51 → F-57 (Tier 2, interactive)
                                                    ║  F-50, F-52           (factory-built candidates)
                                    ▼
         F-53 ─► F-54 ─► F-55                       (Tier 3)
@@ -145,7 +155,7 @@ now ──► F-43 ─► F-44 ─► F-45 ─► F-46 ─► F-47        (Tier 
         F-14 (L4) · F-15 (L3)  ─►  F-17 (second outside project)
 ```
 
-- F-13 gets F-43 to F-47 added to its dependencies. That's a contract change, so it gets re-approved through `factory approve`. F-13 is still `draft`, so nothing in progress breaks.
+- F-13 gets F-43 to F-47 and F-56 added to its dependencies. That's a contract change, so it gets re-approved through `factory approve`. F-13 is still `draft`, so nothing in progress breaks.
 - F-14 and F-15 get F-54 (the pipeline seam) as a dependency, so L3/L4 land on the seam instead of in a 1,136-line function.
 - F-16's baseline is re-measured in F-48 AC-5.
 - Tier 1 order: redaction first (the only finding that leaks off the machine), then verdicts (the product's promise), then the queue wedge, then evasion, then the read boundary.

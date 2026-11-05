@@ -25,7 +25,7 @@ The factory's own build plan, written in the format the factory will consume: on
 | **F-10** | `factory run` / `factory loop` + PR creation | 1 | F-03, F-04, F-06, F-07, F-08, F-09 | deploy | M |
 | **F-11** | `factory status`: daily summary + metrics | 1 | F-03, F-23, F-24, F-25, F-26 | — | S |
 | **F-12** | Importer (`factory import`) | 1 | F-06, F-02, F-23, F-24, F-25, F-26 | — | M |
-| **F-13** | Onboard JobFinderOS (pilot) | 1 | F-00, F-11, F-12, F-16, F-22, F-27, F-28, F-41, F-42, F-43, F-44, F-45, F-46, F-47 | cross_repo | owner |
+| **F-13** | Onboard JobFinderOS (pilot) | 1 | F-00, F-11, F-12, F-16, F-22, F-27, F-28, F-41, F-42, F-43, F-44, F-45, F-46, F-47, F-56 | cross_repo | owner |
 | **F-14** | L4 `verify-live` + merged/deployed tracking | 2 | F-10, F-54 | deploy | M |
 | **F-15** | L3 holdout runner | 2 | F-10, F-54 | — | M |
 | **F-16** | Seeded-bug validator eval | 2 | F-07, F-08, F-09, F-38 | — | M |
@@ -67,6 +67,8 @@ The factory's own build plan, written in the format the factory will consume: on
 | **F-53** | Split `_run_task` into phase functions | 1r | F-43, F-44, F-45, F-46, F-47 | factory_control | M |
 | **F-54** | Validation-pipeline seam | 1r | F-53, F-48 | factory_control | M |
 | **F-55** | Module hygiene | 1r | F-54 | factory_control | M |
+| **F-56** | Session record transport | 1r | F-06, F-30, F-43 | factory_control | M |
+| **F-57** | Importer robustness: per-task tool, repair turn, prose eval | 1r | F-12, F-49, F-56 | factory_control | M |
 
 Order to build in: **F-00 (in parallel) → F-01 → F-02 → F-03 → F-04 → F-07 → F-08 → F-05 → F-06 → F-09 → F-10 → F-29** (done), **then F-24 → F-23 → F-25 → F-26 → F-27 → F-30 → F-33 → F-28 → F-11 → F-12 → F-31 → F-34 → F-35 → F-37 → F-38 → F-16 → F-32 → F-22 → F-41 → F-42 → F-13**; F-39 follows F-22 whenever its admission path is chosen at spec approval — it gates nothing else. The deterministic core (F-02–F-04, F-07, F-08) went first: it's pure Python and testable without any model. F-29 went right after them because nothing else could close without it: F-00 and F-06 were stuck on owner steps no command could tick, and F-09/F-10 can't reconcile until F-06 is done. Hardening comes next, rehearsal fixture first so every later change is checked against a realistic repo. F-30 lands before F-28 so the first unattended loop is traceable while it runs, not only afterwards. F-33 lands before F-28 too: a credential hit escalates with no retry, so the sentinels' false-positive rate is measured before an unattended loop depends on them. F-28 then runs the factory on its own F-11 and F-12. F-31 (dashboard) only reads, but it serves trace content to the browser and owns the Host check that F-34, F-35 and F-37 lean on, so it is risk-flagged `privacy` — its Door is one-way under F-10 AC-9 — while remaining the next WO the factory can build for itself: it touches no protected path, and the flag routes its PR through the fuller Merge Danger review. F-34, F-35 and F-37: all three are built interactively (factory_control: they change what reaches the queue and how — F-34 and F-35 carry approvals to it, F-37 adds draft work orders to it from a seat with a security-sensitive read-plus-fetch surface), never by the factory itself. F-34 and F-37 also carry `privacy` — operator transcripts and client briefs are personal data at rest — so their Doors are one-way under F-10 AC-9 too. F-32 changes how retries spend tokens, so it waits until F-30 and F-28 give a baseline to compare against. Neither F-31 nor F-32 blocks F-13. F-38 lands before F-16 (F-16 depends on it) so the seeded-bug eval measures the parallel reviewer the queue will actually run, not the single reviewer it replaces — the F-28 baseline (independent review 8 findings, L2 2) is the case for not waiting. F-16 measures how much each layer catches before any outside project depends on it. **Review remediation (Phase 1r, from CODE-REVIEW-2026-11-05):** F-43 → F-44 → F-45 → F-46 → F-47 before F-13's first `factory run` on JobFinderOS; F-48 → F-49 → F-51 alongside F-13, with F-50 and F-52 as factory-built candidates; then F-53 → F-54 → F-55, and F-14/F-15 build on F-54's seam.
 
@@ -538,7 +540,7 @@ CODE-REVIEW-2026-11-05.md M-12, M-13, M-14, m-18, m-19, I-13 to I-15, A-8: desti
 Acceptance:
 - AC-1 (M-12) TASK-CONTRACT's queue-marker regeneration claim is removed (`tasks.json` plus `factory status` is the one source; the owner may instead choose to implement it at approval).
 - AC-2 (M-13) VALIDATOR-SPEC's done rule names the no-deploy close-out and marks L3/L4 as not yet built until F-14/F-15 land.
-- AC-3 (M-14) `docs/proposals-2026-10-30-borrowings.md` is deleted or re-baselined with ids from F-56 up; no doc assigns a live WO id a second meaning.
+- AC-3 (M-14) `docs/proposals-2026-10-30-borrowings.md` is deleted or re-baselined with ids from F-58 up; no doc assigns a live WO id a second meaning.
 - AC-4 (m-18) README names the INC-007 skip exception, says the eval runs L0–L2, carries a current WO range, and BOOTSTRAP.md's header matches its use.
 - AC-5 (m-19) VALIDATOR-SPEC names `prompts/reviewer.md` as the L2 base prompt.
 - AC-6 (I-13, I-14, I-15) BUILD-ORDER's build-order narrative is current, F-13 step 2 names the right file, and DESIGN's vendored-skills list matches what is vendored.
@@ -566,6 +568,25 @@ Acceptance:
 - AC-1 (A-3) Venv creation, the prompt builders and `reclaim_runs` move out of `orchestrator.py`; `now_iso()` moves to `runs.py`; `importer.py` no longer imports `_atomic_write_json` privately.
 - AC-2 (A-4) The `contract`/`toolkit` import cycle is broken and an import-graph test asserts the package layering is acyclic.
 - AC-3 (A-5) One git wrapper; a test asserts no direct `subprocess` git call outside it.
+
+### F-56 — Session record transport
+Found in the 2026-11-05 jobfinderos import (F-13 step 3), not in CODE-REVIEW-2026-11-05.md: the sandboxed entry's record crosses the srt stdout pipe as one JSON line, and three of four real importer runs lost it to a truncated line. The fourth run's record line was exactly 81,920 bytes (5 × 16 KiB), cut inside `permission_denials` (the reviewer's denied Bash commands echoed back in full). The cause is unproven: probes ruled out a non-blocking stdout, the pump and record size alone (a 400 KB record survives). A truncated record loses a completed session, which any seat on a real run can hit, so this gates F-13 step 5 alongside Tier 1.
+
+Acceptance:
+- AC-1 The session entry writes its record to a file the orchestrator names (outside the clone, writable by the sandbox, atomic temp-and-rename) and the orchestrator reads it from there; stdout carries only `factory-trace` lines. A test with a 2 MB record whose stdout is cut mid-line still yields the full record.
+- AC-2 A missing or unreadable record raises an error naming the srt exit code, the signal if any, and a stderr tail passed through the F-43 seam; full stdout and stderr are saved together under `<factory-root>/sessions/`. A fake sandbox that exits 1 with stderr asserts all three appear.
+- AC-3 The record's `permission_denials` is bounded: each `tool_input` capped (a documented size), the list capped, and a dropped count recorded. A test with 200 denials of 5 KB each yields a record under the documented bound with the count.
+- AC-4 The 81,920-byte truncation is reproduced or bounded under real srt (candidate: srt's dead-control-channel kill, `node_modules/@anthropic-ai/sandbox-runtime/dist/cli.js`), and when srt reports killing the command the error says so. The finding is recorded in the WO's ledger entry.
+- AC-5 When a session completed but its record is unusable, `factory import` salvages `$TMPDIR/proposal.json` exactly as the F-12 abort path does (PR #95), and the refusal names the saved file and the `--proposal` command.
+
+### F-57 — Importer robustness: per-task tool, repair turn, prose eval
+Found in the 2026-11-05 jobfinderos import: one 47 KB hand-written JSON answer broke on syntax and on every schema shape. PRs #94/#95 put the shapes in the prompt, staged a self-check and kept refused or aborted output, but each failure still costs a full re-run, and no test proves a real model can import a repo whose docs are prose. This WO validates per task as it is written, repairs instead of re-running, and measures the importer on a prose fixture.
+
+Acceptance:
+- AC-1 A `propose_task(task)` tool on the importer seat (the vent pattern, `factory/vent.py`) validates one task per call against the staged proposal schema and the import rules, and returns `accepted <id>` or every violation. Re-proposing an id replaces it; the accepted set is the proposal; zero calls falls back to the text answer. Tests cover accept, every-violation, replace, forbidden fields and the fallback.
+- AC-2 A refused proposal from a real session gets ONE repair session (the saved output, the full violation list and the contract; no doc re-reading; a turn budget well under the import's) instead of a full re-run. Quota stops it, it is a trace event, and a failed repair names both saved files. Scripted-session tests cover success, failure, quota and a stub session (no repair).
+- AC-3 A prose-docs fixture repo (three prose work orders with no contract-shaped content, one owner-only, one too big for size M) drives an offline test: a scripted session returning the 2026-11-05 broken shapes (risk as a string, boolean gates, `AC1` ids, check type `grep`, size `L`, `P0`) is refused with every violation and fixed by the repair path.
+- AC-4 `factory eval --importer` runs one real import against the fixture on demand (never in routine CI) and reports schema validity, task count and whether the oversized work order was split; the owner runs it once and records the report.
 
 ## Phase 1c — First outside project
 
