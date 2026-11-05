@@ -258,7 +258,11 @@ ASSERTION_PATTERNS = (
 # string-blanked line so padding with prose can never level the count.
 # `pytest.raises` sits on BOTH sides (F-44): a block MOVED within a file
 # removes one with-line and adds one — counting it as a replacement keeps
-# moves quiet exactly as moved asserts are.
+# moves quiet exactly as moved asserts do. Review round 1: the raises
+# entry is ANCHORED like the others and matched with any trailing `#`
+# comment removed — `result = parse(x)  # was pytest.raises` and
+# `check = pytest.raises` (an alias assignment, no call) are prose, not
+# replacement statements. The REMOVED side stays broad by design.
 _TAUTOLOGY_ASSERT = re.compile(
     r"""^assert\s+(?:True|False|None|[-\d.]+|(["']).*\1)\s*$"""
 )
@@ -266,7 +270,7 @@ _ASSERTION_STATEMENT = (
     re.compile(r"^assert\b"),           # a bare assert statement
     re.compile(r"^\w+\.assert\w*\("),   # self.assertEqual / mock.assert_…
     re.compile(r"\bexpect\("),          # jest/vitest
-    re.compile(r"\bpytest\.raises\b|\braises\s*\("),
+    re.compile(r"^(?:with\s+)?(?:pytest\.)?raises\("),
 )
 
 
@@ -276,11 +280,15 @@ def _is_replacement_assertion(text: str) -> bool:
     ``assert True`` (or any constant) is a tautology, a string or
     comment mentioning "assert" is prose: neither restores what a
     removed assertion checked, so neither levels the per-file count.
+    Matching runs on the string-blanked line with any trailing ``#``
+    comment cut (F-44 round 1: the blank runs first, so a ``#`` inside a
+    quoted string never truncates code before it).
     """
     line = text.strip()
     if not _is_code_line(text) or _TAUTOLOGY_ASSERT.fullmatch(line):
         return False
-    return any(p.search(_outside_strings(line)) for p in _ASSERTION_STATEMENT)
+    code = _outside_strings(line).split("#", 1)[0]
+    return any(p.search(code) for p in _ASSERTION_STATEMENT)
 
 # Comment openers across the languages the marker and assertion patterns
 # cover: a line starting with one is prose about code, not code — it is

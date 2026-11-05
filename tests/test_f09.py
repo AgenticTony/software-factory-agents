@@ -838,12 +838,27 @@ def test_review6_conflicting_verdict_objects_are_invalid():
     assert report.verdict == "fail"
     assert report.parse_error is not None
 
-    # Agreeing repeats are accepted — the stated verdict stands.
+    # Agreeing repeats are accepted — the stated verdict stands, with no
+    # parse error (and therefore no retry). PASS+PASS…
     agreeing = parse_verdict(
         f"```json\n{real}\n```\nrestated:\n{real}"
     )
     assert agreeing.verdict == "pass"
     assert agreeing.parse_error is None
+    # …and FAIL+FAIL: the original review6 concern in its failing half —
+    # an agreeing example quoted before a real FAIL must not mask it, void
+    # it, or burn a retry (F-44 round 1, finding 7).
+    fail_verdict = json.dumps(
+        {"verdict": "fail",
+         "findings": [{"id": "R-1", "axis": "spec", "severity": "blocking",
+                       "text": "the defect"}]}
+    )
+    agreeing_fail = parse_verdict(
+        f"an example FAIL verdict:\n```json\n{fail_verdict}\n```\n"
+        f"the actual review agrees:\n```json\n{fail_verdict}\n```"
+    )
+    assert agreeing_fail.verdict == "fail"
+    assert agreeing_fail.parse_error is None
 
 
 def test_review7_duplicate_keys_are_an_invalid_verdict():

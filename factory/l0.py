@@ -86,6 +86,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from factory.attribution import attribution_match
+from factory.egress import strip_control_sequences
 from factory.gates import (
     CommandResult,
     CommandRunner,
@@ -129,15 +130,22 @@ FAILURE_MARKERS = (
     re.compile(r"^(?:error|fatal)\b"),  # tool-level error, no location
 )
 
-# F-44 (review m-8): a line of the runner's output counts as a test-count
-# SUMMARY LINE only in one of the shapes the runners actually print —
-# pytest's bordered final line, pytest -q's bare tail, jest's ``Tests:``
-# line. Every ``N passed`` claim ON a summary line is collected (a fake
-# count injected into the same line is a second, disagreeing claim).
-_TEST_SUMMARY_LINE = (
-    re.compile(r"^\s*=+\s*\d.*\bpassed\b"),   # pytest: ==== 5 passed ... ====
-    re.compile(r"^\s*\d+\s+passed\b"),        # pytest -q: 5 passed in 0.01s
-    re.compile(r"^\s*Tests:\s.*\bpassed\b"),  # jest: Tests: 2 failed, 5 passed, 8 total
+# F-44 (review m-8, round 1): the runner's RESULT LINE — the terminal line
+# the runner itself prints. pytest's is bordered (``==== 5 passed ====``)
+# or, under -q, bare; either reports comma-separated count parts and ends
+# ``in N.NNs``. jest's is the ``Tests:`` line. Control sequences (colour —
+# PY_COLORS/FORCE_COLOR/CI, addopts --color=yes) are stripped before the
+# shapes are matched, so honest coloured output reads like plain output.
+_PYTEST_PART = r"\d+ (?:passed|failed|skipped|deselected|xfailed|xpassed|warnings?|errors?)"
+_TEST_RESULT_LINE = (
+    # pytest, bordered or bare: [parts, ]parts in N.NNs  /  no tests ran
+    # (xdist appends a human duration in parens: "… in 374.65s (0:06:14)")
+    re.compile(
+        rf"^\s*=*\s*(?:(?:{_PYTEST_PART}, )*{_PYTEST_PART}|no tests ran)"
+        r"\s+in \d+(?:\.\d+)?s(?:\s*\([^)]*\))?\s*=*\s*$"
+    ),
+    # jest: Tests: 2 failed, 5 passed, 8 total
+    re.compile(r"^\s*Tests:\s.*\b\d+\s+total\b"),
 )
 _TEST_COUNT = re.compile(r"(\d+)\s+passed")
 
@@ -232,31 +240,45 @@ def repo_owned(path: str) -> bool:
 
 
 def parse_test_count(output: str) -> int | None:
-    """Read the passing-test count from the runner's FINAL summary line.
+    """Read the passing-test count from the runner's FINAL RESULT LINE.
 
-    F-44 (review m-8): the pre-F-44 read took the maximum ``N passed``
-    anywhere in the output, so a test that printed ``999999 passed``
-    cleared the min-tests floor the suite never met. The count now comes
-    from the runner's own summary lines — pytest's bordered final line,
-    pytest -q's bare tail, jest's ``Tests:`` line — and:
+    F-44 (review m-8), round 1 — the final-result-line rule: colour and
+    other control sequences are stripped first (the egress seam's one
+    stripper), then the runner's own terminal result line is located —
+    pytest's bordered or bare ``[parts, ]parts in N.NNs`` (any combination
+    of passed/failed/skipped/deselected/xfailed/xpassed/warnings/errors,
+    or ``no tests ran``), jest's ``Tests:`` line. Exactly one result line:
 
-    * no summary line at all → ``None`` (the floor treats unknown as NOT
-      cleared, never as 0 or a guess);
-    * summary lines that DISAGREE → ``None``: the runner prints exactly
-      one count, so differing claims mean a printed forgery (mid-run, or
-      from ``atexit``/a session-finish hook AFTER the real summary —
-      whichever line is "last" is unknowable, and both are untrusted) or
-      an anomalous run; either way there is no recognisable final summary;
-    * every claim agreeing → that count (an echo that agrees with the
-      runner is not a forgery).
+    * its passed count is the count — **0 when it reports none** (an
+      all-skipped or empty run clears no floor, and a forged ``N passed``
+      printed after it is a SECOND result line, refused below, not the
+      only claim — review round 1, finding 1);
+    * two passed claims on the one line is not a readable result
+      (``=== 3 passed, 999999 passed in 0.1s ===`` → ``None``).
+
+    Zero result lines → ``None`` (the floor treats unknown as NOT
+    cleared). MORE than one result line → ``None``: the runner prints
+    exactly one, so a second is a forgery printed after the real one
+    (mid-run, or from ``atexit``/a session-finish hook — whichever is
+    "last" is unknowable, so neither is trusted) or a second suite, and
+    both are refused as ambiguous — **the floor supports ONE runner
+    invocation per test command** (see the project schema's
+    ``commands.test``); chain suites in one command and the count reads
+    unknown, a human decides. A printed bare ``N passed`` that is not
+    result-shaped is not the runner's line: the honest result stands.
     """
-    claims: set[int] = set()
-    for line in output.splitlines():
-        if not any(p.search(line) for p in _TEST_SUMMARY_LINE):
-            continue
-        claims.update(int(n) for n in _TEST_COUNT.findall(line))
-    if len(claims) != 1:
+    result_lines = [
+        line
+        for line in strip_control_sequences(output).splitlines()
+        if any(p.search(line) for p in _TEST_RESULT_LINE)
+    ]
+    if len(result_lines) != 1:
         return None
+    claims = {int(n) for n in _TEST_COUNT.findall(result_lines[0])}
+    if not claims:
+        return 0  # the runner's result line reports no passed count
+    if len(claims) != 1:
+        return None  # two passed counts on the runner's own line
     return claims.pop()
 
 

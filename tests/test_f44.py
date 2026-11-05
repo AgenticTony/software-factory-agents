@@ -188,14 +188,18 @@ def test_ac_3(tmp_path: Path):
     # No recognisable summary -> None (not 0, not a guess).
     assert parse_test_count("no counts here") is None
 
-    # m-8: a printed fake count must not clear the floor — the max
-    # anywhere in the output is not the runner's count.
-    assert parse_test_count("999999 passed\n....\n3 passed in 0.02s") is None
-    # A fake count INSIDE the summary line: two claims on the runner's own
-    # line is not a recognisable summary either.
+    # m-8, review round 1: the count comes from the runner's FINAL RESULT
+    # LINE (see test_review3). A bare printed count is not a result line —
+    # the honest result stands; a full result-shaped forgery makes two
+    # result lines and is refused as ambiguous.
+    assert parse_test_count("999999 passed\n....\n3 passed in 0.02s") == 3
+    assert parse_test_count(
+        "999999 passed in 0.01s\n....\n3 passed in 0.02s"
+    ) is None
+    # A fake count INSIDE the result line: two claims on the runner's own
+    # line is not a readable result either.
     assert parse_test_count("=== 3 passed, 999999 passed in 0.1s ===") is None
-    # Repeated agreeing summaries are one count (an echo that agrees with
-    # the runner is not a forgery).
+    # A prose echo that is not result-shaped never conflicts with the line.
     assert parse_test_count("3 passed\n3 passed in 0.02s") == 3
 
     # The floor treats None as NOT cleared (verified, not assumed): a
@@ -436,3 +440,256 @@ def test_hostile_raises_removal_rewritten(tmp_path: Path):
                  "                    do_thing()"],
     )
     assert "assertion_removed" in _ids([indented])
+
+
+# --------------- review round 1 (PR #100): seven findings, red-first ------
+
+
+def test_review1_all_skipped_suite_plus_atexit_fake_count(tmp_path: Path):
+    """Finding 1 (confirmed bypass): when the real result line reports no
+    passed count (every test skipped), the old claim-collector only saw
+    the forged `999999 passed` — the forgery was the ONLY claim and became
+    the count, clearing the floor with zero tests run. Real pytest run."""
+    from factory.l0 import parse_test_count
+
+    project = tmp_path / "skipped"
+    (project / "tests").mkdir(parents=True)
+    (project / "tests" / "test_probe.py").write_text(
+        "import atexit\n"
+        "import pytest\n"
+        "\n"
+        'atexit.register(lambda: print("999999 passed in 0.01s"))\n'
+        "\n"
+        "\n"
+        "@pytest.mark.skip\n"
+        "def test_a():\n"
+        "    assert False\n"
+        "\n"
+        "\n"
+        "@pytest.mark.skip\n"
+        "def test_b():\n"
+        "    assert False\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         "tests"],
+        cwd=project, capture_output=True, text=True, timeout=120,
+    )
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 0  # a skipped-clean suite exits 0
+    assert "2 skipped in" in output  # the real result line: no passed count
+    assert "999999 passed in 0.01s" in output  # the forgery, after it
+    # The runner's result line reports zero passed; a later full-shape
+    # fake is a SECOND result line — ambiguous, not a count. The floor
+    # cannot be cleared by it (and an honest all-skipped run reads 0,
+    # which no floor clears).
+    assert parse_test_count(output) is None
+    # The honest all-skipped run alone reads 0 (not None, not a guess).
+    assert parse_test_count("2 skipped in 0.00s") == 0
+    assert parse_test_count("no tests ran in 0.01s") == 0
+
+
+def test_review2_colored_and_q_failure_tails(tmp_path: Path):
+    """Finding 2 (confirmed regression): the anchored shapes missed ANSI-
+    coloured output (PY_COLORS/FORCE_COLOR/CI, addopts --color=yes) and
+    pytest -q's tail when a failure leads (`1 failed, 1 passed in …`) —
+    honest runs read None and every floored task failed test_count_unknown.
+    Both halves against real pytest."""
+    from factory.l0 import parse_test_count
+
+    project = tmp_path / "colour"
+    (project / "tests").mkdir(parents=True)
+    (project / "tests" / "test_probe.py").write_text(TWO_TESTS)
+    env = dict(**__import__("os").environ, PY_COLORS="1")
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         "tests"],
+        cwd=project, capture_output=True, text=True, timeout=120, env=env,
+    )
+    output = proc.stdout + proc.stderr
+    assert "\x1b[" in output  # colour really was emitted
+    assert "2 passed" in output
+    assert parse_test_count(output) == 2  # the stripped tail reads clean
+
+    fail_project = tmp_path / "qfail"
+    (fail_project / "tests").mkdir(parents=True)
+    (fail_project / "tests" / "test_probe.py").write_text(
+        "def test_bad():\n    assert False\n"
+        "\n"
+        "\ndef test_ok():\n    assert True\n"
+    )
+    proc2 = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         "tests"],
+        cwd=fail_project, capture_output=True, text=True, timeout=120,
+    )
+    output2 = proc2.stdout + proc2.stderr
+    assert proc2.returncode != 0
+    assert "1 failed, 1 passed in" in output2  # the failure-led -q tail
+    assert parse_test_count(output2) == 1  # readable: no spurious unknown
+
+
+def test_review3_the_final_result_line_rule():
+    """Finding 3 (altitude): the count comes from the runner's FINAL RESULT
+    LINE — whatever it reports — re-implemented as: strip control
+    sequences, find result-shaped lines (pytest bordered, pytest -q's bare
+    `… in N.NNs` tail with any leading parts, jest `Tests:`); exactly one
+    result line -> its passed count (0 when it reports none); zero or more
+    than one -> None (a second result line is a forgery after the real one
+    or a second suite — both refused)."""
+    from factory.l0 import parse_test_count
+
+    # exactly one result line, in each runner shape
+    assert parse_test_count("==== 46 passed, 2 warnings in 0.12s ====") == 46
+    assert parse_test_count("..........\n46 passed in 0.05s") == 46
+    assert parse_test_count("1 failed, 45 passed, 1 error in 0.5s") == 45
+    assert parse_test_count("Tests:       2 failed, 5 passed, 8 total") == 5
+    # a result line that reports no passed count reads 0 (finding 1)
+    assert parse_test_count("2 skipped in 0.00s") == 0
+    assert parse_test_count("=== no tests ran in 0.01s ===") == 0
+    # no result line at all -> None
+    assert parse_test_count("no counts here") is None
+    assert parse_test_count("999999 passed\n....\nran fine") is None
+    # two full result lines -> ambiguous (forgery or second suite)
+    assert parse_test_count(
+        "999999 passed in 0.01s\n....\n3 passed in 0.02s"
+    ) is None
+    assert parse_test_count(
+        "2 passed in 0.00s\n999999 passed in 0.01s"
+    ) is None
+    # ...even when they agree: the runner prints exactly one result line
+    assert parse_test_count("3 passed in 0.1s\n3 passed in 0.2s") is None
+    # a bare count print (no result shape) is not the runner's line: the
+    # honest result stands
+    assert parse_test_count("999999 passed\n....\n3 passed in 0.02s") == 3
+    # two passed claims INSIDE one result line: not a readable result
+    assert parse_test_count("=== 3 passed, 999999 passed in 0.1s ===") is None
+    # colour is stripped before any shape is matched
+    assert parse_test_count("\x1b[32m1 passed\x1b[0m in 0.00s") == 1
+
+
+def test_review4_multi_suite_commands_are_ambiguous():
+    """Finding 4, option (a) — chosen: the floor supports ONE runner
+    invocation per test command. `pytest a -q && pytest b -q` prints two
+    result lines; reading either (first, last, max) invents a count the
+    runner never stated, and summing rewards a dropped suite's sibling.
+    Two result lines with real content between them are refused as
+    ambiguous (None -> test_count_unknown, a human reads it), never
+    silently read. The rule is documented in l0's docstring and the
+    project schema's commands.test description."""
+    from factory.l0 import parse_test_count
+
+    two_suites = (
+        "..........                                   [ 25%]\n"
+        "40 passed in 2.00s\n"
+        "running worker suite\n"
+        "........                                    [100%]\n"
+        "12 passed in 1.00s\n"
+    )
+    assert parse_test_count(two_suites) is None  # ambiguous, not 12 or 40
+
+    import json
+
+    schema = json.loads((REPO / "schema" / "project.schema.json").read_text())
+    test_desc = (
+        schema["properties"]["commands"]["properties"]["test"].get(
+            "description", ""
+        ).lower()
+    )
+    assert "one" in test_desc and "runner" in test_desc, (
+        "the schema's commands.test description states the one-runner rule"
+    )
+
+
+def test_review5_raises_replacement_is_anchored():
+    """Finding 5: the replacement-side raises pattern was unanchored, so a
+    trailing `# pytest.raises` comment or an alias ASSIGNMENT counted as a
+    replacement assertion — removing the real block and adding one such
+    line levelled the count and AC-4 stayed quiet. The replacement must be
+    the statement itself; the removed side stays broad by design."""
+    # the two evasions, each defeating the round-0 pattern
+    for added_line in (
+        "    result = parse(x)  # was pytest.raises",
+        "    check = pytest.raises",
+    ):
+        change = _test_change(
+            added=["def test_bad():", added_line],
+            removed=["def test_bad():",
+                     "    with pytest.raises(ValueError):",
+                     "        do_thing()"],
+        )
+        assert "assertion_removed" in _ids([change]), added_line
+
+    # the real statement forms still count as replacements (moves stay
+    # quiet)
+    for added_line in (
+        "    with pytest.raises(ValueError):",
+        "    pytest.raises(do_thing, ValueError)",
+        "    with raises(E):",
+    ):
+        change = _test_change(
+            added=["def helper():", added_line],
+            removed=["def test_bad():",
+                     "    with pytest.raises(ValueError):",
+                     "        do_thing()"],
+        )
+        assert _ids([change]) == [], added_line
+
+
+def test_review6_nested_verdict_keys_cannot_conflict():
+    """Finding 6 probe, pinned: `_balanced_objects` yields only OUTERMOST
+    spans, so a finding's structured evidence carrying its own `verdict`
+    key is never a candidate — a self-consistent review must not be voided
+    by the conflict rule. This test exists so a future scanner change that
+    starts yielding nested spans fails here instead of silently burning
+    retries on honest reviews."""
+    evidence = {
+        "verdict": "fail",
+        "findings": [
+            {
+                "id": "R-1",
+                "axis": "spec",
+                "severity": "blocking",
+                "text": "breaks the contract",
+                "evidence": {"verdict": "pass", "note": "the prior run"},
+            }
+        ],
+    }
+    from factory.l2 import _balanced_objects
+
+    out = json.dumps(evidence, indent=2)
+    assert len(_balanced_objects(out)) == 1  # only the outer object
+    report = parse_verdict(out)
+    assert report.parse_error is None  # no conflict, no retry burned
+    assert report.verdict == "fail"
+    assert report.findings[0].severity == "blocking"
+
+
+def test_review7_agreeing_example_then_real_verdict():
+    """Finding 7: the re-pinned F-09 concern stays covered — an AGREEING
+    example quoted before the real verdict parses AS THAT VERDICT, with no
+    parse error and therefore no retry. FAIL+FAIL here; PASS+PASS is
+    test_f09's renamed review6 and the AGREEING fixture in test_ac_2."""
+    fail_json = json.dumps(
+        {"verdict": "fail",
+         "findings": [{"id": "R-1", "axis": "spec", "severity": "blocking",
+                       "text": "the defect"}]}
+    )
+    report = parse_verdict(
+        f"An example FAIL verdict:\n```json\n{fail_json}\n```\n"
+        f"and the actual review agrees:\n```json\n{fail_json}\n```"
+    )
+    assert report.parse_error is None
+    assert report.verdict == "fail"
+    # and through the retry harness: no rerun is spent on a clean parse
+    reruns = []
+
+    def rerun(seat_no, session, parse_error):  # pragma: no cover - refused
+        reruns.append(seat_no)
+        return None
+
+    reports, retries = parse_reviews_with_retry(
+        [_session(f"```json\n{fail_json}\n```")], rerun
+    )
+    assert retries == 0 and not reruns
+    assert reports[0].verdict == "fail" and reports[0].parse_error is None
