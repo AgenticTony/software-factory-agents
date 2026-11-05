@@ -117,6 +117,10 @@ from typing import Any, Callable, ClassVar, NamedTuple, Sequence
 
 from factory.gates import Finding, GateReport
 
+# The one quoted-span blanker (sentinels owns it): prose that QUOTES a
+# keyword — a reviewer citing code — states nothing.
+from factory.sentinels import _outside_strings
+
 VALID_AXES = ("spec", "standards")
 VALID_SEVERITIES = ("blocking", "major", "minor", "note")
 
@@ -148,30 +152,32 @@ def _fails_round(finding) -> bool:
 
 # A fenced block (with or without the json tag) around the verdict object —
 # models habitually wrap their JSON; the fence is extracted before parsing.
-_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+# F-44 round 3: a fence tagged with any OTHER language (```python …) is
+# NOT a candidate — the tag used to land inside group 1 and the
+# malformed-verdict rule voided honest reviews that quote code.
+_FENCE = re.compile(r"```(?:json)?(?![\w-])[^\S\n]*(.*?)[^\S\n]*```", re.DOTALL)
 
-# F-44 review round 2 (the AC-2 fail-open): how a line of PROSE states a
-# verdict outside the verdict object — "verdict" on a line naming exactly
-# one of pass/fail, or a standalone PASS/FAIL line. Word boundaries keep
-# "passing"/"fails" prose out; a line naming both keywords is the
-# protocol echo and states neither.
+# F-44 rounds 2-3 (the AC-2 fail-open): the verdicts a fragment of PROSE
+# states outside the verdict object. Markdown emphasis, heading marks,
+# quote markers and list bullets are stripped first, so **FAIL**, `FAIL`,
+# __FAIL__, "## FAIL" and "- FAIL" all state fail; word boundaries keep
+# "passing"/"fails"/"password" prose out; a line naming BOTH keywords
+# ("verdict must be pass or fail", "pass|fail") is the protocol echo and
+# states neither.
+_MD_NOISE = re.compile(r"[*_`#>~]+")
+
+
 def _stated_verdicts(fragment: str) -> set[str]:
-    """The verdicts a text fragment STATES in prose, line by line: a line
-    naming ``verdict`` and exactly one of pass/fail states that verdict;
-    a line that is ONLY ``PASS``/``FAIL`` (optionally punctuated) states
-    it; a line naming BOTH (``verdict must be "pass" or "fail"`` — the
-    protocol echo) states neither, whatever their distance on the line."""
+    """The verdicts the fragment STATES: every line whose pass/fail
+    keyword tokens — quoted spans blanked first (a reviewer quoting code
+    like ``if verdict == "pass":`` states nothing), then markdown noise
+    stripped — name exactly one verdict."""
     stated: set[str] = set()
     for line in fragment.splitlines():
-        low = line.casefold()
-        if "verdict" in low:
-            words = {w for w in ("pass", "fail") if re.search(rf"\b{w}\b", low)}
-            if len(words) == 1:
-                stated |= words
-            continue
-        standalone = re.fullmatch(r"(pass|fail)[.!?]?", line.strip(), re.I)
-        if standalone is not None:
-            stated.add(standalone.group(1).casefold())
+        low = _MD_NOISE.sub(" ", _outside_strings(line)).casefold()
+        words = {w for w in ("pass", "fail") if re.search(rf"\b{w}\b", low)}
+        if len(words) == 1:
+            stated |= words
     return stated
 
 
@@ -360,24 +366,24 @@ def _extract_json(output: Any) -> Any:
     F-44 review round 2 (the AC-2 fail-open) adds two fail-closed rules:
 
     * A verdict-SHAPED candidate (a fenced block or balanced span that
-      mentions ``verdict``) that FAILS to parse while another candidate
-      parses makes the output invalid: the malformed object may be the
-      reviewer's real verdict and the parseable one the quoted example —
-      a stated FAIL used to publish as the example's PASS (duplicate
-      keys, truncation, a trailing comma). The whole-text candidate is
-      exempt: it "fails" whenever any prose surrounds the JSON, which
-      every agreeing multi-object output would trip.
-    * The chosen verdict object must be the LAST verdict-bearing content:
-      any text AFTER its end that states a verdict (``verdict`` naming
-      pass/fail on the same line, or a standalone PASS/FAIL line) makes
-      the output invalid — a FAIL stated only in prose after a quoted
-      example used to publish as the example's PASS. Prose after the
-      object that states no verdict stays fine, and a protocol echo
-      (``verdict must be "pass" or "fail"`` names both, so states
-      neither) never fires. Before the object, only a CONTRADICTING
-      prose verdict invalidates (the goal-attack mirror: a FAIL stated
-      in prose before the only parseable — example — object also used to
-      publish as PASS); an agreeing prose mention is an echo.
+      starts with ``{`` and mentions ``verdict``) that FAILS to parse
+      while another candidate parses makes the output invalid: the
+      malformed object may be the reviewer's real verdict and the
+      parseable one the quoted example — a stated FAIL used to publish
+      as the example's PASS (duplicate keys, truncation, a trailing
+      comma). Fences tagged with a language other than ``json`` are not
+      candidates at all (round 3: a quoted ``python`` block mentioning
+      ``verdict`` voided honest reviews), and the whole-text candidate
+      is exempt: it "fails" whenever any prose surrounds the JSON.
+    * Prose contradicting the chosen object invalidates, on EITHER side
+      of it (rounds 2-3): any pass/fail keyword token the prose states —
+      markdown emphasis, headings and bullets stripped, so ``**FAIL**``,
+      ``## FAIL`` and ``Overall: FAIL`` all state fail — that disagrees
+      with the object's verdict means the object may not be the
+      reviewer's verdict. An AGREEING token is an echo (an honest
+      restatement after the JSON stays clean), and a line naming both
+      keywords (``verdict must be "pass" or "fail"``) is the protocol
+      echo and states neither.
 
     Args:
         output: The reviewer session's result text.
@@ -439,9 +445,14 @@ def _extract_json(output: Any) -> Any:
         )
     if parsed:
         chosen_start, chosen_end, value = parsed[0]
+        # F-44 round 3: the malformed rule considers only OBJECT-SHAPED
+        # candidates — a candidate that starts with "{" and mentions
+        # "verdict" — never a quoted code fence or prose blob.
         malformed_beside = next(
             (start for start, _end, raw in unparsed
-             if start > 0 and "verdict" in raw.casefold()),
+             if start > 0
+             and raw.lstrip().startswith("{")
+             and "verdict" in raw.casefold()),
             None,
         )
         if malformed_beside is None:
@@ -464,28 +475,31 @@ def _extract_json(output: Any) -> Any:
                 "does not parse while another candidate did: the malformed "
                 "object may be the reviewer's real verdict"
             )
-        if chosen_end < len(text):
-            tail = text[chosen_end:]
-            if _stated_verdicts(tail):
-                raise _InvalidVerdict(
-                    "verdict-stating text follows the parsed verdict "
-                    "object: the object may not be the reviewer's last word"
-                )
         declared = value.get("verdict") if isinstance(value, dict) else None
         if isinstance(declared, str):
             declared = declared.strip().lower()
-        # The goal-attack mirror of case 4 (round 2): a FAIL stated in
-        # prose BEFORE the only parseable object — the quoted example —
-        # also published as the example's PASS. Before-text CONTRADICTS
-        # only (after-text states any verdict, above): an agreeing prose
-        # mention before the object is an echo, not a conflict.
+        # F-44 rounds 2-3: CONTRADICTION-only, on either side of the
+        # object. Any pass/fail keyword the prose states (markdown noise
+        # stripped) that disagrees with the object invalidates — a FAIL
+        # stated in prose (bold, heading, "Overall:") beside a quoted
+        # pass example used to publish as the example's PASS, before or
+        # after it. An AGREEING token is an echo, not a conflict, so an
+        # honest reviewer restating its verdict after the JSON stays
+        # clean; a line naming both keywords (the protocol echo) states
+        # neither.
         if declared in ("pass", "fail"):
             before = _stated_verdicts(text[:chosen_start])
-            if before - {declared}:
+            after = (
+                _stated_verdicts(text[chosen_end:])
+                if chosen_end < len(text) else set()
+            )
+            contradicting = (before | after) - {declared}
+            if contradicting:
+                side = "before" if (before - {declared}) else "following"
                 raise _InvalidVerdict(
-                    f"prose before the verdict object states {sorted(before - {declared})} "
-                    f"while the object says {declared}: the object may not be "
-                    "the reviewer's verdict"
+                    f"prose {side} the verdict object states "
+                    f"{sorted(contradicting)} while the object says "
+                    f"{declared}: the object may not be the reviewer's verdict"
                 )
         return value
     reason = (

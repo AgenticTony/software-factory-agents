@@ -302,24 +302,25 @@ def _is_replacement_assertion(text: str) -> bool:
     code = _outside_strings(line).split("#", 1)[0]
     return any(p.search(code) for p in _ASSERTION_STATEMENT)
 
-# F-44 review round 2: ADDED lines in test files (conftest included —
+# F-44 review rounds 2-3: ADDED lines in test files (conftest included —
 # TEST_GLOBS lists it) that can forge the runner's own result line. Test
 # code runs inside the runner's process: it can print a result-shaped
-# line and hard-exit before the runner prints the real one, and the
-# forgery is then the only result line parse_test_count sees (the
-# round-2 probe: a FAILING suite read as 999999 passing, exit 0). No
-# stdout parser can close that, so the line scan flags the shapes that
-# make it possible; the finding escalates exactly as assertion_removed
-# does (an L0 finding and a failed sentinel row — a human decides). Each
-# entry says why it is here; the evadable remainder is L2's to judge
-# (the ledger's known limit).
+# line and hard-exit before the runner prints the real one, flip the
+# outcome the runner reports, or escape the output capture. No stdout
+# parser can close the exit and outcome classes, so the line scan flags
+# the shapes that make them possible; the finding escalates exactly as
+# assertion_removed does (an L0 finding and a failed sentinel row — a
+# human decides). Each entry says why it is here; the evadable remainder
+# is L2's to judge (the ledger's known limit).
 RUNNER_EXIT_FORGERY_PATTERNS = (
     # --- hard exit / kill: no terminal result line is ever printed ---
     re.compile(r"\bos\._exit\s*\("),   # exits without cleanup or summary
     # killing ANOTHER process (the runner itself — getppid — or any pid
     # but self): self-kill (`os.kill(os.getpid(), …)`) is the honest
     # crash-simulation shape this repo's own corpus carries (PR #22's
-    # killed-mid-session seat), so it is deliberately not matched
+    # killed-mid-session seat), and the gate FAILS on the signal exit it
+    # produces (pinned in tests/test_f44.py::test_review20) — so it is
+    # deliberately not matched
     re.compile(r"\bos\.kill\s*\(\s*(?!os\.getpid\()"),
     re.compile(r"\bos\.abort\s*\("),   # C-level abort, same class
     # a test exiting the runner is never legitimate in a suite — the
@@ -331,23 +332,51 @@ RUNNER_EXIT_FORGERY_PATTERNS = (
     re.compile(r"\bcapfd\.disabled\s*\("),   # the fd-level variant
     re.compile(r"\bsys\.__std(?:out|err)__\b"),  # write to the real streams
     re.compile(r"\bos\.write\(\s*[12]\s*,"),     # raw fd 1/2 write
-    # suspending the capture manager turns capture off for the session
-    re.compile(r'getplugin\(\s*["\']capturemanager["\']'),
+    # suspending the capture manager turns capture off session-wide
+    # (round 3: the old getplugin("capturemanager") pattern matched a
+    # quoted string against the string-blanked line and was dead — the
+    # suspension call is the dangerous part and is quoted nowhere)
+    re.compile(r"\bsuspend_global_capture\b"),
+    # --- JS runners (jest/vitest execute in-process too) ---
+    re.compile(r"\bprocess\.exit\s*\("),
+    # non-self JS kill, the os.kill carve-out's mirror (process.pid
+    # self-kill rides the signal-exit the gate fails on)
+    re.compile(r"\bprocess\.kill\s*\(\s*(?!process\.pid\b)"),
+    re.compile(r"\bprocess\.std(?:out|err)\.write\s*\("),  # past jest's capture
 )
 
-# Runner session hooks defined in a TEST FILE (not conftest). pytest only
-# registers hooks from conftest.py and plugins — a `def pytest_…` in a
-# test module is dead code no legitimate test writes, so it flags as the
-# forgery platform's shape. The SAME hook ADDED to a conftest is the
-# registered, honest plugin surface (F-10's sandbox-probe conftest writes
-# one; a repo's existing conftest is not an ADDED line either) — there
-# the exit/capture patterns above carry the forgery load (the round-2
-# conftest probe flags on its os._exit line), so conftest hooks do not
-# flag on the definition alone.
-_RUNNER_HOOK_PATTERNS = (
+# Hooks and assignments that can REWRITE what the runner reports — these
+# flag ANYWHERE in test files or conftest: the conftest is the LIVE
+# surface (pytest registers its hooks — the round-3 probe flipped a
+# failing suite to "1 passed", exit 0, with no exit and no capture
+# escape), and a definition in a test module is still the shape no
+# legitimate test writes.
+_OUTCOME_REWRITE_PATTERNS = (
+    # the report hooks: makereport/report_teststatus/logreport decide the
+    # recorded outcome of every test; runtest_protocol wraps the run itself
+    re.compile(r"^def\s+pytest_runtest_makereport\b"),
+    re.compile(r"^def\s+pytest_report_teststatus\b"),
+    re.compile(r"^def\s+pytest_runtest_logreport\b"),
+    re.compile(r"^def\s+pytest_runtest_protocol\b"),
+    # direct outcome/session-state assignments (the makereport forge's
+    # core: rep.outcome = "passed"; == comparisons are not assignments)
+    re.compile(r"\.\s*outcome\s*=(?!=)"),
+    re.compile(r"\.\s*exitstatus\s*=(?!=)"),
+    re.compile(r"\.\s*testsfailed\s*=(?!=)"),
+)
+
+# Session/reporting hooks: they run AFTER outcomes are computed and can
+# at most print (which the parser's result-line rule and the capture
+# patterns above own). A conftest is their registered, honest surface —
+# F-10's sandbox probe writes a pytest_terminal_summary, and a repo's
+# existing conftest is not an ADDED line — so they flag in TEST files
+# only, where pytest never registers them: dead code no legitimate test
+# writes.
+_SESSION_HOOK_PATTERNS = (
     re.compile(r"^def\s+pytest_sessionfinish\b"),
     re.compile(r"^def\s+pytest_terminal_summary\b"),
     re.compile(r"^def\s+pytest_unconfigure\b"),
+    re.compile(r"^def\s+pytest_collection_modifyitems\b"),
 )
 
 # Comment openers across the languages the marker and assertion patterns
@@ -519,14 +548,17 @@ def builtin_sentinel_findings(changes, risk_globs: dict) -> list:
                     )
                 )
             code_line = _outside_strings(text)
-            # Hooks flag in test files only — a conftest is the
-            # registered plugin surface (see _RUNNER_HOOK_PATTERNS).
+            # Session/reporting hooks: test files only — a conftest is
+            # their registered surface (see _SESSION_HOOK_PATTERNS);
+            # outcome-rewriting hooks and assignments flag anywhere.
             is_conftest = scan_path.rsplit("/", 1)[-1] == "conftest.py"
             forgery = any(
                 p.search(code_line) for p in RUNNER_EXIT_FORGERY_PATTERNS
+            ) or any(
+                p.search(code_line) for p in _OUTCOME_REWRITE_PATTERNS
             ) or (
                 not is_conftest
-                and any(p.search(code_line) for p in _RUNNER_HOOK_PATTERNS)
+                and any(p.search(code_line) for p in _SESSION_HOOK_PATTERNS)
             )
             if test_file and forgery:
                 findings.append(

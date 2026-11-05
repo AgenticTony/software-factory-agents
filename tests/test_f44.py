@@ -954,7 +954,7 @@ def test_review12_prose_verdict_after_example_fails_closed():
     report = parse_verdict(case4)
     assert report.parse_error is not None
     assert report.verdict == "fail"
-    assert "follows the parsed verdict object" in report.parse_error
+    assert "prose following the verdict object" in report.parse_error
 
     # a standalone FAIL line after the object is the same statement
     standalone = (
@@ -1042,3 +1042,368 @@ def test_review14_goalattack_prose_fail_before_example():
     reports, retries = parse_reviews_with_retry([_session(mirror)], rerun)
     assert retries == 1 and reruns == [1]
     assert reports[0].parse_error is not None
+
+
+# --------------------- review round 3 (PR #100): goal closure ----------
+
+FAIL_OBJ_JSON = (
+    '{"verdict": "fail", "findings": [{"id": "R-1", "axis": "spec", '
+    '"severity": "blocking", "file": "a.py", "text": "a blocking bug"}]}'
+)
+
+
+def test_review15_pass_fail_keyword_contradiction_anywhere():
+    """Finding 1 (blocking): the round-2 prose rule keyed on the word
+    "verdict", so the commonest LLM phrasings of a FAIL — bold, heading,
+    'Overall:', 'Result:' — all evaded it and the example's PASS
+    published. The rule is now at the right depth: any word-bounded
+    PASS/FAIL token OUTSIDE the chosen object (markdown emphasis, heading
+    marks and list bullets stripped first) that CONTRADICTS the object
+    invalidates, before or after; the protocol echo (both keywords) stays
+    neutral; an AGREEING token anywhere is an echo (finding 5)."""
+    example = f"```json\n{PASS_EXAMPLE}\n```"
+    # every round-3 shape, after the example — a stated FAIL vs a pass
+    for tail in (
+        "**FAIL** — the migration drops a column",
+        "Overall: FAIL",
+        "Result: FAIL, tests removed.",
+        "## FAIL",
+        "`FAIL`",
+        "__FAIL__",
+        "*Fail*",
+        "- FAIL",
+        "FAIL.",
+    ):
+        report = parse_verdict(f"{example}\n{tail}")
+        assert report.parse_error is not None, tail
+        assert report.verdict == "fail", tail
+    # ...and before it (the mirror)
+    before = parse_verdict("**FAIL** — tests removed.\n" + example)
+    assert before.parse_error is not None and before.verdict == "fail"
+
+    # contradiction works the other way too: a PASS token beside a FAIL
+    # object is the same conflict
+    flipped = parse_verdict("Overall: PASS\n" + FAIL_OBJ_JSON)
+    assert flipped.parse_error is not None
+
+    # agreeing tokens are echoes, not conflicts — before AND after
+    agreeing_after = parse_verdict(
+        PASS_EXAMPLE + "\n\nVerdict: PASS — clean diff."
+    )
+    assert agreeing_after.parse_error is None and agreeing_after.verdict == "pass"
+    agreeing_before = parse_verdict(
+        "My verdict on this diff: pass — clean.\n" + PASS_EXAMPLE
+    )
+    assert agreeing_before.parse_error is None and agreeing_before.verdict == "pass"
+
+    # the protocol echo names both keywords and states neither
+    for prose in (
+        'The verdict must be "pass" or "fail" exactly.',
+        "Format: pass|fail — pick one.",
+    ):
+        echo = parse_verdict(f"{PASS_EXAMPLE}\n{prose}")
+        assert echo.parse_error is None, prose
+
+    # words that merely CONTAIN the keywords never fire
+    containing = parse_verdict(
+        PASS_EXAMPLE + "\nthe password column survives; the failover path too"
+    )
+    assert containing.parse_error is None and containing.verdict == "pass"
+
+    # case 4 and the standalone line still close
+    case4 = parse_verdict(
+        f"Format: {PASS_EXAMPLE}\nVerdict: FAIL. a.py:1 has a blocking bug."
+    )
+    assert case4.parse_error is not None and case4.verdict == "fail"
+    standalone = parse_verdict(f"{PASS_EXAMPLE}\nFAIL")
+    assert standalone.parse_error is not None
+
+
+def test_review16_conftest_outcome_flip_flags(tmp_path: Path):
+    """Finding 2 (blocking): a conftest hookwrapper on
+    pytest_runtest_makereport rewrites failures to passes with no exit
+    and no capture escape — a real forge, pinned against real pytest
+    FIRST (the sentinel guards a real attack), then the added conftest
+    flags. Session/reporting hooks that cannot flip an outcome
+    (terminal_summary: test_f10's honest probe) keep the registered-
+    surface carve-out in conftest and flag as dead code in test files."""
+    # the forge is real: a failing test reads as 1 passed, exit 0
+    project = tmp_path / "forge"
+    (project / "tests").mkdir(parents=True)
+    (project / "conftest.py").write_text(
+        "import pytest\n"
+        "\n"
+        "\n"
+        "@pytest.hookimpl(hookwrapper=True)\n"
+        "def pytest_runtest_makereport(item, call):\n"
+        "    rep = (yield).get_result()\n"
+        "    rep.outcome = 'passed'\n"
+    )
+    (project / "tests" / "test_x.py").write_text(
+        "def test_x():\n    assert 1 == 2\n"
+    )
+    proc = _run_pytest_in(project, "-q", "tests")
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 0  # the forge owns the exit code too
+    assert "1 passed" in output and "failed" not in output
+
+    # and the diff that introduces it flags — the conftest is the live
+    # surface, so outcome hooks flag there (not just in test modules)
+    forge_change = FileChange(
+        "conftest.py", "A",
+        added_lines=[(i + 1, t) for i, t in enumerate([
+            "import pytest",
+            "",
+            "",
+            "@pytest.hookimpl(hookwrapper=True)",
+            "def pytest_runtest_makereport(item, call):",
+            "    rep = (yield).get_result()",
+            "    rep.outcome = 'passed'",
+        ])],
+    )
+    assert {f.id for f in builtin_sentinel_findings([forge_change], {})} == {
+        "runner_exit_forgery"
+    }
+
+    # the outcome assignment alone is the forge's core: flag it too
+    assignment = FileChange(
+        "tests/conftest.py", "M",
+        added_lines=[(4, "    rep.outcome = 'passed'")],
+    )
+    assert "runner_exit_forgery" in {
+        f.id for f in builtin_sentinel_findings([assignment], {})
+    }
+    exitstatus = FileChange(
+        "conftest.py", "M",
+        added_lines=[(4, "    session.exitstatus = 0")],
+    )
+    assert "runner_exit_forgery" in {
+        f.id for f in builtin_sentinel_findings([exitstatus], {})
+    }
+
+    # the honest reporting hook in a conftest stays quiet (test_f10's
+    # probe: terminal_summary cannot flip an outcome; the parser and the
+    # exit/capture patterns carry the load there)...
+    honest = FileChange(
+        "tests/conftest.py", "M",
+        added_lines=[
+            (3, "def pytest_terminal_summary(terminalreporter):"),
+            (4, '    terminalreporter.write_line("PROBE " + results())'),
+        ],
+    )
+    assert builtin_sentinel_findings([honest], {}) == []
+    # ...while the same hook in a TEST file is dead code nothing
+    # legitimate writes, and flags — as do outcome hooks there
+    hook_in_test = FileChange(
+        "tests/test_runner.py", "M",
+        added_lines=[(3, "def pytest_sessionfinish(session, exitstatus):")],
+    )
+    assert {f.id for f in builtin_sentinel_findings([hook_in_test], {})} == {
+        "runner_exit_forgery"
+    }
+    makereport_in_test = FileChange(
+        "tests/test_runner.py", "M",
+        added_lines=[(3, "def pytest_runtest_makereport(item, call):")],
+    )
+    assert "runner_exit_forgery" in {
+        f.id for f in builtin_sentinel_findings([makereport_in_test], {})
+    }
+
+
+def test_review17_every_pattern_entry_fires():
+    """Finding 3: the capturemanager pattern was dead for the whole round
+    (it matched a quoted string against the string-blanked line) and no
+    test noticed. Every entry in all three tuples now fires on its own
+    example line — a dead pattern cannot come back unnoticed. Finding 7's
+    JS shapes are entries here too."""
+    import factory.sentinels as S
+
+    examples = {
+        r"\bos\._exit\s*\(": "    os._exit(0)",
+        r"\bos\.kill\s*\(\s*(?!os\.getpid\()": "    os.kill(pid, signal.SIGTERM)",
+        r"\bos\.abort\s*\(": "    os.abort()",
+        r"\bsys\.exit\s*\(": "    sys.exit(1)",
+        r"\braise\s+SystemExit\b": "    raise SystemExit(0)",
+        r"\bcapsys\.disabled\s*\(": "    with capsys.disabled():",
+        r"\bcapfd\.disabled\s*\(": "    with capfd.disabled():",
+        r"\bsys\.__std(?:out|err)__\b": "    print('x', file=sys.__stdout__)",
+        r"\bos\.write\(\s*[12]\s*,": "    os.write(1, b'999 passed\\n')",
+        r"\bsuspend_global_capture\b": (
+            "    config.pluginmanager.getplugin('capturemanager')"
+            ".suspend_global_capture()"
+        ),
+        r"\bprocess\.exit\s*\(": "process.exit(0)",
+        r"\bprocess\.kill\s*\(\s*(?!process\.pid\b)": (
+            "process.kill(worker.pid, 'SIGTERM')"
+        ),
+        r"\bprocess\.std(?:out|err)\.write\s*\(": (
+            "process.stdout.write('999 passed\\n')"
+        ),
+    }
+    outcome_hook_examples = {
+        r"^def\s+pytest_runtest_makereport\b": (
+            "def pytest_runtest_makereport(item, call):"
+        ),
+        r"^def\s+pytest_report_teststatus\b": (
+            "def pytest_report_teststatus(report):"
+        ),
+        r"^def\s+pytest_runtest_logreport\b": (
+            "def pytest_runtest_logreport(report):"
+        ),
+        r"^def\s+pytest_runtest_protocol\b": (
+            "def pytest_runtest_protocol(item, nextitem):"
+        ),
+        r"\.\s*outcome\s*=(?!=)": "    rep.outcome = 'passed'",
+        r"\.\s*exitstatus\s*=(?!=)": "    session.exitstatus = 0",
+        r"\.\s*testsfailed\s*=(?!=)": "    session.testsfailed = 0",
+    }
+    session_hook_examples = {
+        r"^def\s+pytest_sessionfinish\b": (
+            "def pytest_sessionfinish(session, exitstatus):"
+        ),
+        r"^def\s+pytest_terminal_summary\b": (
+            "def pytest_terminal_summary(terminalreporter):"
+        ),
+        r"^def\s+pytest_unconfigure\b": "def pytest_unconfigure(config):",
+        r"^def\s+pytest_collection_modifyitems\b": (
+            "def pytest_collection_modifyitems(config, items):"
+        ),
+    }
+    live = {p.pattern for p in S.RUNNER_EXIT_FORGERY_PATTERNS}
+    live |= {p.pattern for p in S._OUTCOME_REWRITE_PATTERNS}
+    live |= {p.pattern for p in S._SESSION_HOOK_PATTERNS}
+    for pattern, example in {
+        **examples,
+        **outcome_hook_examples,
+        **session_hook_examples,
+    }.items():
+        assert pattern in live, f"pattern missing from the tuples: {pattern}"
+        # a TEST file: every group flags here
+        change = FileChange("tests/test_a.py", "M", added_lines=[(2, example)])
+        assert "runner_exit_forgery" in {
+            f.id for f in builtin_sentinel_findings([change], {})
+        }, example
+
+
+def test_review18_non_json_fences_and_code_quotes_stay_fine():
+    """Finding 4 (false-fail): _FENCE captured ```python blocks with the
+    language tag inside group 1, and the malformed-beside rule voided any
+    unparsable fence mentioning "verdict" — every dogfood review of this
+    repo's own l2.py quotes such code. Fences tagged with a language
+    other than json are no longer candidates at all, and the malformed
+    rule only considers object-shaped candidates ({ + verdict)."""
+    honest_code_quote = (
+        "```python\n"
+        'if value.get("verdict") == "pass":\n'
+        "    keep()\n"
+        "```\n"
+        "```json\n"
+        f"{PASS_EXAMPLE}\n"
+        "```"
+    )
+    report = parse_verdict(honest_code_quote)
+    assert report.parse_error is None, report.parse_error
+    assert report.verdict == "pass"
+
+    # an unfenced code line mentioning verdict is not an object candidate
+    unfenced = parse_verdict(
+        'the parse checks value.get("verdict") first.\n' + PASS_EXAMPLE
+    )
+    assert unfenced.parse_error is None and unfenced.verdict == "pass"
+
+    # quoted keywords never state a verdict: cited code beside a FAIL
+    # object (the finding-4 dogfood shape, mirrored) must stay clean —
+    # the round-3 contradiction rule reads only unquoted tokens
+    cited_code = parse_verdict(
+        FAIL_OBJ_JSON
+        + '\n```python\nif value.get("verdict") == "pass":\n    keep()\n```'
+    )
+    assert cited_code.parse_error is None, cited_code.parse_error
+    assert cited_code.verdict == "fail"
+
+    # the object-shaped malformed rule itself still fires (round 2)
+    for name, output in MALFORMED_REAL.items():
+        assert parse_verdict(output).parse_error is not None, name
+
+
+def test_review19_agreeing_restatement_after_object_is_fine():
+    """Finding 5 (false-fail): after-text rejected ANY stated verdict, so
+    an honest reviewer restating its verdict after the JSON was voided.
+    Contradiction-only (like before-text) closes case 4 exactly as well."""
+    agreeing = parse_verdict(
+        PASS_EXAMPLE + "\n\nVerdict: PASS — clean diff."
+    )
+    assert agreeing.parse_error is None and agreeing.verdict == "pass"
+    restated_fail = parse_verdict(FAIL_OBJ_JSON + "\n\nVerdict: FAIL.")
+    assert restated_fail.parse_error is None and restated_fail.verdict == "fail"
+
+    # and the contradiction still closes both round-2 shapes
+    case4 = parse_verdict(
+        f"Format: {PASS_EXAMPLE}\nVerdict: FAIL. a.py:1 has a blocking bug."
+    )
+    assert case4.parse_error is not None and case4.verdict == "fail"
+    standalone = parse_verdict(PASS_EXAMPLE + "\nFAIL")
+    assert standalone.parse_error is not None
+
+
+def test_review20_self_kill_fails_the_gate_on_the_signal(tmp_path: Path):
+    """Finding 6: the self-kill carve-out (benign PR #22's crash
+    simulation) exempts killing the runner's own process — SAFE only
+    because the gate fails on the signal exit code. Pinned at both
+    levels, so the carve-out's dependency is explicit: a real pytest
+    killed by its own test exits with a negative (signal) code, and a
+    signal-exit test command FAILS run_l0."""
+    project = tmp_path / "selfkill"
+    (project / "tests").mkdir(parents=True)
+    (project / "tests" / "test_x.py").write_text(
+        "import os, signal\n"
+        "\n"
+        "\n"
+        "def test_kills_runner():\n"
+        "    os.kill(os.getpid(), signal.SIGKILL)\n"
+    )
+    proc = _run_pytest_in(project, "-q", "tests")
+    assert proc.returncode < 0  # killed by signal, not a clean exit
+
+    from test_f07 import BASE_PROFILE, TASK, _change, _repo
+
+    from factory.gates import CommandResult
+    from factory.l0 import run_l0
+
+    repo = _repo(tmp_path, "sk", {"lib/a.py": "x = 1\n"})
+    _change(repo, files={"lib/a.py": "x = 2\n"})
+    signal_result = CommandResult(
+        name="test", command="pytest -q", exit_code=-9, output="", timed_out=False
+    )
+    ok_setup = CommandResult(
+        name="setup", command="true", exit_code=0, output="", timed_out=False
+    )
+    profile = dict(BASE_PROFILE)
+    profile["commands"] = {"setup": "true", "test": "pytest -q"}
+    report = run_l0(
+        profile, repo, "main", "feature", task=dict(TASK),
+        runner=lambda name, cmd, repo, timeout: (
+            signal_result if name == "test" else ok_setup
+        ),
+    )
+    assert report.verdict == "fail"
+    assert any(
+        f.id == "command_failed" and "-9" in f.text for f in report.findings
+    )
+
+
+def test_review21_js_runner_shapes_flag():
+    """Finding 7: TEST_GLOBS include JS tests, but the patterns were
+    Python-only — a jest target got a green runner_exit_forgery row for a
+    check that could never fire. The JS forge shapes flag."""
+    for line in (
+        "process.exit(0)",
+        "process.kill(worker.pid, 'SIGTERM')",
+        "process.stdout.write('999 passed\\n')",
+    ):
+        change = FileChange(
+            "tests/cart.test.js", "M", added_lines=[(2, line)]
+        )
+        assert {f.id for f in builtin_sentinel_findings([change], {})} == {
+            "runner_exit_forgery"
+        }, line
