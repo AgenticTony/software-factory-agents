@@ -59,8 +59,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
+from factory.egress import check_secrets, strip_control_sequences
 from factory.runs import RUN_ID_RE
-from factory.sentinels import redact_credentials
+from factory.sentinels import redact_credentials, scrub_literal
 from factory.state import now_iso
 
 
@@ -89,10 +90,10 @@ SNIPPET_CAP = 2000
 # Any other string field, after redaction, keeps lines bounded.
 STRING_CAP = 4000
 TRUNCATED = " …[trace truncated]"
-# A literal shorter than this is not a secret worth scrubbing — replacing
-# a one-character "token" shreds ordinary text (a real seat token is long).
-MIN_SECRET_LEN = 8
-REDACTED = "[redacted]"
+# F-43: scrub_literal moved to factory.sentinels (beside
+# redact_credentials, so the egress seam composes one home); this module
+# re-exports it unchanged — one implementation, same name, and
+# factory.session's import keeps working.
 # Command-output tails inside gate_check notes.
 _NOTE_TAIL = 200
 # --follow poll interval (seconds).
@@ -118,14 +119,6 @@ def trace_path(factory_root: Path | str, project: str, run_id: str) -> Path:
     """The trace file of one run — outside every clone (``runs/``) and
     outside the sandbox write allowlist by construction."""
     return Path(factory_root) / "trace" / project / f"{run_id}.jsonl"
-
-
-def scrub_literal(text: str, secret: str | None) -> str:
-    """Replace the literal secret (the seat token) with ``[redacted]``.
-    Long secrets only: a short literal redacts noise, not secrets."""
-    if secret and len(secret) >= MIN_SECRET_LEN:
-        return text.replace(secret, REDACTED)
-    return text
 
 
 def snippet(text: str, secret: str | None = None, *,
@@ -197,7 +190,11 @@ class TraceWriter:
         self.path = trace_path(factory_root, project, run_id)
         self.run_id = run_id
         self.task_id = task_id
-        self.secrets = tuple(secret for secret in extra_secrets if secret)
+        # Round 2 (class fix): a bare str extra_secrets iterated
+        # character by character scrubbed nothing — loud at the entry.
+        self.secrets = tuple(
+            secret for secret in check_secrets(extra_secrets) if secret
+        )
         self.attempt = 1
         self.seq = 0
         self.disabled = False
@@ -468,6 +465,11 @@ def read_trace(path: Path, *, follow: bool = False,
     newline-terminated) is pushed back and waited on, so one event never
     prints as two fragments.
 
+    F-43 (m-16): what is PRINTED is control-sequence stripped — the stored
+    line keeps its content (the file is evidence), but a screen clear, a
+    cursor move or an OSC-8 link planted in session text never reaches the
+    owner's terminal through this, the one reading seam.
+
     Raises:
         TraceError: A line is not valid UTF-8 (a corrupted trace).
     """
@@ -481,12 +483,12 @@ def read_trace(path: Path, *, follow: bool = False,
             except UnicodeDecodeError as exc:
                 raise TraceError(f"{path.name}: trace is not valid UTF-8: {exc}") from exc
             if line and line.endswith("\n"):
-                out(line.rstrip("\n"))
+                out(strip_control_sequences(line.rstrip("\n")))
                 if follow and _is_run_end(line):
                     return
                 continue
             if line and not follow:
-                out(line.rstrip("\n"))  # a truncated tail: print what is there
+                out(strip_control_sequences(line.rstrip("\n")))  # truncated tail
                 continue
             if line:  # mid-write in follow mode: push back, wait for the rest
                 handle.seek(position)

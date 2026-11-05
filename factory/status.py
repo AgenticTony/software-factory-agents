@@ -51,6 +51,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from factory.egress import strip_control_sequences
 from factory.vent import VENT_CATEGORIES, weeks_vents
 
 WEEK_DAYS = 7
@@ -593,4 +594,9 @@ def render_status(
         lines += ["", "## Notes", ""]
         lines += [f"- {note}" for note in notes]
     lines.append("")
-    return "\n".join(lines)
+    # F-43 (m-16): the rendered page is what the owner's terminal (and the
+    # dashboard) executes as well as reads — strip at this, the one render
+    # seam, not at write: the progress log keeps what was stored. Vents
+    # were already seam-scrubbed at the flush; this covers anything else
+    # that reaches the page.
+    return strip_control_sequences("\n".join(lines))

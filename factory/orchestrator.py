@@ -70,10 +70,11 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, NamedTuple
+from typing import Callable, NamedTuple, Sequence
 
 from factory.config import CONFIG_FILE, FactoryConfig, in_peak_window, load_config
 from factory.contract import load_profile
+from factory.egress import scrub_session_text, scrub_session_value
 from factory.gates import CommandResult, diff_name_status, git_rc
 from factory.gates import git as hardened_git
 from factory.l0 import run_l0
@@ -417,17 +418,21 @@ def _branch_name(task_id: str, run_id: str) -> str:
 
 
 def _log_vents(log: ProgressLog, record: SessionRecord, seat: str,
-               run_id: str, task_id: str) -> None:
+               run_id: str, task_id: str, secrets: Sequence[str] = ()) -> None:
     """Flush a session's vents into the task's progress log (F-27).
 
     Telemetry, never control flow (AC-3, review finding 5): a flush that
     fails — a broken log chain, a full disk — costs the vents, reported on
     stderr, never the attempt record or the run. The orchestrator stamps
     the run, task and seat it actually ran; the record's own claims about
-    them are untrusted (they crossed the sandbox boundary).
+    them are untrusted (they crossed the sandbox boundary). F-43: the
+    flush hands over the run's ``secrets`` (the seat token), so the vent
+    text passes the egress seam again outside the sandbox — the in-sandbox
+    collector already scrubbed with the same token.
     """
     try:
-        flush_vents(log, record.vents, run_id=run_id, task_id=task_id, seat=seat)
+        flush_vents(log, record.vents, run_id=run_id, task_id=task_id,
+                    seat=seat, secrets=secrets)
     except Exception as exc:  # noqa: BLE001 — telemetry must not crash a run
         print(
             f"factory: {task_id} {seat} vents not logged "
@@ -1858,6 +1863,11 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
     round_no = 0
 
     work = create_run(project, source, factory_root=ctx.factory_root, ref=default_branch)
+    # F-43: the run's egress secrets — every literal this run holds that
+    # session text must never carry out (the seat token today; F-59 adds
+    # per-provider credentials). One tuple feeds the trace writer AND the
+    # egress seam below, so no channel scrubs a different set.
+    egress_secrets = (seat_token() or "",)
     # F-30: this run's live trace — one writer per run, appended to as the
     # events happen and never allowed to change the run itself (AC-5's
     # failure policy lives in the writer). The seat token is handed over
@@ -1865,7 +1875,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
     # gate notes) bypass the session-side tap, and the writer scrubs at
     # every boundary — the token in a shape F-25 cannot match included.
     trace = TraceWriter(ctx.factory_root, project, work.run_id, task_id,
-                        extra_secrets=[seat_token() or ""])
+                        extra_secrets=egress_secrets)
     try:
         with trace.phase("setup"):
             _build_on_remote_default(work, repo_cfg["remote"], default_branch)
@@ -1958,7 +1968,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
             outcomes[seat_no] = {"retry": record}
             records.append(record)
             spend.add(record)
-            _log_vents(log, record, "reviewer", work.run_id, task_id)
+            _log_vents(log, record, "reviewer", work.run_id, task_id,
+                       egress_secrets)
             trace.session_end(record, "reviewer")
             trace.append({
                 "type": "reviewer_retry",
@@ -2134,7 +2145,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                     # F-27: the session's vents reach the task's progress log
                     # the moment the session returns — before any gate can
                     # crash, and whatever the session's outcome was.
-                    _log_vents(log, impl, "implementer", work.run_id, task_id)
+                    _log_vents(log, impl, "implementer", work.run_id, task_id,
+                               egress_secrets)
                     trace.session_end(impl, "implementer")  # F-30
                     if _is_quota(impl):
                         attempt = attempt_record(attempt_no, started, "aborted", records, None,
@@ -2323,7 +2335,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                 for review in reviews:
                                     review_spend.add(review)
                                     _log_vents(log, review, "reviewer",  # F-27
-                                               work.run_id, task_id)
+                                               work.run_id, task_id, egress_secrets)
                                     trace.session_end(review, "reviewer")  # F-30
                                 quota = next(
                                     (r for r in reviews if _is_quota(r)), None
@@ -2405,7 +2417,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                     records.append(verifier)
                                     review_spend.add(verifier)
                                     _log_vents(log, verifier, "verifier",  # F-27
-                                               work.run_id, task_id)
+                                               work.run_id, task_id, egress_secrets)
                                     trace.session_end(verifier, "verifier")  # F-30
                                     if _is_quota(verifier):
                                         attempt = attempt_record(
@@ -2598,7 +2610,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                 for review in final_reviews:
                                     final_spend.add(review)
                                     _log_vents(log, review, "reviewer",  # F-27
-                                               work.run_id, task_id)
+                                               work.run_id, task_id, egress_secrets)
                                     trace.session_end(review, "reviewer")  # F-30
                                 quota = next(
                                     (r for r in final_reviews if _is_quota(r)), None
@@ -2669,7 +2681,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                     records.append(verifier)
                                     final_spend.add(verifier)
                                     _log_vents(log, verifier, "verifier",  # F-27
-                                               work.run_id, task_id)
+                                               work.run_id, task_id, egress_secrets)
                                     trace.session_end(verifier, "verifier")  # F-30
                                     if _is_quota(verifier):
                                         attempt = attempt_record(
@@ -2768,13 +2780,33 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                 if passed:
                     with trace.phase("publish"):
                         task = queue.get(task_id)
+                        # F-43 (C-1): the PR body's session-text inputs
+                        # pass the egress seam BEFORE the body is built —
+                        # the implementer's notes and the whole validator
+                        # report (every L2 finding text, the verdict JSON)
+                        # — scrubbed first, THEN capped (redact-then-cap,
+                        # the F-27 invariant: a cap landing inside a
+                        # credential would leak its other half). The stored
+                        # reports are not touched: this is a projection for
+                        # the body. Scrubbed ONCE, before the shrink loop
+                        # (review round 1, finding 9): compaction only
+                        # shortens already-scrubbed text, so re-scrubbing
+                        # per tail walked and regex-scrubbed the whole
+                        # report up to three times for the same result.
+                        scrubbed_reports = {
+                            key: scrub_session_value(value, egress_secrets)
+                            for key, value in reports.items()
+                        }
+                        scrubbed_notes = scrub_session_text(
+                            impl.result or "", egress_secrets)[:_PR_NOTES_CAP]
                         for tail in (_PR_OUTPUT_TAIL, 200, 0):  # shrink outputs to fit GitHub
                             body = build_pr_body(
                                 task, profile, branch=branch, base_sha=base_sha, head_sha=head_sha,
                                 changed_paths=changed,
-                                reports={k: _compact(v, tail) for k, v in reports.items()},
+                                reports={k: _compact(v, tail)
+                                         for k, v in scrubbed_reports.items()},
                                 l1_report=l1, extra_flags=l0.risk_flags_added,
-                                implementer_notes=(impl.result or "")[:_PR_NOTES_CAP],
+                                implementer_notes=scrubbed_notes,
                                 attempt=attempt_no,
                             )
                             if len(body) <= _PR_BODY_LIMIT:
@@ -2786,9 +2818,12 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                         # pr_create_failed with a stranded branch. Free
                         # text only (fences skipped): quoted trailers in
                         # the validator report are evidence, not
-                        # attribution.
+                        # attribution. F-43 AC-2: the same call is the
+                        # literal-token fence — an independent second
+                        # check that assumes the seam above may have
+                        # failed, so the secrets travel with it.
                         pr_title = f"{task_id}: {task.get('title', '')}"
-                        check_pr_text(pr_title, body)
+                        check_pr_text(pr_title, body, secrets=egress_secrets)
                         push_branch(work.root, repo_cfg["remote"], branch, sha=head_sha,
                                     created=created, default_branch=default_branch)
                         pushed = True

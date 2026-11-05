@@ -82,7 +82,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from factory.contract import (
     SCHEMA_DIR,
@@ -93,6 +93,7 @@ from factory.contract import (
     load_tasks,
     validate_queue,
 )
+from factory.egress import check_secrets, scrub_session_text, scrub_session_value
 from factory.runs import (
     FACTORY_ROOT_DEFAULT,
     RunDir,
@@ -102,7 +103,6 @@ from factory.runs import (
     new_run_id,
 )
 from factory.sandbox import SandboxError
-from factory.sentinels import redact_credentials
 from factory.session import SessionConfigError, run_session_sandboxed, seat_token
 from factory.state import TaskQueue, _atomic_write_json, now_iso
 
@@ -1064,18 +1064,20 @@ def _refusal_suffix(text: str) -> str:
 
 
 def _save_refused_output(
-    text: str, project: str, factory_root: Path | str | None
+    text: str, project: str, factory_root: Path | str | None,
+    *, secrets: "Sequence[str]" = (),
 ) -> Path:
     """Keep the importer session's raw output for a refused proposal.
 
     The sandboxed session's run dir is deleted on every exit path, so
     without this a refused proposal cost the whole session and left
     nothing to fix and re-review with ``factory import --proposal``.
-    The copy is credential-redacted
-    (:func:`factory.sentinels.redact_credentials` — the same scrubber
-    sentinel output goes through; no secrets are *expected* in a
-    proposal, but the session writes the text, not us) and written with
-    mode 0600 under ``<factory-root>/import/`` as
+    The copy passes the F-43 egress seam
+    (:func:`factory.egress.scrub_session_text` with the caller's
+    ``secrets`` — review round 1, finding 2: pattern redaction alone was
+    the exact M-8 gap; the real Z.ai key is ``<id>.<secret>``, no shape
+    catches it, only the literal scrub does) and is written with mode
+    0600 under ``<factory-root>/import/`` as
     ``<project>-<run id>.proposal.json`` (``.txt`` when the output is
     not JSON). The id is :func:`factory.runs.new_run_id` — a UTC stamp
     plus 6 uuid hex, unique per mint (ids minted outside a run are its
@@ -1084,7 +1086,12 @@ def _save_refused_output(
     Raises:
         OSError: The factory root is unwritable — the caller keeps the
             original refusal; the save never masks it.
+        TypeError: ``secrets`` is a bare ``str`` or a non-str element
+            (round 3): a programming error that deliberately wins over
+            the diagnostic being saved — raised while the original is
+            being handled, it stays reachable as the ``__context__``.
     """
+    secrets = check_secrets(secrets)
     root = Path(factory_root) if factory_root is not None else FACTORY_ROOT_DEFAULT
     directory = root / "import"
     directory.mkdir(parents=True, exist_ok=True)
@@ -1096,7 +1103,7 @@ def _save_refused_output(
     # mode is set at creation, not by a later chmod.
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(redact_credentials(text))
+        handle.write(scrub_session_text(text, secrets))
     return path
 
 
@@ -1127,6 +1134,7 @@ def _import_fix_command(
 def keep_refused_import_output(
     exc: Exception, *, text: str, project: str, repo: Path,
     queue_path: Path, docs_dir: str, factory_root: Path | str | None,
+    secrets: "Sequence[str]" = (),
 ) -> Exception:
     """Keep a real session's refused output; return the refusal to raise.
 
@@ -1134,16 +1142,26 @@ def keep_refused_import_output(
     parse/plan/apply guard and the CLI's own apply guard both go through
     here, so no path throws an expensive proposal away — a stale queue
     found at apply time (the session already ran) loses the output
-    exactly like a parse refusal does.
+    exactly like a parse refusal does. ``secrets`` (the seat token, in
+    the caller's hand on both paths) rides into the egress seam the
+    saved copy passes through — review round 1, finding 2.
 
     An :class:`ImportRefused` comes back with the saved file's path and
     the full re-review command in its message. Any other exception (a
     write ``OSError``) keeps its type — its callers already refuse on
     it — and the saved path rides along as a note on the exception; a
-    failed save never masks the original refusal.
+    failed save never masks the original refusal. A :class:`TypeError`
+    from the secrets guard (round 3: a bare str or a bad element) is a
+    programming error and deliberately wins — but CHAINED to ``exc``
+    (``raise … from exc``), so the refusal being kept stays visible as
+    the ``__cause__``.
     """
     try:
-        saved = _save_refused_output(text, project, factory_root)
+        secrets = check_secrets(secrets)
+    except TypeError as guard_error:
+        raise guard_error from exc
+    try:
+        saved = _save_refused_output(text, project, factory_root, secrets=secrets)
     except OSError as save_exc:
         if isinstance(exc, ImportRefused):
             return ImportRefused(
@@ -1176,16 +1194,22 @@ def _scratch_proposal_path(settings_path: Path) -> Path:
 def _abort_refusal(
     head: str, *, run: RunDir, project: str, factory_root: Path,
     repo: Path, queue_path: Path, docs_dir: str,
+    secrets: "Sequence[str]" = (),
 ) -> str:
     """The refusal message for a session that did not complete.
 
     Before ``cleanup_run`` sweeps the scratch, the proposal the session
     had written so far — if any — is copied out through the one writer
-    (:func:`_save_refused_output`: redacted, mode 0600, O_EXCL, under
-    ``<factory-root>/import/``), and the message names the file and the
-    full re-review command. Without a file, the message says so
-    explicitly — never a bare ``aborted`` that leaves the owner guessing
-    what survived. A failed copy never masks the abort."""
+    (:func:`_save_refused_output`: seam-scrubbed with the session's
+    ``secrets``, mode 0600, O_EXCL, under ``<factory-root>/import/``),
+    and the message names the file and the full re-review command.
+    Without a file, the message says so explicitly — never a bare
+    ``aborted`` that leaves the owner guessing what survived. A failed
+    copy never masks the abort; a :class:`TypeError` from the secrets
+    guard (round 3) is a programming error that deliberately wins, and —
+    raised while the caller handles the original failure — the original
+    stays reachable as the ``__context__``."""
+    secrets = check_secrets(secrets)
     proposal = _scratch_proposal_path(run.settings_path)
     try:
         text = proposal.read_text(encoding="utf-8")
@@ -1194,7 +1218,7 @@ def _abort_refusal(
     except (OSError, ValueError) as exc:
         return f"{head}; (its last proposal could not be read: {exc})"
     try:
-        saved = _save_refused_output(text, project, factory_root)
+        saved = _save_refused_output(text, project, factory_root, secrets=secrets)
     except OSError as exc:
         return f"{head}; (its last proposal could not be saved: {exc})"
     command = _import_fix_command(saved, repo, queue_path, docs_dir)
@@ -1282,6 +1306,12 @@ def run_import(
     """
     validate_budget(max_turns, timeout_min)
     repo = Path(repo)
+    # F-43 review round 1 (finding 1): the egress secrets for everything
+    # this run writes from session text — the proposal that becomes
+    # tasks.json (committed and PUSHED by the owner; on a public repo
+    # that is the open web) and the refused-output save. The session may
+    # hold the token in its env; nothing it echoes may come back out.
+    egress_secrets = (seat_token() or "",)
     if queue_path is None:
         queue_path = repo / ".factory" / "tasks.json"
     queue_path = Path(queue_path)
@@ -1322,7 +1352,17 @@ def run_import(
         # kept, and the refusal says where, so the fix is a file edit
         # plus one command, not another session. A stub re-runs free
         # and keeps nothing (unless keep_refused).
-        proposal = parse_proposal(text)
+        #
+        # The proposal passes the egress seam BEFORE plan_import and
+        # validation (review round 1, finding 1): every session-derived
+        # string — titles, sources, AC text, owner steps, keys included —
+        # loses the seat token, the credential shapes and control
+        # sequences first, so (a) nothing reaches tasks.json (which the
+        # owner commits and pushes) or the printed plan unscrubbed, and
+        # (b) a redaction cannot produce a schema-valid-looking but
+        # different task without the plan diff showing it — validation
+        # judges the scrubbed values, not the raw ones.
+        proposal = scrub_session_value(parse_proposal(text), egress_secrets)
         plan = plan_import(existing_doc, proposal, records, project=project)
         summary = render_summary(plan)
         applied = False
@@ -1335,7 +1375,7 @@ def run_import(
             kept = keep_refused_import_output(
                 exc, text=text, project=project, repo=repo,
                 queue_path=queue_path, docs_dir=docs_dir,
-                factory_root=factory_root,
+                factory_root=factory_root, secrets=egress_secrets,
             )
             if kept is not exc:
                 raise kept from exc
@@ -1461,18 +1501,24 @@ def sdk_import_session(
                 f"the importer session timed out after {exc.timeout:.0f}s",
                 run=run, project=profile["name"], factory_root=root,
                 repo=repo, queue_path=Path(queue_path), docs_dir=docs_dir,
+                secrets=(token,),
             )) from exc
         else:
             if record.status != "completed":
                 # The salvage (inside the raise's argument) runs BEFORE
                 # the finally's cleanup_run sweeps the scratch: any other
                 # placement reads a deleted file. This is the seam the
-                # third lost jobfinderos session exposed.
+                # third lost jobfinderos session exposed. record.reason is
+                # session text in a message the terminal prints — seam it
+                # with the token this session itself held.
                 raise ImportRefused(_abort_refusal(
-                    f"the importer session ended {record.status}: "
-                    f"{record.reason}",
+                    scrub_session_text(
+                        f"the importer session ended {record.status}: "
+                        f"{record.reason}", (token,)
+                    ),
                     run=run, project=profile["name"], factory_root=root,
                     repo=repo, queue_path=Path(queue_path), docs_dir=docs_dir,
+                    secrets=(token,),
                 ))
         finally:
             cleanup_run(run)

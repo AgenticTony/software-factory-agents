@@ -39,7 +39,7 @@ from factory.publish import PublishError, PushRefused
 from factory.replay import ReplayError, replay_lines, resolve_replay_files
 from factory.runs import FACTORY_ROOT_DEFAULT, RUN_ID_RE, RunError
 from factory.sandbox import SandboxError
-from factory.session import SessionConfigError
+from factory.session import SessionConfigError, seat_token
 from factory.state import TaskQueue, run_lease_held
 from factory.status import StatusError, render_status
 from factory.tick import TickError, tick_steps
@@ -493,6 +493,11 @@ def _run_import(args: argparse.Namespace) -> int:
                 docs_dir=args.docs,
                 factory_root=Path(args.factory_root)
                 if args.factory_root else None,
+                # F-43 review round 1: the raw output is the session's;
+                # the saved copy passes the egress seam with the token.
+                # Round 2: a TUPLE — this was a parenthesised string,
+                # iterated character by character, scrubbing nothing.
+                secrets=(seat_token() or "",),
             )
             if kept is not exc:
                 raise kept from exc

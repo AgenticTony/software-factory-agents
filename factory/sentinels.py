@@ -95,6 +95,46 @@ _CREDENTIAL_SHAPES = (
             r"|client[_-]?secret)\b[^\n]{0,20}?[\"'][A-Za-z0-9+/=_\-]{16,}[\"']"
         ),
     ),
+    # F-43 (I-10): the three shapes a seat env actually leaks. A JWT is
+    # two eyJ-prefixed base64url segments (the JSON ``{"`` header) plus a
+    # signature; ``ANTHROPIC_AUTH_TOKEN=<jwt>`` echoes carry no quotes, so
+    # the quoted "secret assignment" shape never saw them.
+    (
+        "JSON web token",
+        re.compile(
+            r"\beyJ[A-Za-z0-9_-]{7,}\.eyJ[A-Za-z0-9_-]{7,}(?:\.[A-Za-z0-9_-]+)?"
+        ),
+    ),
+    # An Authorization header printed into text: the scheme plus a long
+    # unquoted value (case-insensitive scheme; the value alphabet is what
+    # every bearer format in use shares).
+    (
+        "bearer token",
+        re.compile(r"(?i)\bbearer[ \t]+[A-Za-z0-9._+/=-]{16,}"),
+    ),
+    # An unquoted YAML ``password:`` value: a bare 16+ run on the value
+    # side of the mapping, where YAML needs no quotes at all. Line-anchored
+    # so prose ("the password: see docs") and quoted values (the secret
+    # assignment shape's territory) stay out.
+    (
+        "unquoted YAML password",
+        re.compile(
+            r"(?im)^[ \t-]*password:[ \t]*[A-Za-z0-9+/=_-]{16,}[ \t]*(?:#.*)?$"
+        ),
+    ),
+    # F-43 review round 1 (finding 8): the bare env echo M-8 named —
+    # ``ANTHROPIC_AUTH_TOKEN=<id>.<secret>`` — is not a JWT (the Z.ai key
+    # shape), so no shape caught it. An UPPERCASE env-var name ending in
+    # _TOKEN/_KEY/_SECRET/_PASSWORD, ``=``, and a 16+ unquoted value (the
+    # value alphabet excludes quotes: quoted assignments are the secret
+    # assignment shape's territory).
+    (
+        "environment variable echo",
+        re.compile(
+            r"\b[A-Z][A-Z0-9_]*(?:_TOKEN|_KEY|_SECRET|_PASSWORD)="
+            r"[A-Za-z0-9+/=_.\-]{16,}"
+        ),
+    ),
 )
 
 # An environment READ is the safe way for a secret to travel: the env
@@ -119,6 +159,12 @@ _ENV_CALL_SPAN = re.compile(
 CREDENTIAL_PATTERNS = tuple(pattern for _, pattern in _CREDENTIAL_SHAPES)
 
 
+# A literal shorter than this is not a secret worth scrubbing — replacing
+# a one-character "token" shreds ordinary text (a real seat token is long).
+MIN_SECRET_LEN = 8
+REDACTED = "[redacted]"
+
+
 def redact_credentials(text: str) -> str:
     """Replace every credential-shaped match in ``text`` with ``[redacted]``.
 
@@ -127,7 +173,34 @@ def redact_credentials(text: str) -> str:
     into findings, reports or PR bodies goes through here first.
     """
     for pattern in CREDENTIAL_PATTERNS:
-        text = pattern.sub("[redacted]", text)
+        text = pattern.sub(REDACTED, text)
+    return text
+
+
+def is_scrubbable_secret(secret: str | None) -> bool:
+    """Whether ``secret`` is a real secret worth scrubbing.
+
+    THE one rule (review round 1, finding 10): both :func:`scrub_literal`
+    and the PR-text fence (:func:`factory.publish.check_pr_text`) call it,
+    so F-59's per-provider formats can change what counts as a secret in
+    one place — a fence that silently stops refusing what the seam still
+    scrubs is exactly the drift this prevents.
+    """
+    return bool(secret) and len(secret) >= MIN_SECRET_LEN
+
+
+def scrub_literal(text: str, secret: str | None) -> str:
+    """Replace the literal secret (the seat token) with ``[redacted]``.
+
+    Long secrets only (:func:`is_scrubbable_secret`): a short literal
+    redacts noise, not secrets. F-30 defined this beside the trace writer;
+    F-43 moved it here — beside :func:`redact_credentials`, whose sibling
+    it is — so the egress seam (:mod:`factory.egress`) composes the two
+    scrubbers from one home. :mod:`factory.trace` re-exports it unchanged
+    (one implementation).
+    """
+    if is_scrubbable_secret(secret):
+        return text.replace(secret, REDACTED)
     return text
 
 

@@ -113,6 +113,7 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk import query as sdk_query
 
+from factory.egress import check_secrets, scrub_session_text
 from factory.runs import FACTORY_ROOT_DEFAULT, GIT_HARDENING, RunError, new_run_id
 from factory.sandbox import (
     build_settings,
@@ -120,7 +121,6 @@ from factory.sandbox import (
     run_sandboxed,
     write_settings,
 )
-from factory.sentinels import redact_credentials
 from factory.state import now_iso
 from factory.toolkit import (
     ENV_SCRUB,
@@ -1359,8 +1359,12 @@ async def run_session(
     if query_fn is None:
         query_fn = sdk_query
     if vent_collector is None:
+        # F-43: the default collector carries this session's token as a
+        # literal secret, so every vent is seam-scrubbed in-sandbox before
+        # it crosses the boundary (the flush scrubs again outside).
         vent_collector = VentCollector(
-            run_id=run_id or "", task_id=task_id or "", seat=seat
+            run_id=run_id or "", task_id=task_id or "", seat=seat,
+            secrets=(token,) if token else (),
         )
     # F-42 AC-5: the denial state shared by the bypass hook (which counts
     # into it), this tap (which marks each denial onto its trace event)
@@ -2175,9 +2179,16 @@ def _run_prepared(
         None,
     )
     if record_line is None:
+        # F-43 review round 1 (finding 5): the runner's stderr is session-
+        # text-adjacent (a tool can write to it) and this message is
+        # printed to the owner's terminal and rides into attempt notes —
+        # seam-scrubbed with the session's own token, THEN capped, like
+        # every other boundary (F-56 AC-2 will generalize this to the
+        # abort paths).
         raise SessionConfigError(
             "the sandboxed session entry produced no record "
-            f"(exit {proc.returncode}): {proc.stderr.strip()[:2000]}"
+            f"(exit {proc.returncode}): "
+            f"{scrub_session_text(proc.stderr or '', (token,))[:2000]}"
         )
     try:
         record = SessionRecord.from_dict(json.loads(record_line))
@@ -2185,29 +2196,38 @@ def _run_prepared(
         raise SessionConfigError(
             "the sandboxed session entry produced an unparsable record "
             f"({exc}); record line length {len(record_line)}; full stdout "
-            f"saved to {_save_session_stdout(proc.stdout, run_dir, factory_root)}"
+            f"saved to {_save_session_stdout(proc.stdout, run_dir, factory_root, secrets=(token,))}"
         ) from exc
 
     return record
 
 
 def _save_session_stdout(
-    stdout: str, run_dir: Path, factory_root: Path | None
+    stdout: str, run_dir: Path, factory_root: Path | None,
+    *, secrets: "Sequence[str]" = (),
 ) -> str:
     """Keep the full raw stdout of a session whose record would not parse.
 
     The once-observed "Unterminated string" record (2026-11-01, 56 turns
     lost) left nothing to diagnose: the run dir is deleted on every exit
     path, and the truncated tail in the error message said nothing about
-    what the whole stream looked like. The copy is credential-redacted
-    (:func:`factory.sentinels.redact_credentials`), written with mode
-    0600, create-only (O_EXCL), under ``<factory-root>/sessions/`` —
-    beside the runs, outside the clone that is about to disappear.
+    what the whole stream looked like. The copy passes the F-43 egress
+    seam (:func:`factory.egress.scrub_session_text` with the session's
+    ``secrets`` — the M-8 gap was the literal token, which pattern
+    redaction alone never caught — then the control-sequence strip), is
+    written with mode 0600, create-only (O_EXCL), under
+    ``<factory-root>/sessions/`` — beside the runs, outside the clone that
+    is about to disappear.
 
     Returns the saved path as text, or ``<not saved: …>`` — the save is
     diagnostics for a SessionConfigError already on its way out, and a
-    failed save must never mask it.
+    failed save must never mask it. A :class:`TypeError` from the secrets
+    guard (round 3: a bare ``str`` or a non-str element) is a programming
+    error and deliberately wins — raised while the caller handles the
+    original failure, the original stays reachable as the
+    ``__context__``.
     """
+    secrets = check_secrets(secrets)
     try:
         root = Path(factory_root) if factory_root is not None else None
         if root is None:
@@ -2218,7 +2238,7 @@ def _save_session_stdout(
         path = directory / f"unparsable-record-{new_run_id()}.stdout.txt"
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(redact_credentials(stdout))
+            handle.write(scrub_session_text(stdout, secrets))
         return str(path)
     except OSError as exc:
         return f"<not saved: {exc}>"
