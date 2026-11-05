@@ -22,6 +22,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -839,10 +840,22 @@ def test_review2(tmp_path, monkeypatch):
 # --- review3: the tripwire sees every module; mutations still trip ----------
 
 
+def _is_secrets_kw_ok(value: ast.AST) -> bool:
+    """A ``secrets=`` keyword that is a real sequence: a tuple/list
+    literal, a name (a pre-built sequence like ``egress_secrets``), or an
+    expression built from one. A parenthesised bare expression — round 2's
+    ``secrets=(seat_token() or "")``, a STRING iterated character by
+    character — is exactly what this refuses."""
+    return isinstance(value, (ast.Tuple, ast.List, ast.Name)) or any(
+        isinstance(n, (ast.Tuple, ast.List)) for n in ast.walk(value)
+    )
+
+
 def test_review3():
     # (a) Channel rules for the new modules: run_import scrubs the
     # proposal BEFORE plan_import; every refused-output writer gets
-    # secrets; the CLI's keep path too.
+    # secrets — as a SEQUENCE (round 2: a bare parenthesised string is
+    # silent no-scrub); the CLI's keep path too.
     importer_src = (REPO_ROOT / "factory" / "importer.py").read_text()
     scrub_at = importer_src.index("scrub_session_value")
     plan_at = importer_src.index("plan_import(existing_doc")
@@ -856,16 +869,28 @@ def test_review3():
         calls = [n for n in ast.walk(itree)
                  if isinstance(n, ast.Call) and _callee_name(n) == callee]
         assert calls, f"{callee} is gone — update this rule"
-        assert all(_kw(c, "secrets") is not None for c in calls), (
-            f"importer.py: a {callee} call lost its secrets"
-        )
+        for call in calls:
+            secrets = _kw(call, "secrets")
+            assert secrets is not None, (
+                f"importer.py:{call.lineno}: a {callee} call lost its secrets"
+            )
+            assert _is_secrets_kw_ok(secrets), (
+                f"importer.py:{call.lineno}: {callee}'s secrets is not a "
+                "sequence (a bare string scrubs nothing)"
+            )
     ctree = ast.parse((REPO_ROOT / "factory" / "cli.py").read_text())
     keeps = [n for n in ast.walk(ctree)
              if isinstance(n, ast.Call)
              and _callee_name(n) == "keep_refused_import_output"]
-    assert keeps and all(_kw(c, "secrets") is not None for c in keeps), (
-        "cli.py: the keep path lost its secrets"
-    )
+    assert keeps, "cli.py: the keep path is gone — update this rule"
+    for call in keeps:
+        secrets = _kw(call, "secrets")
+        assert secrets is not None and _is_secrets_kw_ok(secrets), (
+            f"cli.py:{call.lineno}: the keep path's secrets is missing or "
+            "not a sequence (round 2: secrets=(seat_token() or \"\") is a "
+            "STRING — iterated character by character, the literal scrub "
+            "never ran)"
+        )
 
     # (b) Mutation: a new writer in importer.py or cli.py receiving
     # session text trips the tripwire (finding 3's regression class).
@@ -1089,3 +1114,118 @@ def test_review10():
     # And the behaviours the shared rule produces.
     assert scrub_literal("has short", "short") == "has short"
     assert check_pr_text("t", "body with tok", secrets=("tok",)) is None
+
+
+# ======================= owner review round 2 (PR #98) =======================
+#
+# One defect, introduced by round 1: the CLI's keep path passed
+# ``secrets=(seat_token() or "")`` — a parenthesised STRING, not a tuple.
+# The seam iterated it character by character; every character is shorter
+# than MIN_SECRET_LEN, so the literal scrub never ran and the saved
+# refused output kept the seat token in clear. The fix is two levels:
+# the bug (a tuple at the call site) and the class (a bare str is refused
+# at every entry that takes secrets, one shared guard).
+
+
+def test_review11_cli_keep_scrubs_literal(tmp_path, monkeypatch, capsys):
+    """The real CLI keep path scrubs the literal token: a real session
+    (monkeypatched sdk_import_session — the keep keys on it) proposes a
+    task whose title carries the seat token; the queue goes stale while
+    the apply prompt waits; apply refuses and the CLI saves the session's
+    raw output through keep_refused_import_output with the CLI's secrets.
+    On e9d3078 the CLI passed a bare string and the token survived."""
+    from factory.cli import main
+    from factory.importer import run_import
+
+    repo = _import_repo(tmp_path)
+    root = tmp_path / "home-factory"
+    monkeypatch.setattr("factory.importer.FACTORY_ROOT_DEFAULT", root)
+    monkeypatch.setattr("factory.importer.seat_token", lambda: SEAT_TOKEN)
+    # The CLI's keep path uses ITS OWN seat_token import — plant there
+    # too, or the test would scrub with the real keychain item.
+    monkeypatch.setattr("factory.cli.seat_token", lambda: SEAT_TOKEN)
+    # A queue the plan will differ from: a second task, distinct id, with
+    # the token in its title — session text via the real-session keep path
+    # (the CLI keep keys on the session being real).
+    first = _wo_task("Work order WO-1", "it works")
+    run_import(repo, session=lambda p: json.dumps(
+        {"project": "jobfinderos", "tasks": [first]}), confirm=lambda s: True)
+    poisoned = dict(
+        _wo_task(f"leak {SEAT_TOKEN} echo {ENV_ECHO_ZAI}", f"env {ENV_ECHO_ZAI}"),
+        id="WO-2",
+    )
+    monkeypatch.setattr(
+        "factory.importer.sdk_import_session",
+        lambda prompt, repo, **kwargs: json.dumps(
+            {"project": "jobfinderos", "tasks": [first, poisoned]}
+        ),
+    )
+
+    def approve_meanwhile(prompt: str = "") -> str:
+        from factory.state import TaskQueue
+
+        queue = TaskQueue(repo / ".factory" / "tasks.json")
+        queue.get("WO-1")["title"] = "changed while the prompt waited"
+        queue.save()
+        return "y"
+
+    monkeypatch.setattr("builtins.input", approve_meanwhile)
+    rc = main(["import", "--repo", str(repo)])
+    assert rc == 1, capsys.readouterr().err
+    files = sorted((root / "import").glob("*.proposal.*"))
+    assert files, "the refused output was not kept on the CLI path"
+    kept = files[0].read_text()
+    assert SEAT_TOKEN not in kept, (
+        "the literal seat token survived the CLI keep path — secrets was a "
+        "bare string, iterated character by character"
+    )
+    assert ZAI_KEY not in kept and "\x1b" not in kept
+
+
+def test_review12_str_secrets_refused(tmp_path):
+    """The class fix: a bare str is refused at EVERY entry that takes
+    secrets — iterating it character by character scrubs nothing, so the
+    mistake must be loud, not silent. Tuples and lists still work."""
+    from factory import egress
+    from factory.importer import _abort_refusal, _save_refused_output, keep_refused_import_output
+    from factory.progress import ProgressLog
+    from factory.publish import check_pr_text
+    from factory.session import _save_session_stdout
+    from factory.trace import TraceWriter
+    from factory.vent import VentCollector, clean_text, flush_vents
+
+    log = ProgressLog(tmp_path / "log.jsonl")
+    bad = SEAT_TOKEN  # a str where a sequence belongs
+
+    entries = {
+        "scrub_session_text": lambda: egress.scrub_session_text("x", bad),
+        "scrub_session_value": lambda: egress.scrub_session_value("x", bad),
+        "check_pr_text": lambda: check_pr_text("t", "b", secrets=bad),
+        "flush_vents": lambda: flush_vents(log, [], secrets=bad),
+        "clean_text": lambda: clean_text("x", bad),
+        "VentCollector": lambda: VentCollector("r", "t", "s", secrets=bad),
+        "_save_session_stdout": lambda: _save_session_stdout(
+            "x", tmp_path, tmp_path, secrets=bad),
+        "_save_refused_output": lambda: _save_refused_output(
+            "x", "proj", tmp_path, secrets=bad),
+        "keep_refused_import_output": lambda: keep_refused_import_output(
+            ImportError("x"), text="x", project="p", repo=tmp_path,
+            queue_path=tmp_path, docs_dir="docs", factory_root=tmp_path,
+            secrets=bad),
+        "_abort_refusal": lambda: _abort_refusal(
+            "head", run=SimpleNamespace(settings_path=tmp_path),
+            project="p", factory_root=tmp_path, repo=tmp_path,
+            queue_path=tmp_path, docs_dir="docs", secrets=bad),
+        "TraceWriter.extra_secrets": lambda: TraceWriter(
+            tmp_path, "proj", "run1", "T-1", extra_secrets=bad),
+    }
+    for name, call in entries.items():
+        with pytest.raises(TypeError, match="sequence of secrets"):
+            call()
+    # Sequences still work: tuple AND list scrub the literal.
+    redacted = egress.scrub_session_text(f"leak {SEAT_TOKEN}", (SEAT_TOKEN,))
+    assert redacted == "leak [redacted]"
+    assert egress.scrub_session_text(
+        f"leak {SEAT_TOKEN}", [SEAT_TOKEN]) == "leak [redacted]"
+    with pytest.raises(PushRefused):
+        check_pr_text("t", f"b {SEAT_TOKEN}", secrets=[SEAT_TOKEN])

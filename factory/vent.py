@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
-from factory.egress import scrub_session_text
+from factory.egress import check_secrets, scrub_session_text
 from factory.progress import ProgressLog, ProgressLogError, safe_name
 from factory.state import now_iso
 
@@ -90,7 +90,10 @@ class VentCollector:
         # F-43: the literal secrets this session's runner holds (the seat
         # token), so a vent is seam-scrubbed BEFORE it crosses the sandbox
         # boundary — the orchestrator scrubs again at the flush.
-        self.secrets = tuple(secret for secret in secrets if secret)
+        # Round 2: the one guard — a bare str must be loud here too.
+        self.secrets = tuple(
+            secret for secret in check_secrets(secrets) if secret
+        )
         self.turn = 0
         self.vents: list[dict[str, Any]] = []
         self._seen_ids: set[str] = set()
@@ -177,6 +180,7 @@ def clean_text(text: str, secrets: "Sequence[str]" = ()) -> str:
     echo) and terminal control sequences (m-16: `factory status` prints
     this text to the owner's terminal).
     """
+    secrets = check_secrets(secrets)
     text = scrub_session_text(text, secrets)
     if len(text) > VENT_TEXT_CAP:
         text = text[: VENT_TEXT_CAP - len(VENT_TRUNCATED)] + VENT_TRUNCATED
@@ -272,6 +276,7 @@ def flush_vents(
     flush — a vent cannot be dated into the future to linger in the
     weekly window.
     """
+    secrets = check_secrets(secrets)
     stamp = at or now_iso()
     ceiling = _parse_at(stamp)
     entries = []

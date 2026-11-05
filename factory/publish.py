@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Sequence
 
 from factory.attribution import attribution_match, title_attribution_match
+from factory.egress import check_secrets
 from factory.runs import GIT_HARDENING
 from factory.sentinels import is_scrubbable_secret
 
@@ -84,7 +85,10 @@ def check_pr_text(title: str, body: str, *, secrets: Sequence[str] = ()) -> None
         PushRefused: A literal secret appears in the title or body (named,
             not echoed), or the free text matched an attribution pattern.
             Raised before any git or gh process starts.
+        TypeError: ``secrets`` is a bare ``str``
+            (:func:`factory.egress.check_secrets` — round 2's class fix).
     """
+    secrets = check_secrets(secrets)
     for secret in secrets:
         # The ONE rule for what counts as a secret (review round 1,
         # finding 10): shared with scrub_literal via

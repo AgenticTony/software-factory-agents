@@ -59,7 +59,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
-from factory.egress import strip_control_sequences
+from factory.egress import check_secrets, strip_control_sequences
 from factory.runs import RUN_ID_RE
 from factory.sentinels import redact_credentials, scrub_literal
 from factory.state import now_iso
@@ -190,7 +190,11 @@ class TraceWriter:
         self.path = trace_path(factory_root, project, run_id)
         self.run_id = run_id
         self.task_id = task_id
-        self.secrets = tuple(secret for secret in extra_secrets if secret)
+        # Round 2 (class fix): a bare str extra_secrets iterated
+        # character by character scrubbed nothing — loud at the entry.
+        self.secrets = tuple(
+            secret for secret in check_secrets(extra_secrets) if secret
+        )
         self.attempt = 1
         self.seq = 0
         self.disabled = False

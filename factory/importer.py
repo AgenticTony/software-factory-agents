@@ -93,7 +93,7 @@ from factory.contract import (
     load_tasks,
     validate_queue,
 )
-from factory.egress import scrub_session_text, scrub_session_value
+from factory.egress import check_secrets, scrub_session_text, scrub_session_value
 from factory.runs import (
     FACTORY_ROOT_DEFAULT,
     RunDir,
@@ -1087,6 +1087,7 @@ def _save_refused_output(
         OSError: The factory root is unwritable — the caller keeps the
             original refusal; the save never masks it.
     """
+    secrets = check_secrets(secrets)
     root = Path(factory_root) if factory_root is not None else FACTORY_ROOT_DEFAULT
     directory = root / "import"
     directory.mkdir(parents=True, exist_ok=True)
@@ -1147,6 +1148,7 @@ def keep_refused_import_output(
     it — and the saved path rides along as a note on the exception; a
     failed save never masks the original refusal.
     """
+    secrets = check_secrets(secrets)
     try:
         saved = _save_refused_output(text, project, factory_root, secrets=secrets)
     except OSError as save_exc:
@@ -1193,6 +1195,7 @@ def _abort_refusal(
     Without a file, the message says so explicitly — never a bare
     ``aborted`` that leaves the owner guessing what survived. A failed
     copy never masks the abort."""
+    secrets = check_secrets(secrets)
     proposal = _scratch_proposal_path(run.settings_path)
     try:
         text = proposal.read_text(encoding="utf-8")

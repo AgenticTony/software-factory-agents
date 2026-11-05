@@ -495,7 +495,9 @@ def _run_import(args: argparse.Namespace) -> int:
                 if args.factory_root else None,
                 # F-43 review round 1: the raw output is the session's;
                 # the saved copy passes the egress seam with the token.
-                secrets=(seat_token() or ""),
+                # Round 2: a TUPLE — this was a parenthesised string,
+                # iterated character by character, scrubbing nothing.
+                secrets=(seat_token() or "",),
             )
             if kept is not exc:
                 raise kept from exc

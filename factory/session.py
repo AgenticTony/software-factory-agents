@@ -113,7 +113,7 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk import query as sdk_query
 
-from factory.egress import scrub_session_text
+from factory.egress import check_secrets, scrub_session_text
 from factory.runs import FACTORY_ROOT_DEFAULT, GIT_HARDENING, RunError, new_run_id
 from factory.sandbox import (
     build_settings,
@@ -2223,6 +2223,7 @@ def _save_session_stdout(
     diagnostics for a SessionConfigError already on its way out, and a
     failed save must never mask it.
     """
+    secrets = check_secrets(secrets)
     try:
         root = Path(factory_root) if factory_root is not None else None
         if root is None:

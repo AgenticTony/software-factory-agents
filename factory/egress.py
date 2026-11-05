@@ -94,6 +94,26 @@ _CONTROL_SEQUENCES = (
 )
 
 
+def check_secrets(secrets: Sequence[str]) -> tuple[str, ...]:
+    """The one guard every ``secrets``/``extra_secrets`` entry calls
+    (review round 2): refuse a bare ``str``.
+
+    A parenthesised string — ``secrets=(token or "")`` — is iterable
+    character by character, every character is shorter than the scrub
+    floor, and the literal scrub silently scrubs NOTHING. The mistake
+    must be loud: :class:`TypeError` at the boundary, naming it. Real
+    sequences (tuple, list) pass through as a tuple.
+    """
+    if isinstance(secrets, str):
+        raise TypeError(
+            "secrets must be a sequence of secrets, not a str — a bare "
+            "string is iterated character by character and every character "
+            "is shorter than the scrub floor, so the literal scrub never "
+            "runs; pass a tuple/list, e.g. secrets=(token,)"
+        )
+    return tuple(secrets)
+
+
 def strip_control_sequences(text: str) -> str:
     """Remove ANSI/OSC/C0 control sequences from ``text``.
 
@@ -123,8 +143,10 @@ def scrub_session_text(text: str, secrets: Sequence[str] = ()) -> str:
             — into a PR body, a vent, a dump or a terminal.
         secrets: Caller-known literal secrets (the seat token; F-59 adds
             per-provider credentials). Short literals are noise and are
-            ignored (:data:`factory.sentinels.MIN_SECRET_LEN`).
+            ignored (:data:`factory.sentinels.MIN_SECRET_LEN`). A bare
+            ``str`` is refused (:func:`check_secrets`).
     """
+    secrets = check_secrets(secrets)
 
     def _scrub(value: str) -> str:
         for secret in secrets:
@@ -148,6 +170,7 @@ def scrub_session_value(value: Any, secrets: Sequence[str] = ()) -> Any:
     is new; the input is never mutated (stored reports keep what the
     validators produced).
     """
+    check_secrets(secrets)
     if isinstance(value, str):
         return scrub_session_text(value, secrets)
     if isinstance(value, dict):
