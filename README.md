@@ -25,7 +25,8 @@ mismatch. System dependencies (per srt's own README):
 |---|---|
 | macOS | none (uses the built-in `sandbox-exec`) |
 | Linux | `sudo apt-get install -y bubblewrap socat ripgrep` |
-| Ubuntu 24.04+ | also `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (AppArmor otherwise blocks bubblewrap's user namespaces) |
+| Ubuntu 24.04 | also `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (AppArmor otherwise blocks bubblewrap's user namespaces) |
+| Ubuntu 26.04 | not supported yet: srt's nested user namespace fails (`apply-seccomp: write /proc/self/setgroups … Permission denied`) and the sysctl above does not lift it; CI pins 24.04 |
 
 Then `ruff check . && pytest -q -n auto` (parallel via pytest-xdist; plain
 `pytest -q` works too and is what CI runs). The sandbox tests attempt the forbidden
