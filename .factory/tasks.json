@@ -4320,7 +4320,7 @@
         },
         {
           "id": "AC-3",
-          "text": "(M-14) `docs/proposals-2026-10-30-borrowings.md` is deleted or re-baselined with ids from F-58 up; no doc assigns a live WO id a second meaning.",
+          "text": "(M-14) `docs/proposals-2026-10-30-borrowings.md` is deleted or re-baselined with ids from F-59 up; no doc assigns a live WO id a second meaning.",
           "check": {
             "type": "test",
             "ref": "tests/test_f52.py::test_ac_3"
@@ -4646,6 +4646,84 @@
           "check": {
             "type": "manual",
             "expect": "owner tick evidence: the re-run baseline report"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-58",
+      "title": "Linux sandbox host on Ubuntu 26.04 and red-CI guard",
+      "source": "BUILD-ORDER.md#f-58--linux-sandbox-host-on-ubuntu-2604-and-red-ci-guard",
+      "kind": "build",
+      "priority": "P2",
+      "status": "draft",
+      "depends_on": [
+        "F-05",
+        "F-51"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "The 26.04 failure is reproduced and its cause named (AppArmor userns profile, kernel capability rule, or bubblewrap/srt version), with a minimal repro recorded in the WO's ledger entry.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f58.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "The sandbox runs on ubuntu-26.04 without weakening it: an srt upgrade or a documented host setting (sysctl or an AppArmor profile for bubblewrap). The `tests/test_f05.py` attack tests pass unchanged on 26.04.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f58.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "CI runs the sandbox suite on both `ubuntu-24.04` and `ubuntu-26.04`, as separately named jobs, so a runner image change fails one named job instead of every test; the 24.04-only pin from PR #97 is removed or kept with a stated reason in the workflow.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f58.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "`factory run` preflights the host: when the sandbox cannot create its nested user namespace, the run refuses before picking a task, with one error naming the missing setting, not a cascade of session failures. A test with a fake srt that exits with the setgroups error asserts the refusal.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f58.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "With `repo.branch_protection: unavailable`, the factory self-enforces green CI as it already self-enforces up-to-date: `factory run` refuses to start while the default branch's latest CI run for HEAD failed, and the stale-PR sweep never reports a PR ready whose checks fail. Tests cover a red default branch and a red PR, through the existing `pr_state`/protection seams.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f58.py::test_ac_5"
+          }
+        },
+        {
+          "id": "AC-6",
+          "text": "README's and CLAUDE.md's host table lists exactly the hosts CI verifies; a test asserts every Ubuntu version in that table appears as a CI job.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f58.py::test_ac_6"
           }
         }
       ],

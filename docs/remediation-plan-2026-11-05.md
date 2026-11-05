@@ -1,6 +1,6 @@
 # Remediation plan — CODE-REVIEW-2026-11-05
 
-**Status:** F-43 to F-55 are drafted in `BUILD-ORDER.md` (Phase 1r) and `.factory/tasks.json`, all
+**Status:** F-43 to F-58 are drafted in `BUILD-ORDER.md` (Phase 1r) and `.factory/tasks.json`, all
 `draft`. **`BUILD-ORDER.md` is the canonical spec**; where wording differs, it wins. This doc keeps
 the rationale and the finding-to-WO map.
 
@@ -10,7 +10,7 @@ code. Every doc finding closes with a mechanical check where one is possible. Fo
 decisions, not fixes. They're marked **DECIDE** and have a recommendation.
 
 **Ids:** new WOs start at F-43. F-36 stays unused. The untracked
-`docs/proposals-2026-10-30-borrowings.md` reuses F-40/F-41, and F-52 resolves that. F-56 and F-57 come from the F-13 import run, not the review (§1b).
+`docs/proposals-2026-10-30-borrowings.md` reuses F-40/F-41, and F-52 resolves that. F-56 and F-57 come from the F-13 import run and F-58 from the CI fix (PR #97), not the review (§1b).
 
 ---
 
@@ -105,7 +105,7 @@ control sequences.
 **F-52 — Docs truth pass** · — · S · factory-built candidate (check protected docs)
 - AC-1 (M-12) **DECIDE:** recommendation is to delete the queue-marker regeneration claim from `TASK-CONTRACT.md` (lines 13 and 144). `tasks.json` plus `factory status` is the one source; a second rendered table is the duplicated truth §7 warns about.
 - AC-2 (M-13) VALIDATOR-SPEC's done rule names the no-deploy carve-out, and marks L3/L4 as not yet built until F-14/F-15 land.
-- AC-3 (M-14) The borrowings proposals doc is deleted, or re-baselined with ids from F-58 up.
+- AC-3 (M-14) The borrowings proposals doc is deleted, or re-baselined with ids from F-59 up.
 - AC-4 (m-18) README: "never skipped" names the INC-007 exception, "every layer" becomes L0–L2, the stale WO range is fixed, and BOOTSTRAP.md's "frozen" header is corrected.
 - AC-5 (m-19) VALIDATOR-SPEC names `prompts/reviewer.md` as the L2 base, not `verifier.md`.
 - AC-6 (I-13, I-14, I-15) BUILD-ORDER's build-order narrative is brought current; F-13 step 2 names the right file; DESIGN's vendored-skills list matches what's vendored.
@@ -140,6 +140,9 @@ Three of four real importer runs on 2026-11-05 lost the session record to a trun
 **F-57 — Importer robustness: per-task tool, repair turn, prose eval** · factory_control · M · interactive · Tier 2 · depends F-49, F-56
 A `propose_task` tool validates each task as it is written, one repair session replaces a full re-run, and a prose-docs fixture plus `factory eval --importer` measure the importer on a repo whose docs aren't contract-shaped.
 
+**F-58 — Linux sandbox host on Ubuntu 26.04 and red-CI guard** · factory_control · M · interactive · Tier 2 · depends F-05, F-51
+PR #97 pins CI to ubuntu-24.04 because srt's nested user namespace fails on 26.04. F-58 makes 26.04 a verified host, runs CI on both, preflights the host at `factory run`, and self-enforces green CI when `branch_protection: unavailable` — the gap that let `main` stay red for 11 days while PRs #90–#95 merged.
+
 ## 2. Placement in the build order
 
 ```
@@ -147,7 +150,7 @@ now ──► F-43 ─► F-44 ─► F-45 ─► F-46 ─► F-47 ─► F-56 (
                                    │
         owner: client data step ───┤
                                    ▼
-        F-13 steps 4–5 (first real outside run)   ║  F-48 → F-49 → F-51 → F-57 (Tier 2, interactive)
+        F-13 steps 4–5 (first real outside run)   ║  F-48 → F-49 → F-51 → F-57 → F-58 (Tier 2, interactive)
                                                    ║  F-50, F-52           (factory-built candidates)
                                    ▼
         F-53 ─► F-54 ─► F-55                       (Tier 3)
