@@ -95,6 +95,33 @@ _CREDENTIAL_SHAPES = (
             r"|client[_-]?secret)\b[^\n]{0,20}?[\"'][A-Za-z0-9+/=_\-]{16,}[\"']"
         ),
     ),
+    # F-43 (I-10): the three shapes a seat env actually leaks. A JWT is
+    # two eyJ-prefixed base64url segments (the JSON ``{"`` header) plus a
+    # signature; ``ANTHROPIC_AUTH_TOKEN=<jwt>`` echoes carry no quotes, so
+    # the quoted "secret assignment" shape never saw them.
+    (
+        "JSON web token",
+        re.compile(
+            r"\beyJ[A-Za-z0-9_-]{7,}\.eyJ[A-Za-z0-9_-]{7,}(?:\.[A-Za-z0-9_-]+)?"
+        ),
+    ),
+    # An Authorization header printed into text: the scheme plus a long
+    # unquoted value (case-insensitive scheme; the value alphabet is what
+    # every bearer format in use shares).
+    (
+        "bearer token",
+        re.compile(r"(?i)\bbearer[ \t]+[A-Za-z0-9._+/=-]{16,}"),
+    ),
+    # An unquoted YAML ``password:`` value: a bare 16+ run on the value
+    # side of the mapping, where YAML needs no quotes at all. Line-anchored
+    # so prose ("the password: see docs") and quoted values (the secret
+    # assignment shape's territory) stay out.
+    (
+        "unquoted YAML password",
+        re.compile(
+            r"(?im)^[ \t-]*password:[ \t]*[A-Za-z0-9+/=_-]{16,}[ \t]*(?:#.*)?$"
+        ),
+    ),
 )
 
 # An environment READ is the safe way for a secret to travel: the env
@@ -119,6 +146,12 @@ _ENV_CALL_SPAN = re.compile(
 CREDENTIAL_PATTERNS = tuple(pattern for _, pattern in _CREDENTIAL_SHAPES)
 
 
+# A literal shorter than this is not a secret worth scrubbing — replacing
+# a one-character "token" shreds ordinary text (a real seat token is long).
+MIN_SECRET_LEN = 8
+REDACTED = "[redacted]"
+
+
 def redact_credentials(text: str) -> str:
     """Replace every credential-shaped match in ``text`` with ``[redacted]``.
 
@@ -127,7 +160,21 @@ def redact_credentials(text: str) -> str:
     into findings, reports or PR bodies goes through here first.
     """
     for pattern in CREDENTIAL_PATTERNS:
-        text = pattern.sub("[redacted]", text)
+        text = pattern.sub(REDACTED, text)
+    return text
+
+
+def scrub_literal(text: str, secret: str | None) -> str:
+    """Replace the literal secret (the seat token) with ``[redacted]``.
+
+    Long secrets only: a short literal redacts noise, not secrets. F-30
+    defined this beside the trace writer; F-43 moved it here — beside
+    :func:`redact_credentials`, whose sibling it is — so the egress seam
+    (:mod:`factory.egress`) composes the two scrubbers from one home.
+    :mod:`factory.trace` re-exports it unchanged (one implementation).
+    """
+    if secret and len(secret) >= MIN_SECRET_LEN:
+        return text.replace(secret, REDACTED)
     return text
 
 

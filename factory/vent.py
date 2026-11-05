@@ -33,8 +33,8 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
+from factory.egress import scrub_session_text
 from factory.progress import ProgressLog, ProgressLogError, safe_name
-from factory.sentinels import redact_credentials
 from factory.state import now_iso
 
 if TYPE_CHECKING:  # pragma: no cover — import cycle avoidance, typing only
@@ -82,10 +82,15 @@ class VentCollector:
     session returns.
     """
 
-    def __init__(self, run_id: str, task_id: str, seat: str) -> None:
+    def __init__(self, run_id: str, task_id: str, seat: str,
+                 *, secrets: "Sequence[str]" = ()) -> None:
         self.run_id = run_id
         self.task_id = task_id
         self.seat = seat
+        # F-43: the literal secrets this session's runner holds (the seat
+        # token), so a vent is seam-scrubbed BEFORE it crosses the sandbox
+        # boundary — the orchestrator scrubs again at the flush.
+        self.secrets = tuple(secret for secret in secrets if secret)
         self.turn = 0
         self.vents: list[dict[str, Any]] = []
         self._seen_ids: set[str] = set()
@@ -148,7 +153,7 @@ class VentCollector:
             "seat": self.seat,
             "turn": self.turn,
             "category": category,
-            "text": clean_text(raw),
+            "text": clean_text(raw, self.secrets),
             # When the call was made, not when the session returned.
             "at": now_iso(),
         }
@@ -159,16 +164,20 @@ class VentCollector:
         return vent
 
 
-def clean_text(text: str) -> str:
-    """Redact, THEN cap (review finding 2: capping first could cut a
-    credential in half and leave a prefix no pattern matches).
+def clean_text(text: str, secrets: "Sequence[str]" = ()) -> str:
+    """The F-43 egress seam, then cap (review finding 2: capping first
+    could cut a credential in half and leave a prefix no pattern matches).
 
     F-25's invariant, held for the same reason: untrusted session text is
     redacted before it reaches orchestrator-owned storage — a model echoing
     a credential into a complaint must not persist it into the logs
-    `factory status` later prints.
+    `factory status` later prints. F-43 (M-8) widened the redaction to the
+    full seam: the caller's literal secrets (the seat token — pattern
+    redaction alone never caught a bare ``ANTHROPIC_AUTH_TOKEN=<jwt>``
+    echo) and terminal control sequences (m-16: `factory status` prints
+    this text to the owner's terminal).
     """
-    text = redact_credentials(text)
+    text = scrub_session_text(text, secrets)
     if len(text) > VENT_TEXT_CAP:
         text = text[: VENT_TEXT_CAP - len(VENT_TRUNCATED)] + VENT_TRUNCATED
     return text
@@ -239,6 +248,7 @@ def flush_vents(
     run_id: str | None = None,
     task_id: str | None = None,
     seat: str | None = None,
+    secrets: "Sequence[str]" = (),
 ) -> list[dict[str, Any]]:
     """Append one progress-log entry per valid vent, as one batch.
 
@@ -251,9 +261,11 @@ def flush_vents(
     whitelisted fields only — ``kind`` is always ``"vent"``, and no
     ``n``/``prev``/``finding_keys``/``findings`` can ride in. A vent that
     is not a mapping, has a category outside :data:`VENT_CATEGORIES` or a
-    non-string text is dropped; text is redacted and capped again here;
-    ``run_id``/``task_id``/``seat``, when given, override what the record
-    claims (the orchestrator knows which session it ran).
+    non-string text is dropped; text passes the F-43 egress seam (the
+    caller's ``secrets`` — the orchestrator hands the seat token — then
+    the credential shapes, then the control-sequence strip) and is capped
+    again here; ``run_id``/``task_id``/``seat``, when given, override what
+    the record claims (the orchestrator knows which session it ran).
 
     ``at`` is the flush time: the fallback stamp for a vent whose own
     ``at`` (stamped at call time) is missing, unparsable or later than the
@@ -281,7 +293,7 @@ def flush_vents(
             "turn": turn if isinstance(turn, int) and not isinstance(turn, bool)
             and turn >= 0 else 0,
             "category": category,
-            "text": clean_text(text),
+            "text": clean_text(text, secrets),
             "at": made if keep_made else stamp,
         })
     return log.append_many(entries)

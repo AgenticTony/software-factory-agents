@@ -34,9 +34,11 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 from factory.attribution import attribution_match, title_attribution_match
 from factory.runs import GIT_HARDENING
+from factory.sentinels import MIN_SECRET_LEN
 
 BRANCH_PREFIX = "factory/"
 _BRANCH_RE = re.compile(r"^factory/[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$")
@@ -54,23 +56,45 @@ _GITHUB_REMOTE = re.compile(
 _FENCE_RE = re.compile(r"^(`{3,})[^\n]*\n[\s\S]*?^\1[ \t]*$", re.M)
 
 
-def check_pr_text(title: str, body: str) -> None:
-    """Refuse a PR whose title or body FREE TEXT carries an AI attribution
-    (F-42 AC-2; PR #89 review finding 2).
+def check_pr_text(title: str, body: str, *, secrets: Sequence[str] = ()) -> None:
+    """Refuse a PR whose title or body carries a literal session secret
+    (F-43 AC-2, C-1), or whose FREE TEXT carries an AI attribution (F-42
+    AC-2; PR #89 review finding 2).
 
-    Fenced blocks are skipped (quoted material is evidence, not
-    attribution); the title and every unfenced line are the PR's own
-    words and may not carry :data:`factory.attribution.ATTRIBUTION_PATTERNS`.
-    A squash commit builds its message from this title and the branch's
-    commits — L0 already gates the commits — so refusing the free text
-    closes the inheritance path. The orchestrator calls this BEFORE
-    :func:`push_branch`; :func:`gh_pr_create` calls it again as the seam's
-    backstop.
+    The literal check scans title AND body — fences included — for every
+    caller-known secret (the orchestrator passes the seat token): it is a
+    second, independent fence that assumes the egress seam
+    (:func:`factory.egress.scrub_session_text`) may have FAILED, so it
+    never depends on the body having been scrubbed. The refusal names
+    itself without echoing the token (the message travels into escalation
+    notes the owner reads).
+
+    Fenced blocks are skipped by the attribution half only (quoted
+    material is evidence, not attribution); the title and every unfenced
+    line are the PR's own words and may not carry
+    :data:`factory.attribution.ATTRIBUTION_PATTERNS`. A squash commit
+    builds its message from this title and the branch's commits — L0
+    already gates the commits — so refusing the free text closes the
+    inheritance path. The orchestrator calls this BEFORE
+    :func:`push_branch`; :func:`gh_pr_create` calls it again as the
+    attribution seam's backstop (without secrets — it has none; the
+    literal fence is the orchestrator-side call).
 
     Raises:
-        PushRefused: The title or the body's free text matched, naming
-            the match. Raised before any gh process starts.
+        PushRefused: A literal secret appears in the title or body (named,
+            not echoed), or the free text matched an attribution pattern.
+            Raised before any git or gh process starts.
     """
+    for secret in secrets:
+        if secret and len(secret) >= MIN_SECRET_LEN and (
+            secret in title or secret in body
+        ):
+            raise PushRefused(
+                "refusing to open a PR whose title or body carries a "
+                "literal session credential (a seat token; not echoed "
+                "here) — the egress seam should have scrubbed it; "
+                "nothing was pushed"
+            )
     match = title_attribution_match(title) or attribution_match(
         _FENCE_RE.sub("", body)
     )

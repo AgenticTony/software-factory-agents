@@ -155,6 +155,11 @@ paths:
     # contract test, and test_done_tasks_contract_tests_are_protected
     # failed every gate on main until this entry landed.
     - "tests/test_f16.py"
+    # F-43: same precedent — the egress-seam contract tests land with the
+    # work order (the test_f28/F-42 line); its AC-6 tripwire judges every
+    # channel session text can leave through, so it is protected from the
+    # day it exists.
+    - "tests/test_f43.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 
