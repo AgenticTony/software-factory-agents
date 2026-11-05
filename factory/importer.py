@@ -40,12 +40,16 @@ The queue's project name is known before the session runs (the existing
 queue's, or the profile's for a fresh project): the prompt states it
 literally in the output contract — the session proposes for *this*
 queue, never a spelling guessed from the repository directory. And a
-proposal refused at parse or plan time is not lost with the run dir:
-the real session's raw output is kept (credential-redacted, mode 0600)
-under ``<factory-root>/import/``, and the refusal names the file, so
-the fix is an edit plus ``factory import --proposal <file>`` — not
-another session. Injected sessions keep nothing unless the caller gave
-a factory root: a stub is free to re-run.
+real session's output is never thrown away by a refusal: any
+``ImportRefused`` after the session returns (parse, plan, or an apply
+the queue's change or a failed write refuses) keeps the raw output
+(credential-redacted, mode 0600) under ``<factory-root>/import/`` and
+names the file plus the full re-review command, so the fix is an edit
+and one paste — not another session. Keeping keys on the session's
+cost, not on the factory root: the real session always keeps, an
+injected stub never does (it re-runs free) unless its caller passes
+``keep_refused`` (an eval/replay harness replaying a real run's
+output).
 
 The session sits behind one injected callable (the F-06 pattern):
 ``session(prompt) -> text``. Tests pass a stub returning a fixed
@@ -65,9 +69,9 @@ import difflib
 import json
 import os
 import re
+import shlex
 import subprocess
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -78,7 +82,13 @@ from factory.contract import (
     load_tasks,
     validate_queue,
 )
-from factory.runs import FACTORY_ROOT_DEFAULT, RunError, cleanup_run, create_run
+from factory.runs import (
+    FACTORY_ROOT_DEFAULT,
+    RunError,
+    cleanup_run,
+    create_run,
+    new_run_id,
+)
 from factory.sandbox import SandboxError
 from factory.sentinels import redact_credentials
 from factory.session import SessionConfigError, run_session_sandboxed, seat_token
@@ -681,8 +691,7 @@ def _refusal_suffix(text: str) -> str:
 def _save_refused_output(
     text: str, project: str, factory_root: Path | str | None
 ) -> Path:
-    """Keep the importer session's raw output for a proposal that was
-    refused at parse or plan time.
+    """Keep the importer session's raw output for a refused proposal.
 
     The sandboxed session's run dir is deleted on every exit path, so
     without this a refused proposal cost the whole session and left
@@ -692,8 +701,10 @@ def _save_refused_output(
     sentinel output goes through; no secrets are *expected* in a
     proposal, but the session writes the text, not us) and written with
     mode 0600 under ``<factory-root>/import/`` as
-    ``<project>-<UTC stamp>.proposal.json`` (``.txt`` when the output is
-    not JSON), never overwriting an earlier refusal.
+    ``<project>-<run id>.proposal.json`` (``.txt`` when the output is
+    not JSON). The id is :func:`factory.runs.new_run_id` — a UTC stamp
+    plus 6 uuid hex, unique per mint (ids minted outside a run are its
+    documented use) — so one create-only open suffices.
 
     Raises:
         OSError: The factory root is unwritable — the caller keeps the
@@ -705,26 +716,73 @@ def _save_refused_output(
     # Schema names are slugs (^[a-z0-9-]+$); the sanitiser is defence in
     # depth for a hand-edited queue, whose project still reaches here.
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", project)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    suffix = _refusal_suffix(text)
-    payload = redact_credentials(text)
-    for attempt in range(1, 100):
-        name = (
-            f"{safe}-{stamp}.proposal{suffix}" if attempt == 1
-            else f"{safe}-{stamp}-{attempt}.proposal{suffix}"
+    path = directory / f"{safe}-{new_run_id()}.proposal{_refusal_suffix(text)}"
+    # O_EXCL: create-only, never overwriting an earlier refusal; the
+    # mode is set at creation, not by a later chmod.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(redact_credentials(text))
+    return path
+
+
+def _import_fix_command(
+    saved: Path, repo: Path, queue_path: Path, docs_dir: str
+) -> str:
+    """The ``factory import`` command that re-reviews the saved file
+    against the same repo the refused run used.
+
+    ``--repo`` is always spelled out (absolute, shell-quoted): the CLI
+    defaults it to the current directory, so a bare command pasted from
+    the factory checkout reviews against the wrong repo. ``--queue``
+    and ``--docs`` ride along only when the refused run used non-default
+    values, so the default case stays paste-clean.
+    """
+    parts = [
+        "factory", "import",
+        "--proposal", shlex.quote(str(saved)),
+        "--repo", shlex.quote(str(repo.absolute())),
+    ]
+    if queue_path != repo / ".factory" / "tasks.json":
+        parts += ["--queue", shlex.quote(str(queue_path))]
+    if docs_dir != DEFAULT_DOCS_DIR:
+        parts += ["--docs", shlex.quote(docs_dir)]
+    return " ".join(parts)
+
+
+def keep_refused_import_output(
+    exc: Exception, *, text: str, project: str, repo: Path,
+    queue_path: Path, docs_dir: str, factory_root: Path | str | None,
+) -> Exception:
+    """Keep a real session's refused output; return the refusal to raise.
+
+    One seam for every refusal after a session returns: run_import's
+    parse/plan/apply guard and the CLI's own apply guard both go through
+    here, so no path throws an expensive proposal away — a stale queue
+    found at apply time (the session already ran) loses the output
+    exactly like a parse refusal does.
+
+    An :class:`ImportRefused` comes back with the saved file's path and
+    the full re-review command in its message. Any other exception (a
+    write ``OSError``) keeps its type — its callers already refuse on
+    it — and the saved path rides along as a note on the exception; a
+    failed save never masks the original refusal.
+    """
+    try:
+        saved = _save_refused_output(text, project, factory_root)
+    except OSError as save_exc:
+        if isinstance(exc, ImportRefused):
+            return ImportRefused(
+                f"{exc} (the raw output could not be saved: {save_exc})"
+            )
+        return exc
+    command = _import_fix_command(saved, repo, queue_path, docs_dir)
+    if isinstance(exc, ImportRefused):
+        return ImportRefused(
+            f"{exc}; saved to {saved}; fix it and review with {command}"
         )
-        path = directory / name
-        try:
-            # O_EXCL: create-only, so two refusals in the same second
-            # (parallel runs) never overwrite each other; the mode is
-            # set at creation, not by a later chmod.
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            continue
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-        return path
-    raise OSError(f"{directory}: too many refusals saved this second")
+    exc.add_note(f"raw importer output saved to {saved}; "
+                 f"re-review with {command}")
+    return exc
 
 
 # ------------------------------------------------------------------- entry --
@@ -733,12 +791,18 @@ def _save_refused_output(
 @dataclass
 class ImportResult:
     """What a run proposed: the plan, the rendered summary, the resolved
-    queue path and whether it was written."""
+    queue path, whether it was written, and the session's raw output.
+
+    ``raw_output`` travels to the caller (the CLI holds the interactive
+    apply outside run_import) so a refusal at *its* apply can still keep
+    the output through :func:`keep_refused_import_output`.
+    """
 
     plan: ImportPlan
     summary: str
     queue_path: Path
     applied: bool
+    raw_output: str = ""
 
 
 def run_import(
@@ -749,6 +813,7 @@ def run_import(
     session: Callable[[str], str] | None = None,
     confirm: Callable[[str], bool] | None = None,
     factory_root: Path | str | None = None,
+    keep_refused: bool = False,
 ) -> ImportResult:
     """Propose a queue from the project's planning documents.
 
@@ -766,21 +831,29 @@ def run_import(
         session: Injected importer session (``prompt -> text``); default
             :func:`sdk_import_session` (sandboxed, in a disposable clone).
         confirm: ``summary -> bool``; asked before the one and only write.
-        factory_root: Factory root for the default session's run dir and
-            sandbox settings, and for the refused-output copies a
-            parse/plan refusal keeps (default ``~/factory``).
+        factory_root: Factory root for the default session's run dir,
+            sandbox settings, and refused-output copies (default
+            ``~/factory``).
+        keep_refused: Keep the refused output for an *injected* session
+            too — for a caller replaying a real session's output (an
+            eval/replay harness), where re-running is not free. The real
+            session (``session=None``) always keeps; a plain stub never
+            does.
 
     Returns:
         The :class:`ImportResult` — plan, summary, resolved queue path,
-        and whether the queue was written.
+        whether the queue was written, and the session's raw output.
 
     Raises:
-        ImportRefused: No session output could be parsed or merged into a
-            schema-valid, all-draft proposal (AC-1/AC-2). When the output
-            came from the real session (``session=None``) or the caller
-            passed ``factory_root`` explicitly, the raw output is saved
-            (redacted, 0600) under ``<factory-root>/import/`` and the
-            message names the file for ``factory import --proposal``.
+        ImportRefused: No session output could be parsed or merged into
+            a schema-valid, all-draft proposal (AC-1/AC-2), or the
+            apply was refused (the queue changed while the confirm
+            waited). When the output was expensive (the real session, or
+            ``keep_refused``), the raw output is saved (redacted, 0600)
+            under ``<factory-root>/import/`` and the message names the
+            file and the full re-review command. A write ``OSError``
+            after the session keeps its type — the copy is still saved,
+            noted on the exception.
     """
     repo = Path(repo)
     if queue_path is None:
@@ -806,37 +879,36 @@ def run_import(
             prompt, repo, profile=profile, queue_path=queue_path,
             factory_root=factory_root,
         )
+    keep = session is None or keep_refused
     try:
+        # Everything after the session returns: parse, plan, and the
+        # apply a changed queue or failed write can refuse. The
+        # session's output is the expensive part (a real run's clone is
+        # already deleted by now) — on any of these refusals it is
+        # kept, and the refusal says where, so the fix is a file edit
+        # plus one command, not another session. A stub re-runs free
+        # and keeps nothing (unless keep_refused).
         proposal = parse_proposal(text)
         plan = plan_import(existing_doc, proposal, records, project=project)
-    except ImportRefused as exc:
-        # The session's output is the expensive part (a real run's clone
-        # is already deleted by now) — keep it, redacted, and say where,
-        # so the fix is a file edit plus `factory import --proposal`.
-        # Only when the output was expensive: the real session
-        # (session=None) or an explicitly given factory root. An injected
-        # stub with the default root is free to re-run — nothing is kept
-        # and nothing is written under ~/factory.
-        if session is None or factory_root is not None:
-            try:
-                saved = _save_refused_output(text, project, factory_root)
-            except OSError as save_exc:
-                raise ImportRefused(
-                    f"{exc} (the raw output could not be saved: {save_exc})"
-                ) from exc
-            raise ImportRefused(
-                f"{exc}; saved to {saved}; fix it and review with "
-                f"factory import --proposal {saved}"
-            ) from exc
+        summary = render_summary(plan)
+        applied = False
+        if confirm is not None:
+            applied = apply_import(
+                plan, queue_path, confirm=lambda: bool(confirm(summary))
+            )
+    except (ImportRefused, OSError) as exc:
+        if keep:
+            kept = keep_refused_import_output(
+                exc, text=text, project=project, repo=repo,
+                queue_path=queue_path, docs_dir=docs_dir,
+                factory_root=factory_root,
+            )
+            if kept is not exc:
+                raise kept from exc
         raise
-    summary = render_summary(plan)
-    applied = False
-    if confirm is not None:
-        applied = apply_import(
-            plan, queue_path, confirm=lambda: bool(confirm(summary))
-        )
     return ImportResult(
-        plan=plan, summary=summary, queue_path=queue_path, applied=applied
+        plan=plan, summary=summary, queue_path=queue_path, applied=applied,
+        raw_output=text,
     )
 
 
