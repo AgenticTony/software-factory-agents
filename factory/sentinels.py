@@ -239,14 +239,26 @@ SKIP_MARKER_PATTERNS = (
 # Substring-level on purpose: the removed side stays broad (a human
 # reviews); what counts as a REPLACEMENT is the stricter classifier
 # below (PR #47 review finding 2).
+#
+# F-44 (review I-11): a `pytest.raises` block is an assertion — removing
+# the with-line (the body often carries no assert of its own) silently
+# greens a test that used to demand failure. Both spellings count: the
+# `pytest.raises` attribute form and the `from pytest import raises`
+# bare form. unittest's `assertRaises`/`assertRaisesRegex` were already
+# covered — the broad `\bassert` matches the "assert" inside them (the
+# '.' before it is a word boundary).
 ASSERTION_PATTERNS = (
     re.compile(r"\bassert"),
     re.compile(r"\bexpect\("),
+    re.compile(r"\bpytest\.raises\b|\braises\s*\("),
 )
 
 # What counts as a replacement assertion: a real statement, not a
 # tautology and not a string mentioning "assert". Runs against the
 # string-blanked line so padding with prose can never level the count.
+# `pytest.raises` sits on BOTH sides (F-44): a block MOVED within a file
+# removes one with-line and adds one — counting it as a replacement keeps
+# moves quiet exactly as moved asserts are.
 _TAUTOLOGY_ASSERT = re.compile(
     r"""^assert\s+(?:True|False|None|[-\d.]+|(["']).*\1)\s*$"""
 )
@@ -254,6 +266,7 @@ _ASSERTION_STATEMENT = (
     re.compile(r"^assert\b"),           # a bare assert statement
     re.compile(r"^\w+\.assert\w*\("),   # self.assertEqual / mock.assert_…
     re.compile(r"\bexpect\("),          # jest/vitest
+    re.compile(r"\bpytest\.raises\b|\braises\s*\("),
 )
 
 

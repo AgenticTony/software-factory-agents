@@ -160,6 +160,12 @@ paths:
     # channel session text can leave through, so it is protected from the
     # day it exists.
     - "tests/test_f43.py"
+    # F-44: same precedent — the verdict-integrity contract tests land
+    # with the work order. They judge the canonical-severity, conflicting-
+    # verdict, final-summary and pytest.raises rules the protected
+    # l0/l2/sentinels modules enforce, so they are protected from the day
+    # they exist.
+    - "tests/test_f44.py"
     # F-43 review round 1: the seam itself and its vent wiring, the F-42
     # factory/attribution.py precedent — a factory-built PR must not be
     # able to weaken the C-1 fix (scrub_session_text returning its input,

@@ -129,6 +129,16 @@ FAILURE_MARKERS = (
     re.compile(r"^(?:error|fatal)\b"),  # tool-level error, no location
 )
 
+# F-44 (review m-8): a line of the runner's output counts as a test-count
+# SUMMARY LINE only in one of the shapes the runners actually print —
+# pytest's bordered final line, pytest -q's bare tail, jest's ``Tests:``
+# line. Every ``N passed`` claim ON a summary line is collected (a fake
+# count injected into the same line is a second, disagreeing claim).
+_TEST_SUMMARY_LINE = (
+    re.compile(r"^\s*=+\s*\d.*\bpassed\b"),   # pytest: ==== 5 passed ... ====
+    re.compile(r"^\s*\d+\s+passed\b"),        # pytest -q: 5 passed in 0.01s
+    re.compile(r"^\s*Tests:\s.*\bpassed\b"),  # jest: Tests: 2 failed, 5 passed, 8 total
+)
 _TEST_COUNT = re.compile(r"(\d+)\s+passed")
 
 # A leading ``cd <dir> &&`` sets the directory error paths are relative to.
@@ -222,13 +232,32 @@ def repo_owned(path: str) -> bool:
 
 
 def parse_test_count(output: str) -> int | None:
-    """Read the passing-test count from test output (pytest/jest summaries).
+    """Read the passing-test count from the runner's FINAL summary line.
 
-    Takes the highest ``N passed`` in the output: suites print running
-    totals above the summary, and only the floor comparison matters.
+    F-44 (review m-8): the pre-F-44 read took the maximum ``N passed``
+    anywhere in the output, so a test that printed ``999999 passed``
+    cleared the min-tests floor the suite never met. The count now comes
+    from the runner's own summary lines — pytest's bordered final line,
+    pytest -q's bare tail, jest's ``Tests:`` line — and:
+
+    * no summary line at all → ``None`` (the floor treats unknown as NOT
+      cleared, never as 0 or a guess);
+    * summary lines that DISAGREE → ``None``: the runner prints exactly
+      one count, so differing claims mean a printed forgery (mid-run, or
+      from ``atexit``/a session-finish hook AFTER the real summary —
+      whichever line is "last" is unknowable, and both are untrusted) or
+      an anomalous run; either way there is no recognisable final summary;
+    * every claim agreeing → that count (an echo that agrees with the
+      runner is not a forgery).
     """
-    counts = [int(n) for n in _TEST_COUNT.findall(output)]
-    return max(counts) if counts else None
+    claims: set[int] = set()
+    for line in output.splitlines():
+        if not any(p.search(line) for p in _TEST_SUMMARY_LINE):
+            continue
+        claims.update(int(n) for n in _TEST_COUNT.findall(line))
+    if len(claims) != 1:
+        return None
+    return claims.pop()
 
 
 def _failure_marker(output: str) -> str | None:

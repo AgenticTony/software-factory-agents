@@ -38,6 +38,11 @@ The rules, enforced here rather than trusted from the model:
   duplicate, so ``{"verdict": "fail", ..., "verdict": "pass"}`` would flip
   the verdict. A dup anywhere in the object makes that candidate
   malformed.
+* More than one valid verdict object with **differing verdicts** in the
+  same output is invalid (F-44, review m-10): a reviewer that states FAIL
+  and also quotes an example pass-JSON has said two things — the conflict
+  is a protocol fault, one retry, then fail-closed. Repeated objects with
+  the same verdict are accepted.
 
 F-23 adds review convergence across rounds. Every finding gets a **stable
 key** — sha256 of its file, axis and normalised summary — at parse time, so
@@ -132,10 +137,13 @@ _ROUND_FAILING_SEVERITIES = ("blocking", "major")
 
 
 def _fails_round(finding) -> bool:
-    """Whether one finding's severity fails a round (blocking or major)."""
+    """Whether one finding's severity fails a round (blocking or major).
+
+    Severity is canonical at parse (F-44), so this — like every consumer
+    in this module — compares the canonical spellings directly."""
     return (
         isinstance(finding, L2Finding)
-        and (finding.severity or "").strip().lower() in _ROUND_FAILING_SEVERITIES
+        and finding.severity in _ROUND_FAILING_SEVERITIES
     )
 
 # A fenced block (with or without the json tag) around the verdict object —
@@ -307,10 +315,23 @@ def _extract_json(output: Any) -> Any:
     """Find the verdict JSON in the reviewer's output.
 
     Candidates, tried in order: the whole text (a pure-JSON reply), then
-    every fenced block and balanced object **from last to first** — a
-    model that quotes an example verdict earlier and states the real one
-    at the end must have the real one win. A candidate with repeated keys
-    is malformed and skipped like any parse failure.
+    every fenced block and balanced object **from last to first** — when
+    several candidates parse, the last-positioned one is returned (a model
+    that quotes an example verdict earlier and states the real one at the
+    end has the real one win). A candidate with repeated keys is malformed
+    and skipped like any parse failure.
+
+    F-44 (review m-10): every candidate that parses is examined, not just
+    the first. Output carrying **more than one valid verdict object with
+    differing verdicts** is refused as an invalid verdict — a reviewer
+    that states FAIL and also quotes an example pass-JSON has said two
+    things, and picking either is a guess; the last-wins read used to
+    publish the example as PASS. The refusal rides the existing invalid-
+    verdict path (one retry, then fail-closed). Repeated objects with the
+    SAME verdict are accepted: an echo that agrees with the stated verdict
+    is not a conflict. Only objects whose ``verdict`` is ``pass``/``fail``
+    (the tolerance :func:`_validated_report` applies) count as verdict
+    objects — a vote object or an unparsable blob never conflicts.
 
     Args:
         output: The reviewer session's result text.
@@ -320,7 +341,8 @@ def _extract_json(output: Any) -> Any:
 
     Raises:
         _InvalidVerdict: If no candidate parses as JSON (the last error is
-            carried as the reason).
+            carried as the reason), or the candidates carry valid verdict
+            objects with differing verdicts.
     """
     text = output.strip()
     candidates: list[str] = [text]
@@ -331,12 +353,30 @@ def _extract_json(output: Any) -> Any:
         positioned.append((text.find(span), span))
     candidates.extend(text for _, text in sorted(positioned, reverse=True))
 
+    parsed: list[Any] = []
     last_error: Exception | None = None
     for candidate in candidates:
         try:
-            return json.loads(candidate, object_pairs_hook=_no_duplicate_keys)
+            parsed.append(
+                json.loads(candidate, object_pairs_hook=_no_duplicate_keys)
+            )
         except (json.JSONDecodeError, _DuplicateKey, ValueError) as exc:
             last_error = exc
+    verdicts = {
+        value.get("verdict").strip().lower()
+        for value in parsed
+        if isinstance(value, dict)
+        and isinstance(value.get("verdict"), str)
+        and value.get("verdict").strip().lower() in ("pass", "fail")
+    }
+    if len(verdicts) > 1:
+        raise _InvalidVerdict(
+            "conflicting verdict objects in the reviewer output "
+            f"({' vs '.join(sorted(verdicts))}): the review states both "
+            "PASS and FAIL, so neither stands"
+        )
+    if parsed:
+        return parsed[0]
     reason = (
         f"no valid verdict JSON in the reviewer output ({last_error})"
         if last_error is not None
@@ -401,6 +441,13 @@ def _validated_report(data: Any) -> L2Report:
                 f"finding {index} severity must be one of {VALID_SEVERITIES}, "
                 f"got {severity!r}"
             )
+        # F-44 (review M-1): severity is canonicalised ONCE, here beside
+        # the axis — the stored finding carries the canonical value, so
+        # "Blocking" can never rank as unknown downstream (the raw value
+        # softened merged duplicates to the other reviewer's "minor" and
+        # published a defect one reviewer rated blocking). Every consumer
+        # in this module now compares against the canonical spellings.
+        severity = severity.strip().lower()
         line = item.get("line")
         if isinstance(line, bool):
             # bool IS int in Python; a true/false line is a slip, and
@@ -440,7 +487,7 @@ def _validated_report(data: Any) -> L2Report:
         )
         finding.key = finding_key(finding)
         findings.append(finding)
-        if severity.strip().lower() == "blocking":
+        if severity == "blocking":
             blocking = True
 
     declared = declared.strip().lower()
@@ -860,9 +907,7 @@ def merge_reviews(reports: Sequence[L2Report]) -> L2Report:
         if any(report.declared == "fail" for report in reports)
         else "pass"
     )
-    blocking = any(
-        (f.severity or "").strip().lower() == "blocking" for f in merged
-    )
+    blocking = any(f.severity == "blocking" for f in merged)
     return L2Report(
         verdict="fail" if declared == "fail" or blocking else "pass",
         findings=merged,
@@ -972,8 +1017,7 @@ def parse_verifier_vote(output: Any, findings: Sequence[L2Finding]) -> VerifierO
 
 def _default_tag(severity: str | None) -> str:
     """The tag an unvoted survivor gets: severity's own bucket."""
-    heavy = (severity or "").strip().lower() in ("blocking", "major")
-    return "important" if heavy else "nit"
+    return "important" if severity in ("blocking", "major") else "nit"
 
 
 def _unanimous(finding: L2Finding, reviewers: int) -> bool:
@@ -981,7 +1025,7 @@ def _unanimous(finding: L2Finding, reviewers: int) -> bool:
     major finding (review finding 2's unanimous rule)."""
     if reviewers < 1:
         return False
-    heavy = (finding.severity or "").strip().lower() in ("blocking", "major")
+    heavy = finding.severity in ("blocking", "major")
     reported = set(finding.reported_by or [])
     return heavy and reported == set(range(1, reviewers + 1))
 
@@ -1065,7 +1109,7 @@ def apply_vote(
             decorated.append((0, 0, index, finding))
             continue
         tag = finding.tag or _default_tag(finding.severity)
-        if (finding.severity or "").strip().lower() == "blocking":
+        if finding.severity == "blocking":
             tag = "important"
         decorated.append((
             _SEVERITY_RANK.get(finding.severity, 99),
@@ -1081,7 +1125,7 @@ def apply_vote(
     for finding in ranked:
         if (
             isinstance(finding, L2Finding)
-            and (finding.severity or "").strip().lower() in ("minor", "note")
+            and finding.severity in ("minor", "note")
         ):
             nits += 1
             if nits > NIT_BUDGET:

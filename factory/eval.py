@@ -709,11 +709,18 @@ def run_l2_review(
 
 
 def _count_blocking(l2: dict | None) -> int:
+    """Count ``blocking`` findings in a STORED L2 report dict.
+
+    Case-insensitive on purpose (F-44, review M-1): reports stored before
+    F-44's parse-time canonicalisation may hold ``"Blocking"`` — this
+    reads records on disk, not freshly parsed findings, so it keeps
+    tolerating the casing the parser no longer emits."""
     if not l2:
         return 0
     return sum(
         1 for f in l2.get("findings") or []
-        if isinstance(f, dict) and f.get("severity") == "blocking"
+        if isinstance(f, dict)
+        and (f.get("severity") or "").strip().lower() == "blocking"
     )
 
 
