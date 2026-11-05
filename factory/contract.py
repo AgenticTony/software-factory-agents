@@ -217,6 +217,37 @@ def validate_against_schema(instance: Any, schema_path: Path | str,
     _validate(instance, Path(schema_path), origin)
 
 
+def iter_schema_violations(instance: Any, schema_path: Path | str) -> list[str]:
+    """Every schema violation as ``"<path>: <message>"``, sorted by path.
+
+    :func:`_validate` raises the single most relevant error — the right
+    front door for a load or a write, where one refusal names one thing
+    to fix. The importer's refusal needs the other shape: a proposed
+    queue can violate the same shapes in every task at once, and naming
+    only the first made a 30-task proposal cost one review round per
+    defect class. This lists them all, so one edit round fixes the
+    proposal.
+
+    Args:
+        instance: The parsed document to check.
+        schema_path: The JSON Schema file to check against.
+
+    Returns:
+        Every violation as ``"<path>: <message>"`` (``<root>`` for the
+        document level), sorted by path; empty when the document is
+        schema-valid.
+    """
+    errors = sorted(
+        _validator(Path(schema_path)).iter_errors(instance),
+        key=lambda error: "/".join(str(part) for part in error.absolute_path),
+    )
+    return [
+        f"{'/'.join(str(part) for part in error.absolute_path) or '<root>'}: "
+        f"{error.message}"
+        for error in errors
+    ]
+
+
 def validate_queue(
     data: Any, origin: str = "tasks", schema_path: Path | None = None
 ) -> None:

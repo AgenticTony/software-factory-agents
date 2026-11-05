@@ -76,8 +76,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from factory.contract import (
+    SCHEMA_DIR,
     ContractError,
     canonical_json,
+    iter_schema_violations,
     load_profile,
     load_tasks,
     validate_queue,
@@ -129,6 +131,12 @@ DEFAULT_TIMEOUT_MIN = 20.0
 # Long planning-doc trees are listed, not inlined; the session reads the
 # files it needs from the repo (it runs with read tools).
 MAX_DOC_FILES = 200
+# A refusal lists every violation, capped: a 30-task proposal can carry
+# hundreds of the same three shape errors, and one-per-round (the
+# 2026-11-05 jobfinderos import) makes the fix cost a review round per
+# defect class.
+MAX_SHOWN_VIOLATIONS = 50
+TASKS_SCHEMA = SCHEMA_DIR / "tasks.schema.json"
 
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
@@ -215,6 +223,91 @@ def read_out_of_scope(repo: Path | str) -> list[dict[str, str]]:
 # ------------------------------------------------------------------ prompt --
 
 
+def _load_tasks_schema() -> dict:
+    """The parsed ``schema/tasks.schema.json``.
+
+    The prompt's output contract is *generated* from this (see
+    :func:`_schema_contract_lines`), so the contract and the validator
+    can never drift apart: a schema edit changes the prompt on the next
+    build, and a hand-copied field list that went stale (the 2026-11-05
+    jobfinderos import named field names but never their shapes) cannot
+    exist.
+    """
+    return json.loads(TASKS_SCHEMA.read_text(encoding="utf-8"))
+
+
+def _resolve_ref(prop: dict, schema: dict) -> dict:
+    """Resolve a local ``$ref`` (``#/$defs/<name>``) to its definition."""
+    if "$ref" not in prop:
+        return prop
+    target: Any = schema
+    for part in prop["$ref"].lstrip("#").lstrip("/").split("/"):
+        target = target[part]
+    return target
+
+
+def _describe_prop(prop: dict, schema: dict) -> str:
+    """One schema property as prompt prose: enums, patterns, integer
+    bounds, arrays and object shapes (required keys unmarked, optional
+    keys ``?``-suffixed, ``additionalProperties: false`` stated)."""
+    prop = _resolve_ref(prop, schema)
+    if "enum" in prop:
+        return "one of " + " | ".join(str(value) for value in prop["enum"])
+    kind = prop.get("type")
+    if kind == "boolean":
+        return "true | false"
+    if kind == "integer":
+        low, high = prop.get("minimum"), prop.get("maximum")
+        if low is not None and high is not None:
+            return f"integer {low}–{high}"
+        if low is not None:
+            return f"integer >= {low}"
+        return "integer"
+    if kind == "string":
+        if "pattern" in prop:
+            return f"string matching {prop['pattern']}"
+        return "string"
+    if kind == "array":
+        items = _describe_prop(prop["items"], schema)
+        unique = " (unique items)" if prop.get("uniqueItems") else ""
+        return f"array of {items}{unique}"
+    if kind == "object":
+        required = set(prop.get("required") or [])
+        shape = ", ".join(
+            f"{name}{'?' if name not in required else ''}: "
+            f"{_describe_prop(sub, schema)}"
+            for name, sub in (prop.get("properties") or {}).items()
+        )
+        closed = " — no other keys" if prop.get("additionalProperties") is False else ""
+        return "{" + shape + "}" + closed
+    return str(kind or "any")
+
+
+def _schema_contract_lines(schema: dict) -> list[str]:
+    """The output contract's per-field shape lines, generated from the
+    loaded tasks schema — every spec field the proposal may set, with
+    its enums, patterns, bounds, object shapes and required keys, plus
+    the schema's own required-field list for a task."""
+    tasks = _resolve_ref(schema["properties"]["tasks"], schema)
+    task = _resolve_ref(tasks["items"], schema)
+    props = task["properties"]
+    lines = [
+        "Each task carries: id, title, source (repo-relative path of the doc",
+        "that owns the spec, with #heading when useful) — plus exactly these",
+        "field shapes, generated from the repo's schema/tasks.schema.json",
+        "(a proposal outside them is refused, however plausible it reads):",
+    ]
+    for name in SPEC_FIELDS:
+        lines.append(f"- {name}: {_describe_prop(props[name], schema)}")
+    lines.append(
+        "The schema requires every task to carry: "
+        + ", ".join(task["required"])
+        + ". You never"
+    )
+    lines.extend(["set status — every imported task is draft.", "Rules:"])
+    return lines
+
+
 def build_import_prompt(
     repo: Path, docs_dir: str, records: list[dict], *, project: str | None = None
 ) -> str:
@@ -235,6 +328,15 @@ def build_import_prompt(
     ``"<project name>"`` left the session to guess from the repository
     directory's spelling, and a one-letter-case guess was refused by
     :func:`plan_import` after a full session had already been spent.
+
+    The field shapes are stated, not named: the contract lines come from
+    :func:`_schema_contract_lines` over the loaded schema, so the prompt
+    always says what the validator will enforce. And the session is told
+    to check its own output before answering (parse, then schema — both
+    possible inside its sandbox: ``jsonschema`` imports there, the schema
+    is in the clone, the writable scratch is ``$TMPDIR``; the repo cwd
+    is read-only) — the 2026-11-05 import died on hand-written JSON and
+    shape guesses both, and every one of them was checkable in-session.
     """
     repo = Path(repo)
     docs = repo / docs_dir
@@ -276,15 +378,19 @@ def build_import_prompt(
         "",
         "Output — and output nothing else — one JSON object:",
         contract,
-        "Each task carries: id, title, source (repo-relative path of the doc",
-        "that owns the spec, with #heading when useful), kind (build | docs |",
-        "decision | research | owner_only), priority (P1 | P2 | P3),",
-        "depends_on, risk, gates {spec_approval, merge, deploy}, acceptance",
-        "[{id, text, check {type, ref}}], budget {size, max_attempts,",
-        "max_turns, wall_clock_min}, and owner_steps / slices when the doc",
-        "defines them.",
-        "Rules:",
+        *_schema_contract_lines(_load_tasks_schema()),
         *naming_rule,
+        '- gates.merge is always "human" — the owner merges; the importer',
+        "  never proposes an auto merge.",
+        "- budget.size tops out at M: a task too big for size M is split",
+        "  into slices or proposed as separate tasks, never sized above",
+        "  the enum.",
+        "- priority is P1–P3 only — the values listed above; P0 is not a",
+        "  priority level this queue knows.",
+        '- a check whose type is anything but "manual" must carry ref.',
+        "- owner_steps you propose are objects with text and done: false —",
+        "  done_at, done_by and evidence are written when the owner ticks",
+        '  them, never by you. Slices you propose always have status "todo".',
         "- Never set status, acceptance_hash, approved_at, approved_by,",
         "  attempts, links or out_of_scope. Every task is imported as draft;",
         "  approval is the owner's act (factory approve).",
@@ -294,6 +400,21 @@ def build_import_prompt(
         "  confirms the match; you only surface it.",
         "- Propose every task the documents define, including tasks already",
         "  in the queue; unchanged tasks produce no diff.",
+        "",
+        "Before you answer, check your own output:",
+        "- Write the finished JSON to a file in your writable scratch (the",
+        "  repo cwd is read-only), e.g. $TMPDIR/proposal.json.",
+        '- Parse check: python3 -c "import json;',
+        "  json.load(open('$TMPDIR/proposal.json'))\"",
+        "- Schema check — jsonschema is importable in your sandbox and the",
+        "  schema is in the repo at schema/tasks.schema.json:",
+        '  python3 -c "import json, jsonschema;',
+        "  d=json.load(open('$TMPDIR/proposal.json'));",
+        "  s=json.load(open('schema/tasks.schema.json'));",
+        "  [print(e.json_path + ': ' + e.message) for e in",
+        "  jsonschema.Draft202012Validator(s).iter_errors(d)]\"",
+        "- Fix everything those print, re-check, and only then answer.",
+        "  Your final answer is the JSON object itself, and nothing else.",
     ]
     return "\n".join(lines)
 
@@ -433,6 +554,36 @@ def _merge_task(existing: dict, proposed: dict) -> tuple[dict, list[str]]:
     return merged, changed
 
 
+def _refusal_listing_every_violation(exc: ContractError, doc: dict) -> str:
+    """The refusal message for a merged document that fails validation:
+    every schema violation, capped at :data:`MAX_SHOWN_VIOLATIONS` with a
+    ``+N more`` tail — not just the first.
+
+    One-per-round naming (what ``validate_queue`` alone gives) made the
+    2026-11-05 jobfinderos import cost a review round per defect class:
+    every one of 30 tasks carried the same seven shape errors, and the
+    refusal reported one. A semantic or structural refusal the schema
+    lines do not cover (duplicates, forbidden fields) keeps its own
+    message as the lead line.
+    """
+    lines = iter_schema_violations(doc, TASKS_SCHEMA)
+    head = str(exc)
+    if not lines:
+        return head
+    parts: list[str] = []
+    if not any(f"at {line}" in head for line in lines):
+        parts.append(head)
+    plural = "" if len(lines) == 1 else "s"
+    parts.append(
+        f"the proposed tasks.json is refused: {len(lines)} schema "
+        f"violation{plural}:"
+    )
+    parts.extend(f"- {line}" for line in lines[:MAX_SHOWN_VIOLATIONS])
+    if len(lines) > MAX_SHOWN_VIOLATIONS:
+        parts.append(f"- (+{len(lines) - MAX_SHOWN_VIOLATIONS} more)")
+    return "\n".join(parts)
+
+
 def plan_import(
     existing_doc: dict | None,
     proposal: dict,
@@ -523,7 +674,9 @@ def plan_import(
     try:
         validate_queue(proposed_doc, f"proposed tasks.json for {project}")
     except ContractError as exc:
-        raise ImportRefused(str(exc)) from exc
+        raise ImportRefused(
+            _refusal_listing_every_violation(exc, proposed_doc)
+        ) from exc
 
     before = _doc_text(existing_doc) if existing_doc else ""
     diff = "".join(

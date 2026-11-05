@@ -113,13 +113,14 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk import query as sdk_query
 
-from factory.runs import GIT_HARDENING, RunError
+from factory.runs import FACTORY_ROOT_DEFAULT, GIT_HARDENING, RunError, new_run_id
 from factory.sandbox import (
     build_settings,
     default_toolchain,
     run_sandboxed,
     write_settings,
 )
+from factory.sentinels import redact_credentials
 from factory.state import now_iso
 from factory.toolkit import (
     ENV_SCRUB,
@@ -2132,10 +2133,44 @@ def _run_prepared(
     except (json.JSONDecodeError, TypeError) as exc:
         raise SessionConfigError(
             "the sandboxed session entry produced an unparsable record "
-            f"({exc}): {record_line[:500]}"
+            f"({exc}); record line length {len(record_line)}; full stdout "
+            f"saved to {_save_session_stdout(proc.stdout, run_dir, factory_root)}"
         ) from exc
 
     return record
+
+
+def _save_session_stdout(
+    stdout: str, run_dir: Path, factory_root: Path | None
+) -> str:
+    """Keep the full raw stdout of a session whose record would not parse.
+
+    The once-observed "Unterminated string" record (2026-11-01, 56 turns
+    lost) left nothing to diagnose: the run dir is deleted on every exit
+    path, and the truncated tail in the error message said nothing about
+    what the whole stream looked like. The copy is credential-redacted
+    (:func:`factory.sentinels.redact_credentials`), written with mode
+    0600, create-only (O_EXCL), under ``<factory-root>/sessions/`` —
+    beside the runs, outside the clone that is about to disappear.
+
+    Returns the saved path as text, or ``<not saved: …>`` — the save is
+    diagnostics for a SessionConfigError already on its way out, and a
+    failed save must never mask it.
+    """
+    try:
+        root = Path(factory_root) if factory_root is not None else None
+        if root is None:
+            runs_root = run_dir.parent.parent
+            root = runs_root.parent if runs_root.name == "runs" else FACTORY_ROOT_DEFAULT
+        directory = root / "sessions"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"unparsable-record-{new_run_id()}.stdout.txt"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(redact_credentials(stdout))
+        return str(path)
+    except OSError as exc:
+        return f"<not saved: {exc}>"
 
 
 # python -c <bootstrap> <spec.json> — the in-sandbox entry point (see
@@ -2182,7 +2217,12 @@ def _main(argv: list[str] | None = None) -> int:
     except (OSError, json.JSONDecodeError, KeyError, SessionConfigError) as exc:
         print(f"factory.session: {exc}", file=sys.stderr)
         return 2
-    print(json.dumps(record.to_dict()))
+    # flush=True: this line IS the session's record — the orchestrator
+    # parses it off our stdout. An unflushed buffer torn by teardown is
+    # the truncated-record failure mode (_save_session_stdout guards the
+    # orchestrator side); the explicit flush makes the write land before
+    # anything else can happen to this process.
+    print(json.dumps(record.to_dict()), flush=True)
     return 0
 
 
