@@ -7,7 +7,12 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: from 2026-10-24 that label resolved to
+    # ubuntu-26.04, where srt's nested user namespace is capability-
+    # restricted (`apply-seccomp: write /proc/self/setgroups ...
+    # Permission denied`) and the AppArmor sysctl below does not lift it —
+    # every sandbox test failed. 24.04 is the verified sandbox host.
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         # 3.11 = declared floor (requires-python); 3.13 = local dev version
