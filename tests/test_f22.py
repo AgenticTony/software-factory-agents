@@ -175,14 +175,24 @@ def _make_mcp(toolkit: Path, name: str = "docs",
 
 
 def _write_reports(toolkit: Path, entries: list[dict]) -> None:
-    """Vetting reports that name the content hash each one vetted."""
+    """Vetting reports that name the content hash each one vetted.
+
+    F-47 (I-2): an MCP item's report also records the allowlists it was
+    vetted against (render_report's ``- allowlists:`` line) — the index
+    load checks the descriptor's domains against THAT record. Here the
+    vet ran against a project that allowed exactly the descriptor's
+    domains, so the per-project re-check at resolve time stays the one
+    that refuses a domain the RUNNING project doesn't allow."""
     for entry in entries:
         report = toolkit / entry["report"]
         report.parent.mkdir(parents=True, exist_ok=True)
-        report.write_text(
+        text = (
             f"# Vet report — {entry['name']}\n\n"
             f"content hash: {entry['content_hash']}\n"
         )
+        if entry.get("kind") == "mcp_server":
+            text += f"- allowlists: {', '.join(entry['mcp']['domains'])}\n"
+        report.write_text(text)
 
 
 def _write_index(toolkit: Path, entries: list[dict]) -> None:

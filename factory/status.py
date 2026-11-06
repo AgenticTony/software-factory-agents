@@ -9,6 +9,9 @@ One read-only markdown page per project:
 * the week's sandbox-bypass attempts denied (F-42): Bash calls the
   sessions made with ``dangerouslyDisableSandbox`` and the PreToolUse
   hook refused — a security signal over the same week window;
+* the week's sandbox escapees (F-47): processes that escaped a sandboxed
+  command's process group and were force-closed by the drain, counted
+  from the ``sandbox_escapee`` events in the project's run traces;
 * the week's vents by category, read through the F-27
   :func:`factory.vent.weeks_vents` seam (no second implementation);
 * the outcome measures only (RESEARCH-SOFTWARE-FACTORY §9): interventions
@@ -44,6 +47,7 @@ Everything here reads; nothing writes.
 
 from __future__ import annotations
 
+import json
 import re
 import statistics
 import subprocess
@@ -324,6 +328,58 @@ def compute_metrics(
     }
 
 
+def _week_escapees(
+    factory_root: Path | str, project: str, horizon: datetime,
+    notes: list[str],
+) -> tuple[int, list[str]]:
+    """Count the project's ``sandbox_escapee`` trace events since
+    ``horizon`` (F-47, I-9) and name the runs they came from.
+
+    Only a top-level ``type`` counts — a session's forwarded ``tool_call``
+    cannot carry one (the forwarder passes ``tool_call`` only), and a
+    nested field never matches. A malformed line or an unparsable stamp
+    is skipped, and an unreadable trace file is named in the notes —
+    the gap stays visible, like the vents seam's."""
+    directory = Path(factory_root) / "trace" / project
+    count = 0
+    runs: list[str] = []
+    unreadable: list[str] = []
+    try:
+        files = sorted(directory.glob("*.jsonl"))
+    except OSError:
+        files = []
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            unreadable.append(f"{path.name} ({exc.strerror or exc})")
+            continue
+        if "sandbox_escapee" not in text:
+            continue
+        for line in text.splitlines():
+            if "sandbox_escapee" not in line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict) or event.get("type") != "sandbox_escapee":
+                continue
+            stamp = _parse_time(event.get("ts"))
+            if stamp is None or stamp < horizon:
+                continue
+            count += 1
+            run_id = str(event.get("run_id") or path.stem)
+            if run_id not in runs:
+                runs.append(run_id)
+    if unreadable:
+        notes.append(
+            f"{len(unreadable)} trace file(s) unreadable, escapee count may be "
+            "low: " + "; ".join(unreadable)
+        )
+    return count, runs
+
+
 def _escalation_of(task: dict) -> tuple[str | None, str | None]:
     """The task's escalation reason and note: the most recent attempt
     that carries one (the orchestrator appends the escalation to the
@@ -455,7 +511,8 @@ def render_status(
     Args:
         queue: The parsed, validated queue document.
         project: The project name (vents are read per project).
-        factory_root: The factory root holding ``progress/``.
+        factory_root: The factory root holding ``progress/`` (vents) and
+            ``trace/`` (sandbox escapees, F-47).
         now: The clock for the week windows; defaults to UTC now.
         repo: The project repo, for merge times and revert detection;
             unreadable history degrades to a note, never a crash.
@@ -561,6 +618,21 @@ def render_status(
         f"{bypass} Bash call(s) setting dangerouslyDisableSandbox, denied by "
         "the seats' PreToolUse hook (each lands in the run's trace; the "
         "sandbox is not negotiable)"
+    )
+
+    # F-47 (I-9): processes that escaped a sandboxed command's process
+    # group and were force-closed by the drain — read from the run traces
+    # (the store the callers write ``sandbox_escapee`` events to; no second
+    # store). Same week window; per project, with the run ids, because
+    # each one is a process that may still hold the seat token.
+    escapees, escapee_runs = _week_escapees(factory_root, project, horizon,
+                                            notes)
+    lines += ["", "## Sandbox escapees this week", ""]
+    lines.append(
+        f"{escapees} force-closed sandbox escapee(s) — a process that left "
+        "its command's process group and outlived the kill, holding the "
+        "seat token while it lives (consider rotating it)"
+        + (f": {', '.join(escapee_runs)}" if escapee_runs else "")
     )
 
     # -- The week's vents (through the F-27 seam) --------------------------

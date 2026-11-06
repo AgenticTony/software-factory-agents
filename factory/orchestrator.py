@@ -117,7 +117,12 @@ from factory.runs import (
     create_run,
     new_run_id,
 )
-from factory.sandbox import build_settings, run_sandboxed, write_settings
+from factory.sandbox import (
+    build_settings,
+    escapee_event,
+    run_sandboxed,
+    write_settings,
+)
 from factory.session import (
     DEFAULT_BASE_URL,
     SessionRecord,
@@ -298,7 +303,8 @@ def _create_gate_venv(run_dir: Path) -> Path:
 
 
 def sandboxed_runner(
-    run_dir: Path, settings_path: Path, *, srt_bin_path: Path | None = None
+    run_dir: Path, settings_path: Path, *, srt_bin_path: Path | None = None,
+    on_escapee: "Callable[[dict], None] | None" = None,
 ):
     """A gate command runner that executes every command under srt.
 
@@ -308,9 +314,29 @@ def sandboxed_runner(
     run-local venv (``<run_dir>/.venv``, :func:`_create_gate_venv`) first
     on PATH and ``VIRTUAL_ENV`` set, so the profile's ``pip install``
     lands in the run — never the owner's venv or a host env.
+
+    ``on_escapee`` (F-47, I-9): where a command whose drain force-closed
+    pipes (a process escaped the group and outlived the kill) is
+    reported — one :func:`~factory.sandbox.escapee_event` labelled
+    ``gate:<name>``, on the normal and the timeout path alike. The run
+    passes its trace writer's ``append``; with no sink (a caller that
+    owns no trace, e.g. the eval) the event is printed to stderr — never
+    silently dropped.
     """
     run_dir = Path(run_dir)
     venv = _create_gate_venv(run_dir)
+
+    def report(name: str, outcome, timed_out: bool) -> None:
+        streams = getattr(outcome, "force_closed_pipes", ()) or ()
+        if not streams:
+            return
+        event = escapee_event(f"gate:{name}", streams, timed_out=timed_out)
+        if on_escapee is not None:
+            on_escapee(event)
+        else:
+            print(f"factory: sandbox escapee — {json.dumps(event)} "
+                  f"(run dir {run_dir}; no trace to record it in)",
+                  file=sys.stderr)
 
     def run(name: str, command: str, repo: Path, timeout_sec: int) -> CommandResult:
         if Path(repo).resolve() != run_dir.resolve():
@@ -323,10 +349,12 @@ def sandboxed_runner(
                 timeout=timeout_sec, srt_bin_path=srt_bin_path, venv=venv,
             )
         except subprocess.TimeoutExpired as exc:
+            report(name, exc, True)
             output = (exc.output or "") + (exc.stderr or "")
             if isinstance(output, bytes):
                 output = output.decode(errors="replace")
             return CommandResult(name, command, None, output, timed_out=True)
+        report(name, proc, False)
         return CommandResult(name, command, proc.returncode, proc.stdout + proc.stderr)
 
     return run
@@ -1759,8 +1787,16 @@ def _sweep_stale_prs(
                                    ref=merged_sha)
                 try:
                     _gate_settings(profile, clean, factory_root)
-                    runner = sandboxed_runner(clean.root, clean.settings_path,
-                                              srt_bin_path=srt_bin_path)
+                    # F-47: the sweep owns no attempt trace; an escapee
+                    # here opens this re-validation's own trace file
+                    # (trace/<project>/<work run id>.jsonl) — the store
+                    # `factory status` counts from — only when it fires.
+                    runner = sandboxed_runner(
+                        clean.root, clean.settings_path,
+                        srt_bin_path=srt_bin_path,
+                        on_escapee=_sweep_trace_sink(
+                            factory_root, project, work.run_id, task_id),
+                    )
                     live = queue.get(task_id)
                     l0 = run_l0(profile, clean.root, default_sha, merged_sha,
                                 task=live, runner=runner, timeout_sec=gate_timeout_sec)
@@ -1814,6 +1850,26 @@ def _sweep_stale_prs(
         finally:
             cleanup_run(work)
     return None
+
+
+def _sweep_trace_sink(
+    factory_root: Path, project: str, run_id: str, task_id: str
+) -> "Callable[[dict], None]":
+    """A trace sink for the stale-PR sweep's gate runner (F-47, I-9).
+
+    The sweep runs L0/L1 outside any attempt, so no :class:`TraceWriter`
+    exists for it; the writer is created on the first event (an escapee
+    is the only thing this sink is handed), so a clean sweep leaves no
+    trace file behind."""
+    writer: list[TraceWriter] = []
+
+    def sink(event: dict) -> None:
+        if not writer:
+            writer.append(TraceWriter(factory_root, project, run_id, task_id,
+                                      extra_secrets=(seat_token() or "",)))
+        writer[0].append(event)
+
+    return sink
 
 
 def _build_on_remote_default(work: RunDir, remote: str, default_branch: str) -> None:
@@ -2223,7 +2279,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                     try:
                         _gate_settings(profile, clean, ctx.factory_root)
                         runner = sandboxed_runner(clean.root, clean.settings_path,
-                                                  srt_bin_path=ctx.srt_bin_path)
+                                                  srt_bin_path=ctx.srt_bin_path,
+                                                  on_escapee=trace.append)
                         with trace.phase("L0"):
                             l0 = run_l0(profile, clean.root, base_sha, head_sha, task=task,
                                         runner=runner, timeout_sec=ctx.gate_timeout_sec)

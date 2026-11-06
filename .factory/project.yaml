@@ -179,6 +179,11 @@ paths:
     # not-collected failure) judge the protected l0/l1/sentinels/
     # attribution/contract modules and the schema default itself.
     - "tests/test_f46.py"
+    # F-47: same precedent — the sandbox read-boundary contract tests
+    # (factory-root deny with real srt, the escapee alarm, the vetted-
+    # allowlist admission check, explicit toolkit staging) judge the
+    # protected sandbox/session/orchestrator/trace/toolkit modules.
+    - "tests/test_f47.py"
     # F-43 review round 1: the seam itself and its vent wiring, the F-42
     # factory/attribution.py precedent — a factory-built PR must not be
     # able to weaken the C-1 fix (scrub_session_text returning its input,
