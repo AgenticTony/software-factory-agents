@@ -28,6 +28,7 @@ fsmonitor): the run's clone was written by an agent.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -121,6 +122,77 @@ class PublishError(Exception):
     """git push or gh failed."""
 
 
+class RemoteCallTimeout(PublishError):
+    """A prompt-disabled remote call exceeded its timeout (F-45 AC-3).
+
+    Subclasses :class:`PublishError` so the publish paths, the concurrency
+    count and the CLI all keep their existing error currency; the
+    orchestrator's fetch sites re-wrap it as ``RunError``.
+    """
+
+
+# F-45 AC-3 (M-7): every remote call — publish-side push, the ls-remote
+# readback, ``gh pr create``, and the orchestrator's fetches/ls-remote —
+# runs through :func:`remote_call`, prompt-disabled and time-bounded. A
+# private HTTPS remote with an expired credential helper would otherwise
+# sit git on a username prompt (invisible: /dev/tty) while the run lease
+# is held.
+GIT_NET_ENV = {"GIT_TERMINAL_PROMPT": "0"}
+# gh does NOT honour GIT_TERMINAL_PROMPT. gh's own switch is
+# GH_PROMPT_DISABLED (``gh help environment``: "set to any value to
+# disable interactive prompting in the terminal"), which kills its
+# interactive auth/device-flow prompts; GIT_TERMINAL_PROMPT stays set for
+# any git credential helper gh itself shells out to. The wrapper's timeout
+# is the provable backstop: whatever gh does, the call cannot outlive it.
+GH_NET_ENV = {"GIT_TERMINAL_PROMPT": "0", "GH_PROMPT_DISABLED": "1"}
+NET_TIMEOUT_SEC = 300
+
+
+def remote_call(cmd: Sequence[str], *, env_extra: dict | None = None,
+                timeout_sec: int | None = None,
+                what: str | None = None) -> subprocess.CompletedProcess:
+    """Run ONE remote git/gh call, prompt-disabled and time-bounded.
+
+    The single wrapper every remote call goes through (F-45 AC-3, the
+    mechanism ``_fetch_sha`` pioneered in round 3 of the F-26 review — one
+    mechanism, not one per call site). ``GIT_TERMINAL_PROMPT=0`` by default;
+    gh callers pass ``env_extra=GH_NET_ENV``. The default timeout resolves
+    from :data:`NET_TIMEOUT_SEC` at CALL time (tests shrink it by patching
+    the module attribute).
+
+    Args:
+        cmd: The command to run (git/gh and arguments).
+        env_extra: Env overrides merged over ``os.environ`` (default
+            :data:`GIT_NET_ENV`).
+        timeout_sec: Timeout in seconds (default :data:`NET_TIMEOUT_SEC`).
+        what: A human label for the timeout message (default: the first
+            three argv words).
+
+    Returns:
+        The completed process (captured stdout/stderr).
+
+    Raises:
+        RemoteCallTimeout: The call exceeded ``timeout_sec`` — a hung
+            credential helper, an auth flow or a server that never
+            answered, never a prompt waiting for the owner.
+    """
+    timeout = NET_TIMEOUT_SEC if timeout_sec is None else timeout_sec
+    env = {**os.environ, **(GIT_NET_ENV if env_extra is None else env_extra)}
+    label = what or " ".join(str(part) for part in list(cmd)[:3])
+    try:
+        return subprocess.run(
+            [str(part) for part in cmd], capture_output=True, text=True,
+            env=env, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RemoteCallTimeout(
+            f"{label} timed out after {timeout}s — prompts were disabled on "
+            "the call (GIT_TERMINAL_PROMPT=0 and, for gh, GH_PROMPT_DISABLED=1), "
+            "so this is a hung credential helper, an auth flow or a server "
+            "that never answered, not a prompt waiting for you"
+        ) from exc
+
+
 @dataclass(frozen=True)
 class PullRequest:
     """What the orchestrator asks the PR seam to open."""
@@ -184,7 +256,9 @@ def push_branch(
             object name; raised before git runs.
         PublishError: The push failed, or the remote ref did not read
             back as exactly ``sha`` (the publish is unconfirmed and no
-            PR may be opened about it).
+            PR may be opened about it). A call that exceeds its timeout
+            raises :class:`RemoteCallTimeout` (a PublishError) — the run
+            lease is never held open by a hung remote (F-45 AC-3).
     """
     ref = check_branch(branch, created=created, default_branch=default_branch)
     if not _SHA_RE.match(sha or ""):
@@ -192,20 +266,18 @@ def push_branch(
             f"refusing to push {branch!r}: the validated commit must be a full "
             f"sha, got {sha!r}"
         )
-    proc = subprocess.run(
+    proc = remote_call(
         [
             "git", *GIT_HARDENING, "-C", str(repo), "push", "--no-follow-tags",
             "--porcelain", remote_url, f"{sha}:{ref}",
         ],
-        capture_output=True,
-        text=True,
+        what=f"git push of {ref}",
     )
     if proc.returncode != 0:
         raise PublishError(f"git push of {ref} failed: {proc.stderr.strip()[:1000]}")
-    probe = subprocess.run(
+    probe = remote_call(
         ["git", *GIT_HARDENING, "-C", str(repo), "ls-remote", remote_url, ref],
-        capture_output=True,
-        text=True,
+        what=f"ls-remote readback of {ref}",
     )
     if probe.returncode != 0:
         raise PublishError(
@@ -246,7 +318,10 @@ def gh_pr_create(pr: PullRequest, *, gh_bin: Path | str | None = None) -> str:
             fenced blocks are skipped, and the orchestrator already
             refused before the push; this is the seam's backstop, before
             gh runs).
-        PublishError: gh is missing or fails.
+        PublishError: gh is missing or fails. gh runs prompt-disabled
+            (``GH_PROMPT_DISABLED=1`` + ``GIT_TERMINAL_PROMPT=0``) and
+            time-bounded through :func:`remote_call` (F-45 AC-3): an auth
+            prompt or a hung API cannot hold the run lease.
     """
     if pr.head == pr.base or not _BRANCH_RE.match(pr.head):
         raise PushRefused(f"refusing to open a PR from {pr.head!r} into {pr.base!r}")
@@ -259,13 +334,12 @@ def gh_pr_create(pr: PullRequest, *, gh_bin: Path | str | None = None) -> str:
         fh.write(pr.body)
         body_path = Path(fh.name)
     try:
-        proc = subprocess.run(
+        proc = remote_call(
             [
                 gh, "pr", "create", "--repo", slug, "--base", pr.base, "--head", pr.head,
                 "--title", pr.title, "--body-file", str(body_path),
             ],
-            capture_output=True,
-            text=True,
+            env_extra=GH_NET_ENV, what=f"gh pr create ({pr.head} into {pr.base})",
         )
     finally:
         body_path.unlink(missing_ok=True)

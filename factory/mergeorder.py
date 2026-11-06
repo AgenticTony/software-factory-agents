@@ -100,6 +100,15 @@ def classify_protection(returncode: int, stdout: str, stderr: str) -> Protection
             doc = json.loads(stdout)
         except json.JSONDecodeError:
             return Protection(detail=f"gh api printed no JSON: {stdout.strip()[:200]}")
+        if not isinstance(doc, dict):
+            # F-45 AC-5 (amended): rc-0 with non-object JSON (`null`, a
+            # list, a bare string/number) is an unresolvable answer, not
+            # an AttributeError — the same crash shape m-14 named for
+            # `gh pr view`.
+            return Protection(
+                detail=f"gh api printed non-object JSON "
+                       f"({type(doc).__name__}): {stdout.strip()[:200]}"
+            )
         checks = doc.get("required_status_checks")
         if isinstance(checks, dict) and checks.get("strict") is True:
             return Protection(checked=True, strict=True)
@@ -192,11 +201,21 @@ def gh_pr_state(
             f"cannot check PR state for {pr_url}: {proc.stderr.strip()[:300]}"
         )
     try:
-        state = json.loads(proc.stdout).get("state") or ""
+        doc = json.loads(proc.stdout)
     except json.JSONDecodeError:
-        state = ""
+        doc = None
+    # F-45 AC-5 (m-14): rc-0 with non-object JSON (`null`, a list, a bare
+    # string/number), an object without a usable "state", or empty stdout
+    # all map to the documented unresolvable state — PublishError — never
+    # an AttributeError. The sweep skips an unresolvable PR and the
+    # concurrency limit counts it open (fail closed).
+    state = doc.get("state") if isinstance(doc, dict) else None
     if not isinstance(state, str) or not state.strip():
-        raise PublishError(f"gh pr view {pr_url} printed no state: {proc.stdout[:200]}")
+        raise PublishError(
+            f"gh pr view {pr_url} printed no usable state "
+            f"(stdout {proc.stdout[:200]!r}): the PR's state is "
+            "unresolvable, never guessed"
+        )
     return state.strip().lower()
 
 

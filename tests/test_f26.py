@@ -726,10 +726,12 @@ def test_review12_conflicts_are_structural_locale_pinned_and_named(
     """Round-2 findings 2+3 (blocking + note): conflict detection reads
     git's unmerged-file index (no locale can change it), the merge runs
     under LC_ALL=C, and the stale_base note names the conflicting paths
-    instead of quoting an empty stderr."""
-    import types
+    instead of quoting an empty stderr.
 
-    import factory.orchestrator as orch
+    F-45: the merge now runs through factory.publish.remote_call, so the
+    pin observes the subprocess boundary that wrapper drives (the same
+    env dict the process actually runs under)."""
+    from factory import publish as publish_mod
 
     env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
     assert env.run(Seats()).outcome == "pr_opened"
@@ -744,9 +746,7 @@ def test_review12_conflicts_are_structural_locale_pinned_and_named(
             merge_envs.append(kwargs.get("env"))
         return real_run(args, **kwargs)
 
-    monkeypatch.setattr(
-        orch, "subprocess",
-        types.SimpleNamespace(run=spy, TimeoutExpired=subprocess.TimeoutExpired))
+    monkeypatch.setattr(publish_mod.subprocess, "run", spy)
 
     result = env.run(Seats())
 
@@ -940,10 +940,13 @@ def test_review21_network_git_never_prompts_and_is_bounded(
     """Round-3 finding 3: every remote git call (ls-remote, both fetches,
     the merge) runs with GIT_TERMINAL_PROMPT=0 and a timeout — a private
     remote with an expired credential helper must fail, not hang the
-    lease on a username prompt."""
-    import types
+    lease on a username prompt.
 
-    import factory.orchestrator as orch
+    F-45: the sweep's remote calls (and publish-side push/ls-remote/gh)
+    now all run through factory.publish.remote_call, so the pin observes
+    the subprocess boundary that ONE wrapper drives — the same env and
+    timeout the processes actually run under."""
+    from factory import publish as publish_mod
 
     env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
     assert env.run(Seats()).outcome == "pr_opened"
@@ -958,9 +961,7 @@ def test_review21_network_git_never_prompts_and_is_bounded(
             seen.append((joined, kwargs))
         return real_run(args, **kwargs)
 
-    monkeypatch.setattr(
-        orch, "subprocess",
-        types.SimpleNamespace(run=spy, TimeoutExpired=subprocess.TimeoutExpired))
+    monkeypatch.setattr(publish_mod.subprocess, "run", spy)
 
     result = env.run(Seats())  # drives ls-remote + fetches (+ maybe merge)
 
@@ -1201,8 +1202,12 @@ def test_review29_a_fail_closed_stall_names_its_cause(tmp_path: Path):
 def test_review30_timeouts_surface_as_run_errors(tmp_path: Path, monkeypatch):
     """Round-4 finding 5: the sweep's merge and the build's initial fetch
     wrap TimeoutExpired into RunError — a slow remote is the usual
-    exit-2 message, never a Python traceback."""
-    import factory.orchestrator as orch
+    exit-2 message, never a Python traceback.
+
+    F-45: both calls run through factory.publish.remote_call now; the
+    timeout is hung at the subprocess boundary that wrapper drives and
+    must still surface as the same RunError."""
+    from factory import publish as publish_mod
     from factory.runs import RunError
 
     env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
@@ -1217,10 +1222,10 @@ def test_review30_timeouts_surface_as_run_errors(tmp_path: Path, monkeypatch):
             raise subprocess.TimeoutExpired(args, 300)
         return real_run(args, **kwargs)
 
-    monkeypatch.setattr(orch, "subprocess", SimpleNamespace(
-        run=hang_merge, TimeoutExpired=subprocess.TimeoutExpired))
+    monkeypatch.setattr(publish_mod.subprocess, "run", hang_merge)
     with pytest.raises(RunError, match="timed out"):
         env.run(Seats())
+    monkeypatch.undo()
 
     # Half 2: the run's initial fetch of the remote default branch
     # (_build_on_remote_default — blob-filtered, unlike the sweep's full
@@ -1232,8 +1237,7 @@ def test_review30_timeouts_surface_as_run_errors(tmp_path: Path, monkeypatch):
             raise subprocess.TimeoutExpired(args, 300)
         return real_run(args, **kwargs)
 
-    monkeypatch.setattr(orch, "subprocess", SimpleNamespace(
-        run=hang_build_fetch, TimeoutExpired=subprocess.TimeoutExpired))
+    monkeypatch.setattr(publish_mod.subprocess, "run", hang_build_fetch)
     with pytest.raises(RunError, match="timed out"):
         env2.run(Seats())
 
@@ -1805,8 +1809,12 @@ def test_review36_the_merge_timeout_names_the_local_pathology(
     """Round-5 finding 5: the sweep's merge is local (both commits were
     already fetched) — a timeout there means a pathological merge or a
     disk problem, and the RunError must say so, not blame credentials
-    or the network."""
-    import factory.orchestrator as orch
+    or the network.
+
+    F-45: the merge runs through factory.publish.remote_call with its own
+    (local) timeout; the pin hangs the subprocess boundary and holds the
+    message to the same standard."""
+    from factory import publish as publish_mod
     from factory.runs import RunError
 
     env = Env(tmp_path, tasks=[_task("T-1"), _task("T-2")])
@@ -1821,8 +1829,7 @@ def test_review36_the_merge_timeout_names_the_local_pathology(
             raise subprocess.TimeoutExpired(args, 300)
         return real_run(args, **kwargs)
 
-    monkeypatch.setattr(orch, "subprocess", SimpleNamespace(
-        run=hang_merge, TimeoutExpired=subprocess.TimeoutExpired))
+    monkeypatch.setattr(publish_mod.subprocess, "run", hang_merge)
     with pytest.raises(RunError) as excinfo:
         env.run(Seats())
     assert "local merge" in str(excinfo.value)
