@@ -166,6 +166,13 @@ paths:
     # l0/l2/sentinels modules enforce, so they are protected from the day
     # they exist.
     - "tests/test_f44.py"
+    # F-45: same precedent — the pre-lease/publish/crash-window contract
+    # tests land with the work order (the test_f43/F-44 line). They judge
+    # the lease invariant, the best-effort log seam, the one timed
+    # remote-call wrapper, finish()'s attempt atomicity, the gh JSON
+    # guards, the dir-fsync and the holder-liveness rules the protected
+    # orchestrator/state/publish/mergeorder modules enforce.
+    - "tests/test_f45.py"
     # F-43 review round 1: the seam itself and its vent wiring, the F-42
     # factory/attribution.py precedent — a factory-built PR must not be
     # able to weaken the C-1 fix (scrub_session_text returning its input,

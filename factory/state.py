@@ -40,6 +40,7 @@ import fcntl
 import getpass
 import json
 import os
+import re
 import uuid
 from collections import namedtuple
 from dataclasses import dataclass
@@ -442,20 +443,30 @@ def now_iso() -> str:
 
 
 def _atomic_write_json(path: Path, doc: dict) -> None:
-    """Write ``doc`` to ``path`` atomically: temp file, then rename.
+    """Write ``doc`` to ``path`` atomically: temp file, then rename, then
+    fsync of the parent DIRECTORY.
 
     The temp file lives in the same directory so the rename never crosses
     filesystems, and non-ASCII characters are written literally so the
-    queue stays review-friendly in diffs. Any failure removes the temp
-    file and re-raises; the previous contents of ``path`` are untouched
-    either way.
+    queue stays review-friendly in diffs. The file is fsynced before the
+    rename, and the parent directory is fsynced AFTER it (F-45 AC-6, I-3):
+    a rename is only durable once the directory entry that records it is
+    on disk — without the dir fsync, a power loss between the rename and
+    the next incidental flush can lose the write (the old file comes
+    back), which is a crash-consistency hole in a file the whole state
+    machine rides on. Any failure removes the temp file and re-raises; the
+    previous contents of ``path`` are untouched up to and including a
+    failed rename (a failed dir fsync leaves the NEW contents in place —
+    written, just not yet proven durable — and still re-raises so the
+    caller hears about it).
 
     Args:
         path: Destination file.
         doc: Document to write.
 
     Raises:
-        OSError: If writing or renaming fails (the destination is intact).
+        OSError: If writing, renaming or fsyncing fails (up to the rename,
+            the destination is intact).
     """
     tmp = path.parent / f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
     try:
@@ -465,6 +476,11 @@ def _atomic_write_json(path: Path, doc: dict) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
@@ -689,6 +705,56 @@ def run_lease_held(queue_path: Path | str) -> bool:
         return False
     finally:
         os.close(fd)
+
+
+# F-45 AC-7 (I-4): the lease holder line carries the holder's pid
+# (``<holder> pid=<pid>``) so a contender can ask the kernel whether that
+# process is alive before naming it as the holder.
+_PID_IN_LEASE = re.compile(r"\bpid=(\d+)\b")
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether ``pid`` names a live process, per the kernel.
+
+    ``os.kill(pid, 0)`` sends no signal — it only probes. EPERM means the
+    process EXISTS and belongs to another user: alive is alive, whoever
+    owns it. Any other OSError conservatively reads as not alive (the
+    error message must then never present the pid as the holder).
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _lease_busy_message(queue_path: Path, holder_line: str) -> str:
+    """The RunInProgressError text, naming the holder only when alive.
+
+    The flock is held by definition (the kernel drops it when its holder
+    dies), so the FILE's content is the only thing that can be stale: a
+    previous holder's leftover line (this repo's own run.lock carried
+    ``reclaim`` for weeks) or the acquire/write race of the current one.
+    A line whose pid is alive names the holder; anything else — a dead
+    pid, pre-pid content, garbage, an empty file — is reported as stale,
+    never presented as the holder (I-4).
+    """
+    match = _PID_IN_LEASE.search(holder_line) if holder_line else None
+    if match and _pid_alive(int(match.group(1))):
+        return (
+            f"{queue_path}: a run is in progress (lease held by "
+            f"{holder_line}); one writer task per repo"
+        )
+    shown = holder_line or "(empty)"
+    return (
+        f"{queue_path}: a run is in progress, but the lease file's holder "
+        f"line is stale ({shown!r}) — it names no live process, so the "
+        "live holder cannot be named; one writer task per repo"
+    )
 
 
 class TaskQueue:
@@ -1106,26 +1172,26 @@ class TaskQueue:
         """Hold the non-blocking exclusive run lease on ``<queue>.run.lock``.
 
         Args:
-            holder: Recorded in the lock file, for diagnostics.
+            holder: Recorded in the lock file (with this process's pid),
+                for diagnostics.
 
         Raises:
             RunInProgressError: If the lease is already held; the message
-                names the holder.
+                names the holder only when the recorded pid is alive and
+                reports stale content otherwise (F-45 AC-7, I-4).
         """
         lease_path = self.path.with_name(self.path.name + ".run.lock")
         with lease_path.open("a+") as handle:
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
-                current = lease_path.read_text().strip() or "unknown"
                 raise RunInProgressError(
-                    f"{self.path}: a run is in progress (lease held by {current}); "
-                    "one writer task per repo"
+                    _lease_busy_message(self.path, lease_path.read_text().strip())
                 ) from exc
             try:
                 handle.seek(0)
                 handle.truncate()
-                handle.write(holder)
+                handle.write(f"{holder} pid={os.getpid()}")
                 handle.flush()
                 yield
             finally:
