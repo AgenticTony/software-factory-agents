@@ -953,8 +953,19 @@ def test_two_real_sandboxes_run_concurrently(tmp_path: Path):
     """The fan-out's substrate: two srt invocations at once, each under
     its own settings file, both confined and both returning — the real
     sandbox stack (not the monkeypatched one the guard test uses) must
-    tolerate concurrent profiles."""
+    tolerate concurrent profiles.
+
+    Each session is built exactly as ``_fanout_sandboxed`` builds it:
+    read-only over the shared run dir, writable only in its OWN scratch.
+    The shape matters on Linux: srt stubs every absent deny path under a
+    WRITABLE dir with a bwrap mount point and deletes the stubs when it
+    exits, counting only its own sandboxes — two writable srt processes
+    sharing one dir delete each other's stubs mid-start ("bwrap: Can't
+    find source path …/.git"). The fan-out never shares a writable dir,
+    so neither may this test, or it tests a shape production never runs
+    and flakes under load (CI run 42236785271)."""
     from factory.sandbox import build_settings, run_sandboxed, write_settings
+    from factory.session import _scratch_dirs
 
     repo, profile = _sandbox_repo(tmp_path)
     root = tmp_path / "factory-root"
@@ -966,15 +977,18 @@ def test_two_real_sandboxes_run_concurrently(tmp_path: Path):
 
     def one(name: str):
         settings = sandbox_dir / f"{name}.json"
+        scratch = _scratch_dirs(settings.with_name(settings.name + "-scratch"))
         write_settings(
             build_settings(
                 profile, runs, factory_root=root,
                 model_endpoint="https://api.z.ai/api/anthropic",
+                read_only=True, scratch_write=scratch,
             ),
             settings,
         )
         return run_sandboxed(
-            [sys.executable, "-c", script, name], runs, settings, timeout=120,
+            [sys.executable, "-c", script, name], runs, settings,
+            timeout=120, scratch=scratch,
         )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
