@@ -61,7 +61,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -98,12 +97,15 @@ from factory.prompts import (
     prompt_versions,
 )
 from factory.publish import (
+    GIT_NET_ENV,
     PublishError,
     PullRequest,
     PushRefused,
+    RemoteCallTimeout,
     check_pr_text,
     gh_pr_create,
     push_branch,
+    remote_call,
 )
 from factory.runs import (
     FACTORY_ROOT_DEFAULT,
@@ -436,6 +438,33 @@ def _log_vents(log: ProgressLog, record: SessionRecord, seat: str,
     except Exception as exc:  # noqa: BLE001 — telemetry must not crash a run
         print(
             f"factory: {task_id} {seat} vents not logged "
+            f"({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
+
+
+def _progress_best_effort(log: ProgressLog, entry: dict, task_id: str) -> None:
+    """Append one progress-log entry as telemetry, never control flow
+    (F-45 AC-2/AC-4, M-6).
+
+    The queue and the attempt records are the state machine; the progress
+    log is the human-facing projection of them (the same rule
+    :func:`_log_vents` already applies to vents). An append that fails —
+    a full disk (OSError) or a rewritten/corrupt hash chain
+    (ProgressLogError, an anticipated class) — costs one log line, which
+    is reported on stderr, never the transition it sits next to: before
+    F-45, a failing append in ``_sweep_escalation`` left the task in
+    ``in_review`` with its attempt recorded, and every later run
+    re-validated, failed at the same append and crashed again — an
+    unbudgeted, self-perpetuating wedge (the escalation's note and
+    findings live on in the attempt record and the stored validator
+    report, so the projection is reconstructable).
+    """
+    try:
+        log.append(entry)
+    except Exception as exc:  # noqa: BLE001 — telemetry must not crash a run
+        print(
+            f"factory: {task_id} progress log entry not written "
             f"({type(exc).__name__}: {exc})",
             file=sys.stderr,
         )
@@ -1043,11 +1072,22 @@ def run_once(
         _pr_urls(queue, ("in_review",), skip_merged=True)
         + [task["links"]["pr"] for task in recovery])), pr_state)
     ready: list[str] = []
-    stale = _sweep_stale_prs(
-        queue, profile, factory_root=factory_root,
-        srt_bin_path=srt_bin_path, gate_timeout_sec=gate_timeout_sec,
-        states=states, recovery=recovery, ready=ready, config=config,
-    )
+    # F-45 AC-1 (M-5): the sweep creates run dirs (its scratch and clean
+    # clones), so it runs under the run lease — reclaim_runs trusts the
+    # invariant "every run dir under runs/<project>/ is created or deleted
+    # only while the run lease is held", and the sweep was the one writer
+    # that escaped it: a concurrent invocation's reclaim deleted a live
+    # sweep's clones mid-flight. Under the lease a concurrent invocation
+    # refuses here (RunInProgressError, the lease's normal message)
+    # instead of racing. Nothing inside the sweep re-takes the lease (the
+    # queue's writes serialise on their own lock), and the sweep's dirs
+    # are cleaned up in its own finally blocks before the lease releases.
+    with queue.idle_lease():
+        stale = _sweep_stale_prs(
+            queue, profile, factory_root=factory_root,
+            srt_bin_path=srt_bin_path, gate_timeout_sec=gate_timeout_sec,
+            states=states, recovery=recovery, ready=ready, config=config,
+        )
     if stale is not None:
         stale.ready_prs = ready
         return stale
@@ -1158,23 +1198,20 @@ def _fetch_sha(repo: Path, remote: str, ref: str) -> str:
     is a ``--filter=blob:none`` partial whose lazy blob fetches go to the
     local source repo — which may hold neither. Two refs of full objects
     cost far less than a merge that dies mid-checkout. Runs with
-    GIT_TERMINAL_PROMPT=0 and a timeout (round-3 finding 3): a private
-    remote with an expired credential helper fails fast instead of
-    hanging the run lease on a username prompt.
+    GIT_TERMINAL_PROMPT=0 and a timeout (round-3 finding 3; since F-45
+    through :func:`factory.publish.remote_call`, the ONE wrapper every
+    remote call shares): a private remote with an expired credential
+    helper fails fast instead of hanging the run lease on a username
+    prompt.
     """
     try:
-        proc = subprocess.run(
+        proc = remote_call(
             ["git", *GIT_HARDENING, "-C", str(repo), "fetch", "--quiet", "--no-tags",
              remote, ref],
-            capture_output=True, text=True,
-            env={**os.environ, **_GIT_NET_ENV}, timeout=_NET_TIMEOUT_SEC,
+            what=f"fetch of {ref!r} from {remote}",
         )
-    except subprocess.TimeoutExpired as exc:
-        raise RunError(
-            f"fetch of {ref!r} from {remote} timed out after {_NET_TIMEOUT_SEC}s "
-            "(GIT_TERMINAL_PROMPT=0 was set: a hung credential helper or an "
-            "unreachable remote, not a prompt waiting for you)"
-        ) from exc
+    except RemoteCallTimeout as exc:
+        raise RunError(str(exc)) from exc
     if proc.returncode != 0:
         raise RunError(
             f"cannot fetch {ref!r} from {remote}: {proc.stderr.strip()[:500]}. "
@@ -1207,11 +1244,12 @@ def _conflict_paths(repo: Path) -> list[str]:
 
 _PR_STATES_STATUSES = ("ready", "in_progress", "in_review", "needs_human")
 
-# Remote git (ls-remote, fetches, the sweep's merge) must never sit on a
-# credential prompt: a private HTTPS remote with an expired helper would
-# hold the run lease forever on a username prompt (round-3 finding 3).
-_GIT_NET_ENV = {"GIT_TERMINAL_PROMPT": "0"}
-_NET_TIMEOUT_SEC = 300
+# Remote git (ls-remote, fetches) must never sit on a credential prompt:
+# a private HTTPS remote with an expired helper would hold the run lease
+# forever on a username prompt (round-3 finding 3). Since F-45 every
+# remote call — these and the publish-side push/ls-remote/gh — goes
+# through factory.publish.remote_call (ONE prompt-disabled, timed
+# wrapper); the env and timeout constants live there.
 # Round-5 finding 5: the sweep's merge is LOCAL — both commits were
 # already fetched — so its timeout is its own constant and its failure
 # wording names the local pathology, never the network.
@@ -1325,17 +1363,17 @@ def _ls_remote_heads(remote: str, refs: tuple[str, ...]) -> dict[str, str]:
     An optimization seam only (round-2 finding 7): on any failure —
     including a timeout — the answer is empty and the caller falls
     through to the clone path, whose fetches remain the authoritative
-    check. Runs with GIT_TERMINAL_PROMPT=0 and a timeout so it can never
-    sit on a credential prompt (round-3 finding 3).
+    check. Runs prompt-disabled and timed through the shared
+    :func:`factory.publish.remote_call` wrapper (round-3 finding 3, F-45)
+    so it can never sit on a credential prompt.
     """
     try:
-        proc = subprocess.run(
+        proc = remote_call(
             ["git", *GIT_HARDENING, "ls-remote", remote,
              *(f"refs/heads/{ref}" for ref in refs)],
-            capture_output=True, text=True,
-            env={**os.environ, **_GIT_NET_ENV}, timeout=_NET_TIMEOUT_SEC,
+            what=f"ls-remote of {remote}",
         )
-    except subprocess.TimeoutExpired:
+    except RemoteCallTimeout:
         return {}
     if proc.returncode != 0:
         return {}
@@ -1390,10 +1428,12 @@ def _sweep_escalation(
         [f"[{escalation}] {note}"],
     )
     queue.append_attempt(task_id, attempt)
-    ProgressLog.for_task(factory_root, profile["name"], task_id).append({
-        "run_id": run_id, "outcome": "escalated",
-        "escalation": escalation, "findings": findings,
-    })
+    _progress_best_effort(
+        ProgressLog.for_task(factory_root, profile["name"], task_id),
+        {"run_id": run_id, "outcome": "escalated",
+         "escalation": escalation, "findings": findings},
+        task_id,
+    )
     queue.transition(task_id, "needs_human")
     return RunResult("needs_human", task_id, escalation=escalation, reports=reports)
 
@@ -1464,16 +1504,18 @@ def _close_merged_tasks(
             continue
         target = "awaiting_owner" if open_owner_steps(task) else "done"
         queue.transition_path(task["id"], ["deploying", target])
-        ProgressLog.for_task(factory_root, profile["name"], task["id"]).append({
-            "run_id": new_run_id(),
-            "outcome": "closed",
-            "note": (
-                f"{links['merged']} is merged and the profile has no deploy "
-                f"target (deploy.mechanism none, live_checks empty): nothing "
-                f"to deploy or verify live — {task['id']} in_review → "
-                f"deploying → {target}, the merge itself the evidence"
-            ),
-        })
+        _progress_best_effort(
+            ProgressLog.for_task(factory_root, profile["name"], task["id"]),
+            {"run_id": new_run_id(),
+             "outcome": "closed",
+             "note": (
+                 f"{links['merged']} is merged and the profile has no deploy "
+                 f"target (deploy.mechanism none, live_checks empty): nothing "
+                 f"to deploy or verify live — {task['id']} in_review → "
+                 f"deploying → {target}, the merge itself the evidence"
+             )},
+            task["id"],
+        )
         closed.append((task["id"], target))
     return closed
 
@@ -1577,11 +1619,11 @@ def _sweep_stale_prs(
         else:
             continue  # no owner action to read
         queue.transition(task["id"], new_status)
-        ProgressLog.for_task(factory_root, project, task["id"]).append({
-            "run_id": new_run_id(),
-            "outcome": "recovered",
-            "note": note,
-        })
+        _progress_best_effort(
+            ProgressLog.for_task(factory_root, project, task["id"]),
+            {"run_id": new_run_id(), "outcome": "recovered", "note": note},
+            task["id"],
+        )
     # Recovery stamps are merged-terminal: on a no-deploy profile the
     # tasks they returned to in_review close now, in this run.
     _close_merged_tasks(queue, profile, factory_root)
@@ -1670,16 +1712,18 @@ def _sweep_stale_prs(
                 # from the local source — prompt-free keeps even that
                 # path safe. Conflicts are read from the index, not from
                 # git's localized messages (round-2 finding 2); any
-                # other failure is infrastructure, not the PR.
-                merge = subprocess.run(
+                # other failure is infrastructure, not the PR. F-45: the
+                # call runs through the shared remote_call wrapper with
+                # the merge's own (local) timeout.
+                merge = remote_call(
                     ["git", *GIT_HARDENING, "-C", str(work.root), *_IDENTITY,
                      "merge", "--no-edit", default_sha],
-                    capture_output=True, text=True,
-                    env={**os.environ, "LC_ALL": "C", "LANG": "C",
-                         **_GIT_NET_ENV},
-                    timeout=_MERGE_TIMEOUT_SEC,
+                    env_extra={"LC_ALL": "C", "LANG": "C", **GIT_NET_ENV},
+                    timeout_sec=_MERGE_TIMEOUT_SEC,
+                    what=f"git merge of {branch} onto "
+                         f"{default_branch}@{default_sha[:12]}",
                 )
-            except subprocess.TimeoutExpired as exc:
+            except RemoteCallTimeout as exc:
                 # Round-4 finding 5 + round-5 finding 5: a timeout is a
                 # clean RunError (exit 2, message), never a traceback —
                 # and this merge is local, so the message names the local
@@ -1757,12 +1801,14 @@ def _sweep_stale_prs(
             queue.get(task_id)["links"]["revalidated"] = {
                 "pr": pr_sha, "default": default_sha}
             queue.save()
-            ProgressLog.for_task(factory_root, project, task_id).append({
-                "run_id": work.run_id, "outcome": "pass",
-                "note": (f"stale-base re-validation: L0+L1 pass on {branch} "
-                         f"merged onto {default_branch}@{default_sha[:12]} "
-                         f"({report_path.name})"),
-            })
+            _progress_best_effort(
+                ProgressLog.for_task(factory_root, project, task_id),
+                {"run_id": work.run_id, "outcome": "pass",
+                 "note": (f"stale-base re-validation: L0+L1 pass on {branch} "
+                          f"merged onto {default_branch}@{default_sha[:12]} "
+                          f"({report_path.name})")},
+                task_id,
+            )
             ready.append(f"{links['pr']} against "
                          f"{default_branch}@{default_sha[:12]}")
         finally:
@@ -1782,25 +1828,20 @@ def _build_on_remote_default(work: RunDir, remote: str, default_branch: str) -> 
     than no run.
 
     Raises:
-        RunError: The fetch failed or timed out. Raised before any
-            session starts.
+        RunError: The fetch failed or timed out (F-45: through the shared
+            :func:`factory.publish.remote_call` wrapper). Raised before
+            any session starts.
     """
     try:
-        proc = subprocess.run(
+        proc = remote_call(
             ["git", *GIT_HARDENING, "-C", str(work.root), "fetch", "--quiet",
              "--no-tags", "--filter=blob:none", remote, default_branch],
-            capture_output=True, text=True,
-            env={**os.environ, **_GIT_NET_ENV}, timeout=_NET_TIMEOUT_SEC,
+            what=f"fetch of {default_branch!r} from {remote}",
         )
-    except subprocess.TimeoutExpired as exc:
+    except RemoteCallTimeout as exc:
         # Round-4 finding 5: a slow remote is the usual exit-2 message,
-        # never a raw TimeoutExpired traceback.
-        raise RunError(
-            f"fetch of {default_branch!r} from {remote} timed out after "
-            f"{_NET_TIMEOUT_SEC}s (GIT_TERMINAL_PROMPT=0 was set: a hung "
-            "credential helper or an unreachable remote, not a prompt "
-            "waiting for you)"
-        ) from exc
+        # never a raw traceback.
+        raise RunError(str(exc)) from exc
     if proc.returncode != 0:
         raise RunError(
             f"cannot fetch {default_branch!r} from {remote}: {proc.stderr.strip()[:500]}. "
@@ -1861,6 +1902,11 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
     final_repeats_left = ctx.config.final_review_repeats
     final_pending = False
     round_no = 0
+    # F-45 AC-4 (m-13): whether this round's finish() already recorded its
+    # attempt. The error path below must never append a second attempt for
+    # a round whose first one landed (one failure = exactly one attempt);
+    # the flag resets with every round.
+    round_attempt_landed = False
 
     work = create_run(project, source, factory_root=ctx.factory_root, ref=default_branch)
     # F-43: the run's egress secrets — every literal this run holds that
@@ -2056,6 +2102,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                     "escalated": "failed", "aborted": "aborted"}
 
         def finish(attempt, status, findings, finding_keys=None, **result):
+            nonlocal round_attempt_landed
             entry = {
                 "run_id": attempt["run_id"],
                 "attempt": attempt["rounds"],
@@ -2068,7 +2115,11 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                 # next run seeds its carried set from the log.
                 entry["finding_keys"] = finding_keys
             queue.append_attempt(task_id, attempt)
-            log.append(entry)
+            # F-45 AC-4 (m-13): the attempt is on disk — anything failing
+            # after this point must not let the round handler below append
+            # a second one for the same failure.
+            round_attempt_landed = True
+            _progress_best_effort(log, entry, task_id)
             if status is not None:
                 # The run ends here (a ``None`` status is a failed round
                 # that continues into the next attempt): one terminal
@@ -2104,6 +2155,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
             # This round's state, initialised before anything can raise: the
             # error path below records its attempt from whatever exists.
             round_no += 1
+            round_attempt_landed = False
             records: list = []
             reports: dict = {"L0": None, "L1": None, "L2": None}
             extra_findings: list[str] = []
@@ -2840,8 +2892,12 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                         # A passed round's findings were accepted as non-blocking:
                         # recording their keys would poison a later fix round
                         # after a rejected PR (only failed reviews seed).
-                        log.append({"run_id": work.run_id, "attempt": attempt_no, "outcome": "pass",
-                                    "pr": url, "findings": findings})
+                        _progress_best_effort(
+                            log,
+                            {"run_id": work.run_id, "attempt": attempt_no,
+                             "outcome": "pass", "pr": url, "findings": findings},
+                            task_id,
+                        )
                         task = queue.get(task_id)
                         task["links"] = {**(task.get("links") or {}), "pr": url, "branch": branch}
                         queue.transition(task_id, "in_review")
@@ -2943,13 +2999,24 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                     escalation = "publish_refused"
                 else:
                     escalation = "orchestrator_error"
-                attempt = attempt_record(attempt_no, started, "escalated", records, path,
-                                         escalation=escalation, note=note)
-                findings = _numbered_findings(reports, [f"[{escalation}] {note}"])
-                queue.append_attempt(task_id, attempt)
-                log.append({"run_id": work.run_id, "attempt": attempt_no,
-                            "outcome": attempt["outcome"], "escalation": escalation,
-                            "findings": findings})
+                if not round_attempt_landed:
+                    # F-45 AC-4 (m-13): the round's own finish() did NOT
+                    # record an attempt (it failed at or before
+                    # append_attempt) — the error is this round's one
+                    # attempt. When the flag IS set, finish() already
+                    # recorded it, and a second append here would
+                    # double-spend the budget for one failure.
+                    attempt = attempt_record(attempt_no, started, "escalated", records,
+                                             path, escalation=escalation, note=note)
+                    findings = _numbered_findings(reports, [f"[{escalation}] {note}"])
+                    queue.append_attempt(task_id, attempt)
+                    _progress_best_effort(
+                        log,
+                        {"run_id": work.run_id, "attempt": attempt_no,
+                         "outcome": attempt["outcome"], "escalation": escalation,
+                         "findings": findings},
+                        task_id,
+                    )
                 trace.run_end("failed", escalation=escalation)  # F-30
                 if pushed:
                     task = queue.get(task_id)
