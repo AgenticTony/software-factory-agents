@@ -455,6 +455,13 @@ def touched_paths(change) -> tuple[str, ...]:
     path only, so renaming ``payments/x.py`` to ``utils/x.py`` raised the
     payments flag via the old path while the ``# noqa`` added in the same
     rename sailed through unflagged.
+
+    Args:
+        change: One :class:`~factory.gates.FileChange` from the diff.
+
+    Returns:
+        The paths the change counts as touching — both halves of a
+        rename, otherwise the new path alone.
     """
     if change.status == "R" and change.old_path:
         return (change.path, change.old_path)

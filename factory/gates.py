@@ -177,14 +177,21 @@ def contract_test_files(task: dict) -> set:
     return {p for p in (ref_path(r) for r in contract_test_refs(task)) if p}
 
 
-def git(repo: Path, *args: str) -> str:
+def git(repo: Path, *args: str, errors: str = "strict") -> str:
     """Run hardened git in the repo, raising GateError on any failure.
 
     ``GIT_HARDENING`` (no hooks, no fsmonitor) on every call: the gates
-    run on a clone whose history an agent wrote.
+    run on a clone whose history an agent wrote. ``errors`` passes
+    through to the decode exactly as :class:`subprocess.Popen` takes it
+    — the default strict decode refuses non-UTF-8 output; the one
+    caller that must read arbitrary attacker bytes (the per-commit
+    attribution scan, F-46) passes ``"replace"`` so no commit message
+    can crash or be skipped, while every future hardening of this one
+    invocation reaches it too.
     """
     proc = subprocess.run(
-        ["git", *GIT_HARDENING, "-C", str(repo), *args], capture_output=True, text=True
+        ["git", *GIT_HARDENING, "-C", str(repo), *args],
+        capture_output=True, text=True, errors=errors,
     )
     if proc.returncode != 0:
         raise GateError(
