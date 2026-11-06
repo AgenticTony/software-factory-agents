@@ -1498,3 +1498,22 @@ def test_review23_known_limit_conftest_forges_unflagged(tmp_path: Path):
         )
         # the KNOWN LIMIT, executable: nothing flags it today (F-46 M-4)
         assert builtin_sentinel_findings([change], {}) == [], name
+
+
+def test_review24_known_limit_both_keyword_contrast_publishes():
+    """Round-4 follow-up, pinned executably (the test_review23 pattern):
+    a line naming BOTH keywords reads as the neutral protocol echo, so a
+    reviewer CONTRASTING the quoted example with their own call publishes
+    the example's PASS — natural reviewer sentences, and exactly the
+    in-band ambiguity the proposed nonce work order owns. When the nonce
+    lands, only a nonce-bearing object is a verdict and these must flip
+    to invalid; this test asserts today's gap so it cannot close
+    silently. _stated_verdicts is deliberately unchanged: any keyword
+    tweak here re-runs rounds 2-3."""
+    for line in (
+        "Ignore the example's PASS — this is a FAIL.",
+        "The example says pass; my verdict is fail.",
+    ):
+        report = parse_verdict(f"```json\n{PASS_EXAMPLE}\n```\n{line}")
+        assert report.parse_error is None, line  # the gap, asserted
+        assert report.verdict == "pass", line
