@@ -316,7 +316,8 @@ def test_ac_4():
     assert pytest_steps, "CI must run pytest"
     for step in pytest_steps:
         run = step["run"]
-        assert run.strip() == "pytest -q", (
+        # `-n auto` (pytest-xdist) only parallelises; it filters nothing.
+        assert run.strip() in ("pytest -q", "pytest -q -n auto"), (
             f"the suite must run whole (no marker/path filters): {run!r}"
         )
         assert "if" not in step and "continue-on-error" not in step, (
