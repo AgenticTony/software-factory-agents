@@ -28,3 +28,20 @@ out/
 
 # srt (sandbox runtime) — pinned in package.json; only the lockfile is committed
 node_modules/
+
+# Secrets — never committed (the Z.ai credential lives in the macOS keychain,
+# item factory-zai; nothing on disk should ever hold a real key)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.netrc
+.npmrc
+.pypirc
+id_rsa*
+id_ed25519*
+credentials.json
+secrets.*
