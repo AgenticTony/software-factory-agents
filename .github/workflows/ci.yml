@@ -21,7 +21,14 @@ jobs:
         # 3.11 = declared floor (requires-python); 3.13 = local dev version
         python-version: ["3.11", "3.13"]
     steps:
+      # Full history, not the default depth-1 shallow checkout: create_run
+      # makes `git clone --filter=blob:none` partial clones of this repo, and
+      # a partial clone of a SHALLOW source recurses through lazy fetches
+      # without bound (fetch -> upload-pack -> fetch ...) - ~17k tasks, the
+      # runner cgroup's pids.max, then fork() EAGAIN across the suite.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
