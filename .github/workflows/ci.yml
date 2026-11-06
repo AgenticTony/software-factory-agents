@@ -52,25 +52,44 @@ jobs:
           echo "threads-max=$(cat /proc/sys/kernel/threads-max) pid_max=$(cat /proc/sys/kernel/pid_max) nproc=$(nproc)"
           cg=$(cut -d: -f3 /proc/self/cgroup)
           echo "cgroup=$cg pids.max=$(cat /sys/fs/cgroup$cg/pids.max 2>/dev/null) memory.max=$(cat /sys/fs/cgroup$cg/memory.max 2>/dev/null)"
-          for u in "$cg" $(dirname "$cg"); do echo "$u pids.max=$(cat /sys/fs/cgroup$u/pids.max 2>/dev/null)"; done
+          # One process walks /proc (ps forks per call and fails at the cap).
+          cat > /tmp/snap.py <<'EOF'
+          import collections, os, sys
+          procs = {}
+          for d in os.listdir("/proc"):
+              if not d.isdigit():
+                  continue
+              try:
+                  st = open(f"/proc/{d}/status").read()
+                  f = dict(l.split(":", 1) for l in st.splitlines() if ":" in l)
+                  cmd = open(f"/proc/{d}/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="replace")
+              except OSError:
+                  continue
+              procs[int(d)] = (int(f["PPid"]), int(f["Threads"]), f["Name"].strip(), f["State"].strip()[:1], cmd[:240])
+          print(f"== snapshot {sys.argv[1]}: procs={len(procs)} threads={sum(p[1] for p in procs.values())}")
+          print("-- top 12 by threads (pid ppid threads state name | cmd)")
+          for pid, p in sorted(procs.items(), key=lambda kv: -kv[1][1])[:12]:
+              print(pid, p[0], p[1], p[3], p[2], "|", p[4])
+          print("-- top 12 by process count per (name, state, parent cmd)")
+          groups = collections.Counter((p[2], p[3], procs.get(p[0], (0, 0, "?", "?", "?"))[4][:160]) for p in procs.values())
+          for (name, state, parent), n in groups.most_common(12):
+              print(n, name, state, "| parent:", parent)
+          EOF
           nohup bash -c '
-            peak=0
-            while sleep 2; do
-              mine=$(ps -eLo user= | grep -c "^runner")
-              all=$(ps -eL --no-headers | wc -l)
+            next=1500
+            while sleep 1; do
+              n=$(cat /sys/fs/cgroup'"$cg"'/pids.current 2>/dev/null)
               avail=$(awk "/MemAvailable/{print int(\$2/1024)}" /proc/meminfo)
-              echo "$(date +%T) runner_tasks=$mine all_tasks=$all cg_pids=$(cat /sys/fs/cgroup'"$cg"'/pids.current 2>/dev/null) mem_avail_mb=$avail commit_mb=$(awk "/Committed_AS/{print int(\$2/1024)}" /proc/meminfo)"
-              if [ "$mine" -gt "$peak" ]; then
-                peak=$mine
-                ps -eLo user=,comm= | sort | uniq -c | sort -rn | head -25 > /tmp/peak_snapshot.txt
+              echo "$(date +%T) cg_pids=$n mem_avail_mb=$avail"
+              if [ "$n" -ge "$next" ]; then
+                python3 /tmp/snap.py "cg_pids=$n at $(date +%T)" >> /tmp/snapshots.txt 2>&1
+                next=$((next * 2))
               fi
             done' > /tmp/task_samples.txt 2>&1 &
       - run: pytest -q -n auto
       - name: Task sampler report (diagnostic)
         if: always()
         run: |
-          echo "== peak by runner_tasks"; sort -t= -k2 -n /tmp/task_samples.txt | tail -3
-          echo "== lowest mem_avail_mb"; sed -n "s/.*mem_avail_mb=\([0-9]*\).*/\1 &/p" /tmp/task_samples.txt | sort -n | head -3
-          echo "== overcommit: $(cat /proc/sys/vm/overcommit_memory) $(grep -E "CommitLimit|MemTotal|SwapTotal" /proc/meminfo | tr -s " " | tr "\n" " ")"
-          echo "== top 25 at peak"; cat /tmp/peak_snapshot.txt
-          echo "== last samples"; tail -5 /tmp/task_samples.txt
+          echo "== peak cg_pids"; sort -t= -k2 -n /tmp/task_samples.txt | tail -3
+          cat /tmp/snapshots.txt
+          echo "== last samples"; tail -3 /tmp/task_samples.txt
