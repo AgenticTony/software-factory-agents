@@ -45,7 +45,12 @@ def test_ac_2():
         if "run" in step
     ]
     assert "ruff check ." in runs, "CI must run `ruff check .` as its own step"
-    assert "pytest -q" in runs, "CI must run `pytest -q` as its own step"
+    # `-n auto` (pytest-xdist, pinned in [dev]) parallelises the suite; it
+    # must be on the command line, not PYTEST_ADDOPTS, which nested pytest
+    # runs inherit (it broke the F-44 output-forgery probes).
+    assert {"pytest -q", "pytest -q -n auto"} & set(runs), (
+        "CI must run `pytest -q` as its own step"
+    )
 
 
 def test_ac_3():

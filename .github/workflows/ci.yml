@@ -42,4 +42,4 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: pip install -e ".[dev]"
       - run: ruff check .
-      - run: pytest -q
+      - run: pytest -q -n auto
