@@ -107,7 +107,10 @@ _NOT_FOUND = (
 # the runner prints no outcome lines at all, so the absence of a pytest
 # signature is never treated as proof either way).
 _NO_TESTS_FOUND = re.compile(r"^no tests found", re.IGNORECASE | re.MULTILINE)
-_OUTCOME_LINE = re.compile(r"^(?:PASS|FAIL)[ \t].*$", re.MULTILINE)
+# jest-style per-file outcome lines: ``PASS <path> …`` / ``FAIL <path> …``.
+# The path TOKEN is captured for exact comparison — a substring match
+# let ``src/aa.test.js`` satisfy ``src/a.test.js`` (round 3, finding 2).
+_OUTCOME_LINE = re.compile(r"^(?:PASS|FAIL)[ \t]+(\S+)", re.MULTILINE)
 
 # How a red run went red (F-09, VALIDATOR-SPEC L1 "red for the wrong
 # reason"). The epistemic class that matters downstream is "red only
@@ -193,6 +196,16 @@ def not_collected_evidence(result: CommandResult, ref: str) -> tuple[str, str] |
 
     A run that timed out, or that produced none of these shapes, is a
     real verdict: never treat the absence of a signature as proof.
+
+    Args:
+        result: One phase's :class:`~factory.gates.CommandResult` for the ref.
+        ref: The contract test ref the command targeted
+            (``path::name``).
+
+    Returns:
+        ``(class, evidence)`` — class ``"not_found"`` or
+        ``"not_collected"`` with a legible evidence string — or ``None``
+        when the run produced a real verdict.
     """
     if result.timed_out or result.exit_code is None:
         return None
@@ -208,14 +221,24 @@ def not_collected_evidence(result: CommandResult, ref: str) -> tuple[str, str] |
     match = _NO_TESTS_FOUND.search(result.output)
     if match:
         return "not_collected", f"runner reported {match.group(0).strip()!r}"
-    outcome_lines = _OUTCOME_LINE.findall(result.output)
-    if outcome_lines:
+    outcome_tokens = _OUTCOME_LINE.findall(result.output)
+    if outcome_tokens:
         path = ref_path(ref) or ref
-        basename = path.rsplit("/", 1)[-1]
-        if not any(path in line or basename in line for line in outcome_lines):
+
+        def ran(token: str) -> bool:
+            # Exact token match, or a real directory suffix (an
+            # absolute-vs-relative spelling of the same file). A bare
+            # basename match is deliberately NOT accepted: a root-level
+            # ref must not be satisfied by a nested file of the same
+            # name, and a longer name must not contain it.
+            if token == path:
+                return True
+            return "/" in path and token.endswith("/" + path)
+
+        if not any(ran(token) for token in outcome_tokens):
             return (
                 "not_collected",
-                f"absent from the runner's outcome list ({len(outcome_lines)} "
+                f"absent from the runner's outcome list ({len(outcome_tokens)} "
                 f"outcome lines, none naming {path})",
             )
     return None

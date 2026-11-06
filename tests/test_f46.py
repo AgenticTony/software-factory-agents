@@ -989,3 +989,175 @@ def test_review14_pytest_config_at_distinguishes_absent_from_unreadable(monkeypa
     findings = [l0_module._runner_config_change(
         "setup.cfg", "modified", repo, "main", "feature")]
     assert findings and "unparseable" in findings[0], findings
+
+
+# ------------------- owner review round 3 (real probes, red-first) ---------
+
+def test_review15_confusables_fold_after_nfkd():
+    """A precomposed confusable (Cyrillic ie-with-grave, Greek alpha with
+    tonos) decomposes under NFKD into a base letter the confusables map
+    knows plus a combining mark; folding BEFORE the decomposition missed
+    the base letter (review round 3, finding 1). The translate now runs
+    after NFKD and the mark strip."""
+    for word in ("Claudѐ", "Clάude"):
+        hit = attribution_match(f"Co-Authored-By: {word} <dev@e.org>\n")
+        assert hit is not None and hit[0] == "co_author_ai_author", (word, hit)
+
+
+def test_review16_outcome_list_matches_path_tokens_exactly():
+    """The outcome-list check is a token match, not a substring: jest's
+    PASS/FAIL lines are ``PASS <path> ...``, so the path token is
+    extracted and compared exactly (or by a ``/<path>`` suffix for
+    absolute-vs-relative spellings). ``src/aa.test.js`` must never
+    satisfy ``src/a.test.js``, and a root-level ref must not match a
+    nested file that merely ends with its name (round 3, finding 2)."""
+    from factory.gates import CommandResult
+    from factory.l1 import not_collected_evidence
+
+    def result(output, exit_code=1):
+        return CommandResult("run", "jest", exit_code, output)
+
+    # a DIFFERENT file whose name merely contains the ref's — not collected
+    evidence = not_collected_evidence(result("PASS src/aa.test.js\n"),
+                                      "src/a.test.js::adds")
+    assert evidence and evidence[0] == "not_collected", evidence
+    # a root-level ref vs a nested run of a same-named file — not collected
+    evidence = not_collected_evidence(result("PASS src/a.test.js\n"),
+                                      "a.test.js::adds")
+    assert evidence and evidence[0] == "not_collected", evidence
+    # the exact file ran — a real verdict either way
+    assert not_collected_evidence(result("PASS src/a.test.js\n"),
+                                  "src/a.test.js::adds") is None
+    # an absolute-path spelling of the same file satisfies the ref
+    assert not_collected_evidence(
+        result("PASS /repo/src/a.test.js (2 ms)\n"),
+        "src/a.test.js::adds") is None
+
+
+def test_review17_absence_proven_from_the_tree_only(monkeypatch, tmp_path):
+    """Absence comes from `git ls-tree` (no blob needed — a
+    --filter=blob:none clone's lazy fetch can never turn "absent" into a
+    lie); every other failure — a dead git, a timeout, a broken ref — is
+    an ERROR and fails the comparison closed (round 3, finding 3)."""
+    from factory import l0 as l0_module
+
+    repo = _repo(tmp_path, "lstree")
+    _branch(repo)
+    _commit(repo, "chore: cfg\n", files={
+        "setup.cfg": "[metadata]\nname = x\n\n[tool:pytest]\naddopts = -x\n",
+    })
+    # proven absent from the tree: all-None, no error.
+    surface, error = l0_module._pytest_config_at(
+        repo, "feature", "nope/setup.cfg", ["tool:pytest"])
+    assert error is None and surface == {"tool:pytest": None}, (surface, error)
+    # an odd literal path still resolves through the pathspec: absent
+    # at main (it only exists on the feature branch) and — a pin of the
+    # fail-closed direction — present-but-garbage at feature is an
+    # error, never "absent".
+    _commit(repo, "chore: odd\n", files={"sub/we ird[1].cfg": "x = 1\n"})
+    surface, error = l0_module._pytest_config_at(
+        repo, "main", "sub/we ird[1].cfg", ["tool:pytest"])
+    assert error is None and surface == {"tool:pytest": None}, (surface, error)
+    surface, error = l0_module._pytest_config_at(
+        repo, "feature", "sub/we ird[1].cfg", ["tool:pytest"])
+    assert error is not None, (surface, error)
+
+    # a failing presence probe (timeout / dead git shape) is an error,
+    # and the diff-policy flags the config as touched, failing closed.
+    real_git = l0_module._git
+
+    def dead_git(repo_arg, *args):
+        if args[:2] == ("ls-tree", None) or args[0] == "ls-tree":
+            raise l0_module.GateError("git ls-tree failed: rc 124 (timeout)")
+        return real_git(repo_arg, *args)
+
+    monkeypatch.setattr(l0_module, "_git", dead_git)
+    surface, error = l0_module._pytest_config_at(
+        repo, "feature", "setup.cfg", ["tool:pytest"])
+    assert error is not None and "124" in error, (surface, error)
+    finding = l0_module._runner_config_change(
+        "setup.cfg", "modified", repo, "main", "feature")
+    assert finding and "unparseable" in finding, finding
+
+
+def test_review18_ini_option_names_are_case_sensitive(tmp_path):
+    """ConfigParser lowercases option names and pytest does not: an inert
+    ``Addopts`` at base flipped to a live ``addopts`` at head compared
+    equal and passed (round 3, finding 4 — probed: capital-A Addopts is
+    inert in pytest 9.2, lowercase hides a named test). Option names are
+    now compared case-sensitively."""
+    for name in ("setup.cfg", "tox.ini"):
+        base_section = ("[tool:pytest]\n" if name == "setup.cfg" else "[pytest]\n")
+        head_section = ("[tool:pytest]\n" if name == "setup.cfg" else "[pytest]\n")
+        repo = _repo(tmp_path, f"case-{name}", {name: base_section
+                                                + "Addopts = -q\n"})
+        _branch(repo)
+        _commit(repo, "chore: flip case\n", files={
+            name: head_section + "addopts = --deselect tests/x.py::t\n"})
+        changes = diff_file_changes(repo, "main", "feature")
+        findings, _esc, _a, _m = check_diff_policy(
+            BASE_PROFILE, changes, TASK, repo=repo, base_ref="main",
+            head_ref="feature")
+        hits = [f for f in findings if f.id == "protected_path_touched"]
+        assert hits and hits[0].file == name, (name, findings)
+
+    # same case on both sides — an inert option unchanged beside an
+    # unrelated section edit — is not a runner-config change.
+    repo = _repo(tmp_path, "case-same", {"tox.ini": "[pytest]\nAddopts = -q\n"})
+    _branch(repo)
+    _commit(repo, "chore: inert edit\n", files={
+        "tox.ini": "[pytest]\nAddopts = -q\n\n[testenv]\ncommands = make check\n"})
+    changes = diff_file_changes(repo, "main", "feature")
+    findings, _esc, _a, _m = check_diff_policy(
+        BASE_PROFILE, changes, TASK, repo=repo, base_ref="main",
+        head_ref="feature")
+    assert not [f for f in findings if f.id == "protected_path_touched"], findings
+
+
+def test_review19_param_id_only_at_head_fails_closed(tmp_path):
+    """The recorded residual, pinned executably (round 3, finding 5): a
+    ref naming a parametrize id that only exists at head fails closed as
+    not-collected, even though the bare function IS collected at red.
+    Deliberate: exempting it would reopen a shaped evasion (a param list
+    conditioned on find_spec hides the named case's red behind its
+    sibling), and the honest contract shape exists — name the bare
+    function, which collects every param at red."""
+    body = (
+        "from impl import VERSIONS, check\n"
+        "import pytest\n"
+        "\n"
+        "\n"
+        "@pytest.mark.parametrize('v', VERSIONS)\n"
+        "def test_ac_1(v):\n"
+        "    assert check(v)\n"
+    )
+    repo = _repo(tmp_path, "param-id",
+                 {"impl.py": "VERSIONS = ['v1']\n\n\ndef check(v):\n    return False\n"})
+    _branch(repo)
+    _commit(repo, "feat: add v2\n", files={
+        "impl.py": "VERSIONS = ['v1', 'v2']\n\n\ndef check(v):\n    return True\n",
+        "tests/test_contract.py": body,
+    })
+    report = run_l1({"name": "fixture", "commands": {}}, repo, "main", "feature",
+                    task={"id": "T-1", "risk": [], "acceptance": [
+                        {"id": "AC-1", "text": "w", "check": {
+                            "type": "test",
+                            "ref": "tests/test_contract.py::test_ac_1[v2]"}}]})
+    assert report.verdict == "fail", report.findings
+    assert [f.id for f in report.findings] == ["contract_not_collected"]
+
+    # the honest shape: the bare function name collects every param at
+    # red (the v1 leg fails on base), green passes — L1 green end to end.
+    repo = _repo(tmp_path, "param-bare",
+                 {"impl.py": "VERSIONS = ['v1']\n\n\ndef check(v):\n    return False\n"})
+    _branch(repo)
+    _commit(repo, "feat: add v2\n", files={
+        "impl.py": "VERSIONS = ['v1', 'v2']\n\n\ndef check(v):\n    return True\n",
+        "tests/test_contract.py": body,
+    })
+    report = run_l1({"name": "fixture", "commands": {}}, repo, "main", "feature",
+                    task={"id": "T-1", "risk": [], "acceptance": [
+                        {"id": "AC-1", "text": "w", "check": {
+                            "type": "test",
+                            "ref": "tests/test_contract.py::test_ac_1"}}]})
+    assert report.verdict == "pass", report.findings

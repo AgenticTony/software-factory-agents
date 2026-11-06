@@ -81,7 +81,6 @@ import copy
 import json
 import posixpath
 import re
-import subprocess
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -98,13 +97,11 @@ from factory.gates import (
     GateReport,
     contract_test_files,
     diff_file_changes,
-    git_rc,
 )
 from factory.gates import git as _git
 from factory.gates import is_test_file as _is_test_file
 from factory.gates import matches as _matches
 from factory.gates import run_command as _run_command
-from factory.runs import GIT_HARDENING
 from factory.sentinels import (
     builtin_sentinel_pass,
     matched_risk_flags,
@@ -421,11 +418,18 @@ def _pytest_config_at(repo: Path, ref: str, path: str, tables: list) -> tuple[di
         an error string when the file is present but unparseable.
     """
     surface: dict = {table: None for table in tables}
-    # Absence must be PROVEN (cat-file -e answers 0 only for an existing
-    # object): a read or decode failure on a file that exists is an
-    # ERROR — "unreadable" fails the comparison closed, it must never
-    # masquerade as "absent" (review round 1, finding 6).
-    if git_rc(repo, "cat-file", "-e", f"{ref}:{path}") != 0:
+    # Absence must be PROVEN from the TREE (``git ls-tree`` needs no
+    # blob, so a lazy blob fetch in a --filter=blob:none clone can never
+    # turn "absent" into a lie, and no exit-code reading of a failed
+    # call is misread): every other failure — dead git, timeout, broken
+    # ref — is an ERROR, and "unreadable" fails the comparison closed;
+    # it must never masquerade as "absent" (round 1 finding 6, round 3
+    # finding 3).
+    try:
+        listing = _git(repo, "ls-tree", ref, "--", f":(literal){path}")
+    except (GateError, UnicodeDecodeError) as exc:
+        return surface, f"cannot prove presence at {ref}:{path}: {exc}"
+    if not listing.strip():
         return surface, None
     try:
         content = _git(repo, "show", f"{ref}:{path}")
@@ -446,6 +450,11 @@ def _pytest_config_at(repo: Path, ref: str, path: str, tables: list) -> tuple[di
             surface[table] = node
     else:
         parser = configparser.ConfigParser(interpolation=None)
+        # Option names are case-sensitive: pytest's own ini reading is,
+        # and ConfigParser's default lowercasing compared an inert
+        # ``Addopts`` at base equal to a live ``addopts`` at head
+        # (round 3, finding 4).
+        parser.optionxform = str
         try:
             parser.read_string(content)
         except configparser.Error as exc:
@@ -653,20 +662,19 @@ def _commit_message(repo: Path, sha: str) -> str:
     ``git log -1 --format=%B`` returns the message as stored — raw bytes,
     whatever encoding they carry (a latin-1 body is not re-encoded on
     output). The shared hardened ``_git`` decodes strictly and would
-    CRASH the scan on such a commit; this reads bytes and decodes with
-    U+FFFD replacement so every commit is scanned — never skipped, never
-    a crashed gate (F-46 AC-1, M-2's neighbour).
+    CRASH the scan on such a commit, so this call passes its one decode
+    override (``errors="replace"``) through the same invocation — every
+    commit is scanned, never skipped, never a crashed gate (F-46 AC-1,
+    M-2's neighbour), and future hardening of ``gates.git`` reaches it.
+
+    Args:
+        repo: Repository holding the commit.
+        sha: The commit sha whose full message is wanted.
+
+    Returns:
+        The commit message decoded as UTF-8 with U+FFFD replacement.
     """
-    proc = subprocess.run(
-        ["git", *GIT_HARDENING, "-C", str(repo), "log", "-1", "--format=%B", sha],
-        capture_output=True,
-    )
-    if proc.returncode != 0:
-        raise GateError(
-            f"git log -1 --format=%B failed in {repo}: "
-            f"{proc.stderr.decode('utf-8', 'replace').strip()}"
-        )
-    return proc.stdout.decode("utf-8", "replace")
+    return _git(repo, "log", "-1", "--format=%B", sha, errors="replace")
 
 
 def attribution_findings(repo: Path, base_ref: str, head_ref: str) -> list:

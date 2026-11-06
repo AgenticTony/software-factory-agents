@@ -194,19 +194,27 @@ _LINE_BOUNDARY = re.compile("\r\n|[\r\v\f\x1c\x1d\x1e\x85\n  ]")
 
 
 def _fold(text: str) -> str:
-    """The shared fold: confusable lookalikes translated, NFKD (fullwidth
-    and mathematical-bold spellings decompose to ASCII, accents to base +
-    mark), then the invisible set — format characters (Cf), the
+    """Fold one text to its match form: NFKD (fullwidth and
+    mathematical-bold spellings decompose to ASCII, accents to base +
+    mark), the invisible set — format characters (Cf), the
     Default_Ignorable set (variation selectors, Hangul fillers) and
     nonspacing/enclosing marks (Mn/Me — the combining accent of
     ``Cláude``) — stripped, other control characters except tab and
     newline stripped (an ``\\x1e`` inside the trailer keyword splits it
     as surely as a zero-width space, and a commit body can carry any
-    byte), and Unicode dashes (Pd) folded to ``-``.
+    byte), Unicode dashes (Pd) folded to ``-``, and finally the
+    confusable lookalikes translated — AFTER the decomposition, so a
+    precomposed confusable (Cyrillic ``ѐ`` → Cyrillic ``е`` + grave)
+    has its base letter folded once the mark is gone (review round 3).
 
-    Newlines survive, so each caller's line structure is preserved.
+    Args:
+        text: The text to fold (line structure must be preserved by the
+            caller — newlines survive this fold).
+
+    Returns:
+        The folded text; same number of newlines as the input modulo the
+        caller's own line-boundary handling.
     """
-    text = text.translate(_CONFUSABLES)
     text = unicodedata.normalize("NFKD", text)
     out = []
     for ch in text:
@@ -219,7 +227,7 @@ def _fold(text: str) -> str:
         ):
             continue
         out.append("-" if category == "Pd" else ch)
-    return "".join(out)
+    return "".join(out).translate(_CONFUSABLES)
 
 
 def _canonical_forms(text: str):
@@ -232,6 +240,14 @@ def _canonical_forms(text: str):
     By``). The two pull opposite ways for the record separators, so both
     run and the echo names the original line of whichever hit (review
     round 1, finding 4).
+
+    Args:
+        text: The text to canonicalise (non-empty; the caller skips
+            empty texts).
+
+    Yields:
+        ``(canonical, original_lines)`` pairs — the folded form and the
+        original lines its line numbering maps back onto.
     """
     yield _fold(text), text.split("\n")
     yield _fold(_LINE_BOUNDARY.sub("\n", text)), text.splitlines()
@@ -274,16 +290,16 @@ def _match(patterns: tuple[tuple[str, re.Pattern[str]], ...], *texts: str):
     emoji with the footer, the address with the author).
 
     Matching runs on each text's TWO canonical forms
-    (:func:`_canonical_forms`), so a trailer spelled with Unicode tricks,
-    or parked behind a Unicode line separator, is the trailer all the
-    same; the returned line is the text's ORIGINAL one, aligned by the
-    form that hit, so a human reads what was actually written.
+    (:func:`_canonical_forms`), computed once per text before the
+    pattern loop, so a trailer spelled with Unicode tricks, or parked
+    behind a Unicode line separator, is the trailer all the same; the
+    returned line is the text's ORIGINAL one, aligned by the form that
+    hit, so a human reads what was actually written.
     """
+    prepared = [(text, list(_canonical_forms(text))) for text in texts if text]
     for name, pattern in patterns:
-        for text in texts:
-            if not text:
-                continue
-            for canonical, original_lines in _canonical_forms(text):
+        for text, forms in prepared:
+            for canonical, original_lines in forms:
                 match = pattern.search(canonical)
                 if match:
                     line_no = canonical.count("\n", 0, match.start())
