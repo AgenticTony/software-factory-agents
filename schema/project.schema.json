@@ -44,7 +44,7 @@
         "setup": { "type": "string" },
         "lint": { "type": "string" },
         "typecheck": { "type": "string" },
-        "test": { "type": "string" },
+        "test": { "type": "string", "description": "Runs the whole suite for the L0 gate and its min_tests floor. ONE runner invocation only (a single pytest/jest/etc. call): the floor reads the runner's single terminal result line, and a command that chains suites (pytest a && pytest b) prints several result lines, which reads as unknown — the floor is then never cleared by machine." },
         "test_ref": { "type": "string", "description": "Shell template that runs ONE named test for the L1 red-first proof. Placeholders, substituted by literal replacement (shell braces like ${VAR} pass through): {ref} = the quoted test node id, {path} and {name} = its file and test-name halves (jest-style runners take them separately), {python} = the orchestrator's interpreter. Default: python -m pytest -q {ref}." },
         "build": { "type": "string" },
         "extra": { "type": "object", "additionalProperties": { "type": "string" } }

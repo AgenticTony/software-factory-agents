@@ -38,6 +38,11 @@ The rules, enforced here rather than trusted from the model:
   duplicate, so ``{"verdict": "fail", ..., "verdict": "pass"}`` would flip
   the verdict. A dup anywhere in the object makes that candidate
   malformed.
+* More than one valid verdict object with **differing verdicts** in the
+  same output is invalid (F-44, review m-10): a reviewer that states FAIL
+  and also quotes an example pass-JSON has said two things — the conflict
+  is a protocol fault, one retry, then fail-closed. Repeated objects with
+  the same verdict are accepted.
 
 F-23 adds review convergence across rounds. Every finding gets a **stable
 key** — sha256 of its file, axis and normalised summary — at parse time, so
@@ -132,15 +137,51 @@ _ROUND_FAILING_SEVERITIES = ("blocking", "major")
 
 
 def _fails_round(finding) -> bool:
-    """Whether one finding's severity fails a round (blocking or major)."""
+    """Whether one finding's severity fails a round (blocking or major).
+
+    Severity is canonical at parse (F-44), so this — like every consumer
+    in this module — compares the canonical spellings directly."""
     return (
         isinstance(finding, L2Finding)
-        and (finding.severity or "").strip().lower() in _ROUND_FAILING_SEVERITIES
+        and finding.severity in _ROUND_FAILING_SEVERITIES
     )
 
 # A fenced block (with or without the json tag) around the verdict object —
 # models habitually wrap their JSON; the fence is extracted before parsing.
-_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+# F-44 round 3: a fence tagged with any OTHER language (```python …) is
+# NOT a candidate — the tag used to land inside group 1 and the
+# malformed-verdict rule voided honest reviews that quote code.
+_FENCE = re.compile(r"```(?:json)?(?![\w-])[^\S\n]*(.*?)[^\S\n]*```", re.DOTALL)
+
+# F-44 rounds 2-3 (the AC-2 fail-open): the verdicts a fragment of PROSE
+# states outside the verdict object. Markdown emphasis, heading marks,
+# quote markers and list bullets are stripped first, so **FAIL**, `FAIL`,
+# __FAIL__, "## FAIL" and "- FAIL" all state fail; word boundaries keep
+# "passing"/"fails"/"password" prose out; a line naming BOTH keywords
+# ("verdict must be pass or fail", "pass|fail") is the protocol echo and
+# states neither.
+_MD_NOISE = re.compile(r"[*_`#>~]+")
+# Double-quoted spans only, on prose lines (round 4): the code blanker's
+# single-quote spans ate English apostrophes and reopened closed shapes.
+_DQ_SPAN = re.compile(r'"[^"\n]*"')
+
+
+def _stated_verdicts(fragment: str) -> set[str]:
+    """The verdicts the fragment STATES: every line whose pass/fail
+    keyword tokens — DOUBLE-quoted spans blanked first (a reviewer
+    citing code like ``if verdict == "pass":`` states nothing), then
+    markdown noise stripped — name exactly one verdict. Single
+    quotes/apostrophes are prose, not code: an English apostrophe is not
+    a quote mark here, so "It's a FAIL — the reviewer's call" states
+    FAIL (round 4: the code blanker's single-quote spans blanked exactly
+    that shape and published the example's PASS)."""
+    stated: set[str] = set()
+    for line in fragment.splitlines():
+        low = _MD_NOISE.sub(" ", _DQ_SPAN.sub(" ", line)).casefold()
+        words = {w for w in ("pass", "fail") if re.search(rf"\b{w}\b", low)}
+        if len(words) == 1:
+            stated |= words
+    return stated
 
 
 @dataclass
@@ -307,10 +348,45 @@ def _extract_json(output: Any) -> Any:
     """Find the verdict JSON in the reviewer's output.
 
     Candidates, tried in order: the whole text (a pure-JSON reply), then
-    every fenced block and balanced object **from last to first** — a
-    model that quotes an example verdict earlier and states the real one
-    at the end must have the real one win. A candidate with repeated keys
-    is malformed and skipped like any parse failure.
+    every fenced block and balanced object **from last to first** — when
+    several candidates parse, the last-positioned one is returned (a model
+    that quotes an example verdict earlier and states the real one at the
+    end has the real one win). A candidate with repeated keys is malformed
+    and skipped like any parse failure.
+
+    F-44 (review m-10): every candidate that parses is examined, not just
+    the first. Output carrying **more than one valid verdict object with
+    differing verdicts** is refused as an invalid verdict — a reviewer
+    that states FAIL and also quotes an example pass-JSON has said two
+    things, and picking either is a guess; the last-wins read used to
+    publish the example as PASS. The refusal rides the existing invalid-
+    verdict path (one retry, then fail-closed). Repeated objects with the
+    SAME verdict are accepted: an echo that agrees with the stated verdict
+    is not a conflict. Only objects whose ``verdict`` is ``pass``/``fail``
+    (the tolerance :func:`_validated_report` applies) count as verdict
+    objects — a vote object or an unparsable blob never conflicts.
+
+    F-44 review round 2 (the AC-2 fail-open) adds two fail-closed rules:
+
+    * A verdict-SHAPED candidate (a fenced block or balanced span that
+      starts with ``{`` and mentions ``verdict``) that FAILS to parse
+      while another candidate parses makes the output invalid: the
+      malformed object may be the reviewer's real verdict and the
+      parseable one the quoted example — a stated FAIL used to publish
+      as the example's PASS (duplicate keys, truncation, a trailing
+      comma). Fences tagged with a language other than ``json`` are not
+      candidates at all (round 3: a quoted ``python`` block mentioning
+      ``verdict`` voided honest reviews), and the whole-text candidate
+      is exempt: it "fails" whenever any prose surrounds the JSON.
+    * Prose contradicting the chosen object invalidates, on EITHER side
+      of it (rounds 2-3): any pass/fail keyword token the prose states —
+      markdown emphasis, headings and bullets stripped, so ``**FAIL**``,
+      ``## FAIL`` and ``Overall: FAIL`` all state fail — that disagrees
+      with the object's verdict means the object may not be the
+      reviewer's verdict. An AGREEING token is an echo (an honest
+      restatement after the JSON stays clean), and a line naming both
+      keywords (``verdict must be "pass" or "fail"``) is the protocol
+      echo and states neither.
 
     Args:
         output: The reviewer session's result text.
@@ -320,23 +396,115 @@ def _extract_json(output: Any) -> Any:
 
     Raises:
         _InvalidVerdict: If no candidate parses as JSON (the last error is
-            carried as the reason).
+            carried as the reason), the candidates carry valid verdict
+            objects with differing verdicts, a verdict-shaped candidate
+            fails to parse beside a parseable one, or verdict-stating text
+            follows the chosen object. Every reason names a POSITION,
+            never the candidate's content.
     """
     text = output.strip()
-    candidates: list[str] = [text]
-    positioned: list[tuple[int, str]] = []
+    positioned: list[tuple[int, int, str]] = []
     for match in _FENCE.finditer(text):
-        positioned.append((match.start(1), match.group(1)))
-    for span in _balanced_objects(text):
-        positioned.append((text.find(span), span))
-    candidates.extend(text for _, text in sorted(positioned, reverse=True))
+        positioned.append((match.start(1), match.end(1), match.group(1)))
+    cursor = 0  # spans come out left-to-right; duplicate texts find their
+    for span in _balanced_objects(text):  # own occurrence, not the first's
+        start = text.find(span, cursor)
+        positioned.append((start, start + len(span), span))
+        cursor = start + len(span)
+    # Whole text first (a pure-JSON reply), then fenced/balanced spans
+    # from last to first — the round-0 selection order, unchanged.
+    candidates: list[tuple[int, int, str]] = [
+        (0, len(text), text), *sorted(positioned, reverse=True),
+    ]
 
+    def line_of(offset: int) -> int:
+        return text[:offset].count("\n") + 1
+
+    parsed: list[tuple[int, int, Any]] = []
+    unparsed: list[tuple[int, int, str]] = []
     last_error: Exception | None = None
-    for candidate in candidates:
+    for start, end, candidate in candidates:
         try:
-            return json.loads(candidate, object_pairs_hook=_no_duplicate_keys)
+            parsed.append(
+                (start, end,
+                 json.loads(candidate, object_pairs_hook=_no_duplicate_keys))
+            )
         except (json.JSONDecodeError, _DuplicateKey, ValueError) as exc:
             last_error = exc
+            unparsed.append((start, end, candidate))
+
+    verdicts = {
+        value.get("verdict").strip().lower()
+        for _, _, value in parsed
+        if isinstance(value, dict)
+        and isinstance(value.get("verdict"), str)
+        and value.get("verdict").strip().lower() in ("pass", "fail")
+    }
+    if len(verdicts) > 1:
+        raise _InvalidVerdict(
+            "conflicting verdict objects in the reviewer output "
+            f"({' vs '.join(sorted(verdicts))}): the review states both "
+            "PASS and FAIL, so neither stands"
+        )
+    if parsed:
+        chosen_start, chosen_end, value = parsed[0]
+        # F-44 round 3: the malformed rule considers only OBJECT-SHAPED
+        # candidates — a candidate that starts with "{" and mentions
+        # "verdict" — never a quoted code fence or prose blob.
+        malformed_beside = next(
+            (start for start, _end, raw in unparsed
+             if start > 0
+             and raw.lstrip().startswith("{")
+             and "verdict" in raw.casefold()),
+            None,
+        )
+        if malformed_beside is None:
+            # A TRUNCATED verdict object never closes, so it is neither a
+            # fence nor a balanced span (addendum case 2): scan the lines
+            # after the chosen object for a verdict-bearing line carrying
+            # an unclosed object that does not parse alone.
+            for match in re.finditer(r"[^\n]+", text[chosen_end:]):
+                line = match.group(0)
+                if "{" not in line or "verdict" not in line.casefold():
+                    continue
+                try:
+                    json.loads(line, object_pairs_hook=_no_duplicate_keys)
+                except (json.JSONDecodeError, _DuplicateKey, ValueError):
+                    malformed_beside = chosen_end + match.start()
+                    break
+        if malformed_beside is not None:
+            raise _InvalidVerdict(
+                f"a verdict-shaped candidate at line {line_of(malformed_beside)} "
+                "does not parse while another candidate did: the malformed "
+                "object may be the reviewer's real verdict"
+            )
+        declared = value.get("verdict") if isinstance(value, dict) else None
+        if isinstance(declared, str):
+            declared = declared.strip().lower()
+        # F-44 rounds 2-3: CONTRADICTION-only, on either side of the
+        # object. Any pass/fail keyword the prose states (markdown noise
+        # stripped) that disagrees with the object invalidates — a FAIL
+        # stated in prose (bold, heading, "Overall:") beside a quoted
+        # pass example used to publish as the example's PASS, before or
+        # after it. An AGREEING token is an echo, not a conflict, so an
+        # honest reviewer restating its verdict after the JSON stays
+        # clean; a line naming both keywords (the protocol echo) states
+        # neither.
+        if declared in ("pass", "fail"):
+            before = _stated_verdicts(text[:chosen_start])
+            after = (
+                _stated_verdicts(text[chosen_end:])
+                if chosen_end < len(text) else set()
+            )
+            contradicting = (before | after) - {declared}
+            if contradicting:
+                side = "before" if (before - {declared}) else "following"
+                raise _InvalidVerdict(
+                    f"prose {side} the verdict object states "
+                    f"{sorted(contradicting)} while the object says "
+                    f"{declared}: the object may not be the reviewer's verdict"
+                )
+        return value
     reason = (
         f"no valid verdict JSON in the reviewer output ({last_error})"
         if last_error is not None
@@ -401,6 +569,13 @@ def _validated_report(data: Any) -> L2Report:
                 f"finding {index} severity must be one of {VALID_SEVERITIES}, "
                 f"got {severity!r}"
             )
+        # F-44 (review M-1): severity is canonicalised ONCE, here beside
+        # the axis — the stored finding carries the canonical value, so
+        # "Blocking" can never rank as unknown downstream (the raw value
+        # softened merged duplicates to the other reviewer's "minor" and
+        # published a defect one reviewer rated blocking). Every consumer
+        # in this module now compares against the canonical spellings.
+        severity = severity.strip().lower()
         line = item.get("line")
         if isinstance(line, bool):
             # bool IS int in Python; a true/false line is a slip, and
@@ -440,7 +615,7 @@ def _validated_report(data: Any) -> L2Report:
         )
         finding.key = finding_key(finding)
         findings.append(finding)
-        if severity.strip().lower() == "blocking":
+        if severity == "blocking":
             blocking = True
 
     declared = declared.strip().lower()
@@ -860,9 +1035,7 @@ def merge_reviews(reports: Sequence[L2Report]) -> L2Report:
         if any(report.declared == "fail" for report in reports)
         else "pass"
     )
-    blocking = any(
-        (f.severity or "").strip().lower() == "blocking" for f in merged
-    )
+    blocking = any(f.severity == "blocking" for f in merged)
     return L2Report(
         verdict="fail" if declared == "fail" or blocking else "pass",
         findings=merged,
@@ -972,8 +1145,7 @@ def parse_verifier_vote(output: Any, findings: Sequence[L2Finding]) -> VerifierO
 
 def _default_tag(severity: str | None) -> str:
     """The tag an unvoted survivor gets: severity's own bucket."""
-    heavy = (severity or "").strip().lower() in ("blocking", "major")
-    return "important" if heavy else "nit"
+    return "important" if severity in ("blocking", "major") else "nit"
 
 
 def _unanimous(finding: L2Finding, reviewers: int) -> bool:
@@ -981,7 +1153,7 @@ def _unanimous(finding: L2Finding, reviewers: int) -> bool:
     major finding (review finding 2's unanimous rule)."""
     if reviewers < 1:
         return False
-    heavy = (finding.severity or "").strip().lower() in ("blocking", "major")
+    heavy = finding.severity in ("blocking", "major")
     reported = set(finding.reported_by or [])
     return heavy and reported == set(range(1, reviewers + 1))
 
@@ -1065,7 +1237,7 @@ def apply_vote(
             decorated.append((0, 0, index, finding))
             continue
         tag = finding.tag or _default_tag(finding.severity)
-        if (finding.severity or "").strip().lower() == "blocking":
+        if finding.severity == "blocking":
             tag = "important"
         decorated.append((
             _SEVERITY_RANK.get(finding.severity, 99),
@@ -1081,7 +1253,7 @@ def apply_vote(
     for finding in ranked:
         if (
             isinstance(finding, L2Finding)
-            and (finding.severity or "").strip().lower() in ("minor", "note")
+            and finding.severity in ("minor", "note")
         ):
             nits += 1
             if nits > NIT_BUDGET:

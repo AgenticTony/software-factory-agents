@@ -6,7 +6,7 @@ there. This module is L0's standing set of "security sentinel" invariants
 sentinel's name, so a human merge sees exactly what was checked, pass or
 fail.
 
-All four built-in scanners live here — each sentinel's scanner and its
+All five built-in scanners live here — each sentinel's scanner and its
 result are produced together, so renaming a finding id can no longer
 silently orphan a sentinel result behind an always-``pass`` row:
 
@@ -47,6 +47,18 @@ silently orphan a sentinel result behind an always-``pass`` row:
   a one-line conditional, ``pytest.param`` marks, the JS forms) while
   marker text inside a string fixture stays inert — fixture data, not
   a marker (F-33 corpus, PR #8).
+- ``runner_exit_forgery`` — an ADDED line in a test file (conftest
+  included) that can forge the runner's own result line: a hard
+  exit/kill, an output-capture escape, or a runner session hook defined
+  in test code (F-44 review round 2 — test code runs inside the
+  runner's process and can print a result-shaped line then exit before
+  the real one; a line scan is the only layer that sees the diff, so it
+  flags the enablers and a human decides). Self-kill
+  (``os.kill(os.getpid(), …)``) is deliberately not matched: it is the
+  honest crash-simulation shape this repo's own corpus carries (PR #22).
+  Evadable by construction (``getattr(os, "_e" + "xit")``, importlib,
+  exec) — that remainder is L2's diff review to judge; the real fix is
+  an out-of-band result file (drafted as a new F-46 acceptance).
 
 Projects extend the set per risk flag in ``project.yaml``::
 
@@ -239,14 +251,30 @@ SKIP_MARKER_PATTERNS = (
 # Substring-level on purpose: the removed side stays broad (a human
 # reviews); what counts as a REPLACEMENT is the stricter classifier
 # below (PR #47 review finding 2).
+#
+# F-44 (review I-11): a `pytest.raises` block is an assertion — removing
+# the with-line (the body often carries no assert of its own) silently
+# greens a test that used to demand failure. Both spellings count: the
+# `pytest.raises` attribute form and the `from pytest import raises`
+# bare form. unittest's `assertRaises`/`assertRaisesRegex` were already
+# covered — the broad `\bassert` matches the "assert" inside them (the
+# '.' before it is a word boundary).
 ASSERTION_PATTERNS = (
     re.compile(r"\bassert"),
     re.compile(r"\bexpect\("),
+    re.compile(r"\bpytest\.raises\b|\braises\s*\("),
 )
 
 # What counts as a replacement assertion: a real statement, not a
 # tautology and not a string mentioning "assert". Runs against the
 # string-blanked line so padding with prose can never level the count.
+# `pytest.raises` sits on BOTH sides (F-44): a block MOVED within a file
+# removes one with-line and adds one — counting it as a replacement keeps
+# moves quiet exactly as moved asserts do. Review round 1: the raises
+# entry is ANCHORED like the others and matched with any trailing `#`
+# comment removed — `result = parse(x)  # was pytest.raises` and
+# `check = pytest.raises` (an alias assignment, no call) are prose, not
+# replacement statements. The REMOVED side stays broad by design.
 _TAUTOLOGY_ASSERT = re.compile(
     r"""^assert\s+(?:True|False|None|[-\d.]+|(["']).*\1)\s*$"""
 )
@@ -254,6 +282,7 @@ _ASSERTION_STATEMENT = (
     re.compile(r"^assert\b"),           # a bare assert statement
     re.compile(r"^\w+\.assert\w*\("),   # self.assertEqual / mock.assert_…
     re.compile(r"\bexpect\("),          # jest/vitest
+    re.compile(r"^(?:with\s+)?(?:pytest\.)?raises\("),
 )
 
 
@@ -263,11 +292,92 @@ def _is_replacement_assertion(text: str) -> bool:
     ``assert True`` (or any constant) is a tautology, a string or
     comment mentioning "assert" is prose: neither restores what a
     removed assertion checked, so neither levels the per-file count.
+    Matching runs on the string-blanked line with any trailing ``#``
+    comment cut (F-44 round 1: the blank runs first, so a ``#`` inside a
+    quoted string never truncates code before it).
     """
     line = text.strip()
     if not _is_code_line(text) or _TAUTOLOGY_ASSERT.fullmatch(line):
         return False
-    return any(p.search(_outside_strings(line)) for p in _ASSERTION_STATEMENT)
+    code = _outside_strings(line).split("#", 1)[0]
+    return any(p.search(code) for p in _ASSERTION_STATEMENT)
+
+# F-44 review rounds 2-3: ADDED lines in test files (conftest included —
+# TEST_GLOBS lists it) that can forge the runner's own result line. Test
+# code runs inside the runner's process: it can print a result-shaped
+# line and hard-exit before the runner prints the real one, flip the
+# outcome the runner reports, or escape the output capture. No stdout
+# parser can close the exit and outcome classes, so the line scan flags
+# the shapes that make them possible; the finding escalates exactly as
+# assertion_removed does (an L0 finding and a failed sentinel row — a
+# human decides). Each entry says why it is here; the evadable remainder
+# is L2's to judge (the ledger's known limit).
+RUNNER_EXIT_FORGERY_PATTERNS = (
+    # --- hard exit / kill: no terminal result line is ever printed ---
+    re.compile(r"\bos\._exit\s*\("),   # exits without cleanup or summary
+    # killing ANOTHER process (the runner itself — getppid — or any pid
+    # but self): self-kill (`os.kill(os.getpid(), …)`) is the honest
+    # crash-simulation shape this repo's own corpus carries (PR #22's
+    # killed-mid-session seat), and the gate FAILS on the signal exit it
+    # produces (pinned in tests/test_f44.py::test_review20) — so it is
+    # deliberately not matched
+    re.compile(r"\bos\.kill\s*\(\s*(?!os\.getpid\()"),
+    re.compile(r"\bos\.abort\s*\("),   # C-level abort, same class
+    # a test exiting the runner is never legitimate in a suite — the
+    # runner owns the exit code
+    re.compile(r"\bsys\.exit\s*\("),
+    re.compile(r"\braise\s+SystemExit\b"),  # sys.exit's exception form
+    # --- escape the output capture: print past pytest's capture ---
+    re.compile(r"\bcapsys\.disabled\s*\("),  # the documented escape hatch
+    re.compile(r"\bcapfd\.disabled\s*\("),   # the fd-level variant
+    re.compile(r"\bsys\.__std(?:out|err)__\b"),  # write to the real streams
+    re.compile(r"\bos\.write\(\s*[12]\s*,"),     # raw fd 1/2 write
+    # suspending the capture manager turns capture off session-wide
+    # (round 3: the old getplugin("capturemanager") pattern matched a
+    # quoted string against the string-blanked line and was dead — the
+    # suspension call is the dangerous part and is quoted nowhere)
+    re.compile(r"\bsuspend_global_capture\b"),
+    # --- JS runners (jest/vitest execute in-process too) ---
+    re.compile(r"\bprocess\.exit\s*\("),
+    # non-self JS kill, the os.kill carve-out's mirror (process.pid
+    # self-kill rides the signal-exit the gate fails on)
+    re.compile(r"\bprocess\.kill\s*\(\s*(?!process\.pid\b)"),
+    re.compile(r"\bprocess\.std(?:out|err)\.write\s*\("),  # past jest's capture
+)
+
+# Hooks and assignments that can REWRITE what the runner reports — these
+# flag ANYWHERE in test files or conftest: the conftest is the LIVE
+# surface (pytest registers its hooks — the round-3 probe flipped a
+# failing suite to "1 passed", exit 0, with no exit and no capture
+# escape), and a definition in a test module is still the shape no
+# legitimate test writes.
+_OUTCOME_REWRITE_PATTERNS = (
+    # the report hooks: makereport/report_teststatus/logreport decide the
+    # recorded outcome of every test; runtest_protocol wraps the run itself
+    re.compile(r"^def\s+pytest_runtest_makereport\b"),
+    re.compile(r"^def\s+pytest_report_teststatus\b"),
+    re.compile(r"^def\s+pytest_runtest_logreport\b"),
+    re.compile(r"^def\s+pytest_runtest_protocol\b"),
+    # direct outcome/session-state assignments (the makereport forge's
+    # core: rep.outcome = "passed"; == comparisons are not assignments)
+    re.compile(r"\.\s*outcome\s*=(?!=)"),
+    re.compile(r"\.\s*exitstatus\s*=(?!=)"),
+    re.compile(r"\.\s*testsfailed\s*=(?!=)"),
+)
+
+# Session/reporting hooks: they run AFTER outcomes are computed and can
+# at most print (which the parser's result-line rule and the capture
+# patterns above own). A conftest is their registered, honest surface —
+# F-10's sandbox probe writes a pytest_terminal_summary, and a repo's
+# existing conftest is not an ADDED line — so they flag in TEST files
+# only, where pytest never registers them: dead code no legitimate test
+# writes.
+_SESSION_HOOK_PATTERNS = (
+    re.compile(r"^def\s+pytest_sessionfinish\b"),
+    re.compile(r"^def\s+pytest_terminal_summary\b"),
+    re.compile(r"^def\s+pytest_unconfigure\b"),
+    re.compile(r"^def\s+pytest_collection_modifyitems\b"),
+)
 
 # Comment openers across the languages the marker and assertion patterns
 # cover: a line starting with one is prose about code, not code — it is
@@ -281,7 +391,7 @@ def _is_code_line(text: str) -> bool:
     return bool(stripped) and not stripped.startswith(_COMMENT_OPENERS)
 
 # (required comment syntax, pattern) — a suppression is real only where
-# that syntax introduces a comment in the changed file: "# noqa" inside
+# that syntax introduces a comment in the changed file: a noqa inside
 # JSON or markdown prose QUOTES the pattern, it cannot silence a linter
 # there (F-33 corpus: PRs #25 and #37 documenting these sentinels
 # tripped the unfiltered scan).
@@ -324,6 +434,7 @@ BUILTIN_SENTINELS = (
     "assertion_removed",
     "credential_added",
     "lint_suppression_added",
+    "runner_exit_forgery",
     "skip_marker_added",
 )
 
@@ -380,9 +491,10 @@ def builtin_sentinel_findings(changes, risk_globs: dict) -> list:
     Returns:
         Findings for ``credential_added`` (any file) and
         ``lint_suppression_added`` (risk-path files only) — those two
-        scanners plus the skip-marker and assertion scanners below, one
-        home for the whole standing set. Credential-bearing lines are
-        never echoed: findings name the shape only.
+        scanners plus the skip-marker, runner-exit-forgery and assertion
+        scanners below, one home for the whole standing set.
+        Credential-bearing lines are never echoed: findings name the
+        shape only.
     """
     findings: list[Finding] = []
     all_risk_globs = [glob for globs in risk_globs.values() for glob in globs]
@@ -432,6 +544,29 @@ def builtin_sentinel_findings(changes, risk_globs: dict) -> list:
                         "lint_suppression_added",
                         f"lint suppression added in {change.path}:{no}: {echo}",
                         file=change.path,
+                        line=no,
+                    )
+                )
+            code_line = _outside_strings(text)
+            # Session/reporting hooks: test files only — a conftest is
+            # their registered surface (see _SESSION_HOOK_PATTERNS);
+            # outcome-rewriting hooks and assignments flag anywhere.
+            is_conftest = scan_path.rsplit("/", 1)[-1] == "conftest.py"
+            forgery = any(
+                p.search(code_line) for p in RUNNER_EXIT_FORGERY_PATTERNS
+            ) or any(
+                p.search(code_line) for p in _OUTCOME_REWRITE_PATTERNS
+            ) or (
+                not is_conftest
+                and any(p.search(code_line) for p in _SESSION_HOOK_PATTERNS)
+            )
+            if test_file and forgery:
+                findings.append(
+                    Finding(
+                        "runner_exit_forgery",
+                        f"runner-exit/capture-escape shape added in "
+                        f"{scan_path}:{no}: {echo}",
+                        file=scan_path,
                         line=no,
                     )
                 )
@@ -499,7 +634,7 @@ def builtin_sentinel_pass(profile: dict, changes, matched: set):
             :func:`matched_risk_flags` computed ONCE by the caller.
 
     Returns:
-        ``(findings, results, escalations)`` — the four built-in scans'
+        ``(findings, results, escalations)`` — the five built-in scans'
         findings, one result dict per built-in sentinel (pass/fail), and
         the ``credential_added`` escalation when a credential was found:
         nothing is pushed before a passing round, but a passing retry

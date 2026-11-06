@@ -80,7 +80,15 @@ it. Written fresh, separate files from the F-25 AC-3 seed fixtures
 pattern to its own seed cannot hide a regression. The review round
 added one file per relaxed boundary (`skipIf`/`pytestmark`/inline/
 `param` marks, `assert True` swaps, string padding, env-comment and
-`or`-fallback secrets, a quoted-path secret).
+`or`-fallback secrets, a quoted-path secret). F-44 (review I-11) added
+`assertion_removed-5.patch`: a `with pytest.raises(...)` block removed
+wholesale — the with-line is the only line naming the assertion. F-44
+review rounds 2-3 added `runner_exit_forgery-{1,2,3}.patch`: the
+hard-exit, capture-escape and conftest-outcome-flip families of the
+in-process runner forgery (one file per family — round 3 replaced the
+inert test-module hook fixture with the working conftest
+`pytest_runtest_makereport` forge, the attack that actually flips a
+failing suite to "1 passed").
 
 Every fixture token is deliberately **low-entropy placeholder-shaped**
 (`ghp_0000…`, `AKIA0000…`, zero runs): they match the sentinel's shapes

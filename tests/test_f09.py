@@ -802,10 +802,15 @@ def test_review5_missing_name_classification_matrix():
     assert red_reason(quoted) == "assertion"
 
 
-def test_review6_the_real_verdict_wins_over_an_earlier_example():
-    # Finding 6: a JSON snippet quoted earlier in the output (an example,
-    # or restating the format) parsed before the real verdict at the end —
-    # a false FAIL. Extraction now prefers the LAST candidate.
+def test_review6_conflicting_verdict_objects_are_invalid():
+    # Finding 6 (F-09 round): extraction prefers the LAST candidate, so a
+    # JSON snippet quoted earlier never masked the real verdict at the end.
+    # F-44 (review m-10) closed the inverse hole that rule opened — a
+    # reviewer stating FAIL then quoting an example pass-JSON parsed as
+    # PASS. Differing verdict objects are now a CONFLICT: invalid verdict,
+    # one retry, fail-closed — in either order. Repeated objects with the
+    # SAME verdict stay accepted (the last-positioned one is returned, the
+    # F-09 rule for agreeing candidates).
     example = json.dumps(
         {
             "verdict": "fail",
@@ -816,19 +821,44 @@ def test_review6_the_real_verdict_wins_over_an_earlier_example():
     )
     real = json.dumps({"verdict": "pass", "findings": []})
 
+    # Example quoted earlier, real verdict later: a conflict, not a win.
     report = parse_verdict(
         f"An example verdict looks like:\n```json\n{example}\n```\n\n"
         f"The actual review:\n```json\n{real}\n```"
     )
-    assert report.verdict == "pass"
-    assert report.parse_error is None
+    assert report.verdict == "fail"
+    assert report.parse_error is not None
+    assert "conflict" in report.parse_error
 
-    # And symmetrically: an example pass quoted early must not mask a real
-    # fail (nor a raw trailing object an earlier real one).
+    # Symmetrically: a real verdict earlier and a differing object after
+    # it (the m-10 shape) is the same conflict.
     report = parse_verdict(
         f"```json\n{real}\n```\nthe diff is wrong, so:\n{example}"
     )
     assert report.verdict == "fail"
+    assert report.parse_error is not None
+
+    # Agreeing repeats are accepted — the stated verdict stands, with no
+    # parse error (and therefore no retry). PASS+PASS…
+    agreeing = parse_verdict(
+        f"```json\n{real}\n```\nrestated:\n{real}"
+    )
+    assert agreeing.verdict == "pass"
+    assert agreeing.parse_error is None
+    # …and FAIL+FAIL: the original review6 concern in its failing half —
+    # an agreeing example quoted before a real FAIL must not mask it, void
+    # it, or burn a retry (F-44 round 1, finding 7).
+    fail_verdict = json.dumps(
+        {"verdict": "fail",
+         "findings": [{"id": "R-1", "axis": "spec", "severity": "blocking",
+                       "text": "the defect"}]}
+    )
+    agreeing_fail = parse_verdict(
+        f"an example FAIL verdict:\n```json\n{fail_verdict}\n```\n"
+        f"the actual review agrees:\n```json\n{fail_verdict}\n```"
+    )
+    assert agreeing_fail.verdict == "fail"
+    assert agreeing_fail.parse_error is None
 
 
 def test_review7_duplicate_keys_are_an_invalid_verdict():

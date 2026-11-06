@@ -285,6 +285,27 @@ _SENTINEL_CASES = {
         "flagged": {"src/pay/charge.py": "x = 2  # type: ignore\n"},
         "clean": {"src/pay/charge.py": "x = 2\n"},
     },
+    # F-44 review round 2: the in-process runner forgery enablers. The
+    # flagged shape is the hard exit; the clean shape asserts SystemExit
+    # (the honest CLI-test pattern — the forger's shape is the call, not
+    # the assertion).
+    "runner_exit_forgery": {
+        "risk": {},
+        "task_risk": [],
+        "base": {"tests/test_a.py": _clean_test_file()},
+        "flagged": {
+            "tests/test_a.py":
+                "import os\n\n\n" + _clean_test_file()
+                + "\n\ndef test_zz_forge():\n    os._exit(0)\n"
+        },
+        "clean": {
+            "tests/test_a.py":
+                "import pytest\n\n\n" + _clean_test_file()
+                + "\n\ndef test_exit_code():\n"
+                  "    with pytest.raises(SystemExit):\n"
+                  "        run_cli()\n"
+        },
+    },
 }
 
 
