@@ -42,4 +42,35 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: pip install -e ".[dev]"
       - run: ruff check .
+      # TEMPORARY DIAGNOSTIC (fix/ci-xdist-flakes; remove before merge):
+      # parallel runs intermittently fail with fork() EAGAIN ("Resource
+      # temporarily unavailable") on this runner only. Record the limits
+      # and sample task counts while the suite runs, to name the cap hit.
+      - name: Start task sampler (diagnostic)
+        run: |
+          ulimit -a
+          echo "threads-max=$(cat /proc/sys/kernel/threads-max) pid_max=$(cat /proc/sys/kernel/pid_max) nproc=$(nproc)"
+          cg=$(cut -d: -f3 /proc/self/cgroup)
+          echo "cgroup=$cg pids.max=$(cat /sys/fs/cgroup$cg/pids.max 2>/dev/null) memory.max=$(cat /sys/fs/cgroup$cg/memory.max 2>/dev/null)"
+          for u in "$cg" $(dirname "$cg"); do echo "$u pids.max=$(cat /sys/fs/cgroup$u/pids.max 2>/dev/null)"; done
+          nohup bash -c '
+            peak=0
+            while sleep 2; do
+              mine=$(ps -eLo user= | grep -c "^runner")
+              all=$(ps -eL --no-headers | wc -l)
+              avail=$(awk "/MemAvailable/{print int(\$2/1024)}" /proc/meminfo)
+              echo "$(date +%T) runner_tasks=$mine all_tasks=$all cg_pids=$(cat /sys/fs/cgroup'"$cg"'/pids.current 2>/dev/null) mem_avail_mb=$avail commit_mb=$(awk "/Committed_AS/{print int(\$2/1024)}" /proc/meminfo)"
+              if [ "$mine" -gt "$peak" ]; then
+                peak=$mine
+                ps -eLo user=,comm= | sort | uniq -c | sort -rn | head -25 > /tmp/peak_snapshot.txt
+              fi
+            done' > /tmp/task_samples.txt 2>&1 &
       - run: pytest -q -n auto
+      - name: Task sampler report (diagnostic)
+        if: always()
+        run: |
+          echo "== peak by runner_tasks"; sort -t= -k2 -n /tmp/task_samples.txt | tail -3
+          echo "== lowest mem_avail_mb"; sed -n "s/.*mem_avail_mb=\([0-9]*\).*/\1 &/p" /tmp/task_samples.txt | sort -n | head -3
+          echo "== overcommit: $(cat /proc/sys/vm/overcommit_memory) $(grep -E "CommitLimit|MemTotal|SwapTotal" /proc/meminfo | tr -s " " | tr "\n" " ")"
+          echo "== top 25 at peak"; cat /tmp/peak_snapshot.txt
+          echo "== last samples"; tail -5 /tmp/task_samples.txt
