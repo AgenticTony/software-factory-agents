@@ -9,10 +9,14 @@ of quietly weakening the sandbox.
 
 The settings file (DESIGN-LOCAL-FACTORY D3) allows writes only inside the
 run dir (minus its ``.git/hooks`` and ``.git/config`` — see GIT_HARDENING
-in :mod:`factory.runs`), denies reads of the entire home directory (the run
-dir is re-allowed), the holdouts, and every other run, and allows network
-only to the model endpoint plus the project profile's ``docs_allowlist``
-and ``network_allowlist``. Credentials are defence-in-depth: the
+in :mod:`factory.runs`), denies reads of the entire home directory (the
+run dir is re-allowed), the factory root itself (F-47: trace, progress,
+sessions, settings — whatever ``--factory-root`` is), the holdouts, and
+every other run, and allows network only to the model endpoint plus the
+project profile's ``docs_allowlist`` and ``network_allowlist``. (On Linux
+srt read-denies a directory with a tmpfs over it: a write under a denied
+root lands in that tmpfs and never reaches the host — the host is the
+invariant, on both platforms.) Credentials are defence-in-depth: the
 environment is scrubbed before the child is spawned (allowlist, then the
 whole ``GH_*``/``GITHUB_*`` prefix), *and* the settings file denies GitHub
 names inside srt as a backstop. srt's deny takes exact names only, so the
@@ -414,6 +418,55 @@ def _allow_write(
     return [str(run_dir)]
 
 
+# System dirs every sandboxed command needs to read (exec, libc, the
+# dynamic loader, /etc, devices). A factory root at or above one of them
+# would deny it wholesale: refused (F-47), never silently carved out.
+_SYSTEM_READ_ROOTS = (
+    "/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/dev", "/proc",
+    "/sys", "/System", "/Library", "/private/etc", "/private/var/db",
+)
+
+
+def _refuse_unsafe_factory_root(factory_root: Path) -> None:
+    """Refuse a factory root whose read-deny would take the system with it.
+
+    F-47 denies the (resolved) factory root itself. That is sound for any
+    root that holds factory state — ``~/factory``, ``/srv/factory``, a
+    root equal to ``$HOME`` or above it (``/Users``: the deny only widens
+    over other homes), even one that contains this checkout — because
+    srt's package, the toolchain, the run and the caller's reads are
+    carved out explicitly (proven with real srt in tests/test_f47.py).
+    It is not sound for ``/`` or a root at or above a system read root
+    (``/usr``, ``/etc`` — ``/private`` on macOS): libc, the loader or
+    ``/etc`` would be hidden and every command would die at exec. Those
+    are refused, naming why — never silently carved out.
+
+    Raises:
+        SandboxError: ``factory_root`` is one of those shapes.
+    """
+    root = Path(factory_root)
+    if root == Path(root.anchor):
+        raise SandboxError(
+            f"refusing factory root {root}: it is the filesystem root, and "
+            "the sandbox denies reads of the whole factory root (F-47) — "
+            "the session could read nothing, not even /usr. Point "
+            "--factory-root at a dedicated directory."
+        )
+    for system in _SYSTEM_READ_ROOTS:
+        spellings = {Path(system)}
+        with suppress(OSError):
+            spellings.add(Path(system).resolve())
+        for spelling in spellings:
+            if root == spelling or root in spelling.parents:
+                raise SandboxError(
+                    f"refusing factory root {root}: it contains the system "
+                    f"read root {spelling}, and the sandbox denies reads of "
+                    "the whole factory root (F-47) — every sandboxed command "
+                    "would lose its interpreter or libraries. Point "
+                    "--factory-root at a dedicated directory."
+                )
+
+
 def build_settings(
     profile: dict,
     run_dir: Path,
@@ -480,7 +533,10 @@ def build_settings(
 
     Raises:
         SandboxError: ``run_dir`` doesn't follow the canonical layout and no
-            explicit ``factory_root`` was given.
+            explicit ``factory_root`` was given; or the factory root is one
+            whose read-deny would take the system with it (``/`` or a
+            root at or above a system read root — see
+            :func:`_refuse_unsafe_factory_root`).
 
     ``network.allowLocalBinding`` is granted only by the profile opt-in
     AND the caller's explicit request — two hands on one switch, because
@@ -525,6 +581,7 @@ def build_settings(
         factory_root = runs_root.parent
     else:
         factory_root = Path(factory_root).resolve()
+    _refuse_unsafe_factory_root(factory_root)
     if toolchain is None:
         toolchain = default_toolchain()
     allowed_domains = [
@@ -554,8 +611,13 @@ def build_settings(
         for scratch in (run_dir / ".home", run_dir / ".tmp"):
             scratch.mkdir(parents=True, exist_ok=True)
     home = Path("~").expanduser()
+    # F-47 (M-9): the factory root is a denied root like home, so a
+    # toolchain installed under it (a repo-local venv when the root
+    # contains the checkout) gets the same narrow carve-outs there.
     toolchain_reads = sorted(
-        _toolchain_allowread(home, toolchain), key=str
+        _toolchain_allowread(home, toolchain)
+        | _toolchain_allowread(factory_root, toolchain),
+        key=str,
     )
     network: dict = {"allowedDomains": allowed_domains, "deniedDomains": []}
     if local_binding and (profile.get("sandbox") or {}).get("allow_local_binding"):
@@ -567,8 +629,22 @@ def build_settings(
     return {
         "network": network,
         "filesystem": {
+            # F-47 (M-9): the factory root ITSELF is denied — trace/,
+            # progress/, sessions/, other runs, the settings dir — so
+            # isolation never depends on the root happening to live
+            # under $HOME. The carve-outs are the explicit allowRead
+            # entries below (own run, srt's package, the toolchain, the
+            # caller's allow_read, the session's scratch); runs/ and
+            # holdouts stay listed on their own (defence in depth).
+            # Platform semantics of a read-denied DIRECTORY: Seatbelt
+            # (macOS) refuses reads and writes under it; srt on Linux
+            # mounts a tmpfs over it, so a write under a denied root
+            # "succeeds" into that tmpfs and never reaches the host
+            # (review round 1; tests/test_f05.py::test_ac_1 asserts the
+            # host on both platforms). denyWrite does not change that.
             "denyRead": [
                 str(home),
+                str(factory_root),
                 str(factory_root / "holdouts"),
                 str(Path("~/.ssh").expanduser()),
                 str(Path("~/.config/gh").expanduser()),
@@ -782,7 +858,12 @@ def run_sandboxed(
             it keeps the model token in its memory and environment for as
             long as it lives; deleting the run dir revokes nothing. Treat
             escaped processes as a prompt for the owner to rotate the seat
-            token if abuse is suspected.
+            token if abuse is suspected. F-47: the force-close is reported
+            as ``force_closed_pipes`` (the names of the pipes still open
+            at the drain deadline; empty when none) on the returned
+            CompletedProcess AND on a raised TimeoutExpired; callers that
+            own a trace emit :func:`escapee_event` and ``factory status``
+            counts them.
         cwd: Working dir (default: the run dir).
         srt_bin_path: Test injection for the srt binary (still pin-checked).
             There is no production override path.
@@ -882,6 +963,15 @@ def run_sandboxed(
             break
         _pump(streams, buffers, max(0.0, drain_deadline - time.monotonic()),
               on_stdout_line=on_stdout_line, partials=partials)
+    # F-47 (I-9): a pipe still open at the drain deadline has a writer
+    # that outlived the group kill — a process that escaped it (setsid).
+    # That fact rides out on what this returns or raises; the callers that
+    # own a trace turn it into a ``sandbox_escapee`` event. This layer
+    # stays free of trace I/O.
+    force_closed = tuple(
+        label for name, label in (("out", "stdout"), ("err", "stderr"))
+        if streams[name] >= 0
+    )
     # Close the owning file objects exactly once each (single-threaded here,
     # so nothing can be mid-read on them): raw os.close would race the
     # buffered objects' own close at GC time and leak unraisable warnings.
@@ -891,8 +981,29 @@ def run_sandboxed(
     out = buffers["out"].decode(errors="replace")
     err = buffers["err"].decode(errors="replace")
     if timed_out:
-        raise subprocess.TimeoutExpired(proc.args, timeout, output=out, stderr=err)
-    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+        exc = subprocess.TimeoutExpired(proc.args, timeout, output=out, stderr=err)
+        exc.force_closed_pipes = force_closed
+        raise exc
+    completed = subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+    completed.force_closed_pipes = force_closed
+    return completed
+
+
+def escapee_event(label: str, force_closed: "Sequence[str]", *,
+                  timed_out: bool = False) -> dict:
+    """The one ``sandbox_escapee`` trace event shape (F-47, I-9).
+
+    Built here, beside the signal it reports, so every caller that owns a
+    trace (the gate runner, the session seats, the stale-PR sweep) emits
+    the same fields; the trace writer stamps run id, task, attempt and
+    time. ``label`` names what ran (``gate:<check>``,
+    ``session:<seat>``)."""
+    return {
+        "type": "sandbox_escapee",
+        "label": label,
+        "streams": list(force_closed),
+        "timed_out": bool(timed_out),
+    }
 
 
 def _pump(streams: dict, buffers: dict, wait: float, *,

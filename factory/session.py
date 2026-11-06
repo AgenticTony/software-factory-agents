@@ -118,6 +118,7 @@ from factory.runs import FACTORY_ROOT_DEFAULT, GIT_HARDENING, RunError, new_run_
 from factory.sandbox import (
     build_settings,
     default_toolchain,
+    escapee_event,
     run_sandboxed,
     write_settings,
 )
@@ -128,7 +129,7 @@ from factory.toolkit import (
     TOOLKIT_PLUGIN_NAME,
     stage_toolkit,
 )
-from factory.trace import STREAM_PREFIX, scrub_literal, snippet
+from factory.trace import STREAM_PREFIX, TraceWriter, scrub_literal, snippet
 from factory.vent import VENT_QUALIFIED_NAME, VENT_TOOL_NAME, VentCollector, vent_server
 
 DEFAULT_BASE_URL = "https://api.z.ai/api/anthropic"
@@ -2152,25 +2153,32 @@ def _run_prepared(
     )
     write_settings(settings, settings_path)
 
-    proc = run_sandboxed(
-        [sys.executable, "-c", _entry_bootstrap(runner_dir), str(spec_path)],
-        run_dir,
-        settings_path,
-        env={
-            "ANTHROPIC_AUTH_TOKEN": token,
-            "ANTHROPIC_BASE_URL": base_url,
-            "API_TIMEOUT_MS": str(int(timeout_ms)),
-        },
-        timeout=timeout_min * 60.0 + teardown_grace_sec,
-        srt_bin_path=srt_bin_path,
-        scratch=scratch,
-        # F-30: tool_call events stream out as prefixed lines while the
-        # session runs; the record stays the last un-prefixed line.
-        on_stdout_line=(
-            trace_line_forwarder(trace_sink, secret=token)
-            if trace_sink is not None else None
-        ),
-    )
+    try:
+        proc = run_sandboxed(
+            [sys.executable, "-c", _entry_bootstrap(runner_dir), str(spec_path)],
+            run_dir,
+            settings_path,
+            env={
+                "ANTHROPIC_AUTH_TOKEN": token,
+                "ANTHROPIC_BASE_URL": base_url,
+                "API_TIMEOUT_MS": str(int(timeout_ms)),
+            },
+            timeout=timeout_min * 60.0 + teardown_grace_sec,
+            srt_bin_path=srt_bin_path,
+            scratch=scratch,
+            # F-30: tool_call events stream out as prefixed lines while the
+            # session runs; the record stays the last un-prefixed line.
+            on_stdout_line=(
+                trace_line_forwarder(trace_sink, secret=token)
+                if trace_sink is not None else None
+            ),
+        )
+    except subprocess.TimeoutExpired as exc:
+        _report_escapee(seat, exc, True, trace_sink, run_dir, factory_root,
+                        run_id, task_id, token)
+        raise
+    _report_escapee(seat, proc, False, trace_sink, run_dir, factory_root,
+                    run_id, task_id, token)
 
     lines = [line for line in proc.stdout.splitlines() if line.strip()]
     record_line = next(
@@ -2200,6 +2208,38 @@ def _run_prepared(
         ) from exc
 
     return record
+
+
+def _report_escapee(
+    seat: str, outcome: Any, timed_out: bool,
+    trace_sink: "Callable[[dict[str, Any]], None] | None",
+    run_dir: Path, factory_root: Path | None,
+    run_id: str | None, task_id: str | None, token: str,
+) -> None:
+    """F-47 (I-9): a session whose drain force-closed pipes left a process
+    alive outside the killed group — holding the seat token. One
+    :func:`~factory.sandbox.escapee_event` (``session:<seat>``) goes to
+    the run's trace sink; a caller with no sink but a run id (the
+    importer) gets the run's own trace file, the store ``factory status``
+    counts; with neither, stderr. Never raises: the alarm must not
+    replace the outcome it rides on."""
+    streams = getattr(outcome, "force_closed_pipes", ()) or ()
+    if not streams:
+        return
+    event = escapee_event(f"session:{seat}", streams, timed_out=timed_out)
+    try:
+        if trace_sink is not None:
+            trace_sink(event)
+            return
+        root = Path(factory_root) if factory_root is not None else None
+        if root is not None and run_id:
+            TraceWriter(root, run_dir.parent.name, run_id, task_id or "-",
+                        extra_secrets=(token,) if token else ()).append(event)
+            return
+    except Exception:  # noqa: BLE001 — the alarm never steers the run
+        pass
+    print(f"factory: sandbox escapee — {json.dumps(event)} (run dir "
+          f"{run_dir}; no trace to record it in)", file=sys.stderr)
 
 
 def _save_session_stdout(

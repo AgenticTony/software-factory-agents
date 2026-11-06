@@ -72,9 +72,14 @@ class TraceError(Exception):
 
 # The event vocabulary (AC-1) plus the terminal marker AC-6's --follow
 # needs: without it, "until the attempt ends" has nothing to stop on.
+# F-47 (I-9): ``sandbox_escapee`` — a sandboxed command whose drain
+# force-closed pipes held by a process that escaped its group
+# (:func:`factory.sandbox.escapee_event`); written orchestrator-side only
+# (the stdout forwarder passes tool_call alone, so a session cannot forge
+# or suppress one), counted by ``factory status``.
 EVENT_TYPES = (
     "phase_start", "phase_end", "tool_call", "gate_check", "session_end",
-    "run_end",
+    "run_end", "sandbox_escapee",
 )
 PHASES = ("setup", "implementer", "L0", "L1", "L2", "publish")
 RUN_END_OUTCOMES = ("published", "failed", "aborted")

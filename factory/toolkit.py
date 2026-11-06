@@ -911,8 +911,8 @@ def _check_entry(root: Path, entry: dict) -> None:
             f"toolkit item {name!r}: vetting report {entry['report']} is "
             "missing — an item is admitted only with its report (AC-4)"
         )
-    if entry["content_hash"] not in report.read_text(encoding="utf-8",
-                                                     errors="replace"):
+    report_text = report.read_text(encoding="utf-8", errors="replace")
+    if entry["content_hash"] not in report_text:
         raise ToolkitError(
             f"toolkit item {name!r}: report {entry['report']} does not name "
             "the content hash it vetted — a version bump repeats the full "
@@ -936,12 +936,69 @@ def _check_entry(root: Path, entry: dict) -> None:
             f"{identified!r} — the licence gate refuses (AC-2)"
         )
     if entry["kind"] == "mcp_server":
-        reasons = _descriptor_reasons(entry["mcp"], entry["mcp"]["domains"])
+        # F-47 (I-2): the descriptor is judged against the allowlists the
+        # item was VETTED against — the independent record in its report
+        # (render_report's ``- allowlists:`` line, the report the hash
+        # check above already ties to this exact content) — never against
+        # its own ``domains``, which passed by construction. resolve_toolkit
+        # still re-checks against the running project's allowlists.
+        vetted = vetted_allowlists(report_text, name, entry["report"])
+        reasons = _descriptor_reasons(entry["mcp"], vetted)
         if reasons:
             raise ToolkitError(
-                f"toolkit item {name!r}: MCP descriptor refuses admission: "
+                f"toolkit item {name!r}: MCP descriptor refuses admission "
+                f"against the allowlists its vet report {entry['report']} "
+                f"records ({', '.join(vetted) or '(none)'}): "
                 + "; ".join(reasons)
             )
+
+
+# A report line that mentions the allowlists at all — the exact form
+# render_report writes, or any spoofed/indented/re-cased variant of it.
+_ALLOWLISTS_ANY = re.compile(r"^\s*[-*]?\s*allowlists\s*:", re.I)
+_ALLOWLISTS_LINE = re.compile(r"^- allowlists: (?P<value>.*)$")
+_DOMAIN_TOKEN = re.compile(r"^[A-Za-z0-9.-]+$")
+
+
+def vetted_allowlists(report_text: str, name: str, report: str) -> list[str]:
+    """The allowlists an item's vet report records (F-47, I-2).
+
+    :func:`render_report` writes exactly one ``- allowlists: a, b`` line
+    (``(none)`` when empty). Fail closed on anything else: no such line,
+    more than one line mentioning allowlists (a duplicate or a spoof in
+    the report body), a variant spelling, or an entry that is not a bare
+    domain.
+
+    Raises:
+        ToolkitError: The report does not record one parseable allowlist.
+    """
+    mentions = [line for line in report_text.splitlines()
+                if _ALLOWLISTS_ANY.match(line)]
+    if len(mentions) != 1:
+        raise ToolkitError(
+            f"toolkit item {name!r}: vet report {report} must record exactly "
+            f"one '- allowlists:' line (found {len(mentions)}) — the MCP "
+            "descriptor's domains are checked against what the item was "
+            "vetted against, and an ambiguous record fails closed"
+        )
+    match = _ALLOWLISTS_LINE.match(mentions[0].rstrip())
+    if match is None:
+        raise ToolkitError(
+            f"toolkit item {name!r}: vet report {report} has an unparseable "
+            f"allowlists line {mentions[0].strip()!r} (expected the "
+            "render_report form '- allowlists: a, b')"
+        )
+    value = match.group("value").strip()
+    if value == "(none)":
+        return []
+    domains = [part.strip() for part in value.split(",")]
+    bad = [d for d in domains if not d or not _DOMAIN_TOKEN.match(d)]
+    if bad:
+        raise ToolkitError(
+            f"toolkit item {name!r}: vet report {report} allowlists line "
+            f"carries non-domain entries {bad!r}"
+        )
+    return domains
 
 
 def load_index(toolkit_root: Path | str, *,
@@ -1082,6 +1139,18 @@ def stage_toolkit(resolved: dict, dest: Path | str) -> Path:
     """
     dest = Path(dest)
     root = Path(resolved["root"])
+    # Two items naming one vendored dir would merge into one staged dir
+    # under the file-by-file copy below (copytree used to crash on it):
+    # refused before anything is written.
+    owners: dict[str, str] = {}
+    for entry in resolved["items"]:
+        if entry["dir"] in owners:
+            raise ToolkitError(
+                f"toolkit items {owners[entry['dir']]!r} and {entry['name']!r} "
+                f"both vendor {entry['dir']} — refusing to stage one dir "
+                "for two pins"
+            )
+        owners[entry["dir"]] = entry["name"]
     # Pre-copy: the source tree must be exactly what the index pinned —
     # plain files, matching hashes, nothing mutated since resolve.
     for entry in resolved["items"]:
@@ -1120,13 +1189,37 @@ def stage_toolkit(resolved: dict, dest: Path | str) -> Path:
             }, indent=2) + "\n",
             encoding="utf-8",
         )
+        # F-47 (I-19): what is staged is derived from the SAME pins the
+        # checks compare against — each item's index-listed files, copied
+        # one by one (mode kept: a vendored executable stays executable;
+        # never through a link: a file swapped for a symlink after the
+        # pre-copy check is copied as a link and refused by the re-hash).
+        # Nothing is created implicitly: no unpinned file, no empty dir,
+        # and the descriptor dir is made on purpose, not left to an
+        # earlier copy that happened to live under mcp/.
+        expected: set[str] = {".claude-plugin/plugin.json"}
         for entry in resolved["items"]:
-            shutil.copytree(root / entry["dir"], dest / entry["dir"])
+            for rel in sorted(entry["files"]):
+                target = dest / entry["dir"] / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(root / entry["dir"] / rel, target,
+                             follow_symlinks=False)
+                expected.add(f"{entry['dir']}/{rel}")
             if entry["kind"] == "mcp_server":
-                (dest / "mcp" / f"{entry['name']}.json").write_text(
+                descriptors = dest / "mcp"
+                descriptors.mkdir(exist_ok=True)
+                descriptor = descriptors / f"{entry['name']}.json"
+                if descriptor.exists() or descriptor.is_symlink():
+                    raise ToolkitError(
+                        f"toolkit item {entry['name']!r}: staged descriptor "
+                        f"mcp/{entry['name']}.json collides with staged "
+                        "content — refusing to overwrite a pinned file"
+                    )
+                descriptor.write_text(
                     json.dumps(entry["mcp"], indent=2, sort_keys=True) + "\n",
                     encoding="utf-8",
                 )
+                expected.add(f"mcp/{entry['name']}.json")
         # Post-copy: re-hash the copy itself and compare against the
         # index entry — the session reads this tree, so this tree must
         # be exactly what the pins describe (finding 4: resolve's
@@ -1139,6 +1232,18 @@ def stage_toolkit(resolved: dict, dest: Path | str) -> Path:
                     "not match its index hashes — refusing to hand the "
                     "session an unpinned copy"
                 )
+        # And the whole staged tree is exactly the expected set: plugin
+        # manifest + pinned files + one descriptor per MCP item, nothing
+        # else, nothing irregular (F-47 AC-4: an equality, not a subset).
+        staged_files, irregular = _scan_tree(dest)
+        if irregular or set(staged_files) != expected:
+            extra = sorted(set(staged_files) - expected) + irregular
+            missing = sorted(expected - set(staged_files))
+            raise ToolkitError(
+                "the staged toolkit is not exactly the pinned set "
+                f"(unexpected: {extra[:3]}, missing: {missing[:3]}) — "
+                "refusing to hand the session an unpinned copy"
+            )
     except BaseException:
         shutil.rmtree(dest, ignore_errors=True)
         raise

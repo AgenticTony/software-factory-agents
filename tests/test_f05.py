@@ -138,14 +138,27 @@ def test_ac_1(tmp_path: Path):
     )
     outcomes = dict(line.split(":", 1) for line in proc.stdout.splitlines())
     assert outcomes["inside"] == "ok", proc.stdout + proc.stderr
-    assert outcomes["outside_run"].startswith("denied"), (
-        "write outside the run dir but inside the factory root succeeded\n"
-        f"{proc.stdout}{proc.stderr}"
-    )
+    assert (run.root / "inside.txt").read_text() == "x"  # reached the host
+    # F-47 re-seat: the invariant is the HOST. Both platforms: nothing
+    # written outside the run dir exists on the host afterwards.
+    assert not outside_run.exists() and not outside_tmp.exists()
+    if sys.platform == "darwin":
+        # Seatbelt refuses the write itself.
+        assert outcomes["outside_run"].startswith("denied"), (
+            "write outside the run dir but inside the factory root succeeded\n"
+            f"{proc.stdout}{proc.stderr}"
+        )
+    else:
+        # bwrap: the factory root is read-denied (F-47), which srt
+        # implements as a tmpfs mounted over it — a write there lands in
+        # that tmpfs and dies with the sandbox. "ok" is accepted ONLY
+        # together with the host-absence assertion above.
+        assert outcomes["outside_run"].startswith(("denied", "ok")), (
+            f"{proc.stdout}{proc.stderr}"
+        )
     assert outcomes["outside_tmp"].startswith("denied"), (
         f"write to /tmp succeeded\n{proc.stdout}{proc.stderr}"
     )
-    assert not outside_run.exists() and not outside_tmp.exists()
 
 
 # --- F-05 AC-2: a sandboxed process can't read ~/factory/holdouts ---------
