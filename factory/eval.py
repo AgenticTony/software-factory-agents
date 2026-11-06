@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from factory.contract import apply_profile_defaults
 from factory.gates import git as hardened_git
 from factory.l0 import run_l0
 from factory.l1 import run_l1
@@ -250,11 +251,14 @@ def eval_profile(repo: Path, python: str | None = None) -> dict:
     ``python`` overrides the interpreter in the command strings; the
     default is this process's (the F-38 fixture convention — under the
     gate sandbox the commands run exactly as a real profile's do, with
-    the run-local gate venv first on PATH).
+    the run-local gate venv first on PATH). The profile routes through
+    :func:`factory.contract.apply_profile_defaults` like every loaded
+    profile, so the schema-level runner-config default (F-46 AC-4) is
+    unioned in here too.
     """
     python = python or sys.executable
     quoted = shlex.quote(python)
-    return {
+    return apply_profile_defaults({
         "name": "soloadventurer",
         "repo": {
             "path": str(repo),
@@ -283,7 +287,7 @@ def eval_profile(repo: Path, python: str | None = None) -> dict:
         "live_checks": {},
         "docs_allowlist": [],
         "network_allowlist": [],
-    }
+    })
 
 
 def build_soloadventurer_fixture(dest: Path) -> Path:

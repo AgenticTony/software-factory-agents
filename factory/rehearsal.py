@@ -55,7 +55,7 @@ from pathlib import Path
 import yaml
 
 from factory import sandbox
-from factory.contract import acceptance_hash
+from factory.contract import acceptance_hash, apply_profile_defaults
 from factory.gates import git as hardened_git
 from factory.mergeorder import Protection
 from factory.orchestrator import run_once
@@ -281,7 +281,11 @@ def _write(path: Path, text: str, executable: bool = False) -> None:
 
 
 def _profile(repo: Path, remote: Path) -> dict:
-    return {
+    """The rehearsal fixture's profile — routed through
+    :func:`factory.contract.apply_profile_defaults` like every loaded
+    profile, so the schema-level runner-config default (F-46 AC-4) is
+    unioned in here too."""
+    return apply_profile_defaults({
         "name": "rehearsal-fixture",
         "repo": {
             "path": str(repo),
@@ -307,7 +311,7 @@ def _profile(repo: Path, remote: Path) -> dict:
         "deploy": {"mechanism": "none", "auto_on_merge": False},
         "live_checks": {},
         "docs_allowlist": [],
-    }
+    })
 
 
 def _task() -> dict:

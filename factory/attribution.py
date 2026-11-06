@@ -31,11 +31,14 @@ Matching rules (PR #89 review round):
 * **AI vendor addresses** flag whatever the name; Copilot's
   ``copilot@github.com`` is named exactly so GitHub's human
   ``<login>@users.noreply.github.com`` addresses pass.
-* **The ``Generated with`` footer** is the phrase followed (within two
-  connecting tokens) by an AI tool or an AI vendor link — anywhere in a
-  line, in every surface (commit message, PR body, title). Ordinary prose
-  ("generated with openapi-generator/faker/ruff") names no AI tool and
-  passes.
+* **The ``Generated with`` footer** is the phrase followed (anywhere
+  later on the same line, however many connecting tokens sit between) by
+  an AI tool or an AI vendor link — in every surface (commit message, PR
+  body, title). Ordinary prose ("generated with
+  openapi-generator/faker/ruff") names no AI tool and passes; the
+  AI-tool requirement is the guard, not the token count (m-17: a
+  ``{0,2}`` cap was an evasion — "Generated with my favourite shiny tool
+  Claude").
 * A bare ``AI-assisted: yes`` declaration fails on its own: the trailer
   exists only to declare AI assistance.
 
@@ -53,11 +56,27 @@ trailer exists for. Where the classes must choose, they over-match (a
 human genuinely named Claude fails closed — the branch FAILs and a human
 reads it); under-matching silently publishes an attribution the contract
 forbids.
+
+**Canonical form (F-46, m-17, review round 1).** Every pattern matches
+against TWO canonical forms of the text (:func:`_canonical_forms`):
+confusable lookalikes folded (Cyrillic ``с`` inside "claude"), NFKD
+(fullwidth and mathematical-bold spellings become ASCII, accents
+decompose), the invisible set stripped — format characters, the
+Default_Ignorable set (variation selectors, Hangul fillers), nonspacing
+and enclosing marks (``Cláude`` is "Claude"), and control characters
+other than tab and newline (``Co-Authored\\x1e-By`` is the trailer) —
+and Unicode dashes folded to ``-``. The two forms differ on line
+separators: the line-split form turns every ``str.splitlines()``
+boundary into a newline (a trailer behind ``\\r``/LS/PS/NEL is
+line-initial), the control-stripped form joins a keyword a record
+separator split — both run, and the finding echoes the ORIGINAL line of
+whichever hit.
 """
 
 from __future__ import annotations
 
 import re
+import unicodedata
 
 # Trailer prefixes a squash-merged body can carry an AI attribution
 # under.
@@ -114,18 +133,109 @@ _PATTERN_CORES: tuple[tuple[str, str], ...] = (
     ),
     (
         "generated_with_footer",
-        # The phrase, then (within two connecting tokens, so "Generated
-        # with GitHub Copilot" reaches its tool) an AI tool — bracketed
-        # or bare — or an AI vendor link. The AI-tool requirement is what
-        # keeps ordinary prose out: "generated with
-        # faker/ruff/openapi-generator" names none.
-        r"generated with\s+(?:[\w.-]+[ \t]+){0,2}("
+        # The phrase, then (anywhere later on the line, however many
+        # connecting tokens sit between — m-17: a {0,2} cap was an
+        # evasion) an AI tool — bracketed or bare — or an AI vendor link.
+        # The AI-tool requirement is what keeps ordinary prose out:
+        # "generated with faker/ruff/openapi-generator" names none.
+        r"generated with\s+[^\n]*?("
         r"\[[^\]\n]*\b(?:claude|copilot|cursor|codex|gemini)\b[^\]\n]*\]"
         r"|\b(?:claude|copilot|cursor|codex|gemini|chatgpt|gpt|openai|anthropic)\b"
         r"|[^\s\n]*(?:" + _AI_VENDOR_DOMAINS + r")"
         r")",
     ),
 )
+
+# Single letters visually confusable with ASCII, folded to their Latin
+# lookalike BEFORE matching (F-46's decision on the m-17 homoglyph class:
+# NFKC does not cross scripts, and "сlaude" with a Cyrillic с is
+# indistinguishable from "claude" in every terminal a human reads). A
+# hand-picked set — the unambiguous Cyrillic/Greek shapes — not a
+# confusables database; over-matching is the module's standing direction.
+_CONFUSABLES = str.maketrans({
+    # Cyrillic lookalikes (lowercase and uppercase forms)
+    "а": "a", "А": "a", "в": "b", "В": "b", "с": "c", "С": "c",
+    "е": "e", "Е": "e", "һ": "h", "Һ": "h", "і": "i", "І": "i",
+    "ј": "j", "Ј": "j", "к": "k", "К": "k", "м": "m", "М": "m",
+    "н": "h", "Н": "h", "о": "o", "О": "o", "р": "p", "Р": "p",
+    "ѕ": "s", "Ѕ": "s", "т": "t", "Т": "t", "ԁ": "d", "у": "y", "У": "y",
+    "ԛ": "q", "ԝ": "w", "х": "x", "Х": "x",
+    # Greek lookalikes
+    "α": "a", "Α": "a", "ϵ": "e", "ε": "e", "ι": "i", "Ι": "i",
+    "κ": "k", "Κ": "k", "ν": "v", "ο": "o", "Ο": "o", "ρ": "p",
+    "Ρ": "p", "ϲ": "c", "ς": "s", "τ": "t", "Τ": "t", "υ": "u",
+})
+
+# The Unicode Default_Ignorable_Code_Point set (PropList.txt), as ranges.
+# Covers what Cf alone misses (review round 1, finding 5): variation
+# selectors (FE00..FE0F — also Mn), the Hangul fillers 115F/1160/3164 and
+# FFA0 (category Lo, invisible in rendering), CGJ 034F, the ARABIC LETTER
+# MARK, the tag and supplementary-variation-selector planes. Most of it
+# is also Cf/Mn; the Lo fillers are why the set exists.
+_DI_RANGES = (
+    (0x00AD, 0x00AD), (0x034F, 0x034F), (0x061C, 0x061C),
+    (0x115F, 0x1160), (0x17B4, 0x17B5), (0x180B, 0x180E),
+    (0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x206F),
+    (0x3164, 0x3164), (0xFE00, 0xFE0F), (0xFEFF, 0xFEFF),
+    (0xFFF0, 0xFFF8), (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF), (0xFFA0, 0xFFA0),
+)
+_DEFAULT_IGNORABLE = frozenset(
+    chr(cp)
+    for start, end in _DI_RANGES
+    for cp in range(start, end + 1)
+)
+
+# Every str.splitlines() boundary except \n and the two-char \r\n: each
+# renders as a line break in the surfaces this module scans, so a trailer
+# behind one is line-initial to a human terminal (review round 1,
+# finding 4).
+_LINE_BOUNDARY = re.compile("\r\n|[\r\v\f\x1c\x1d\x1e\x85\n  ]")
+
+
+def _fold(text: str) -> str:
+    """The shared fold: confusable lookalikes translated, NFKD (fullwidth
+    and mathematical-bold spellings decompose to ASCII, accents to base +
+    mark), then the invisible set — format characters (Cf), the
+    Default_Ignorable set (variation selectors, Hangul fillers) and
+    nonspacing/enclosing marks (Mn/Me — the combining accent of
+    ``Cláude``) — stripped, other control characters except tab and
+    newline stripped (an ``\\x1e`` inside the trailer keyword splits it
+    as surely as a zero-width space, and a commit body can carry any
+    byte), and Unicode dashes (Pd) folded to ``-``.
+
+    Newlines survive, so each caller's line structure is preserved.
+    """
+    text = text.translate(_CONFUSABLES)
+    text = unicodedata.normalize("NFKD", text)
+    out = []
+    for ch in text:
+        category = unicodedata.category(ch)
+        if (
+            category == "Cf"
+            or ch in _DEFAULT_IGNORABLE
+            or category in ("Mn", "Me")
+            or (category == "Cc" and ch not in "\t\n")
+        ):
+            continue
+        out.append("-" if category == "Pd" else ch)
+    return "".join(out)
+
+
+def _canonical_forms(text: str):
+    """The TWO canonical forms every attribution pattern is tried
+    against, each with its aligned ORIGINAL lines: the line-split form
+    (every ``str.splitlines()`` boundary — CR, VT, FF, the record
+    separators, NEL, LS, PS — becomes a newline first, so a trailer
+    behind one is line-anchored) and the control-stripped form (those
+    bytes vanish, which JOINS a keyword they split — ``Co-Authored\\x1e-
+    By``). The two pull opposite ways for the record separators, so both
+    run and the echo names the original line of whichever hit (review
+    round 1, finding 4).
+    """
+    yield _fold(text), text.split("\n")
+    yield _fold(_LINE_BOUNDARY.sub("\n", text)), text.splitlines()
+
 
 # Cores that match anywhere in a line, in every surface. The footer's
 # AI-tool requirement is what keeps ordinary prose out, not its position:
@@ -161,16 +271,23 @@ TITLE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
 def _match(patterns: tuple[tuple[str, re.Pattern[str]], ...], *texts: str):
     """The first hit of ``patterns`` across ``texts``, as the full source
     line — a finding that names the trailer names the whole line (the
-    emoji with the footer, the address with the author), taken from the
-    line's own start whatever the pattern anchored on."""
+    emoji with the footer, the address with the author).
+
+    Matching runs on each text's TWO canonical forms
+    (:func:`_canonical_forms`), so a trailer spelled with Unicode tricks,
+    or parked behind a Unicode line separator, is the trailer all the
+    same; the returned line is the text's ORIGINAL one, aligned by the
+    form that hit, so a human reads what was actually written.
+    """
     for name, pattern in patterns:
         for text in texts:
-            match = pattern.search(text or "")
-            if match:
-                start = text.rfind("\n", 0, match.start()) + 1
-                end = text.find("\n", match.start())
-                line = text[start:end if end != -1 else len(text)]
-                return name, line.strip()
+            if not text:
+                continue
+            for canonical, original_lines in _canonical_forms(text):
+                match = pattern.search(canonical)
+                if match:
+                    line_no = canonical.count("\n", 0, match.start())
+                    return name, original_lines[line_no].strip()
     return None
 
 

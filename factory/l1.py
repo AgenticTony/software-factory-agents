@@ -23,7 +23,11 @@ Mechanics (the caller — F-10 — passes a clean clone of the slice's branch):
    its test half), run each ref. Exit 0 is a FAIL
    (``test_proves_nothing``); collection errors and assertion failures
    both count as red — the question is "would it fail without the
-   change".
+   change" — but a run that never COLLECTED the test does not (F-46
+   AC-5/M-4: exit 5, "no tests ran", or the ref absent from the runner's
+   outcome list is a ``contract_not_collected`` FAIL at both ends; a
+   conftest or runner config hiding the contract test manufactures a red
+   that proves nothing).
 3. Green: ``git checkout --force <head>``, run each ref. Any non-zero exit
    is a FAIL: ``contract_ambiguous`` when the runner's own output says
    the test wasn't found (anchored on the runner's message lines — a
@@ -95,6 +99,16 @@ _NOT_FOUND = (
     re.compile(r"^no tests ran in \d", re.MULTILINE),
 )
 
+# Non-pytest "collected nothing" shapes: jest's message (case-insensitive
+# for the runner's -f and --silent variants), and jest-style per-file
+# outcome lines — a runner that prints PASS/FAIL per file NAMES the files
+# that ran, so a list whose lines never name the ref's file is proof it
+# was skipped (F-46 AC-5's positive-evidence check; it never fires when
+# the runner prints no outcome lines at all, so the absence of a pytest
+# signature is never treated as proof either way).
+_NO_TESTS_FOUND = re.compile(r"^no tests found", re.IGNORECASE | re.MULTILINE)
+_OUTCOME_LINE = re.compile(r"^(?:PASS|FAIL)[ \t].*$", re.MULTILINE)
+
 # How a red run went red (F-09, VALIDATOR-SPEC L1 "red for the wrong
 # reason"). The epistemic class that matters downstream is "red only
 # because a name was missing" — the case the L2 reviewer is told to
@@ -155,12 +169,66 @@ def red_reason(result: CommandResult) -> str | None:
     return "unknown"
 
 
+def not_collected_evidence(result: CommandResult, ref: str) -> tuple[str, str] | None:
+    """Evidence that the named contract test was never COLLECTED in one
+    run — ``(class, evidence)`` — or ``None`` when the run produced a real
+    verdict worth judging (it ran and passed or failed, it errored at
+    collection, or it timed out).
+
+    F-46 AC-5 (M-4): "not collected" is never a red proof, at either end
+    of the red-first check. Two classes:
+
+    * ``not_found`` — the runner says the named test doesn't exist. At
+      the GREEN end that stays a contract problem
+      (``contract_ambiguous``); at the RED end it FAILS closed too
+      (review round 1: the red phase applies head's own test file, so
+      not-found at red means the test was hidden — a conditional
+      definition keyed on a module only the diff adds).
+    * ``not_collected`` — pytest's exit 5 / "no tests ran" (the
+      collection-hiding shapes: ``collect_ignore`` where the runner
+      honours it, ``pytest_collection_modifyitems`` dropping the item,
+      ``-k``/``--deselect`` injected through config), jest's "No tests
+      found", or the ref absent from a runner that prints per-file
+      outcome lines. FAILs both ends with ``contract_not_collected``.
+
+    A run that timed out, or that produced none of these shapes, is a
+    real verdict: never treat the absence of a signature as proof.
+    """
+    if result.timed_out or result.exit_code is None:
+        return None
+    if result.exit_code == 5:
+        return "not_collected", "runner exit 5: no tests collected"
+    match = _NOT_FOUND[0].search(result.output)
+    if match:
+        return "not_found", f"runner reported {match.group(0).strip()!r}"
+    for pattern in _NOT_FOUND[1:]:
+        match = pattern.search(result.output)
+        if match:
+            return "not_collected", f"runner reported {match.group(0).strip()!r}"
+    match = _NO_TESTS_FOUND.search(result.output)
+    if match:
+        return "not_collected", f"runner reported {match.group(0).strip()!r}"
+    outcome_lines = _OUTCOME_LINE.findall(result.output)
+    if outcome_lines:
+        path = ref_path(ref) or ref
+        basename = path.rsplit("/", 1)[-1]
+        if not any(path in line or basename in line for line in outcome_lines):
+            return (
+                "not_collected",
+                f"absent from the runner's outcome list ({len(outcome_lines)} "
+                f"outcome lines, none naming {path})",
+            )
+    return None
+
+
 @dataclass
 class L1Report(GateReport):
     """The L1 verdict plus everything F-09/F-10 consume downstream.
 
     ``red_reasons`` maps each provable contract test ref to how its red run
-    went red — ``assertion``, ``collection`` or ``unknown`` — or None when
+    went red — ``assertion``, ``collection``, ``unknown``, or
+    ``not_collected`` (F-46 AC-5: the run collected nothing; also a FAIL
+    finding, so the value can never pose as a real red) — or None when
     the ref never produced a red verdict (green on base, or a timeout).
     The verdict itself never depends on it; the L2 reviewer's test-quality
     pass reads it (a ref red only by ``collection`` proved just that a name
@@ -375,6 +443,29 @@ def run_l1(
                         file=ref_path(ref),
                     )
                 )
+            else:
+                # F-46 AC-5 (M-4, review round 1): a red run that never
+                # collected the named test proves nothing — and at the
+                # RED end that includes the runner's own not-found line:
+                # the red phase applies the diff's own test file (head's
+                # content), so a test that exists at head and is
+                # "not found" at red was hidden by the very file under
+                # proof (a conditional definition) or by base-side
+                # config. Any not-collected evidence fails closed here.
+                evidence = not_collected_evidence(result, ref)
+                if evidence is not None:
+                    findings.append(
+                        Finding(
+                            "contract_not_collected",
+                            f"{ref} was not collected in the red run ({evidence[1]}) "
+                            "— a hidden test proves nothing; the contract test must "
+                            "run and fail on the base commit, and a run that "
+                            "collected nothing (or did not find the test it was "
+                            "given) is a failure, never a red proof",
+                            file=ref_path(ref),
+                        )
+                    )
+                    reasons[ref] = "not_collected"
 
         git(repo, "checkout", "--force", head_ref)
         _clean(repo, keep)
@@ -386,12 +477,27 @@ def run_l1(
                     Finding("command_timeout", f"green run of {ref} exceeded {timeout_sec}s")
                 )
             elif result.exit_code != 0:
-                if any(p.search(result.output) for p in _NOT_FOUND):
+                # F-46 AC-5: at the green end too, "not collected" is its
+                # own failure — a config-injected deselection must not
+                # read as a broken contract (the test exists; it never
+                # ran), and never as a pass.
+                evidence = not_collected_evidence(result, ref)
+                if evidence and evidence[0] == "not_found":
                     findings.append(
                         Finding(
                             "contract_ambiguous",
                             f"{ref} does not exist on {head_ref}: "
                             f"{result.output.strip()[:200]}",
+                            file=ref_path(ref),
+                        )
+                    )
+                elif evidence:
+                    findings.append(
+                        Finding(
+                            "contract_not_collected",
+                            f"{ref} was not collected in the green run "
+                            f"({evidence[1]}) — the contract test did not run "
+                            "with the full diff applied",
                             file=ref_path(ref),
                         )
                     )

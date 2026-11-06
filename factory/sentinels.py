@@ -439,23 +439,40 @@ BUILTIN_SENTINELS = (
 )
 
 
+def touched_paths(change) -> tuple[str, ...]:
+    """The paths a change counts as touching for glob matching.
+
+    Both halves of a rename (a rename away from a risk path still touched
+    it — the pre-F-25 event split's semantics); the new path alone for
+    everything else. A copy's source path does NOT count: the diff
+    changes the new file, and copying out of a risk path never raised the
+    flag before F-25 (round-2 finding 3).
+
+    ONE implementation, shared by :func:`matched_risk_flags` and the
+    lint-suppression sentinel's risk-path check, so the flag a diff
+    raises and the sentinel that guards it can never disagree — m-9 was
+    exactly that disagreement: ``lint_suppression_added`` judged the new
+    path only, so renaming ``payments/x.py`` to ``utils/x.py`` raised the
+    payments flag via the old path while the ``# noqa`` added in the same
+    rename sailed through unflagged.
+    """
+    if change.status == "R" and change.old_path:
+        return (change.path, change.old_path)
+    return (change.path,)
+
+
 def matched_risk_flags(risk_globs: dict, changes) -> set:
     """The risk flags whose ``paths.risk`` globs the diff touches.
 
     THE single implementation of "which risk flags did this diff touch"
     (owner review finding 7): L0 computes it once and passes it through —
     the builtin pass, the project sentinels and ``check_diff_policy``
-    consume the same set. A RENAME touches both its old and new path (a
-    rename away from a risk path still touched it — the pre-F-25 event
-    split's semantics). A copy's source path does NOT count: the diff
-    changes the new file, and copying out of a risk path never raised the
-    flag before F-25 (round-2 finding 3).
+    consume the same set. Rename/copy path semantics come from
+    :func:`touched_paths`, the one shared rule.
     """
     matched: set = set()
     for change in changes:
-        paths = {change.path}
-        if change.status == "R" and change.old_path:
-            paths.add(change.old_path)
+        paths = touched_paths(change)
         for flag, globs in risk_globs.items():
             if any(matches(path, globs) for path in paths):
                 matched.add(flag)
@@ -499,13 +516,25 @@ def builtin_sentinel_findings(changes, risk_globs: dict) -> list:
     findings: list[Finding] = []
     all_risk_globs = [glob for globs in risk_globs.values() for glob in globs]
     for change in changes:
-        in_risk_path = matches(change.path, all_risk_globs)
+        # The risk-path check uses BOTH halves of a rename, exactly as
+        # matched_risk_flags does (touched_paths is the one rule) — m-9:
+        # a suppression added while renaming out of a risk path flags.
+        in_risk_path = any(
+            matches(path, all_risk_globs) for path in touched_paths(change)
+        )
         # Skip/assertion scanning follows the rename semantics of
         # check_diff_policy's event split: a rename's old half is judged by
         # its own side, so a test renamed INTO the test paths scans by its
         # new path, one renamed OUT by its old.
         scan_path = change.old_path if is_test_file(change.old_path or "") else change.path
         test_file = is_test_file(scan_path)
+        # The comment-syntax lookup deliberately reads the NEW path: the
+        # added lines live in the file at its new path, and a suppression
+        # only takes effect where the file's actual format makes that
+        # syntax a comment — a `.py` renamed to `.json` with a noqa
+        # comment added suppresses nothing there (F-46 AC-3's pinned
+        # choice; a `.py` renamed to `.txt` keeps every syntax, since
+        # formats the map doesn't know fail safe).
         syntaxes = _comment_syntaxes(change.path)
         for no, text in change.added_lines:
             shape = _credential_shape(text)

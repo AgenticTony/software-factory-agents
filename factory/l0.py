@@ -76,16 +76,19 @@ not a near-miss of a popular name). L0 records the escalation; the checks
 run when there is a sandbox to run them in.
 """
 
+import configparser
 import copy
 import json
 import posixpath
 import re
+import subprocess
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 
 from factory.attribution import attribution_match
+from factory.contract import runner_config_policy
 from factory.egress import strip_control_sequences
 from factory.gates import (
     CommandResult,
@@ -95,11 +98,13 @@ from factory.gates import (
     GateReport,
     contract_test_files,
     diff_file_changes,
+    git_rc,
 )
 from factory.gates import git as _git
 from factory.gates import is_test_file as _is_test_file
 from factory.gates import matches as _matches
 from factory.gates import run_command as _run_command
+from factory.runs import GIT_HARDENING
 from factory.sentinels import (
     builtin_sentinel_pass,
     matched_risk_flags,
@@ -394,6 +399,110 @@ def _pyproject_surface_unchanged(change, path: str, *, repo, base_ref, head_ref)
         return False
 
 
+def _pytest_config_at(repo: Path, ref: str, path: str, tables: list) -> tuple[dict, str | None]:
+    """The pytest-config surface of one file at one ref, for the
+    runner-config table check (F-46 AC-4).
+
+    Each named table/section's content, with absent tables as ``None`` —
+    so "the table was removed" compares unequal against "the table
+    exists". A file absent from the ref has no surface; a file present
+    but unparseable carries an error, and the caller fails the whole
+    comparison closed (an unreadable config cannot be proven unchanged).
+
+    Args:
+        repo: Repository holding ``ref``.
+        ref: The ref to read the file from.
+        path: Repo-relative config file path.
+        tables: The table/section names the schema's runner-config policy
+            declares for this file.
+
+    Returns:
+        ``(surface, error)`` — the ``{table: content-or-None}`` mapping and
+        an error string when the file is present but unparseable.
+    """
+    surface: dict = {table: None for table in tables}
+    # Absence must be PROVEN (cat-file -e answers 0 only for an existing
+    # object): a read or decode failure on a file that exists is an
+    # ERROR — "unreadable" fails the comparison closed, it must never
+    # masquerade as "absent" (review round 1, finding 6).
+    if git_rc(repo, "cat-file", "-e", f"{ref}:{path}") != 0:
+        return surface, None
+    try:
+        content = _git(repo, "show", f"{ref}:{path}")
+    except (GateError, UnicodeDecodeError) as exc:
+        return surface, f"unreadable at {ref}:{path}: {exc}"
+    if path.endswith(".toml"):
+        try:
+            doc = tomllib.loads(content)
+        except tomllib.TOMLDecodeError as exc:
+            return surface, f"TOML parse error: {exc}"
+        for table in tables:
+            node: Any = doc
+            for part in table.split("."):
+                if not isinstance(node, dict) or part not in node:
+                    node = None
+                    break
+                node = node[part]
+            surface[table] = node
+    else:
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            parser.read_string(content)
+        except configparser.Error as exc:
+            return surface, f"config parse error: {exc}"
+        for table in tables:
+            surface[table] = dict(parser[table]) if parser.has_section(table) else None
+    return surface, None
+
+
+def _runner_config_change(path: str, verb: str, repo, base_ref, head_ref) -> str | None:
+    """F-46 AC-4 (M-4): a change to test-runner CONFIGURATION is a
+    protected-path touch whatever the profile says — the runner decides
+    whether the contract tests run at all, so it is judge surface like
+    the validator itself. Whole files (conftest.py, pytest.ini) are
+    covered by the default globs unioned into the protected list;
+    pyproject.toml/setup.cfg/tox.ini are NOT whole-file protected
+    (dependency bumps must still flow to the new-dependency rule) —
+    their pytest tables/sections are compared between the merge-base and
+    head, added or removed included. Unparseable at either end, or no
+    refs to compare: fail closed, exactly like the dependency rule.
+
+    Args:
+        path: The changed path (its basename names the config file).
+        verb: The change verb from the event split.
+        repo: Repository holding both refs, when the caller passed them.
+        base_ref: Base ref (compared from the merge-base).
+        head_ref: Head ref carrying the slice.
+
+    Returns:
+        The finding text, or ``None`` when the pytest config is provably
+        unchanged.
+    """
+    tables = runner_config_policy()["pytest_tables"].get(path.rsplit("/", 1)[-1])
+    if tables is None:
+        return None
+    if repo is None or not base_ref or not head_ref:
+        return (
+            f"protected path {verb}: {path} — test-runner configuration "
+            "touched with no refs to compare its pytest table; failing closed"
+        )
+    merge_base = _git(Path(repo), "merge-base", base_ref, head_ref).strip()
+    before, before_err = _pytest_config_at(Path(repo), merge_base, path, tables)
+    after, after_err = _pytest_config_at(Path(repo), head_ref, path, tables)
+    if before_err or after_err:
+        side = "head" if after_err else "the merge-base"
+        return (
+            f"protected path {verb}: {path} — its pytest configuration is "
+            f"unparseable at {side} ({after_err or before_err}); failing closed"
+        )
+    if before != after:
+        return (
+            f"protected path {verb}: {path} — its pytest configuration "
+            f"changed between {merge_base[:12]} and {head_ref}"
+        )
+    return None
+
+
 def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
                       matched_flags: set | None = None, *,
                       repo: Path | str | None = None,
@@ -436,7 +545,16 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
     task = task or {}
     paths = profile.get("paths") or {}
     contract_files = contract_test_files(task)
-    protected = list(paths.get("protected") or []) + sorted(contract_files)
+    declared = list(paths.get("protected") or [])
+    # F-46 AC-4: the schema-level runner-config default is unioned in
+    # HERE as well as in load_profile — the protection is structural, so
+    # even a hand-built profile dict (a test fixture, a future caller)
+    # cannot narrow it. A profile can only widen the set.
+    runner_globs = runner_config_policy()["protected_globs"]
+    protected = (
+        declared + sorted(contract_files)
+        + [glob for glob in runner_globs if glob not in declared]
+    )
     manifests = profile.get("dependency_manifests") or []
 
     findings: list[Finding] = []
@@ -490,6 +608,15 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
                 change, path, repo=repo, base_ref=base_ref, head_ref=head_ref,
             ):
                 escalations.add("new_dependency")
+            # F-46 AC-4 (M-4): test-runner configuration is protected
+            # whatever the profile says — a runner the implementer
+            # reshapes judges its own tests.
+            runner_hit = _runner_config_change(path, verb, repo, base_ref, head_ref)
+            if runner_hit is not None:
+                findings.append(
+                    Finding("protected_path_touched", runner_hit, file=path)
+                )
+                escalations.add("protected_path_touched")
 
         if change.status == "D" and _is_test_file(change.path):
             findings.append(
@@ -520,19 +647,48 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
     return findings, sorted(escalations), risk_flags_added, matched_flags
 
 
+def _commit_message(repo: Path, sha: str) -> str:
+    """One commit's full message, decoded with replacement.
+
+    ``git log -1 --format=%B`` returns the message as stored — raw bytes,
+    whatever encoding they carry (a latin-1 body is not re-encoded on
+    output). The shared hardened ``_git`` decodes strictly and would
+    CRASH the scan on such a commit; this reads bytes and decodes with
+    U+FFFD replacement so every commit is scanned — never skipped, never
+    a crashed gate (F-46 AC-1, M-2's neighbour).
+    """
+    proc = subprocess.run(
+        ["git", *GIT_HARDENING, "-C", str(repo), "log", "-1", "--format=%B", sha],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise GateError(
+            f"git log -1 --format=%B failed in {repo}: "
+            f"{proc.stderr.decode('utf-8', 'replace').strip()}"
+        )
+    return proc.stdout.decode("utf-8", "replace")
+
+
 def attribution_findings(repo: Path, base_ref: str, head_ref: str) -> list:
     """FAIL findings for AI-attribution trailers in the branch's own
-    commits (F-42 AC-1).
+    commits (F-42 AC-1; per-commit reads since F-46/M-2).
 
-    The commit messages between the merge-base and head are matched
-    against :data:`factory.attribution.ATTRIBUTION_PATTERNS` — the ONE
-    list the publish step refuses PR text with, so a trailer blocked here
-    is also blocked at the PR seam and a squash commit can't inherit one.
-    Only the branch's own commits are scanned: trailers already sitting on
-    the base (this repo's ``main`` carries five) belong to the base's
+    The shas between the merge-base and head are listed first
+    (``git rev-list``), then each commit's FULL message is read on its
+    own (``git log -1 --format=%B <sha>``, bytes with replacement
+    decoding) and matched against
+    :data:`factory.attribution.ATTRIBUTION_PATTERNS` — the ONE list the
+    publish step refuses PR text with, so a trailer blocked here is also
+    blocked at the PR seam and a squash commit can't inherit one. One
+    message per read means no separator byte to split a combined log on:
+    a commit body embedding ``\\x1e``/``\\x1f`` before its trailer is
+    scanned like any other (M-2 — the implementer writes its own
+    commits, so the message is attacker-controlled bytes). Only the
+    branch's own commits are scanned: trailers already sitting on the
+    base (this repo's ``main`` carries five) belong to the base's
     history, which F-42 deliberately does not rewrite (AC-6). A human
-    ``Co-Authored-By`` passes — the patterns name AI authors and AI vendor
-    addresses, not the trailer itself.
+    ``Co-Authored-By`` passes — the patterns name AI authors and AI
+    vendor addresses, not the trailer itself.
 
     Args:
         repo: Repository holding ``base_ref`` and ``head_ref``.
@@ -544,15 +700,10 @@ def attribution_findings(repo: Path, base_ref: str, head_ref: str) -> list:
         the commit, the matched line and the pattern class.
     """
     merge_base = _git(repo, "merge-base", base_ref, head_ref).strip()
-    log = _git(repo, "log", f"{merge_base}..{head_ref}",
-               "--pretty=format:%H%x1f%B%x1e")
+    shas = _git(repo, "rev-list", f"{merge_base}..{head_ref}").split()
     findings: list[Finding] = []
-    for record in log.split("\x1e"):
-        record = record.removeprefix("\n")
-        if not record.strip():
-            continue
-        sha, _, message = record.partition("\x1f")
-        match = attribution_match(message)
+    for sha in shas:
+        match = attribution_match(_commit_message(repo, sha))
         if match is not None:
             name, line = match
             findings.append(
