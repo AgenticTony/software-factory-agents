@@ -31,7 +31,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from factory.config import ConfigError, FactoryConfig, load_config
-from factory.contract import ContractError, acceptance_hash
+from factory.contract import ContractError, acceptance_hash, load_profile
 from factory.orchestrator import PullRequest, run_once
 from factory.session import SessionRecord
 from factory.state import TaskQueue
@@ -391,9 +391,13 @@ def test_ac_1(tmp_path: Path):
     assert [f["tag"] for f in findings] == ["important", "nit", "pre-existing"]
     assert report["L2"]["verdict"] == "fail"  # the declared fail stands
     # Every session's prompt hash is recorded per seat (AC-5 asserts this
-    # fully; here just the shape the fan-out produced).
+    # fully; here just the shape the fan-out produced). F-46 AC-4 re-seat:
+    # the expected versions come from the profile as the orchestrator
+    # loads it (load_profile unions the schema-level runner-config
+    # defaults into paths.protected, which the prompts embed).
     attempt = env.task()["attempts"][-1]
-    assert attempt["prompt_versions"] == prompt_versions(env.profile)
+    assert attempt["prompt_versions"] == prompt_versions(
+        load_profile(env.queue_path.parent / "project.yaml"))
 
 
 # --- AC-2: style-only dropped before the verdict; the nit budget is enforced -
@@ -625,12 +629,15 @@ def test_ac_5(tmp_path: Path, monkeypatch):
     assert result.outcome == "pr_opened", result
 
     # Every reviewer and verifier prompt hash, one entry per session.
+    # (F-46 AC-4 re-seat: expected hashes from the loaded profile — the
+    # prompts embed the runner-config-default-unioned protected list.)
     attempt = env.task()["attempts"][-1]
     versions = attempt["prompt_versions"]
     assert set(versions) == {"implementer", "reviewer-1", "reviewer-2", "verifier"}
-    assert versions == prompt_versions(env.profile)
+    loaded = load_profile(env.queue_path.parent / "project.yaml")
+    assert versions == prompt_versions(loaded)
     assert versions["reviewer-1"] == versions["reviewer-2"]
-    assert versions["verifier"] == prompt_hash(assemble_verifier_prompt(env.profile))
+    assert versions["verifier"] == prompt_hash(assemble_verifier_prompt(loaded))
     assert versions["verifier"] != versions["reviewer-1"]
 
     # The fan-out is inside the attempt's turn budget (review round

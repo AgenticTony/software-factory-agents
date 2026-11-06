@@ -7,6 +7,36 @@
   "required": ["name", "repo", "commands", "paths", "deploy", "live_checks", "docs_allowlist"],
   "additionalProperties": false,
   "$defs": {
+    "defaultRunnerConfig": {
+      "description": "F-46 AC-4 (M-4): test-runner configuration is judge surface — the runner decides whether the contract tests run at all — so it is protected by default, not by each profile's own list. protected_globs are whole-file globs (root AND any depth — fnmatch's **/x needs a slash before x, so the root needs its own entry) covering conftest and every dedicated pytest config name pytest discovers (pytest.ini, .pytest.ini, pytest.toml, .pytest.toml; tests/test_f46.py reads the name list from the installed pytest); they are unioned into paths.protected by the profile loader (a profile can only widen, never remove). pytest_tables names, per file, the TOML tables / configparser sections of the three SHARED config files whose content L0's diff policy compares between the merge-base and head, structurally, whatever the profile says (added or removed included; unparseable at either end, or no refs to compare, fails closed). pyproject.toml, setup.cfg and tox.ini are deliberately NOT whole-file protected: dependency bumps and tox/metadata edits must still flow to their own rules.",
+      "type": "object",
+      "required": ["protected_globs", "pytest_tables"],
+      "additionalProperties": false,
+      "properties": {
+        "protected_globs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "pytest_tables": {
+          "type": "object",
+          "additionalProperties": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+        }
+      },
+      "const": {
+        "protected_globs": [
+          "conftest.py", "**/conftest.py",
+          "pytest.ini", "**/pytest.ini",
+          ".pytest.ini", "**/.pytest.ini",
+          "pytest.toml", "**/pytest.toml",
+          ".pytest.toml", "**/.pytest.toml"
+        ],
+        "pytest_tables": {
+          "pyproject.toml": ["tool.pytest.ini_options", "tool.pytest"],
+          "setup.cfg": ["tool:pytest"],
+          "tox.ini": ["pytest", "tool:pytest"]
+        }
+      }
+    },
     "toolkitNameList": {
       "type": "array",
       "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" }

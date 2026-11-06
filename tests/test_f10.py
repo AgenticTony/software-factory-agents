@@ -35,7 +35,7 @@ import yaml
 from factory import l0 as l0_module
 from factory import l1 as l1_module
 from factory.config import ConfigError, PeakWindow, in_peak_window, load_config
-from factory.contract import ContractError, acceptance_hash
+from factory.contract import ContractError, acceptance_hash, load_profile
 from factory.gates import CommandResult
 from factory.l1 import L1Report
 from factory.mergeorder import Protection
@@ -592,7 +592,12 @@ def test_ac_6(tmp_path: Path):
     env.run(Seats(answer=41))  # three attempts, every outcome path
     env2 = Env(tmp_path / "pass")
     env2.run(Seats())
-    profile = yaml.safe_load(env.profile_path.read_text())
+    # F-46 AC-4 re-seat: the orchestrator loads the profile through
+    # load_profile, which unions the schema-level runner-config defaults
+    # into paths.protected — the prompt hashes are computed from the
+    # loaded profile, so the expected versions must be too (the raw YAML
+    # no longer equals what assembly sees).
+    profile = load_profile(env.profile_path)
     attempts = env.task()["attempts"] + env2.task()["attempts"]
     assert len(attempts) == 4
     for attempt in attempts:
@@ -800,7 +805,19 @@ def test_progress_log_reaches_every_round(tmp_path: Path):
 # --- AC-11: L0 and L1 run project commands inside the sandbox ---------------
 
 
-def _probe_conftest(outside: Path, holdout: Path) -> str:
+def _probe_test_source(outside: Path, holdout: Path) -> str:
+    """The sandbox probe, as the CONTRACT TEST FILE's module body.
+
+    F-46 AC-4 re-seat: a diff-shipped conftest is protected runner
+    configuration now (M-4's remedy — the runner decides whether the
+    contract tests run at all), so the honest F-05 probe rides the one
+    file an implementer session legitimately adds. Its module body runs
+    at collection time inside every project command (the whole-suite
+    ``test`` and both L1 ends); the commands run with ``-s`` so the
+    module-level print reaches the captured output without any
+    capture-escape shape (which the runner-forgery sentinel rightly
+    flags in test files).
+    """
     return textwrap.dedent(
         f"""
         import pathlib
@@ -814,27 +831,36 @@ def _probe_conftest(outside: Path, holdout: Path) -> str:
             RESULTS.append("READ-ALLOWED:" + pathlib.Path({str(holdout)!r}).read_text())
         except OSError:
             RESULTS.append("READ-DENIED")
+        print("PROBE " + " ".join(RESULTS))
+
+        from impl import answer
 
 
-        def pytest_terminal_summary(terminalreporter):
-            terminalreporter.write_line("PROBE " + " ".join(RESULTS))
+        def test_ac_1():
+            assert answer() == 42
         """
     )
 
 
 def test_ac_11(tmp_path: Path, monkeypatch):
-    env = Env(tmp_path)
+    env = Env(tmp_path, profile_extra={"commands": {
+        "setup": "true",
+        "test": f"{shlex.quote(sys.executable)} -m pytest -q -s -p no:cacheprovider",
+        "test_ref": f"{shlex.quote(sys.executable)} -m pytest -q -s {{ref}}",
+    }})
     outside = tmp_path / "outside" / "pwned.txt"
     outside.parent.mkdir()
-    conftest = _probe_conftest(outside, env.holdout)
+    probe = _probe_test_source(outside, env.holdout)
 
     # Control: the probe is real — run unsandboxed, it writes and reads.
     control = tmp_path / "control"
     (control / "tests").mkdir(parents=True)
-    (control / "tests" / "conftest.py").write_text(conftest)
-    (control / "tests" / "test_x.py").write_text("def test_x():\n    pass\n")
-    proc = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
-                          cwd=control, capture_output=True, text=True)
+    (control / "impl.py").write_text("def answer():\n    return 42\n")
+    (control / "tests" / "test_feature.py").write_text(probe)
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-s", "-p", "no:cacheprovider"],
+        cwd=control, capture_output=True, text=True,
+    )
     assert "PROBE WRITE-ALLOWED READ-ALLOWED:HOLDOUT-SECRET-CANARY" in proc.stdout
     outside.unlink()
 
@@ -845,7 +871,7 @@ def test_ac_11(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(l0_module, "_run_command", forbidden)
     monkeypatch.setattr(l1_module, "run_command", forbidden)
 
-    seats = Seats(extra_files={"tests/conftest.py": conftest})
+    seats = Seats(extra_files={"tests/test_feature.py": probe})
     result = env.run(seats)
     assert result.outcome == "pr_opened", result
 

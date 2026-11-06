@@ -782,7 +782,18 @@ def test_default_import_session_runs_sandboxed_never_in_process(
     assert call["factory_root"] == factory_root
     assert call["settings_path"].parent == factory_root / "sandbox"
     assert call["profile"]["name"] == "proj"
-    assert call["protected"] == []
+    # F-46 AC-4 (review round 1: the root forms and every dedicated
+    # pytest config name joined the default): the schema-level
+    # runner-config default is unioned into every loaded profile
+    # (load_profile), so the importer seat's protected set carries it
+    # too — the fixture's own list is empty.
+    assert call["protected"] == [
+        "conftest.py", "**/conftest.py",
+        "pytest.ini", "**/pytest.ini",
+        ".pytest.ini", "**/.pytest.ini",
+        "pytest.toml", "**/pytest.toml",
+        ".pytest.toml", "**/.pytest.toml",
+    ]
     # The clone and its sandbox files are disposable: gone afterwards.
     assert not run_dir.exists()
     assert not list((factory_root / "runs" / "proj").iterdir())

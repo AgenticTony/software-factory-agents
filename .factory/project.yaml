@@ -173,6 +173,12 @@ paths:
     # guards, the dir-fsync and the holder-liveness rules the protected
     # orchestrator/state/publish/mergeorder modules enforce.
     - "tests/test_f45.py"
+    # F-46: same precedent — the gate-evasion contract tests (per-commit
+    # attribution scan, canonical-form matching, rename-aware lint
+    # suppression, schema-default runner-config protection, L1's
+    # not-collected failure) judge the protected l0/l1/sentinels/
+    # attribution/contract modules and the schema default itself.
+    - "tests/test_f46.py"
     # F-43 review round 1: the seam itself and its vent wiring, the F-42
     # factory/attribution.py precedent — a factory-built PR must not be
     # able to weaken the C-1 fix (scrub_session_text returning its input,

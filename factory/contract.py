@@ -12,6 +12,7 @@ Any failure — unreadable file, bad parse, semantic violation, schema
 violation — raises ContractError with a message a human can act on.
 """
 
+import copy
 import functools
 import hashlib
 import json
@@ -170,6 +171,25 @@ def read_file(path: Path, origin: str) -> str:
 
 
 @functools.lru_cache(maxsize=None)
+def _schema_document(schema_path: Path) -> dict:
+    """Load (once) a JSON Schema document.
+
+    Args:
+        schema_path: Path to the JSON Schema file.
+
+    Returns:
+        The parsed schema mapping.
+
+    Raises:
+        ContractError: If the schema file is missing, unreadable, or not JSON.
+    """
+    try:
+        return json.loads(read_file(schema_path, str(schema_path)))
+    except json.JSONDecodeError as exc:
+        raise ContractError(f"schema {schema_path} is not valid JSON: {exc}") from exc
+
+
+@functools.lru_cache(maxsize=None)
 def _validator(schema_path: Path) -> jsonschema.Draft202012Validator:
     """Build (once) the validator for a schema file.
 
@@ -182,11 +202,7 @@ def _validator(schema_path: Path) -> jsonschema.Draft202012Validator:
     Raises:
         ContractError: If the schema file is missing, unreadable, or not JSON.
     """
-    try:
-        schema = json.loads(read_file(schema_path, str(schema_path)))
-    except json.JSONDecodeError as exc:
-        raise ContractError(f"schema {schema_path} is not valid JSON: {exc}") from exc
-    return jsonschema.Draft202012Validator(schema)
+    return jsonschema.Draft202012Validator(_schema_document(schema_path))
 
 
 def _validate(instance: Any, schema_path: Path, origin: str) -> None:
@@ -319,6 +335,69 @@ def _check_profile_semantics(data: dict, origin: str, *,
                            toolkit_root=toolkit_root)
 
 
+def runner_config_policy(schema_path: Path | None = None) -> dict:
+    """The default test-runner-config protection policy (F-46 AC-4).
+
+    THE one copy lives in the project schema (``$defs.defaultRunnerConfig
+    .const`` — schema state, changeable only by a reviewed PR); this
+    reads it. ``protected_globs`` are unioned into every loaded profile's
+    ``paths.protected`` by :func:`apply_profile_defaults`; ``pytest_tables``
+    names, per config file, the TOML tables / configparser sections L0's
+    diff policy compares between the merge-base and head, structurally,
+    whatever the profile says — a profile can only widen the default set,
+    never remove from it.
+
+    Args:
+        schema_path: Optional override for the profile schema path.
+
+    Returns:
+        The policy mapping (a deep copy; callers may not mutate the
+        schema's copy).
+
+    Raises:
+        ContractError: If the schema is missing the ``$defs`` entry —
+            the runner-config default is judge state; the factory refuses
+            to guess it.
+    """
+    path = Path(schema_path) if schema_path is not None else (
+        SCHEMA_DIR / "project.schema.json"
+    )
+    try:
+        policy = _schema_document(path)["$defs"]["defaultRunnerConfig"]["const"]
+    except (KeyError, TypeError) as exc:
+        raise ContractError(
+            f"schema {path} is missing $defs.defaultRunnerConfig.const — "
+            "the runner-config default is judge state; refusing to guess it"
+        ) from exc
+    return copy.deepcopy(policy)
+
+
+def apply_profile_defaults(profile: dict, schema_path: Path | None = None) -> dict:
+    """Union the schema-level runner-config defaults into a profile.
+
+    The ONE route every profile-shaped mapping takes: ``load_profile``
+    after validation, and the in-code synthetic profiles eval and the
+    rehearsal fixture build. ``paths.protected`` gains the default
+    protected globs (conftest, pytest.ini) — a profile can only ADD to
+    the default set, never remove from it (F-46 AC-4), so every consumer
+    reading ``paths.protected`` downstream (L0's diff policy, the seats'
+    protected-path hook, the reviewer prompt) sees the same widened set.
+
+    Args:
+        profile: The profile mapping (validated, when it came from disk).
+        schema_path: Optional override for the profile schema path.
+
+    Returns:
+        The same mapping, with ``paths.protected`` widened.
+    """
+    globs = runner_config_policy(schema_path)["protected_globs"]
+    paths = profile.setdefault("paths", {})
+    protected = list(paths.get("protected") or [])
+    protected += [glob for glob in globs if glob not in protected]
+    paths["protected"] = protected
+    return profile
+
+
 def _check_profile_toolkit(section: Any, origin: str, *,
                            toolkit_root: Path | str | None) -> None:
     """F-22 AC-6: every toolkit name in a profile must be an index entry
@@ -382,7 +461,9 @@ def load_profile(path: Path | str, schema_path: Path | None = None, *,
             ``toolkit/`` dir).
 
     Returns:
-        The parsed profile mapping.
+        The parsed profile mapping, with the schema-level runner-config
+        defaults unioned into ``paths.protected`` (F-46 AC-4 — a profile
+        can only widen the default set, never remove from it).
 
     Raises:
         ContractError: If the file is unreadable or not YAML, not a mapping,
@@ -403,4 +484,4 @@ def load_profile(path: Path | str, schema_path: Path | None = None, *,
         )
     _validate(data, schema_path or SCHEMA_DIR / "project.schema.json", origin)
     _check_profile_semantics(data, origin, toolkit_root=toolkit_root)
-    return data
+    return apply_profile_defaults(data, schema_path)
