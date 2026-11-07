@@ -18,7 +18,7 @@ import threading
 from pathlib import Path
 
 import pytest
-from test_f16 import (
+from _support.f16 import (
     _FINDINGS_ARRAY,
     MOCK_SEED_FINDINGS,
     ScriptedSeats,
@@ -174,7 +174,7 @@ def test_ac_1(tmp_path: Path, monkeypatch):
     # The real orchestrator path: one scripted pass round through
     # run_once (the test_f38 harness), the shared symbol spied where the
     # orchestrator bound it, delegating to the real function.
-    from test_f38 import Env, Fanout, _one_round_task, _verdict
+    from _support.f38 import Env, Fanout, _one_round_task, _verdict
 
     orch_calls: list[dict] = []
     real = orchestrator_module.settle_review_verdict

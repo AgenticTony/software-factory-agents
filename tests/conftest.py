@@ -1,6 +1,7 @@
 """Suite-wide guards for the environment the tests run in."""
 
 import functools
+import os
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,28 @@ import pytest
 import factory
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_spend(monkeypatch):
+    """F-51 round 1, finding m7: without the explicit live opt-in, NO test
+    can spend on a model — goal-level, not just test_f06's own gating.
+
+    The keychain lookup is stubbed to "not found" and any ambient
+    ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL is stripped from the test
+    environment, so a future ungated real-session test fails to
+    AUTHENTICATE instead of spending. With ``FACTORY_LIVE_TESTS=1`` the
+    guard stands down (the owner opted in; the f06 live halves then run
+    on the real credential). Tests that need their own shapes still
+    monkeypatch on top, as before.
+    """
+    if os.environ.get("FACTORY_LIVE_TESTS") == "1":
+        return
+    import factory.session as session_module
+
+    monkeypatch.setattr(session_module, "_keychain_token", lambda: None)
+    for name in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
 
 
 def pytest_configure(config: pytest.Config) -> None:

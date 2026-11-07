@@ -28,9 +28,16 @@ a path.
 from __future__ import annotations
 
 import hashlib
+import importlib.resources
 from pathlib import Path
 
-PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
+# F-51 (I-1): the seat prompts ship inside the package
+# (factory/data/prompts), resolved through importlib.resources — the
+# same one resolver as the schemas and the toolkit (no __file__ escapes,
+# no CWD-relative reads).
+PROMPTS_DIR = Path(
+    str(importlib.resources.files("factory").joinpath("data", "prompts"))
+)
 IMPLEMENTER_FILE = "implementer.md"
 REVIEWER_FILE = "reviewer.md"
 VERIFIER_FILE = "verifier.md"
@@ -167,6 +174,9 @@ def assemble_reviewer_prompt(profile: dict | None = None) -> str:
         )
     sections: list[str] = []
     for rel in standards:
+        # standards is empty when profile is None, so the loop body only
+        # ever runs with a loaded profile (stated for the checker).
+        assert profile is not None
         path = _standards_path(profile, rel)
         if not path.is_file():
             raise PromptError(
@@ -212,6 +222,9 @@ def assemble_verifier_prompt(profile: dict | None = None) -> str:
         )
     sections: list[str] = []
     for rel in standards:
+        # standards is empty when profile is None, so the loop body only
+        # ever runs with a loaded profile (stated for the checker).
+        assert profile is not None
         path = _standards_path(profile, rel)
         if not path.is_file():
             raise PromptError(

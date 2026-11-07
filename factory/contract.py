@@ -26,6 +26,7 @@ import copy
 import fnmatch
 import functools
 import hashlib
+import importlib.resources
 import json
 import tomllib
 from pathlib import Path
@@ -35,7 +36,14 @@ import jsonschema
 import yaml
 from jsonschema.exceptions import best_match
 
-SCHEMA_DIR = Path(__file__).resolve().parent.parent / "schema"
+# F-51 (I-1): the schemas ship INSIDE the package (factory/data/schema)
+# and are resolved through importlib.resources — the ONE resolver — so a
+# wheel install reads exactly what this checkout reads. No
+# ``Path(__file__).parent.parent`` escapes, no CWD-relative reads: those
+# are the two ways the package only worked from the checkout.
+SCHEMA_DIR = Path(
+    str(importlib.resources.files("factory").joinpath("data", "schema"))
+)
 
 # Kinds the factory never executes (TASK-CONTRACT §2).
 # MIRRORS the schema's task allOf rule 3 (non-executable kinds limited to
@@ -128,7 +136,9 @@ def _check_semantics(tasks: Any, origin: str) -> None:
             seen_ids.add(tid)
         tid = tid if isinstance(tid, str) else "<missing id>"
         risk = task.get("risk")
-        gates = task.get("gates") if isinstance(task.get("gates"), dict) else {}
+        # bound once so the isinstance guard narrows the .get below
+        gates_value = task.get("gates")
+        gates = gates_value if isinstance(gates_value, dict) else {}
 
         if risk and gates.get("merge") == "auto":
             raise ContractError(

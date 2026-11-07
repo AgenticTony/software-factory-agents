@@ -265,7 +265,9 @@ def _name_status_rows(status_out: str, head_ref: str) -> list:
         if not row.strip():
             continue
         parts = row.split("\t")
-        status = re.match(r"^[A-Z]+", parts[0]).group()
+        status_match = re.match(r"^[A-Z]+", parts[0])
+        assert status_match is not None  # a git status row starts with letters
+        status = status_match.group()
         if status == "U":
             raise GateError(f"unmerged path in diff of {head_ref}: {row}")
         # Exotic paths arrive quoted (single-quoted C style); decode so

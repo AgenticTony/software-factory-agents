@@ -211,7 +211,7 @@ def scrub_literal(text: str, secret: str | None) -> str:
     scrubbers from one home. :mod:`factory.trace` re-exports it unchanged
     (one implementation).
     """
-    if is_scrubbable_secret(secret):
+    if secret is not None and is_scrubbable_secret(secret):
         return text.replace(secret, REDACTED)
     return text
 

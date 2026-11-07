@@ -423,7 +423,10 @@ def _recover_credential_task(
     call, made with the finding named in ``evidence``). Refuses before
     any write on a missing or empty evidence, on ``--yes`` (the
     confirmation IS the gate), and on a declined prompt."""
-    if not (evidence or "").strip():
+    # Same refusal as `(evidence or "").strip()`, written so the type
+    # narrows to str for every use below (F-51/A-7: narrowing, no
+    # behaviour change — None and whitespace-only both stop here).
+    if evidence is None or not evidence.strip():
         raise ApprovalError(
             f"{task_id}: credential_added recovery requires --evidence — "
             "what you checked (e.g. 'test fixture, not a real credential' "
@@ -506,7 +509,10 @@ def _recover_attempts_task(
             "(e.g. 'all attempts died to the sandbox bind bug, fixed in "
             "PR #NN')."
         )
-    if not (evidence or "").strip():
+    # Same refusal as `(evidence or "").strip()`, written so the type
+    # narrows to str for every use below (F-51/A-7: narrowing, no
+    # behaviour change — None and whitespace-only both stop here).
+    if evidence is None or not evidence.strip():
         raise ApprovalError(
             f"{task_id}: attempts_exhausted recovery requires --evidence — "
             "what you checked before granting more attempts (the three "

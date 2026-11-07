@@ -124,13 +124,15 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping, NamedTuple, Sequence
+from typing import Any, Callable, Mapping, NamedTuple, Sequence, cast
 
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKError,
+    HookCallback,
     HookMatcher,
+    PermissionMode,
     ResultMessage,
 )
 from claude_agent_sdk import query as sdk_query
@@ -285,8 +287,12 @@ class BypassDenials:
         self.denied: set[str] = set()
         self.count: int = 0
 
+# F-51 (I-1): the staging source is the package itself (Path(__file__)'s
+# own dir — inside the package, so a wheel install stages from
+# site-packages exactly as this checkout stages from the repo). The old
+# _REPO_ROOT escape (parent.parent, checkout-relative) was dead code and
+# is gone: the package must work installed, not only from a checkout.
 _FACTORY_PKG = Path(__file__).resolve().parent
-_REPO_ROOT = _FACTORY_PKG.parent
 
 
 def _stage_runner(runner_dir: Path) -> Path:
@@ -516,7 +522,9 @@ class SeatConfig:
     system_prompt: str | None = None
     allowed_tools: tuple[str, ...] = ()
     disallowed_tools: tuple[str, ...] = ()
-    permission_mode: str | None = None
+    # The SDK's own mode literal (F-51/A-7): the values assigned below
+    # are exactly its members; str was the under-typed annotation.
+    permission_mode: "PermissionMode | None" = None
 
 
 SEATS: dict[str, SeatConfig] = {
@@ -823,7 +831,7 @@ def protected_path_hook(protected: "Sequence[str]") -> HookMatcher:
             return _deny(f"{file_path} matches protected path {matched!r}")
         return {}
 
-    return HookMatcher(matcher="Write|Edit|NotebookEdit", hooks=[_hook])
+    return HookMatcher(matcher="Write|Edit|NotebookEdit", hooks=[cast(HookCallback, _hook)])
 
 
 def _bash_write_targets(command: str) -> list[str]:
@@ -960,7 +968,7 @@ def bash_guard_hook(protected: "Sequence[str]" = ()) -> HookMatcher:
                     )
         return {}
 
-    return HookMatcher(matcher="Bash", hooks=[_hook])
+    return HookMatcher(matcher="Bash", hooks=[cast(HookCallback, _hook)])
 
 
 def sandbox_bypass_hook(denials: BypassDenials | None = None) -> HookMatcher:
@@ -995,7 +1003,7 @@ def sandbox_bypass_hook(denials: BypassDenials | None = None) -> HookMatcher:
         state.count += 1
         return _deny(SANDBOX_DENY_REASON)
 
-    return HookMatcher(matcher="Bash", hooks=[_hook])
+    return HookMatcher(matcher="Bash", hooks=[cast(HookCallback, _hook)])
 
 
 # ----------------------------------------------------------- options/record --
@@ -1035,7 +1043,7 @@ def mcp_guard_hook(granted: "frozenset[tuple[str, str]]") -> HookMatcher:
             )
         return {}
 
-    return HookMatcher(matcher="mcp__.*", hooks=[_hook])
+    return HookMatcher(matcher="mcp__.*", hooks=[cast(HookCallback, _hook)])
 
 
 def _apply_toolkit(options: ClaudeAgentOptions, toolkit: dict) -> None:
@@ -1095,16 +1103,27 @@ def _apply_toolkit(options: ClaudeAgentOptions, toolkit: dict) -> None:
         # The wrapper plugin (skills' on-disk home) rides first; plugin
         # items keep their own manifests.
         plugin_dirs.insert(0, {"type": "local", "path": str(staged)})
-    options.plugins = plugin_dirs
+    # The SDK accepts plain dicts for local plugins at runtime; its
+    # SdkPluginConfig TypedDict doesn't model this shape. Narrow,
+    # rule-named ignore (F-51/A-7, counted in test_f51's allowlist).
+    options.plugins = plugin_dirs  # pyright: ignore[reportAttributeAccessIssue]
     if skills:
         options.skills = skills
     if mcp_servers:
-        options.mcp_servers = {**(options.mcp_servers or {}), **mcp_servers}
+        # mcp_servers is dict|str|Path in the SDK; this branch only
+        # ever assigns a mapping built from its own dict-or-None value.
+        # Narrow, rule-named ignore (F-51/A-7 allowlist).
+        options.mcp_servers = {
+            **cast("dict[str, object]", options.mcp_servers or {}),
+            **mcp_servers,
+        }  # pyright: ignore[reportAttributeAccessIssue]
         options.strict_mcp_config = True
     options.allowed_tools = allowed
     # Finding 2: the granted pairs are the enforced set, not a wish.
-    if VENT_TOOL_NAME in (options.mcp_servers or {}):
+    if VENT_TOOL_NAME in cast("dict[str, object]", options.mcp_servers or {}):
         granted.add((VENT_TOOL_NAME, VENT_TOOL_NAME))
+    if options.hooks is None:  # SDK default is {}; None never occurs here
+        options.hooks = {}
     options.hooks["PreToolUse"].append(mcp_guard_hook(frozenset(granted)))
 
 
@@ -1257,7 +1276,9 @@ def _primary_model(model_usage: dict[str, Any] | None) -> str | None:
     back null from the CLI; they weigh zero rather than crash."""
 
     def weight(name: str) -> int:
-        entry = model_usage.get(name) or {}
+        # model_usage is None only when the caller returns early; the
+        # ``or {}`` keeps the closure total either way (F-51/A-7).
+        entry = (model_usage or {}).get(name) or {}
         return int(entry.get("inputTokens") or 0) + int(
             entry.get("outputTokens") or 0
         )
@@ -1802,7 +1823,11 @@ def probe_session_interpreter(
         run_dir.mkdir(parents=True)
         settings = build_settings(
             profile, run_dir, model_endpoint=DEFAULT_BASE_URL,
-            toolchain=default_toolchain(extra=[_bundled_cli()]),
+            # _bundled_cli() is a Path here or the probe cannot run at
+            # all; the cast keeps the [None] impossible shape typed away.
+            toolchain=default_toolchain(
+                extra=cast("list[Path]", [_bundled_cli()])),
+
         )
         settings_path = run_dir / "probe-settings.json"
         write_settings(settings, settings_path)
@@ -1950,7 +1975,7 @@ def run_session_sandboxed(
     # BEFORE the baseline so their (untracked) presence can never look
     # like a mutation between the two snapshots.
     review_guard = seat in ("reviewer", "verifier")
-    reviewer_writable: tuple[Path, Path] = ()
+    reviewer_writable: tuple[Path, ...] = ()
     baseline: _GitState | None = None
     record: SessionRecord | None = None
     if scratch_files and any(Path(name).name != name for name in scratch_files):
@@ -2005,6 +2030,10 @@ def run_session_sandboxed(
         finally:
             if review_guard:
                 _teardown_reviewer_scratch(run_dir)
+    # Every path that reaches the return produced a record (the None
+    # sentinel is consumed by the carry/teardown above) — the repo's
+    # impossible-state assert, same as state.py's table asserts.
+    assert record is not None
     return record
 
 
@@ -2415,10 +2444,16 @@ def _run_prepared(
                 seat, saved_record, trace_sink, run_dir, factory_root,
                 run_id, task_id)
             return saved_record
-        tail = scrub_session_text(exc.stderr or "", (token,))[:RECORD_STDERR_TAIL_CHARS]
+        # text=True run: the streams are str (TimeoutExpired is
+        # generic; the unparameterized type widens to bytes). The
+        # isinstance locals narrow for the checker without handing
+        # session text to any new callee (the F-43 AC-6 tripwire).
+        out_text = exc.output if isinstance(exc.output, str) else ""
+        err_text = exc.stderr if isinstance(exc.stderr, str) else ""
+        tail = scrub_session_text(err_text, (token,))[:RECORD_STDERR_TAIL_CHARS]
         saved = _save_session_stdout(
-            exc.output or "", run_dir, factory_root,
-            secrets=(token,), stderr=exc.stderr or "",
+            out_text, run_dir, factory_root,
+            secrets=(token,), stderr=err_text,
         )
         exc.add_note(_record_failure_text(
             "the sandboxed session entry was killed at the orchestrator's "
@@ -2485,11 +2520,13 @@ def _read_record(
     one, a seam-scrubbed stderr tail, and where the full streams were
     saved."""
     text, why = _open_record_once(record_path)
-    if why is None and not text.strip():
+    # why is None guarantees a read text (the _open_record_once
+    # correlation); ``or ""`` mirrors it for the type checker.
+    if why is None and not (text or "").strip():
         why = "is empty"
     if why is None:
         try:
-            return SessionRecord.from_dict(json.loads(text))
+            return SessionRecord.from_dict(json.loads(cast(str, text)))
         except (json.JSONDecodeError, TypeError, ValueError,
                 RecursionError) as exc:
             # RecursionError: a planted record can nest arbitrarily deep
@@ -2522,10 +2559,10 @@ def _read_record_quietly(record_path: Path) -> SessionRecord | None:
     session's delivered result (used, never discarded); anything else
     returns None — the timeout itself stays the failure being raised."""
     text, why = _open_record_once(record_path)
-    if why is not None or not text.strip():
+    if why is not None or not (text or "").strip():
         return None
     try:
-        return SessionRecord.from_dict(json.loads(text))
+        return SessionRecord.from_dict(json.loads(cast(str, text)))
     except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
         return None
 

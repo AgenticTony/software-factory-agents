@@ -19,7 +19,6 @@ Two invariants shape every fixture here:
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import re
 import shlex
@@ -32,8 +31,20 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import yaml
+from _support.f22 import (
+    MIT,
+    SKILL_MD,
+    _content_hash,
+    _hash_tree,
+    _make_mcp,
+    _make_skill,
+    _sha,
+    _toolkit_with,
+    _write_index,
+    _write_reports,
+)
 
-from factory.contract import ContractError, acceptance_hash, load_profile
+from factory.contract import SCHEMA_DIR, ContractError, acceptance_hash, load_profile
 from factory.mergeorder import Protection
 from factory.orchestrator import run_once
 from factory.session import SessionRecord, build_options, run_session
@@ -41,6 +52,7 @@ from factory.toolkit import (
     ALLOWED_LICENCES,
     TOOLKIT_PLUGIN_NAME,
     VET_CLASSES,
+    default_toolkit_dir,
     load_index,
     resolve_toolkit,
     stage_toolkit,
@@ -48,7 +60,7 @@ from factory.toolkit import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-TOOLKIT_DIR = REPO_ROOT / "toolkit"
+TOOLKIT_DIR = default_toolkit_dir()  # F-51: the vetted tree ships in the package
 FIXTURES = TOOLKIT_DIR / "fixtures" / "vet"
 STOCKHOLM = ZoneInfo("Europe/Stockholm")
 # A Sunday afternoon: outside every default peak window, so runs may start.
@@ -57,160 +69,14 @@ OFF_PEAK = datetime(2026, 10, 18, 15, 0, tzinfo=STOCKHOLM)
 # may talk to. api.z.ai stands in for the model endpoint.
 ALLOW = ["docs.python.org", "docs.example.com", "api.z.ai"]
 
-MIT = textwrap.dedent(
-    """
-    MIT License
-
-    Copyright (c) 2026 Fixture Upstream
-
-    Permission is hereby granted, free of charge, to any person obtaining a copy
-    of this software and associated documentation files (the "Software"), to deal
-    in the Software without restriction.
-
-    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
-    """
-).strip() + "\n"
 
 PROPRIETARY = "All rights reserved. No use, copying or redistribution.\n"
 
-SKILL_MD = (
-    "---\n"
-    "name: demo-skill\n"
-    "description: Demonstration vetted skill for the F-22 contract tests.\n"
-    "---\n"
-    "\n"
-    "Look things up on https://docs.python.org before guessing.\n"
-)
 
 DEMO_HASH_PLACEHOLDER = "0" * 64  # replaced by _make_skill at runtime
 
 
 # ---------------------------------------------------------------- helpers --
-
-
-def _sha(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def _hash_tree(root: Path) -> dict[str, str]:
-    """``{posix relpath: sha256}`` over every file under ``root``.
-
-    The test's own independent implementation of the content-addressing
-    ``factory.toolkit`` must agree with — a drift in either changes the
-    index hashes and refuses at load (AC-1).
-    """
-    files: dict[str, str] = {}
-    for path in sorted(root.rglob("*")):
-        if path.is_file():
-            files[path.relative_to(root).as_posix()] = _sha(path.read_bytes())
-    return files
-
-
-def _content_hash(files: dict[str, str]) -> str:
-    blob = "\n".join(f"{name}\n{digest}" for name, digest in sorted(files.items()))
-    return _sha(blob.encode())
-
-
-def _make_skill(toolkit: Path, name: str = "demo-skill",
-                licence_text: str = MIT) -> dict:
-    """One vendored skill item on disk; its index entry (hashes real)."""
-    item_dir = toolkit / "skills" / name
-    item_dir.mkdir(parents=True, exist_ok=True)
-    (item_dir / "SKILL.md").write_text(SKILL_MD)
-    (item_dir / "LICENSE").write_text(licence_text)
-    files = _hash_tree(item_dir)
-    return {
-        "kind": "skill",
-        "name": name,
-        "upstream": "https://github.com/example/example-skills",
-        "pin": {"commit": "a" * 40},
-        "licence": "MIT",
-        "content_hash": _content_hash(files),
-        "files": files,
-        "report": f"reports/{name}.md",
-        "dir": f"skills/{name}",
-    }
-
-
-def _make_mcp(toolkit: Path, name: str = "docs",
-              domains: list | None = None) -> dict:
-    """One vendored read-only MCP server item; its index entry.
-
-    The spawn references ``{staged}`` (review finding 3): the server
-    runs from the vendored, hash-verified copy inside the staged
-    toolkit — never a runtime fetch (npx/uvx/…) or an ambient install.
-    """
-    item_dir = toolkit / "mcp" / name
-    item_dir.mkdir(parents=True, exist_ok=True)
-    (item_dir / "LICENSE").write_text(MIT)
-    (item_dir / "README.md").write_text(f"# {name}\n\nRead-only docs server.\n")
-    (item_dir / "server.js").write_text(
-        "// stub vendored server entrypoint (review finding 3 fixture)\n"
-    )
-    files = _hash_tree(item_dir)
-    return {
-        "kind": "mcp_server",
-        "name": name,
-        "upstream": "https://github.com/example/example-docs-server",
-        "pin": {"version": "1.2.3", "integrity": "b" * 64},
-        "licence": "MIT",
-        "content_hash": _content_hash(files),
-        "files": files,
-        "report": f"reports/{name}.md",
-        "dir": f"mcp/{name}",
-        "mcp": {
-            "command": "node",
-            "args": [f"{{staged}}/mcp/{name}/server.js"],
-            # Admitted inert keys only (review round 3: descriptor env
-            # is an allowlist — CACHE_MODE-style knobs were never inert
-            # by construction, so the fixture uses the real admitted set).
-            "env": {"NO_COLOR": "1", "TZ": "Europe/Stockholm"},
-            "tools": [
-                {"name": "search", "mode": "read"},
-                {"name": "fetch_doc", "mode": "read"},
-            ],
-            "domains": domains if domains is not None else ["docs.example.com"],
-        },
-    }
-
-
-def _write_reports(toolkit: Path, entries: list[dict]) -> None:
-    """Vetting reports that name the content hash each one vetted.
-
-    F-47 (I-2): an MCP item's report also records the allowlists it was
-    vetted against (render_report's ``- allowlists:`` line) — the index
-    load checks the descriptor's domains against THAT record. Here the
-    vet ran against a project that allowed exactly the descriptor's
-    domains, so the per-project re-check at resolve time stays the one
-    that refuses a domain the RUNNING project doesn't allow."""
-    for entry in entries:
-        report = toolkit / entry["report"]
-        report.parent.mkdir(parents=True, exist_ok=True)
-        text = (
-            f"# Vet report — {entry['name']}\n\n"
-            f"content hash: {entry['content_hash']}\n"
-        )
-        if entry.get("kind") == "mcp_server":
-            text += f"- allowlists: {', '.join(entry['mcp']['domains'])}\n"
-        report.write_text(text)
-
-
-def _write_index(toolkit: Path, entries: list[dict]) -> None:
-    (toolkit / "index.yaml").write_text(
-        yaml.safe_dump({"items": entries}, sort_keys=False)
-    )
-
-
-def _toolkit_with(  # one skill + one mcp server, reports and index written
-    tmp: Path,
-) -> tuple[Path, dict, dict]:
-    toolkit = tmp / "toolkit"
-    skill = _make_skill(toolkit)
-    mcp = _make_mcp(toolkit)
-    entries = [skill, mcp]
-    _write_reports(toolkit, entries)
-    _write_index(toolkit, entries)
-    return toolkit, skill, mcp
 
 
 PROFILE_EXTRA_BASE = {
@@ -351,7 +217,7 @@ def test_ac_2(tmp_path: Path):
     assert ALLOWED_LICENCES == (
         "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC",
     )
-    schema = json.loads((REPO_ROOT / "schema" / "toolkit.schema.json").read_text())
+    schema = json.loads((SCHEMA_DIR / "toolkit.schema.json").read_text())
     entry = schema["properties"]["items"]["items"]
     enum = entry["properties"]["licence"]["enum"]
     assert sorted(enum) == sorted(ALLOWED_LICENCES)
@@ -684,7 +550,7 @@ def test_ac_6(tmp_path: Path):
     # inside toolkit refuses, a seat beyond the two known refuses).
     import jsonschema
 
-    schema = json.loads((REPO_ROOT / "schema" / "project.schema.json").read_text())
+    schema = json.loads((SCHEMA_DIR / "project.schema.json").read_text())
     valid = {
         "name": "demo", "repo": {"path": "/x", "default_branch": "main",
                                  "remote": "https://example.com/d.git"},

@@ -7,7 +7,7 @@ and no failure marker fired, nothing explains the non-zero exit: it must
 still produce ``command_failed``, never a pass (fail-closed).
 """
 
-from test_f07 import BASE_PROFILE, _change, _git, _repo, _run
+from _support.f07 import BASE_PROFILE, _change, _git, _repo, _run
 
 from factory.gates import CommandResult
 

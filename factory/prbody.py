@@ -372,6 +372,9 @@ def check_pr_body(body: str) -> None:
                 f"PR body must carry section '## {name}' exactly once (found {count})"
             )
     match = re.search(r"^## Merge Danger\n(.*?)(?=^## |\Z)", body, re.M | re.S)
+    # the section-presence check above guarantees the match (same failure
+    # class if it ever lied)
+    assert match is not None
     danger = match.group(1)
     for value in ("**Door:**", "**Blast Radius:**"):
         if value not in danger:

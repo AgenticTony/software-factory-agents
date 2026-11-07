@@ -39,7 +39,7 @@ import time
 from contextlib import suppress
 from functools import lru_cache
 from pathlib import Path
-from typing import Sequence
+from typing import Sequence, cast
 from urllib.parse import urlsplit
 
 SRT_PIN = "0.0.79"
@@ -383,7 +383,7 @@ def default_toolchain(extra: "Sequence[Path] | None" = None) -> list[Path]:
     entries (the session runner adds the resolved Claude CLI, which is not
     necessarily on the orchestrator's non-login PATH).
     """
-    toolchain: list[Path] = [sys.executable, *_python_toolchain()]
+    toolchain: list[Path] = [Path(sys.executable), *_python_toolchain()]
     toolchain += [
         Path(found) for name in TOOLCHAIN_BINS if (found := shutil.which(name))
     ]
@@ -953,6 +953,9 @@ def run_sandboxed(
     # past the pipe buffer (~64KB) — pytest -v, npm install logs, Claude
     # Code streams all blow past it. Nothing in this process ever blocks on
     # a pipe: every read goes through select with a bounded timeout.
+    # Both streams are PIPEd above; the assert states it for the type
+    # checker (Popen's stubs keep stdout/stderr Optional).
+    assert proc.stdout is not None and proc.stderr is not None
     streams = {"out": proc.stdout.fileno(), "err": proc.stderr.fileno()}
     buffers = {"out": bytearray(), "err": bytearray()}
     for fd in streams.values():
@@ -1016,10 +1019,12 @@ def run_sandboxed(
     out = buffers["out"].decode(errors="replace")
     err = buffers["err"].decode(errors="replace")
     if timed_out:
-        exc = subprocess.TimeoutExpired(proc.args, timeout, output=out, stderr=err)
+        exc = _ForcedCloseTimeoutExpired(
+            proc.args, cast(float, timeout), output=out, stderr=err
+        )
         exc.force_closed_pipes = force_closed
         raise exc
-    completed = subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+    completed = _ForcedCloseCompletedProcess(proc.args, proc.returncode, out, err)
     completed.force_closed_pipes = force_closed
     return completed
 
@@ -1039,6 +1044,20 @@ def escapee_event(label: str, force_closed: "Sequence[str]", *,
         "streams": list(force_closed),
         "timed_out": bool(timed_out),
     }
+
+
+class _ForcedCloseTimeoutExpired(subprocess.TimeoutExpired):
+    """TimeoutExpired carrying the F-47 drain fact (force_closed_pipes)
+    as a declared attribute instead of a dynamic one — same exception
+    identity for every except TimeoutExpired handler (F-51/A-7)."""
+
+    force_closed_pipes: "tuple[str, ...]" = ()
+
+
+class _ForcedCloseCompletedProcess(subprocess.CompletedProcess):
+    """CompletedProcess with the same declared drain fact."""
+
+    force_closed_pipes: "tuple[str, ...]" = ()
 
 
 def _pump(streams: dict, buffers: dict, wait: float, *,
@@ -1061,6 +1080,9 @@ def _pump(streams: dict, buffers: dict, wait: float, *,
         if chunk:
             buffers[name] += chunk
             if on_stdout_line is not None and name == "out":
+                # Callers pair on_stdout_line with partials (both or
+                # neither); the assert keeps that loud instead of None.
+                assert partials is not None
                 # Search only the new chunk for a newline; the accumulated
                 # partial is copied just once, when a line is actually
                 # emitted — a long newline-free line over many small reads

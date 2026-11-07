@@ -29,9 +29,15 @@ mismatch. System dependencies (per srt's own README):
 | Ubuntu 26.04 | not supported yet: srt's nested user namespace fails (`apply-seccomp: write /proc/self/setgroups … Permission denied`) and the sysctl above does not lift it; CI pins 24.04 |
 
 Then `ruff check . && pytest -q -n auto` (parallel via pytest-xdist; plain
-`pytest -q` works too and is what CI runs). The sandbox tests attempt the forbidden
+`pytest -q` works too). The sandbox tests attempt the forbidden
 actions for real and are never skipped: a missing `srt` or system dependency
-fails them, by design. CI (`.github/workflows/ci.yml`) runs the same steps.
+fails them, by design. Deliberate exceptions are visible in the `-rs` skip
+summary, never silent: the live-session halves of the f06 contract tests run
+only on the explicit `FACTORY_LIVE_TESTS=1` opt-in (F-51 — never inferred
+from a credential being present), and tests marked `live_network` (they need
+the public internet) are deselected by the main CI job and run in the named
+`live-network` job instead. CI (`.github/workflows/ci.yml`) runs the same
+steps plus the `typecheck` (pyright) and `wheel` install jobs.
 
 ## Operating: the monthly validator eval (F-16)
 

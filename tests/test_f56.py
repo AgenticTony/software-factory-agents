@@ -27,9 +27,9 @@ import textwrap
 from pathlib import Path
 
 import pytest
+from _support.f05 import _child, _fixture_repo
+from _support.f12 import _git_repo
 from claude_agent_sdk import ResultMessage
-from test_f05 import _child, _fixture_repo
-from test_f12 import _git_repo
 
 from factory.sandbox import SRT_PIN
 from factory.session import (
@@ -201,7 +201,7 @@ def test_ac_1_real_srt_record_dir_persists_on_the_host(tmp_path: Path):
     round 1, finding 1). Real srt writes into the session's -record dir
     through settings built exactly as _run_prepared builds them — the
     file must exist on the host afterwards (macOS and Linux CI alike)."""
-    from test_f05 import _child, _fixture_repo
+    from _support.f05 import _child, _fixture_repo
 
     from factory.runs import create_run
     from factory.sandbox import build_settings, run_sandboxed, write_settings
@@ -397,7 +397,7 @@ def test_ac_4_real_srt_large_line_survives_a_live_reader(tmp_path: Path):
     survive); what cuts a line is the READER stopping (the wall-clock
     kill / the F-47 force-close), which the file transport makes
     irrelevant to the record."""
-    from test_f05 import _child, _fixture_repo
+    from _support.f05 import _child, _fixture_repo
 
     from factory.runs import create_run
     from factory.sandbox import build_settings, run_sandboxed, write_settings

@@ -1,6 +1,6 @@
 # Task Contract — what the factory consumes
 
-The factory never reads a project's planning prose to decide what to do. It reads **`.factory/tasks.json`** (the queue) and **`.factory/project.yaml`** (how to build, check, and ship the project). Both live in the target repo. Schemas: [`schema/tasks.schema.json`](schema/tasks.schema.json), [`schema/project.schema.json`](schema/project.schema.json). Draft profiles: [`projects/`](projects/).
+The factory never reads a project's planning prose to decide what to do. It reads **`.factory/tasks.json`** (the queue) and **`.factory/project.yaml`** (how to build, check, and ship the project). Both live in the target repo. Schemas: [`factory/data/schema/tasks.schema.json`](factory/data/schema/tasks.schema.json), [`factory/data/schema/project.schema.json`](factory/data/schema/project.schema.json) (shipped in the package, F-51). Draft profiles: [`projects/`](projects/).
 
 Companion docs: [DESIGN-LOCAL-FACTORY.md](DESIGN-LOCAL-FACTORY.md) (architecture + decisions), [VALIDATOR-SPEC.md](VALIDATOR-SPEC.md) (how "done" is proven).
 

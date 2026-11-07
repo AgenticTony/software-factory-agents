@@ -5,12 +5,16 @@ The runner wraps ``claude_agent_sdk.query()`` per seat, inside the F-05
 sandbox: per-seat options (setting_sources=[], Z.ai env, tool lists),
 in-process PreToolUse hooks, a wall clock around the message stream, and a
 SessionRecord distilled from the ResultMessage. ``query`` is injected, so
-AC-1/2/5 (and AC-3's callback half) run against fakes; the real-session
-halves of AC-3/AC-4 need the Z.ai token, which by design (DESIGN D2, Rule
-of Two) exists only on the orchestrator's Mac. Where the token is absent —
-the Linux CI runner — those tests prove the runner's refusal path instead
-of skipping: a credential that must never leave the Mac is not a broken
-stack, and the refusal is real, tested behaviour.
+AC-1/2/5 (and AC-3's callback half) run against fakes. The real-session
+halves of AC-3/AC-4 spend money on the Z.ai model, so since F-51 (m-21)
+they run ONLY on the explicit ``FACTORY_LIVE_TESTS=1`` opt-in — never
+inferred from a credential being present (an org runner standardizing on
+the Z.ai gateway must not silently flip them to real spend). Without the
+opt-in they skip with a reason naming the variable; with the opt-in and
+no credential they fail loudly. The refusal-without-credential half is
+mandatory and hermetic on every machine (the credential lookup is
+monkeypatched to None): a credential that must never leave the Mac is not
+a broken stack, and the refusal is real, tested behaviour.
 """
 
 import ast
@@ -23,6 +27,7 @@ from pathlib import Path
 from typing import Callable
 
 import pytest
+from _support import live_session_gate
 from claude_agent_sdk import CLINotFoundError, ResultMessage
 
 from factory.session import (
@@ -163,10 +168,13 @@ def test_ac_2():
 
 # ----------------------------------------------- F-06 AC-3: blocking hooks --
 
-def test_ac_3(tmp_path: Path):
+def test_ac_3(tmp_path: Path, monkeypatch):
     """The protected-path hook denies Write/Edit/NotebookEdit on protected
-    paths (unit half on the callback), and blocks a write inside a real
-    session (real half, token-gated; refusal path where there is no token).
+    paths (unit half on the callback), the runner refuses to start
+    without a credential (refusal half — hermetic on every machine since
+    F-51/m-21), and a REAL session in a REAL sandbox runs only on the
+    explicit ``FACTORY_LIVE_TESTS=1`` opt-in — a credential being present
+    never turns the live half on.
     """
     hook = protected_path_hook(["schema/**", ".git/config"])
     callback = hook.hooks[0]
@@ -201,27 +209,38 @@ def test_ac_3(tmp_path: Path):
     for command in ["git status", "git commit -m x", "echo gh-gh-gh", "ls .config"]:
         assert _decision(guard, "Bash", {"command": command}) is None, command
 
-    # --- real half -----------------------------------------------------------
-    # A bool, never the token: a local holding it would print under
-    # `pytest -l` (showlocals) on any failure below.
+    # --- refusal half (mandatory, hermetic since F-51/m-21) ------------------
+    # The CI shape on EVERY machine: with no credential the runner must
+    # refuse loudly rather than spawn a session that cannot authenticate.
+    # Monkeypatched to None so the owner's real keychain item cannot answer
+    # first — and so the refusal is proven even with the live opt-in set.
+    import factory.session as session_mod
+
+    monkeypatch.setattr(session_mod, "seat_token", lambda: None)
+    with pytest.raises(SessionConfigError, match="factory-zai"):
+        run_session_sandboxed(
+            seat="implementer",
+            prompt="blocked",
+            run_dir=tmp_path,
+            profile={},
+            factory_root=tmp_path,
+            max_turns=2,
+            timeout_min=1,
+            protected=[".git/config"],
+            token=None,
+            srt_bin_path=None,
+        )
+    monkeypatch.undo()
+
+    # --- live half (explicit opt-in only; never credential-inferred) ---------
+    live_session_gate()
     have_token = seat_token() is not None
     if not have_token:
-        # The CI shape: no credential exists here by design. The runner must
-        # refuse loudly rather than spawn a session that cannot authenticate.
-        with pytest.raises(SessionConfigError, match="factory-zai"):
-            run_session_sandboxed(
-                seat="implementer",
-                prompt="blocked",
-                run_dir=tmp_path,
-                profile={},
-                factory_root=tmp_path,
-                max_turns=2,
-                timeout_min=1,
-                protected=[".git/config"],
-                token=None,
-                srt_bin_path=None,
-            )
-        return
+        pytest.fail(
+            "FACTORY_LIVE_TESTS=1 is set but no factory-zai credential is "
+            "available: the opted-in live session cannot authenticate. Loud "
+            "by design — never a silent skip. (F-51/m-21)"
+        )
 
     # The owner's Mac: a real session in a real sandbox is ordered to
     # create a file at a protected path. If the hook failed, the Write
@@ -617,26 +636,36 @@ def test_ac3_retry_budget_bounds_and_is_documented():
 
 # ----------------------------------------------- F-06 AC-4: real smoke run --
 
-def test_ac_4(tmp_path: Path):
+def test_ac_4(tmp_path: Path, monkeypatch):
     """A real session against Z.ai completes a trivial prompt; the recorded
-    model name comes from model_usage. Token-gated like AC-3's real half:
-    without a credential the runner's refusal is the assertion (CI shape).
+    model name comes from model_usage. Like AC-3: the refusal without a
+    credential is the mandatory, hermetic half; the real session runs only
+    on the explicit ``FACTORY_LIVE_TESTS=1`` opt-in (F-51/m-21) and fails
+    loudly when the opt-in is set but the credential is missing.
     """
-    # A bool, never the token: a local holding it would print under
-    # `pytest -l` (showlocals) on any failure below.
+    import factory.session as session_mod
+
+    monkeypatch.setattr(session_mod, "seat_token", lambda: None)
+    with pytest.raises(SessionConfigError, match="factory-zai"):
+        run_session_sandboxed(
+            seat="implementer",
+            prompt="ok",
+            run_dir=tmp_path,
+            profile={},
+            factory_root=tmp_path,
+            max_turns=2,
+            timeout_min=1,
+        )
+    monkeypatch.undo()
+
+    live_session_gate()
     have_token = seat_token() is not None
     if not have_token:
-        with pytest.raises(SessionConfigError, match="factory-zai"):
-            run_session_sandboxed(
-                seat="implementer",
-                prompt="ok",
-                run_dir=tmp_path,
-                profile={},
-                factory_root=tmp_path,
-                max_turns=2,
-                timeout_min=1,
-            )
-        return
+        pytest.fail(
+            "FACTORY_LIVE_TESTS=1 is set but no factory-zai credential is "
+            "available: the opted-in live session cannot authenticate. Loud "
+            "by design — never a silent skip. (F-51/m-21)"
+        )
 
     from factory.runs import cleanup_run, create_run
     from factory.sandbox import ensure_srt

@@ -454,7 +454,10 @@ def _pytest_config_at(repo: Path, ref: str, path: str, tables: list) -> tuple[di
         # and ConfigParser's default lowercasing compared an inert
         # ``Addopts`` at base equal to a live ``addopts`` at head
         # (round 3, finding 4).
-        parser.optionxform = str
+        # the documented configparser idiom (assigning the transform);
+        # the stubs type the slot as a method — narrow, rule-named
+        # ignore (F-51/A-7, counted in test_f51's allowlist)
+        parser.optionxform = str  # pyright: ignore[reportAttributeAccessIssue]
         try:
             parser.read_string(content)
         except configparser.Error as exc:

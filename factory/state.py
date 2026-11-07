@@ -46,6 +46,7 @@ from collections import namedtuple
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import cast
 
 from factory.contract import (
     NON_EXECUTABLE_KINDS,
@@ -58,7 +59,7 @@ from factory.contract import (
 )
 
 # All task statuses. MIRRORS the schema's status enum
-# (schema/tasks.schema.json $defs/status); keep both in sync.
+# (factory/data/schema/tasks.schema.json $defs/status); keep both in sync.
 STATUSES = frozenset(
     {
         "draft",
@@ -300,7 +301,7 @@ def check_recovery_transition(task: dict, new: str) -> str:
         TransitionError: If the edge isn't a recovery edge, or the task
             isn't a stale_base/pr_closed escalation holding a PR link.
     """
-    reason = RECOVERY_TRANSITIONS.get((task.get("status"), new))
+    reason = RECOVERY_TRANSITIONS.get((_status_of(task), new))
     if reason is None or not recovery_task_eligible(task):
         raise TransitionError(
             f"recovery transition {task.get('status')} -> {new} needs a "
@@ -310,6 +311,13 @@ def check_recovery_transition(task: dict, new: str) -> str:
             "only through TaskQueue.recover_attempts)"
         )
     return reason
+
+
+def _status_of(task: dict) -> str:
+    """The task's status, typed: schema-required on every task
+    (tasks.schema.json is validated on load — F-02), so this is a typed
+    read, not a presence check (F-51/A-7, a cast with its reason)."""
+    return cast(str, task.get("status"))
 
 
 @dataclass(frozen=True)
@@ -850,7 +858,7 @@ class TaskQueue:
             ConcurrentWriteError: If another writer changed the file.
         """
         task = self.get(task_id)
-        current = task.get("status")
+        current = _status_of(task)
         if (current, new_status) in RECOVERY_TRANSITIONS:
             # F-26 recovery edges: gated on the task, not just the pair
             # (round-4 finding 2) — only the sweep and `factory recover`
@@ -858,7 +866,7 @@ class TaskQueue:
             check_recovery_transition(task, new_status)
         else:
             check_transition(current, new_status)
-        _check_kind_rules(task, task.get("status"), new_status)
+        _check_kind_rules(task, _status_of(task), new_status)
         _check_slice_rules(task, new_status)
         _check_owner_step_rules(task, new_status)
         task["status"] = new_status
@@ -904,9 +912,9 @@ class TaskQueue:
             "blocked" if unmet_dependencies(task, self.doc.get("tasks", []))
             else "ready"
         )
-        reason = RECOVERY_TRANSITIONS.get((task.get("status"), new_status))
+        reason = RECOVERY_TRANSITIONS.get((_status_of(task), new_status))
         assert reason is not None  # needs_human → ready/blocked is in the table
-        _check_kind_rules(task, task.get("status"), new_status)
+        _check_kind_rules(task, _status_of(task), new_status)
         _check_slice_rules(task, new_status)
         _check_owner_step_rules(task, new_status)
         task["status"] = new_status
@@ -959,9 +967,9 @@ class TaskQueue:
             "blocked" if unmet_dependencies(task, self.doc.get("tasks", []))
             else "ready"
         )
-        reason = RECOVERY_TRANSITIONS.get((task.get("status"), new_status))
+        reason = RECOVERY_TRANSITIONS.get((_status_of(task), new_status))
         assert reason is not None  # needs_human → ready/blocked is in the table
-        _check_kind_rules(task, task.get("status"), new_status)
+        _check_kind_rules(task, _status_of(task), new_status)
         _check_slice_rules(task, new_status)
         _check_owner_step_rules(task, new_status)
         task["status"] = new_status
@@ -1002,7 +1010,7 @@ class TaskQueue:
         if not statuses:
             raise StateError(f"{task_id}: transition_path needs at least one status")
         task = self.get(task_id)
-        current = task.get("status")
+        current = _status_of(task)
         for new_status in statuses:
             check_transition(current, new_status)
             _check_kind_rules(task, current, new_status)
@@ -1048,7 +1056,7 @@ class TaskQueue:
             candidate["owner_steps"][number - 1].update(
                 done=True, done_at=stamp, done_by=done_by, evidence=evidence.strip()
             )
-        current = candidate.get("status")
+        current = _status_of(candidate)
         path: list = []
         if not open_owner_steps(candidate):
             if current == "awaiting_owner":

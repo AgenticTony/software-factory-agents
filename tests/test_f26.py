@@ -28,7 +28,7 @@ from zoneinfo import ZoneInfo
 import pytest
 import yaml
 
-from factory.contract import ContractError, acceptance_hash, load_profile
+from factory.contract import SCHEMA_DIR, ContractError, acceptance_hash, load_profile
 from factory.mergeorder import (
     MergeOrderError,
     Protection,
@@ -410,7 +410,7 @@ def test_ac_3(tmp_path: Path):
 
     # The escalation exists in the schema enum (red-first) and the
     # in_review -> needs_human edge is legal (lateral targets unchanged).
-    schema = json.loads((REPO_ROOT / "schema" / "tasks.schema.json").read_text())
+    schema = json.loads((SCHEMA_DIR / "tasks.schema.json").read_text())
     assert "stale_base" in schema["$defs"]["escalation"]["enum"]
     assert ("in_review", "needs_human") in ALLOWED_TRANSITIONS
     assert ("in_review", "awaiting_owner") not in ALLOWED_TRANSITIONS
@@ -802,7 +802,7 @@ def test_review14_a_closed_pr_escalates_pr_closed(tmp_path: Path):
     last = task["attempts"][-1]
     assert last["escalation"] == "pr_closed"
     assert last["outcome"] == "escalated"
-    schema = json.loads((REPO_ROOT / "schema" / "tasks.schema.json").read_text())
+    schema = json.loads((SCHEMA_DIR / "tasks.schema.json").read_text())
     assert "pr_closed" in schema["$defs"]["escalation"]["enum"]
 
 

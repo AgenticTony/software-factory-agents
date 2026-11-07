@@ -9,7 +9,9 @@ subcommand is a stub naming the work order that implements it
 
 import argparse
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from factory.approve import (
     ApprovalError,
@@ -445,7 +447,9 @@ def _run_import(args: argparse.Namespace) -> int:
         # the tuple below names no decode error; OSError is for the
         # write path (TaskQueue lock, mkdir, atomic rename).
         validate_budget(args.max_turns, args.timeout_min)
-        session = None
+        # Optional callable (F-51/A-7: the explicit annotation keeps the
+        # None sentinel and the later def assignable to one name).
+        session: Callable[[str], str] | None = None
         # `is not None`, not truthiness: --proposal "" (an unset shell
         # variable) is a missing file to refuse, not a request for the
         # model session.
@@ -454,8 +458,10 @@ def _run_import(args: argparse.Namespace) -> int:
                 raise ContractError("--proposal is empty: name a proposal file")
             proposal_text = read_file(Path(args.proposal), args.proposal)
 
-            def session(prompt: str) -> str:
+            def _proposal_session(prompt: str) -> str:
                 return proposal_text
+
+            session = _proposal_session
 
         # session=None: the importer session runs sandboxed (srt, the
         # read-only reviewer guard) in a disposable clone, never
@@ -641,7 +647,12 @@ def _run_extra(result) -> str:
 def _run_orchestrator(args: argparse.Namespace) -> int:
     """Dispatch run/loop; known failures exit 2 with a message, not a traceback."""
     try:
-        kwargs = {"factory_root": Path(args.factory_root) if args.factory_root else None}
+        # Any-typed bag (F-51/A-7): run_once/loop take different
+        # keyword subsets; the calls below are type-checked at their own
+        # call sites.
+        kwargs: dict[str, Any] = {
+            "factory_root": Path(args.factory_root) if args.factory_root else None
+        }
         if args.config:
             kwargs["config"] = load_config(args.config)
         if args.command == "run":

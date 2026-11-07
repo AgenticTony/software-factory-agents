@@ -26,7 +26,10 @@ commands:
 paths:
   risk:
     # Control files: touching these changes how work is chosen or judged.
-    factory_control: ["schema/**", "TASK-CONTRACT.md", "VALIDATOR-SPEC.md", ".factory/**"]
+    # F-51 (I-1): schema/** moved into the package (factory/data/schema)
+    # and the risk glob followed the files — a move never de-risks the
+    # queue's own schema.
+    factory_control: ["factory/data/schema/**", "TASK-CONTRACT.md", "VALIDATOR-SPEC.md", ".factory/**"]
     deploy: [".github/workflows/**"]
   # #53 finding 1: setup's npm ci installs node_modules/.bin/srt; L1's
   # between-phase git clean -fdx keeps only declared setup outputs, so
@@ -37,7 +40,11 @@ paths:
   protected:
     - ".factory/**"
     - ".github/workflows/**"
-    - "schema/**"
+    # F-51 (I-1): schema/**, toolkit/** and prompts/** moved into the
+    # package as factory/data/**; this glob followed the files so the
+    # move never unprotected them (tests/test_f51.py proves the moved
+    # paths still match).
+    - "factory/data/**"
     - "TASK-CONTRACT.md"
     - "VALIDATOR-SPEC.md"
     - "CLAUDE.md"
@@ -201,6 +208,12 @@ paths:
     # session/sandbox/egress modules and the record channel every seat's
     # result rides on.
     - "tests/test_f56.py"
+    # F-51: same precedent — the suite/CI-hygiene contract tests (the
+    # interpreter-independent prompt check, the live-network job split,
+    # the explicit live opt-in, exact tool pins, warnings-as-errors,
+    # condition waits, the shared tests/_support package, the wheel
+    # install, pyright) judge the gate every other WO is judged by.
+    - "tests/test_f51.py"
     # F-43 review round 1: the seam itself and its vent wiring, the F-42
     # factory/attribution.py precedent — a factory-built PR must not be
     # able to weaken the C-1 fix (scrub_session_text returning its input,

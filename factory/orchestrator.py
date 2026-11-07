@@ -69,7 +69,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, NamedTuple, Sequence
+from typing import Any, Callable, NamedTuple, Sequence, cast
 
 from factory.config import CONFIG_FILE, FactoryConfig, in_peak_window, load_config
 from factory.contract import load_profile
@@ -348,7 +348,12 @@ def sandboxed_runner(
             )
         except subprocess.TimeoutExpired as exc:
             report(name, exc, True)
-            output = (exc.output or "") + (exc.stderr or "")
+            # TimeoutExpired is generic; this run is text-mode (str
+            # streams) — Any locals keep the tolerant isinstance below
+            # meaningful instead of lying about the type (F-51/A-7).
+            out_any: Any = exc.output
+            err_any: Any = exc.stderr
+            output = (out_any or "") + (err_any or "")
             if isinstance(output, bytes):
                 output = output.decode(errors="replace")
             return CommandResult(name, command, None, output, timed_out=True)
@@ -568,12 +573,12 @@ def _compact(report: dict | None, tail: int) -> dict | None:
     """A report dict with each command output cut to its last ``tail`` chars."""
     if report is None:
         return None
-    report = json.loads(json.dumps(report))
-    for command in report.get("commands") or []:
+    clone = json.loads(json.dumps(report))
+    for command in clone.get("commands") or []:
         out = command.get("output") or ""
         if len(out) > tail:
             command["output"] = f"[... {len(out) - tail} chars cut ...]\n" + out[-tail:]
-    return report
+    return clone
 
 
 def _numbered_findings(reports: dict, extra: list[str],
@@ -1461,7 +1466,13 @@ def _sweep_escalation(
         task_id,
     )
     queue.transition(task_id, "needs_human")
-    return RunResult("needs_human", task_id, escalation=escalation, reports=reports)
+    # reports may be None on this escalation path (pre-existing shape;
+    # consumers on escalated results treat it as falsy) — the cast
+    # preserves today's exact value (F-51/A-7).
+    return RunResult(
+        "needs_human", task_id, escalation=escalation,
+        reports=cast("dict", reports),
+    )
 
 
 def _no_deploy_target(profile: dict) -> bool:
@@ -2909,11 +2920,13 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                             impl.result or "", egress_secrets)[:_PR_NOTES_CAP]
                         for tail in (_PR_OUTPUT_TAIL, 200, 0):  # shrink outputs to fit GitHub
                             body = build_pr_body(
-                                task, profile, branch=branch, base_sha=base_sha, head_sha=head_sha,
+                                task, profile, branch=branch, base_sha=base_sha,
+                                head_sha=cast(str, head_sha),
                                 changed_paths=changed,
                                 reports={k: _compact(v, tail)
                                          for k, v in scrubbed_reports.items()},
-                                l1_report=l1, extra_flags=l0.risk_flags_added,
+                                l1_report=l1,
+                                extra_flags=cast("Any", l0).risk_flags_added,
                                 implementer_notes=scrubbed_notes,
                                 attempt=attempt_no,
                             )
@@ -2932,7 +2945,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                         # failed, so the secrets travel with it.
                         pr_title = f"{task_id}: {task.get('title', '')}"
                         check_pr_text(pr_title, body, secrets=egress_secrets)
-                        push_branch(work.root, repo_cfg["remote"], branch, sha=head_sha,
+                        push_branch(work.root, repo_cfg["remote"], branch,
+                                    sha=cast(str, head_sha),
                                     created=created, default_branch=default_branch)
                         pushed = True
                         url = ctx.open_pr(PullRequest(
@@ -2941,7 +2955,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                         ))
                         opened = True
                         attempt = attempt_record(attempt_no, started, "pass", records, path,
-                                                 pr=url, sentinels=list(l0.sentinel_results),
+                                                 pr=url,
+                                                 sentinels=list(cast("Any", l0).sentinel_results),
                                                  review_drops=_review_drops(l2),
                                                  final_review=final_field)
                         queue.append_attempt(task_id, attempt)
@@ -2973,7 +2988,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                 # deterministic findings are actionable work, whatever the
                 # review repeats.
                 if _round_stuck(l0, l1, l2):
-                    note = _NO_PROGRESS_NOTES[l2.no_progress_reason]
+                    note = _NO_PROGRESS_NOTES[
+                        cast("Any", l2).no_progress_reason]
                     attempt = attempt_record(
                         attempt_no, started, "escalated", records, path,
                         escalation="review_not_converging", note=note,

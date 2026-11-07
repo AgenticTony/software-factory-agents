@@ -122,7 +122,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, ClassVar, NamedTuple, Sequence
+from typing import Any, Callable, ClassVar, NamedTuple, Sequence, cast
 
 from factory.gates import Finding, GateReport
 
@@ -443,11 +443,12 @@ def _extract_json(output: Any) -> Any:
             unparsed.append((start, end, candidate))
 
     verdicts = {
-        value.get("verdict").strip().lower()
+        v.strip().lower()
         for _, _, value in parsed
         if isinstance(value, dict)
-        and isinstance(value.get("verdict"), str)
-        and value.get("verdict").strip().lower() in ("pass", "fail")
+        # bound once so the isinstance guard narrows the strip below
+        for v in [value.get("verdict")]
+        if isinstance(v, str) and v.strip().lower() in ("pass", "fail")
     }
     if len(verdicts) > 1:
         raise _InvalidVerdict(
@@ -862,11 +863,12 @@ def apply_convergence(
         else "pass"
     )
     l2_findings = [f for f in active if isinstance(f, L2Finding)]
-    only_this_runs_carries = (
+    only_this_runs_carries = bool(
         l2_findings
         and len(l2_findings) == len(active)
         and all(
-            f.state == "carried" and prior.get(f.key) is not None
+            f.state == "carried"
+            and prior.get(cast(str, f.key)) is not None
             for f in l2_findings
         )
     )
@@ -1002,7 +1004,7 @@ def merge_reviews(reports: Sequence[L2Report]) -> L2Report:
         for finding in report.findings:
             if not isinstance(finding, L2Finding):
                 continue  # an invalid-verdict Finding never reaches here
-            index = index_of_key.get(finding.key)
+            index = index_of_key.get(cast(str, finding.key))
             if index is None:
                 # F-41: no exact-text duplicate — try the location key
                 # (same file, nearby line) before registering a new entry.
@@ -1018,13 +1020,16 @@ def merge_reviews(reports: Sequence[L2Report]) -> L2Report:
                     finding, id=f"U-{len(merged) + 1}", reported_by=[number]
                 )
                 merged.append(union_finding)
-                index_of_key[union_finding.key] = len(merged) - 1
+                index_of_key[cast(str, union_finding.key)] = len(merged) - 1
                 continue
             existing = merged[index]
             if number not in existing.reported_by:
                 existing.reported_by.append(number)
-            harsher = _SEVERITY_RANK.get(finding.severity, 99) < _SEVERITY_RANK.get(
-                existing.severity, 99
+            # severity is Optional on the dataclass but a finding that
+            # reached the union always carries one (the verdict schema
+            # requires it) — cast for the rank lookups only.
+            harsher = _SEVERITY_RANK.get(cast(str, finding.severity), 99) < _SEVERITY_RANK.get(
+                cast(str, existing.severity), 99
             )
             # The harsher call leads (replace() preserves the entry's
             # identity). Rank 0 is blocking, so harsher is the SMALLER rank
@@ -1223,7 +1228,9 @@ def apply_vote(
         if isinstance(finding, L2Finding) and _unanimous(finding, reviewers)
     }
     for entry in outcome.dropped:
-        finding = unanimous_pool.get((entry.get("finding") or {}).get("id"))
+        # the vote record's finding id is schema-required; ``or {}``
+        # guards a malformed entry the same way as before (F-51/A-7 cast)
+        finding = unanimous_pool.get(cast(str, (entry.get("finding") or {}).get("id")))
         if finding is None:
             drops.append(entry)
             continue
@@ -1249,7 +1256,7 @@ def apply_vote(
         if finding.severity == "blocking":
             tag = "important"
         decorated.append((
-            _SEVERITY_RANK.get(finding.severity, 99),
+            _SEVERITY_RANK.get(cast(str, finding.severity), 99),
             _TAG_RANK.get(tag, 99),
             index,
             replace(finding, tag=tag),
