@@ -80,6 +80,11 @@ class TraceError(Exception):
 EVENT_TYPES = (
     "phase_start", "phase_end", "tool_call", "gate_check", "session_end",
     "run_end", "sandbox_escapee",
+    # F-56 review round 1: a record read and used after the orchestrator's
+    # wall-clock kill (the file could only predate the kill). Emitted by
+    # the session runner's timeout path, never accepted from stdout (the
+    # forwarder still passes tool_call only).
+    "record_used_after_timeout",
 )
 PHASES = ("setup", "implementer", "L0", "L1", "L2", "publish")
 RUN_END_OUTCOMES = ("published", "failed", "aborted")

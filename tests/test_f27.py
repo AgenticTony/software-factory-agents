@@ -489,9 +489,13 @@ def test_sandboxed_spec_carries_run_and_task_ids(tmp_path: Path, monkeypatch):
     def fake_run_sandboxed(cmd, run_dir, settings_path, **kwargs):
         captured["spec"] = json.loads(Path(cmd[-1]).read_text())
         record = SessionRecord(seat="implementer", status="completed")
-        return subprocess.CompletedProcess(
-            cmd, 0, json.dumps(record.to_dict()) + "\n", ""
-        )
+        # F-56 re-seat: the record rides the file the spec names.
+        from factory.session import record_path_for
+
+        record_path = record_path_for(Path(settings_path))
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        record_path.write_text(json.dumps(record.to_dict()))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(session_mod, "run_sandboxed", fake_run_sandboxed)
     session_mod.run_session_sandboxed(

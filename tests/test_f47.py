@@ -565,19 +565,23 @@ def test_session_escapee_reaches_the_trace_sink(tmp_path: Path, monkeypatch):
     """The session path (``_run_prepared``, shared by the single session
     and the fan-out) emits one ``sandbox_escapee`` event through its
     trace sink when run_sandboxed reports force-closed pipes — on the
-    normal return AND on the timeout raise."""
+    normal return AND on the timeout raise. F-56 re-seat: the record the
+    fake entry leaves travels by the file (record_path_for), so the
+    timeout leg keeps its record and still raises only the timeout."""
     import factory.session as session_module
 
-    record = {"seat": "implementer", "status": "completed", "reason": None}
+    record = {"seat": "implementer", "status": "completed", "reason": None,
+              "permission_denials_dropped": 0}
 
     def fake(cmd, run_dir, settings_path, **kwargs):
-        proc = subprocess.CompletedProcess(cmd, 0, json.dumps(record) + "\n", "")
+        record_path = session_module.record_path_for(Path(settings_path))
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        record_path.write_text(json.dumps(record))
+        proc = subprocess.CompletedProcess(cmd, 0, "", "")
         proc.force_closed_pipes = ("stdout",)
         return proc
 
     monkeypatch.setattr(session_module, "run_sandboxed", fake)
-    monkeypatch.setattr(session_module.SessionRecord, "from_dict",
-                        classmethod(lambda cls, d: d))
     root = tmp_path / "factory-root"
     run = create_run(PROJECT, _fixture_repo(tmp_path), factory_root=root)
     events: list[dict] = []
@@ -594,6 +598,9 @@ def test_session_escapee_reaches_the_trace_sink(tmp_path: Path, monkeypatch):
     assert events[0]["streams"] == ["stdout"]
 
     def fake_timeout(cmd, run_dir, settings_path, **kwargs):
+        # No record written: the runner hung before delivering one, so
+        # the timeout itself stays the failure (a record WOULD be used —
+        # F-56 pins that in tests/test_f56.py's timeout test).
         exc = subprocess.TimeoutExpired(cmd, 1, output="", stderr="")
         exc.force_closed_pipes = ("stderr",)
         raise exc
