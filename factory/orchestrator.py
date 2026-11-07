@@ -80,12 +80,10 @@ from factory.l0 import run_l0
 from factory.l1 import run_l1
 from factory.l2 import (
     L2Finding,
-    apply_convergence,
-    apply_vote,
-    final_review_verdict,
     merge_reviews,
     parse_reviews_with_retry,
     parse_verifier_vote,
+    settle_review_verdict,
 )
 from factory.mergeorder import admission, gh_branch_protection, gh_pr_state
 from factory.prbody import PRBodyError, build_pr_body, check_pr_body
@@ -2463,7 +2461,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                 if quota_result is not None:
                                     return quota_result
                                 union = merge_reviews(verdicts)
-                                l2 = union
+                                vote = None
                                 if union.parse_error is None and union.findings:
                                     remaining_verifier = (
                                         budget["wall_clock_min"]
@@ -2548,21 +2546,21 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                             f"{verifier.reason} — nothing was "
                                             "dropped; every finding stands"
                                         )
-                                    l2 = apply_vote(
-                                        union,
-                                        parse_verifier_vote(
-                                            verifier.result
-                                            if verifier.status == "completed"
-                                            else None,
-                                            union.findings,
-                                        ),
-                                        reviewers=ctx.config.reviewers,
+                                    vote = parse_verifier_vote(
+                                        verifier.result
+                                        if verifier.status == "completed"
+                                        else None,
+                                        union.findings,
                                     )
-                                l2 = apply_convergence(
-                                    l2,
-                                    prior,
-                                    delta_files if delta_files is not None else frozenset(),
+                                # F-48 (M-3): the post-review chain — union,
+                                # vote, convergence — is ONE shared function
+                                # (factory.l2.settle_review_verdict), so the
+                                # eval measures the verdict this queue
+                                # actually renders, not a drifting copy.
+                                l2 = settle_review_verdict(
+                                    union, prior, delta_files,
                                     delta_mode=delta is not None,
+                                    vote=vote, reviewers=ctx.config.reviewers,
                                 )
                                 reports["L2"] = l2.to_dict()
                                 trace.gate_checks(reports["L2"])  # F-30 AC-3
@@ -2732,7 +2730,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                 if quota_result is not None:
                                     return quota_result
                                 union = merge_reviews(verdicts)
-                                l2 = union
+                                vote = None
                                 if union.parse_error is None and union.findings:
                                     remaining_verifier = (
                                         budget["wall_clock_min"]
@@ -2812,15 +2810,11 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                             f"{verifier.reason} — nothing was "
                                             "dropped; every finding stands"
                                         )
-                                    l2 = apply_vote(
-                                        union,
-                                        parse_verifier_vote(
-                                            verifier.result
-                                            if verifier.status == "completed"
-                                            else None,
-                                            union.findings,
-                                        ),
-                                        reviewers=ctx.config.reviewers,
+                                    vote = parse_verifier_vote(
+                                        verifier.result
+                                        if verifier.status == "completed"
+                                        else None,
+                                        union.findings,
                                     )
                                 # AC-2: the F-23 delta rules do not apply —
                                 # the full diff is the scope, nothing is out
@@ -2829,9 +2823,14 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                 # surviving blocking or major finding fails
                                 # the final review (a declared fail alone
                                 # does not: minors reach the PR body within
-                                # the nit budget).
-                                l2 = final_review_verdict(apply_convergence(
-                                    l2, prior, frozenset(), delta_mode=False))
+                                # the nit budget). F-48 (M-3): the chain is
+                                # the ONE shared function, final=True for
+                                # F-41's failure rule.
+                                l2 = settle_review_verdict(
+                                    union, prior, frozenset(),
+                                    delta_mode=False, vote=vote,
+                                    reviewers=ctx.config.reviewers, final=True,
+                                )
                                 if reports.get("L2") is not None:
                                     # The round's delta review stays on the
                                     # record; the final review is the

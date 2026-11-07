@@ -300,41 +300,47 @@ def _clean_line(clean_record: dict) -> str:
 
 
 def test_clean_line_reports_l2_verdict():
+    # F-48 re-seat: the line names all three layers now (m-11); the
+    # record is the real run_seed shape (L0/L1 always recorded).
     record = {
         "id": "clean-new-helper",
         "title": "New helper, no defect",
         "blocking_findings": 0,
-        "layers": {"L2": {"verdict": "pass", "parse_error": None,
+        "layers": {"L0": {"verdict": "pass"}, "L1": {"verdict": "pass"},
+                   "L2": {"verdict": "pass", "parse_error": None,
                           "findings": []}},
     }
     assert _clean_line(record) == (
-        "- clean clean-new-helper: L2 pass, 0 blocking finding(s) "
+        "- clean clean-new-helper: L0 pass, L1 pass, "
+        "L2 pass, 0 blocking finding(s) "
         "— New helper, no defect"
     )
 
 
 def test_clean_line_reports_invalid_verdict_json():
     # The 2026-11-04 eval shape: verdict fail, parse_error set, the sole
-    # finding the parser's invalid_verdict_json — and 0 blocking.
+    # finding the parser's invalid_verdict_json — and 0 blocking. F-48
+    # re-seat: the fail is marked L2's false positive, naming why.
     record = {
         "id": "clean-docstring",
         "title": "Docstring-only change",
         "blocking_findings": 0,
-        "layers": {
-            "L2": {
-                "verdict": "fail",
-                "parse_error": (
-                    "reviewer 2: finding 0 missed_earlier must be a "
-                    "non-empty string explaining why the earlier round "
-                    "missed it"
-                ),
-                "findings": [{"id": "invalid_verdict_json",
-                              "severity": None}],
-            }
-        },
+        "layers": {"L0": {"verdict": "pass"}, "L1": {"verdict": "pass"},
+                   "L2": {
+                       "verdict": "fail",
+                       "parse_error": (
+                           "reviewer 2: finding 0 missed_earlier must be a "
+                           "non-empty string explaining why the earlier "
+                           "round missed it"
+                       ),
+                       "findings": [{"id": "invalid_verdict_json",
+                                     "severity": None}],
+                   }},
     }
     line = _clean_line(record)
-    assert line.startswith("- clean clean-docstring: L2 fail")
+    assert line.startswith(
+        "- clean clean-docstring: L0 pass, L1 pass, "
+        "L2 fail (false positive, invalid_verdict_json)")
     assert "invalid_verdict_json" in line
     assert line.endswith("— Docstring-only change")
 
@@ -344,11 +350,13 @@ def test_clean_line_reports_l2_fail_without_parse_error():
         "id": "clean-fail",
         "title": "Clean diff a reviewer flagged",
         "blocking_findings": 1,
-        "layers": {"L2": {"verdict": "fail", "parse_error": None,
+        "layers": {"L0": {"verdict": "pass"}, "L1": {"verdict": "pass"},
+                   "L2": {"verdict": "fail", "parse_error": None,
                           "findings": [{"id": "R-1", "severity": "blocking"}]}},
     }
     assert _clean_line(record) == (
-        "- clean clean-fail: L2 fail, 1 blocking finding(s) "
+        "- clean clean-fail: L0 pass, L1 pass, "
+        "L2 fail (false positive), 1 blocking finding(s) "
         "— Clean diff a reviewer flagged"
     )
 
@@ -358,8 +366,8 @@ def test_clean_line_keeps_l2_skipped_wording():
         "id": "clean-skipped",
         "title": "No sessions",
         "blocking_findings": None,
-        "layers": {},
+        "layers": {"L0": {"verdict": "pass"}, "L1": {"verdict": "pass"}},
     }
     assert _clean_line(record) == (
-        "- clean clean-skipped: n/a (L2 skipped) — No sessions"
+        "- clean clean-skipped: L0 pass, L1 pass, L2 n/a (skipped) — No sessions"
     )

@@ -202,7 +202,7 @@ def test_factory_eval_runs_at_the_configured_reviewer_width(tmp_path, monkeypatc
     (root / "config.yaml").write_text("reviewers: 3\n")
     seen = {}
 
-    def fake_run(factory_root, out_path, *, reviewers, keep_fixture):
+    def fake_run(factory_root, out_path, *, reviewers, repeats, keep_fixture):
         seen["factory_root"] = factory_root
         seen["reviewers"] = reviewers
         rendered = tmp_path / "rendered.md"
@@ -227,7 +227,7 @@ def test_factory_eval_config_default_and_flag_override(tmp_path, monkeypatch):
     root.mkdir()
     seen = []
 
-    def fake_run(factory_root, out_path, *, reviewers, keep_fixture):
+    def fake_run(factory_root, out_path, *, reviewers, repeats, keep_fixture):
         seen.append(reviewers)
         rendered = tmp_path / "rendered.md"
         rendered.write_text("report")
@@ -343,7 +343,9 @@ def test_on_demand_driver_reports_and_cleans_up(tmp_path: Path):
 
     factory_root = tmp_path / "factory-root"
     result = run_on_demand_eval(
-        factory_root, session_runner=ScriptedSeats(MOCK_SEED_FINDINGS)
+        factory_root, session_runner=ScriptedSeats(MOCK_SEED_FINDINGS),
+        repeats=1,  # F-48 re-seat: this test's subject is the plumbing,
+                    # not the (now defaulted) repeat spread.
     )
     report = result["report"]
     assert result["report_path"].exists()
@@ -370,6 +372,7 @@ def test_on_demand_driver_plumbing_with_unconfined_gates(tmp_path: Path):
         factory_root,
         session_runner=ScriptedSeats(MOCK_SEED_FINDINGS),
         command_runner=run_command,
+        repeats=1,  # F-48 re-seat: plumbing test, single repeat is its subject
     )
     report = result["report"]
     assert json.loads(result["report_path"].read_text()) == report

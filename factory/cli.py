@@ -21,7 +21,7 @@ from factory.approve import (
 from factory.config import CONFIG_FILE, ConfigError, load_config
 from factory.contract import ContractError, load_profile, load_tasks, read_file
 from factory.dashboard import DEFAULT_PORT, make_server
-from factory.eval import EvalError, run_on_demand_eval
+from factory.eval import DEFAULT_REPEATS, EvalError, run_on_demand_eval
 from factory.gates import GateError
 from factory.importer import (
     TIMEOUT_MIN_CEILING,
@@ -182,6 +182,10 @@ def build_parser() -> argparse.ArgumentParser:
     eval_cmd.add_argument(
         "--reviewers", type=int, default=None,
         help="reviewer sessions per diff (default: the factory config)")
+    eval_cmd.add_argument(
+        "--repeats", type=int, default=None,
+        help="run each seed N times; the report carries mean and spread "
+             "per metric (default: 3; F-48 — cost scales with N)")
     eval_cmd.add_argument(
         "--keep-fixture", action="store_true",
         help="keep the fixture repo after the run for inspection")
@@ -541,10 +545,17 @@ def _run_eval(args: argparse.Namespace) -> int:
     fan-out width is the factory config's (the same
     ``load_config(factory_root / CONFIG_FILE)`` read the orchestrator
     does, so the eval certifies the width the queue actually runs);
-    ``--reviewers`` overrides it. Known failures exit 2 with a message,
-    not a traceback."""
+    ``--reviewers`` overrides it. ``--repeats`` (F-48) runs each seed N
+    times — default 3 — so the report carries each metric's mean and
+    spread; a repeats below 1 is refused here, exit 2. Known failures
+    exit 2 with a message, not a traceback."""
     factory_root = (Path(args.factory_root) if args.factory_root
                     else FACTORY_ROOT_DEFAULT)
+    repeats = args.repeats if args.repeats is not None else DEFAULT_REPEATS
+    if repeats < 1:
+        print(f"factory eval: --repeats must be an integer >= 1, "
+              f"got {repeats}", file=sys.stderr)
+        return 2
     try:
         reviewers = args.reviewers or load_config(
             factory_root / CONFIG_FILE
@@ -553,6 +564,7 @@ def _run_eval(args: argparse.Namespace) -> int:
             factory_root if args.factory_root else None,
             Path(args.out) if args.out else None,
             reviewers=reviewers,
+            repeats=repeats,
             keep_fixture=args.keep_fixture,
         )
     except (ConfigError, EvalError, GateError, RunError, SandboxError,
