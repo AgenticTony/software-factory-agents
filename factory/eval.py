@@ -592,7 +592,8 @@ def _catch_evidence(report: dict) -> list[str]:
 
 
 def _seed_task(seed: SeedSpec | CleanSpec) -> dict:
-    acceptance = [seed.contract] if getattr(seed, "contract", None) else []
+    contract = seed.contract if isinstance(seed, SeedSpec) else None
+    acceptance = [contract] if contract else []
     return {
         "id": f"EVAL-{seed.id}",
         "title": seed.title,

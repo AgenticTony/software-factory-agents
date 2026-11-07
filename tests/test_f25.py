@@ -25,7 +25,7 @@ from zoneinfo import ZoneInfo
 import pytest
 import yaml
 
-from factory.contract import ContractError, acceptance_hash, load_profile
+from factory.contract import SCHEMA_DIR, ContractError, acceptance_hash, load_profile
 from factory.gates import FileChange
 from factory.l0 import run_l0
 from factory.l1 import L1Report
@@ -704,7 +704,7 @@ def test_matched_risk_flags_count_renamed_old_paths():
 
 def test_escalation_enum_has_sentinel_failed():
     schema = json.loads(
-        (Path(__file__).resolve().parent.parent / "schema" / "tasks.schema.json").read_text()
+        (SCHEMA_DIR / "tasks.schema.json").read_text()
     )
     assert "sentinel_failed" in schema["$defs"]["escalation"]["enum"]
 
@@ -796,7 +796,7 @@ def test_review4_a_committed_credential_escalates_with_no_retry(tmp_path):
 
     # schema half: the escalation enum knows it
     schema = json.loads(
-        (Path(__file__).resolve().parent.parent / "schema" / "tasks.schema.json").read_text()
+        (SCHEMA_DIR / "tasks.schema.json").read_text()
     )
     assert "credential_added" in schema["$defs"]["escalation"]["enum"]
 
@@ -954,9 +954,8 @@ def test_review10_risk_flag_enums_match_across_schemas():
     """The risk-flag list is spelled three times across the two schema
     files; this pins them equal so a new flag lands everywhere or nowhere
     (review finding 10 — the requested mechanical rule as a test)."""
-    repo = Path(__file__).resolve().parent.parent
-    tasks_schema = json.loads((repo / "schema" / "tasks.schema.json").read_text())
-    project_schema = json.loads((repo / "schema" / "project.schema.json").read_text())
+    tasks_schema = json.loads((SCHEMA_DIR / "tasks.schema.json").read_text())
+    project_schema = json.loads((SCHEMA_DIR / "project.schema.json").read_text())
     risk_flag = set(tasks_schema["$defs"]["risk_flag"]["enum"])
     paths_risk = set(
         project_schema["properties"]["paths"]["properties"]["risk"]["propertyNames"]["enum"]

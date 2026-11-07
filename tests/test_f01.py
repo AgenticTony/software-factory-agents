@@ -12,6 +12,8 @@ from pathlib import Path
 import jsonschema
 import yaml
 
+from factory.contract import SCHEMA_DIR
+
 REPO = Path(__file__).resolve().parent.parent
 SUBCOMMANDS = ["approve", "run", "loop", "status", "import", "verify-live"]
 
@@ -48,7 +50,13 @@ def test_ac_2():
     # `-n auto` (pytest-xdist, pinned in [dev]) parallelises the suite; it
     # must be on the command line, not PYTEST_ADDOPTS, which nested pytest
     # runs inherit (it broke the F-44 output-forgery probes).
-    assert {"pytest -q", "pytest -q -n auto"} & set(runs), (
+    # F-51 (m-20): the main job deselects exactly live_network (pinned
+    # by tests/test_f51.py::test_ac_2 — the only allowed filter).
+    assert {
+        "pytest -q", "pytest -q -n auto",
+        'pytest -q -m "not live_network"', 'pytest -q -n auto -m "not live_network"',
+        "pytest -q -rs -m live_network",
+    } & set(runs), (
         "CI must run `pytest -q` as its own step"
     )
 
@@ -56,7 +64,7 @@ def test_ac_2():
 def test_ac_3():
     """AC-3: this repo's own project profile validates against the schema."""
     profile = yaml.safe_load((REPO / ".factory" / "project.yaml").read_text())
-    schema = json.loads((REPO / "schema" / "project.schema.json").read_text())
+    schema = json.loads((SCHEMA_DIR / "project.schema.json").read_text())
     jsonschema.validate(profile, schema)
 
 

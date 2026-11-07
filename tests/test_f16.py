@@ -13,10 +13,14 @@ spec), never from recomputing what the eval reports.
 """
 
 import json
-import re
 from pathlib import Path
 
 import pytest
+from _support.f16 import (
+    MOCK_SEED_FINDINGS,
+    ScriptedSeats,
+    _finding,
+)
 
 from factory.eval import (
     CLEAN_DIFFS,
@@ -27,7 +31,6 @@ from factory.eval import (
     run_seeded_eval,
     seed_by_id,
 )
-from factory.session import SessionRecord
 
 
 def _fixture(tmp_path: Path):
@@ -59,58 +62,6 @@ def test_ac_2(tmp_path: Path):
 
 
 # --- the scripted L2 seats (no real model anywhere in this file) ------------
-
-_FINDINGS_ARRAY = re.compile(r"```json\n(\[\s*\{.*?\}\s*\])\n```", re.S)
-
-
-def _finding():
-    return {
-        "id": "R-1",
-        "axis": "standards",
-        "severity": "blocking",
-        "file": "tests/test_api.py",
-        "text": "the test mocks checkin_count — the function it claims to test",
-    }
-
-
-class ScriptedSeats:
-    """Scripted reviewer/verifier seats, keyed by the eval contract id
-    in the prompt. Reviewers return the scripted findings for their diff
-    (an empty list is a declared pass); the verifier keeps every finding.
-    Same seat signature the F-38 fan-out calls the real runner with.
-    """
-
-    def __init__(self, findings_by_contract: dict[str, list] | None = None):
-        self.findings_by_contract = findings_by_contract or {}
-        self.calls: list[tuple[str, str]] = []
-
-    def __call__(self, seat, prompt, run_dir, profile, **kwargs):
-        match = re.search(r'"id": "(EVAL-[^"]+)"', prompt)
-        assert match, f"no eval contract id in the {seat} prompt"
-        contract_id = match.group(1)
-        self.calls.append((seat, contract_id))
-        if seat == "reviewer":
-            findings = self.findings_by_contract.get(contract_id, [])
-            verdict = "fail" if findings else "pass"
-            return SessionRecord(
-                seat=seat, status="completed", num_turns=2, model="stub-model",
-                tokens={"input_tokens": 10, "output_tokens": 5},
-                result=json.dumps({"verdict": verdict, "findings": findings}),
-            )
-        found = json.loads(_FINDINGS_ARRAY.search(prompt).group(1))
-        votes = [
-            {"id": f["id"], "keep": True, "reason": "confirmed against the diff",
-             "tag": "important"}
-            for f in found
-        ]
-        return SessionRecord(
-            seat=seat, status="completed", num_turns=1, model="stub-model",
-            tokens={"input_tokens": 8, "output_tokens": 4},
-            result=json.dumps({"votes": votes}),
-        )
-
-
-MOCK_SEED_FINDINGS = {"EVAL-mocks-what-it-tests": [_finding()]}
 
 
 # --- AC-1 -------------------------------------------------------------------

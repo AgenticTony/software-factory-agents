@@ -16,6 +16,7 @@ import json
 import os
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import textwrap
@@ -23,6 +24,8 @@ import time
 from pathlib import Path
 
 import pytest
+from _support import wait_until
+from _support.f05 import _child, _fixture_repo, _git
 
 from factory.runs import RunError, cleanup_run, create_run
 from factory.sandbox import (
@@ -40,25 +43,6 @@ from factory.sandbox import (
 
 MODEL_ENDPOINT = "api.z.ai"
 REPO_ROOT = Path(__file__).resolve().parent.parent
-
-
-def _git(repo: Path, *args: str) -> None:
-    subprocess.run(
-        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
-    )
-
-
-def _fixture_repo(tmp_path: Path) -> Path:
-    """A tiny local repo to clone from (the real clone source for runs)."""
-    repo = tmp_path / "source-repo"
-    repo.mkdir()
-    (repo / "README.md").write_text("# fixture\n")
-    _git(repo, "init", "-b", "main")
-    _git(repo, "config", "user.email", "test@factory.local")
-    _git(repo, "config", "user.name", "factory test")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-m", "base")
-    return repo
 
 
 def _factory_root(tmp_path: Path) -> Path:
@@ -80,10 +64,6 @@ def _make_run(tmp_path: Path, **kwargs):
     )
     write_settings(settings, run.settings_path)
     return run, root, settings
-
-
-def _child(script: str, args: list[str]) -> list[str]:
-    return [sys.executable, "-c", script, *args]
 
 
 def _env_probe(planted: set[str]) -> str:
@@ -201,6 +181,13 @@ def test_ac_2(tmp_path: Path):
 
 
 # --- F-05 AC-3: network allowlist ------------------------------------------
+#
+# F-51 (m-20) split: the DENY half (a non-allowlisted domain is refused
+# by the sandbox's own proxy — a local boundary, no internet needed)
+# keeps the exact contract name test_ac_3 and stays mandatory in the
+# main CI job. The ALLOW half (api.z.ai reachable) genuinely needs the
+# public internet, so it moved to its own live_network test below: a
+# Z.ai outage now reddens the named live-network job, not every PR.
 
 
 def test_ac_3(tmp_path: Path):
@@ -217,36 +204,74 @@ def test_ac_3(tmp_path: Path):
             )
             return proc.returncode, (proc.stdout or "").strip(), proc.stderr.strip()
 
-        allowed_code, blocked_code, blocked_err = None, None, None
+        blocked_code, blocked_err = None, None
         rc, code, err = fetch(sys.argv[1])
-        print(f"allowed rc={rc} code={code} err={err!r}", flush=True)
-        if rc == 0 and code != "000":
-            allowed_code = code
-        rc, code, err = fetch(sys.argv[2])
         print(f"blocked rc={rc} code={code} err={err!r}", flush=True)
         blocked_code, blocked_err = code, err
-        print(f"RESULT allowed={allowed_code} blocked_code={blocked_code}", flush=True)
+        print(f"RESULT blocked_code={blocked_code} blocked_err={blocked_err}", flush=True)
         """
     )
     proc = run_sandboxed(
-        _child(script, [f"https://{MODEL_ENDPOINT}", "https://example.com"]),
+        _child(script, ["https://example.com"]),
         run.root,
         run.settings_path,
         timeout=120,
     )
     result = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT")]
     assert result, f"child produced no verdict\n{proc.stdout}{proc.stderr}"
-    allowed = result[0].split("allowed=")[1].split()[0]
-    blocked = result[0].split("blocked_code=")[1].strip()
-    assert allowed != "None", (
-        "api.z.ai was NOT reachable from inside the sandbox. The allowlist names it, "
-        "so this is either a Z.ai outage (external — retry before debugging) or a "
-        "sandbox/proxy misconfiguration; the blocked-domain control below tells them "
-        f"apart.\n{proc.stdout}{proc.stderr}"
-    )
+    blocked = result[0].split("blocked_code=")[1].split()[0]
     assert blocked == "000", (
         f"non-allowlisted example.com was reachable (http_code={blocked})\n"
         f"{proc.stdout}{proc.stderr}"
+    )
+    # F-51 round 1 (major 5): pin the PROXY's denial signature, not just
+    # http 000 — offline also yields 000, but the local proxy's CONNECT
+    # refusal (curl 56, "CONNECT tunnel failed", response 403) is the
+    # sandbox's own boundary talking. Observed identically on macOS; the
+    # proxy is srt's (one pinned package) on both platforms.
+    blocked_err = result[0].split("blocked_err=")[1].strip() if "blocked_err=" in result[0] else ""
+    assert "CONNECT tunnel failed" in blocked_err, (
+        f"the blocked control did not go through the proxy's refusal — an "
+        f"offline-looking failure is not the deny being proven\n"
+        f"{proc.stdout}{proc.stderr}"
+    )
+
+
+@pytest.mark.live_network
+def test_allowlisted_model_endpoint_is_reachable_from_the_sandbox(tmp_path: Path):
+    """The allow half of F-05 AC-3 (F-51/m-20 split): the model endpoint
+    the allowlist names IS reachable from inside the sandbox. Genuinely
+    needs the public internet — this is the positive control that tells
+    a Z.ai outage (external) apart from a sandbox/proxy misconfiguration,
+    which is exactly why it runs in the named live-network CI job and
+    not on every PR."""
+    run, _, settings = _make_run(tmp_path)
+    script = textwrap.dedent(
+        """
+        import subprocess, sys
+
+        proc = subprocess.run(
+            ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
+             "--max-time", "20", sys.argv[1]],
+            capture_output=True, text=True,
+        )
+        print(f"RESULT allowed={proc.stdout.strip()}", flush=True)
+        """
+    )
+    proc = run_sandboxed(
+        _child(script, [f"https://{MODEL_ENDPOINT}"]),
+        run.root,
+        run.settings_path,
+        timeout=120,
+    )
+    result = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT")]
+    assert result, f"child produced no verdict\n{proc.stdout}{proc.stderr}"
+    allowed = result[0].split("allowed=")[1].strip()
+    assert allowed != "000" and allowed != "", (
+        "api.z.ai was NOT reachable from inside the sandbox. The allowlist names it, "
+        "so this is either a Z.ai outage (external — retry before debugging) or a "
+        "sandbox/proxy misconfiguration; the mandatory blocked-domain control in "
+        f"test_ac_3 tells them apart.\n{proc.stdout}{proc.stderr}"
     )
 
 
@@ -972,11 +997,16 @@ def test_scrub_env_strips_github_prefixes_and_forbidden_names():
 # --- review round: raw sockets, git-hook escapes, env allowlist, home reads ---
 
 
+@pytest.mark.live_network
 def test_direct_socket_to_non_allowlisted_ip_is_blocked(tmp_path: Path):
     """A process that ignores the proxy env vars and dials a raw IP must be
     blocked too — proxy filtering alone is not the boundary. 1.1.1.1:443 is
     a real, stable, non-allowlisted endpoint; the socket API cannot use the
-    proxy, so this exercises the kernel-level network denial."""
+    proxy, so this exercises the kernel-level network denial.
+
+    F-51 (m-20): "denied" here can only be told apart from "offline" on a
+    live network, so this runs in the named live-network CI job; the
+    proxy-level deny (test_ac_3) stays mandatory in the main job."""
     run, _, settings = _make_run(tmp_path)
     script = textwrap.dedent(
         """
@@ -996,6 +1026,73 @@ def test_direct_socket_to_non_allowlisted_ip_is_blocked(tmp_path: Path):
         f"raw socket to non-allowlisted 1.1.1.1:443 connected — proxy filtering "
         f"is the only network boundary\n{proc.stdout}{proc.stderr}"
     )
+
+
+def _host_lan_ip() -> str:
+    """The host's own non-loopback IPv4 (routing-table lookup via a UDP
+    socket — no packets leave the machine)."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("192.0.2.1", 9))  # TEST-NET address; UDP sends nothing
+        return probe.getsockname()[0]
+    finally:
+        probe.close()
+
+
+def test_raw_socket_to_the_hosts_own_ip_is_blocked_sandbox(tmp_path: Path):
+    """The MANDATORY raw-socket deny (F-51 round 1, major 5): a sandboxed
+    process that ignores the proxy env vars and dials a raw TCP socket to
+    a non-loopback address must be blocked — kernel-level, not just proxy
+    filtering. Hermetic by construction: the target is a listener on THIS
+    host's own non-loopback IP, and the unsandboxed positive control
+    first proves the exact same dial SUCCEEDS outside the sandbox — so a
+    pass can never mean "offline", the weakness of a public-IP target.
+    (The public-IP variant stays in the live_network job: telling
+    "denied" from "offline" against 1.1.1.1 needs a live network.)"""
+    try:
+        host_ip = _host_lan_ip()
+    except OSError as exc:  # no route/default interface at all
+        pytest.fail(f"cannot determine this host's non-loopback IP ({exc}) — "
+                    "the raw-socket deny control cannot run")
+    if host_ip in ("127.0.0.1", "0.0.0.0", ""):
+        pytest.fail(f"no non-loopback IPv4 on this host ({host_ip!r}) — the "
+                    "raw-socket deny control cannot run")
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind((host_ip, 0))
+    listener.listen(8)
+    port = listener.getsockname()[1]
+
+    # Positive control OUTSIDE the sandbox: the same dial must connect.
+    control = socket.create_connection((host_ip, port), timeout=10)
+    control.close()
+
+    run, _, settings = _make_run(tmp_path)
+    script = textwrap.dedent(
+        """
+        import socket, sys
+        try:
+            conn = socket.create_connection((sys.argv[1], int(sys.argv[2])),
+                                            timeout=10)
+            conn.close()
+            print("direct:CONNECTED", flush=True)
+        except Exception as exc:
+            print(f"direct:BLOCKED {type(exc).__name__}: {exc}", flush=True)
+        """
+    )
+    try:
+        proc = run_sandboxed(
+            _child(script, [host_ip, str(port)]),
+            run.root, run.settings_path, timeout=60,
+        )
+        assert "direct:BLOCKED" in proc.stdout, (
+            f"raw socket to this host's own non-loopback {host_ip}:{port} "
+            f"connected from INSIDE the sandbox — proxy filtering is the "
+            f"only network boundary (the unsandboxed control above proved "
+            f"the dial works)\n{proc.stdout}{proc.stderr}"
+        )
+    finally:
+        listener.close()
 
 
 def test_git_hook_and_config_planting_is_denied_in_sandbox(tmp_path: Path):
@@ -1179,12 +1276,34 @@ def test_timeout_kills_the_whole_process_group(tmp_path: Path):
     )
     with pytest.raises(subprocess.TimeoutExpired):
         run_sandboxed(_child(script, []), run.root, run.settings_path, timeout=4)
-    time.sleep(1.0)
-    first = heartbeat.stat().st_size
-    time.sleep(1.2)
-    assert heartbeat.stat().st_size == first, (
-        "the heartbeat kept growing after the timeout — sandboxed descendants "
-        "survived the kill and are still running unsupervised"
+    # F-51 (I-16, review round 1 critical 1): poll the condition instead of
+    # paying a fixed sleep. Quiet means two samples at least 1.0 s apart
+    # agree — the fixture writes every 0.2 s, so any 1.0 s window (five
+    # write periods) with a living descendant sees growth, and the FIRST
+    # look never counts (a first sample microseconds after the previous
+    # one is vacuously "quiet" — round 1's finding: the original
+    # conversion returned True while the writer was still alive).
+    _last_size = heartbeat.stat().st_size
+    _last_look = time.monotonic()
+
+    def _heartbeat_quiet() -> bool:
+        nonlocal _last_size, _last_look
+        now = time.monotonic()
+        if now - _last_look < 1.0:
+            return False  # the window since the last JUDGED sample is too
+            # short to be evidence — polling faster never widens it
+        current = heartbeat.stat().st_size
+        quiet = current == _last_size
+        _last_size = current
+        _last_look = now
+        return quiet
+
+    wait_until(
+        _heartbeat_quiet,
+        timeout=30,
+        interval=0.5,
+        what="sandboxed descendants stopped writing the heartbeat after the "
+        "timeout kill (the whole process group died)",
     )
 
 

@@ -23,6 +23,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from factory.contract import SCHEMA_DIR
 from factory.eval import _count_blocking
 from factory.gates import FileChange
 from factory.l2 import (
@@ -204,7 +205,7 @@ def test_ac_3(tmp_path: Path):
 
     # The floor treats None as NOT cleared (verified, not assumed): a
     # min_tests floor with no readable count fails with test_count_unknown.
-    from test_f07 import BASE_PROFILE, _change, _repo, _run
+    from _support.f07 import BASE_PROFILE, _change, _repo, _run
 
     repo = _repo(tmp_path, "count", {"lib/a.py": "x = 1\n"})
     _change(repo, files={"lib/a.py": "x = 2\n"})
@@ -590,7 +591,7 @@ def test_review4_multi_suite_commands_are_ambiguous():
 
     import json
 
-    schema = json.loads((REPO / "schema" / "project.schema.json").read_text())
+    schema = json.loads((SCHEMA_DIR / "project.schema.json").read_text())
     test_desc = (
         schema["properties"]["commands"]["properties"]["test"].get(
             "description", ""
@@ -1365,7 +1366,7 @@ def test_review20_self_kill_fails_the_gate_on_the_signal(tmp_path: Path):
     proc = _run_pytest_in(project, "-q", "tests")
     assert proc.returncode < 0  # killed by signal, not a clean exit
 
-    from test_f07 import BASE_PROFILE, TASK, _change, _repo
+    from _support.f07 import BASE_PROFILE, TASK, _change, _repo
 
     from factory.gates import CommandResult
     from factory.l0 import run_l0

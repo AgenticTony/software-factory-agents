@@ -9,7 +9,7 @@ agents do the volume. Architecture and reasoning: `DESIGN-LOCAL-FACTORY.md`.
 1. `TASK-CONTRACT.md` — the task record, statuses, picker (what the factory consumes)
 2. `VALIDATOR-SPEC.md` — validation layers L0–L4, how "done" is proven
 3. `BUILD-ORDER.md` + `.factory/tasks.json` — the queue; this repo's own build plan
-4. `schema/` — `tasks.schema.json`, `project.schema.json`
+4. `factory/data/schema/` — `tasks.schema.json`, `project.schema.json` (shipped in the package, F-51)
 5. `projects/` — draft adapters for the target projects
 
 ## Rules that outlive this file
@@ -22,7 +22,7 @@ agents do the volume. Architecture and reasoning: `DESIGN-LOCAL-FACTORY.md`.
 - **Contract test names are exact:** an acceptance ref `tests/test_fNN.py::test_ac_N`
   means a test function with exactly that name.
 - **Schema-validate on load.** Code touching `tasks.json` or `project.yaml`
-  validates against `schema/` first (F-02). Invalid state refuses to run.
+  validates against `factory/data/schema/` first (F-02; the schemas ship in the package, F-51). Invalid state refuses to run.
 - **Acceptance criteria become failing tests before code** (red-first,
   VALIDATOR-SPEC L1). A work-order session writes the tests first.
 - **Mechanical rules are linters/tests, not prose.** If a rule can be checked,
@@ -38,9 +38,11 @@ agents do the volume. Architecture and reasoning: `DESIGN-LOCAL-FACTORY.md`.
 - Python >= 3.11; CI tests 3.11 and 3.13. CLI: `factory --help`.
 - Tests run in parallel: `pytest -q -n auto` (pytest-xdist, pinned in the
   `[dev]` extra). Plain `pytest -q` still works. The two real-session tests in
-  `tests/test_f06.py` (`test_ac_3`/`test_ac_4`) go live against the `factory-zai`
-  credential when one exists and are conventionally deselected (`--deselect`)
-  from local parallel runs.
+  `tests/test_f06.py` (`test_ac_3`/`test_ac_4`) run their live halves only when
+  `FACTORY_LIVE_TESTS=1` is set explicitly (F-51): without the opt-in they skip
+  with a reason naming the variable, with the opt-in and no `factory-zai`
+  credential they fail loudly, and a credential alone never turns them on — so
+  no `--deselect` is needed anywhere.
 - Setup: `pip install -e ".[dev]"` **and** `npm ci` (installs the pinned sandbox
   runtime `srt` from `package-lock.json`; needs Node >= 22.12). System deps:
   none on macOS; Linux `bubblewrap socat ripgrep`, and on Ubuntu

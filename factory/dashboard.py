@@ -96,7 +96,7 @@ _STATIC_FILES = {
 }
 
 # Page group order for the queue view: what needs the operator first
-# sorts first. (The members mirror schema/tasks.schema.json's status
+# sorts first. (The members mirror factory/data/schema/tasks.schema.json's status
 # enum; the order is the dashboard's presentation choice.)
 _STATUS_ORDER = (
     "needs_human", "awaiting_owner", "in_progress", "in_review",
@@ -396,7 +396,9 @@ class Dashboard:
         content_type = _STATIC_FILES.get(name)
         if content_type is None:
             return _error(404, "Not found")
-        resource = importlib.resources.files(__package__) / "dashboard_static" / name
+        # this module's package is literally "factory" (typed Package;
+        # __package__ is str | None to the checker)
+        resource = importlib.resources.files("factory") / "dashboard_static" / name
         return Response(200, resource.read_bytes(), content_type)
 
     # -------------------------------------------------------------- runs
@@ -561,7 +563,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     @property
     def dashboard(self) -> Dashboard:
-        return self.server.dashboard  # type: ignore[attr-defined]
+        # http.server stubs don't know the attached dashboard attribute
+        # (narrow, rule-named; F-51/A-7)
+        return self.server.dashboard  # pyright: ignore[reportAttributeAccessIssue]
 
     def _send(self, response: Response) -> None:
         self.send_response(response.status)

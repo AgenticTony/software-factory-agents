@@ -27,7 +27,7 @@ done, say that — never "no steps recorded".
 - Conventional commits with the WO id in the subject: `feat: … (F-11)`.
 - One branch + one PR per work order; never commit to main.
 - Protected paths (`.factory/**`, judge modules, contract tests,
-  `prompts/**`, the spec docs) change only through owner-reviewed
+  `factory/data/**`, the spec docs) change only through owner-reviewed
   interactive PRs — a factory session touching them is a blocker.
 
 ## Nit budget

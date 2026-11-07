@@ -29,8 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-from test_f05 import _child, _fixture_repo
-from test_f22 import (
+from _support.f05 import _child, _fixture_repo
+from _support.f22 import (
     _content_hash,
     _hash_tree,
     _make_mcp,
@@ -48,7 +48,7 @@ from factory.sandbox import (
     write_settings,
 )
 from factory.status import render_status
-from factory.toolkit import ToolkitError, load_index, stage_toolkit
+from factory.toolkit import ToolkitError, default_toolkit_dir, load_index, stage_toolkit
 from factory.trace import TraceWriter, trace_path
 
 MODEL_ENDPOINT = "api.z.ai"
@@ -405,7 +405,7 @@ def test_ac_3(tmp_path: Path):
                           ["docs.python.org", "docs.example.com"])
     assert [e["name"] for e in load_index(vetted)["items"]] == ["docs"]
 
-    assert load_index(REPO_ROOT / "toolkit")["items"]
+    assert load_index(default_toolkit_dir())["items"]
 
 
 # --- AC-4 (I-19): staging copies explicitly ---------------------------------
@@ -681,7 +681,7 @@ def test_run_once_wires_the_gate_runner_to_the_run_trace(tmp_path: Path,
     """The orchestrator hands its gate runner the run's trace writer: an
     escapee reported during the L0/L1 gates lands in THAT run's trace
     (stamped with its run id and task) and in `factory status`."""
-    from test_f30 import Env, Seats
+    from _support.f30 import Env, Seats
 
     import factory.orchestrator as orch
     from factory.sandbox import escapee_event

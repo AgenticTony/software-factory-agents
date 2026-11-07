@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _support import no_bare_python3
 from jsonschema import Draft202012Validator
 
 from factory.cli import main
@@ -222,10 +223,18 @@ def test_prompt_carries_the_self_check_instruction(tmp_path: Path):
     resolves to whatever the sandbox PATH finds, which is not the
     factory's venv) and the STAGED proposal schema under $TMPDIR (the
     target repo has no schema/ dir of its own, and the queue schema
-    would flag a valid proposal's missing status/version)."""
+    would flag a valid proposal's missing status/version).
+
+    F-51 (M-11): "no bare python3" is checked interpreter-INDEPENDENTLY —
+    the exact quoted interpreter path is removed first, then a bare
+    ``python3`` is searched for — so a conda/pyenv/system interpreter
+    whose own path ends in ``python3`` cannot false-positive (the suite
+    used to be red on every such interpreter; green CI was a naming
+    accident). The check itself lives in _support so the F-51 contract
+    test runs the same teeth."""
     prompt = build_import_prompt(tmp_path, "docs", [], project="proj")
     assert sys.executable in prompt  # named, never bare
-    assert "python3" not in prompt
+    assert no_bare_python3(prompt, sys.executable) is None  # no BARE python3
     assert "$TMPDIR/proposal.json" in prompt
     assert "$TMPDIR/proposal.schema.json" in prompt  # staged before the session
     assert "schema/tasks.schema.json" not in prompt  # not the target repo's

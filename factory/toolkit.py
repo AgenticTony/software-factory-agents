@@ -52,6 +52,7 @@ to toolkit versions.
 from __future__ import annotations
 
 import hashlib
+import importlib.resources
 import json
 import os
 import re
@@ -207,8 +208,15 @@ def content_hash_of(root: Path) -> str:
 
 
 def default_toolkit_dir() -> Path:
-    """This factory checkout's ``toolkit/`` dir (the default index root)."""
-    return Path(__file__).resolve().parent.parent / "toolkit"
+    """The shipped vetted toolkit dir (the default index root).
+
+    F-51 (I-1): resolved through importlib.resources — the vetted tree
+    ships inside the package (``factory/data/toolkit``), so a wheel
+    install stages the same index this checkout does.
+    """
+    return Path(
+        str(importlib.resources.files("factory").joinpath("data", "toolkit"))
+    )
 
 
 # ---------------------------------------------------------- the licence gate --
@@ -337,7 +345,7 @@ def _url_hosts(line: str) -> list[str]:
     hosts = []
     for match in _URL_RE.finditer(line):
         rest = match.group(0).split("://", 1)[1]
-        host = re.split(r"[/?:#]", rest, 1)[0]
+        host = re.split(r"[/?:#]", rest, maxsplit=1)[0]
         if host:
             hosts.append(host)
     return hosts

@@ -317,7 +317,16 @@ def test_ac_4():
     for step in pytest_steps:
         run = step["run"]
         # `-n auto` (pytest-xdist) only parallelises; it filters nothing.
-        assert run.strip() in ("pytest -q", "pytest -q -n auto"), (
+        # F-51 (m-20): `-m "not live_network"` is the ONE sanctioned
+        # filter — tests/test_f51.py::test_ac_2 pins that it deselects
+        # exactly live_network and that the mandatory deny tests stay in
+        # the main job; anything else is still a silent-deselect refusal.
+        assert run.strip() in (
+            "pytest -q", "pytest -q -n auto",
+            'pytest -q -m "not live_network"',
+            'pytest -q -n auto -m "not live_network"',
+            "pytest -q -rs -m live_network",
+        ), (
             f"the suite must run whole (no marker/path filters): {run!r}"
         )
         assert "if" not in step and "continue-on-error" not in step, (
@@ -357,7 +366,13 @@ def test_ac_4():
                 )
     ini = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
     ini_options = ini.get("tool", {}).get("pytest", {}).get("ini_options", {})
-    assert "addopts" not in ini_options, "pytest must run with no addopts filters"
+    # F-51: addopts may carry only --strict-markers (it filters NOTHING —
+    # an unknown marker errors the suite, so a typo'd marker name cannot
+    # silently deselect). The allowlist is exact: any filter-shaped token
+    # (-m/-k/--deselect/--ignore/-p no:…) fails here, as before.
+    assert set(ini_options.get("addopts", "").split()) <= {"--strict-markers"}, (
+        "pytest must run with no addopts filters"
+    )
 
 
 # --- AC-5: the incident register ---------------------------------------------

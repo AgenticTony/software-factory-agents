@@ -26,10 +26,20 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# F-51 (m-22): the gate's own tools are exactly pinned — the versions the
+# gate passes on today. A drift here must be a deliberate, reviewed bump,
+# never a silent behaviour change of the thing that judges every change.
+# New tools this WO added: pyright (A-7) and build (I-1's wheel check).
 dev = [
-    "pytest>=8",
+    "pytest==9.2.0",
     "pytest-xdist==3.8.0",
-    "ruff>=0.6",
+    "ruff==0.17.4",
+    "pyright==1.1.414",
+    "build==1.6.1",
+    # The suite's wheel check builds with --no-isolation (offline-safe),
+    # which uses the RUNNING env's setuptools; Python 3.12+ venvs bundle
+    # none. Satisfies [build-system]'s >=68 floor exactly.
+    "setuptools==84.2.1",
 ]
 
 [project.scripts]
@@ -39,8 +49,18 @@ factory = "factory.cli:main"
 include = ["factory*"]
 
 # F-31: the dashboard's static assets ship in the package.
+# F-51 (I-1): the schemas, the vetted toolkit and the seat prompts ship
+# inside the package too (factory/data/**), read through
+# importlib.resources — a wheel install works, not just this checkout.
+# tests/test_f51.py compares these patterns against every file under
+# factory/data and against the built wheel's contents.
 [tool.setuptools.package-data]
-"factory" = ["dashboard_static/*"]
+"factory" = [
+    "dashboard_static/*",
+    "data/schema/*.json",
+    "data/toolkit/**/*",
+    "data/prompts/**/*",
+]
 
 [tool.ruff]
 line-length = 100
@@ -49,5 +69,33 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I"]
 
+# F-51 (A-7): pyright in basic mode over the factory package. Scope is
+# the PACKAGE, not tests/: the contract tests are dynamic by design
+# (tmp_path repos, stub seats, subprocess probes) and typing them adds
+# no gate strength for the churn — the choice is recorded in the F-51
+# ledger. Suppressions, where unavoidable, are narrow and rule-named
+# (``# pyright: ignore[rule]`` with a reason); tests/test_f51.py counts
+# them against an exact allowlist.
+[tool.pyright]
+typeCheckingMode = "basic"
+include = ["factory"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# F-51 (m-20): one registered marker for tests that need the PUBLIC
+# INTERNET (Z.ai reachability, the raw-socket deny to a public IP —
+# where "denied" can only be told apart from "offline" on a live
+# network). The main CI job deselects exactly this marker; the
+# live-network job selects it. --strict-markers so a typo'd marker name
+# errors instead of silently selecting nothing.
+addopts = "--strict-markers"
+markers = [
+    "live_network: needs the public internet (a named live-network CI job runs these; the main job deselects the marker)",
+]
+# F-51 (m-23): the suite meets its own future — a DeprecationWarning is
+# an error under this config (plain `pytest -q`, `-n auto` and CI all
+# inherit it; this is config, not a CI-only CLI flag). Narrow ignores,
+# naming module and message, would go here — never a blanket one.
+filterwarnings = [
+    "error::DeprecationWarning",
+]

@@ -23,7 +23,7 @@ Env/Scripted harness (same fake session runners, no real model).
 import json
 from pathlib import Path
 
-from test_f23 import Env, Scripted, _finding, _review_rounds, _verdict
+from _support.f23 import Env, Scripted, _finding, _review_rounds, _verdict
 
 from factory.l2 import parse_reviews_with_retry
 from factory.orchestrator import _is_quota, _retry_budget

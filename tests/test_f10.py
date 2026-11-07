@@ -35,7 +35,7 @@ import yaml
 from factory import l0 as l0_module
 from factory import l1 as l1_module
 from factory.config import ConfigError, PeakWindow, in_peak_window, load_config
-from factory.contract import ContractError, acceptance_hash, load_profile
+from factory.contract import SCHEMA_DIR, ContractError, acceptance_hash, load_profile
 from factory.gates import CommandResult
 from factory.l1 import L1Report
 from factory.mergeorder import Protection
@@ -55,7 +55,7 @@ from factory.prbody import (
     how_to_revert,
 )
 from factory.progress import ProgressLog, ProgressLogError
-from factory.prompts import prompt_versions
+from factory.prompts import PROMPTS_DIR, prompt_versions
 from factory.publish import PushRefused, gh_pr_create, push_branch
 from factory.runs import GIT_HARDENING, RunError, create_run
 from factory.session import SessionRecord
@@ -573,7 +573,7 @@ def test_ac_5():
     # endpoint); merging a PR remains the owner's act.
     offenders = []
     files = sorted((REPO_ROOT / "factory").rglob("*.py")) + sorted(
-        (REPO_ROOT / "prompts").rglob("*.md")
+        PROMPTS_DIR.rglob("*.md")
     )
     assert files
     for path in files:
@@ -1662,7 +1662,7 @@ def test_review7_task_contract_lists_every_escalation_reason():
     """Mechanical sweep: every escalation the schema allows is documented
     in TASK-CONTRACT.md's escalation-reasons line."""
     repo = Path(__file__).resolve().parent.parent
-    schema = json.loads((repo / "schema" / "tasks.schema.json").read_text())
+    schema = json.loads((SCHEMA_DIR / "tasks.schema.json").read_text())
     reasons = schema["$defs"]["escalation"]["enum"]
     doc = (repo / "TASK-CONTRACT.md").read_text()
     line = next(ln for ln in doc.splitlines() if ln.startswith("Escalation reasons"))
