@@ -189,6 +189,11 @@ paths:
     # clean line, repeats with spread) judge the protected l2/orchestrator
     # verdict path and the eval that measures it.
     - "tests/test_f48.py"
+    # F-49: same precedent — the contract/importer-hardening contract
+    # tests (the queue-wide AST ref guard, the live format checker, the
+    # announced truncation, the locked fresh-queue race) judge the
+    # protected contract/state modules and the queue's own integrity.
+    - "tests/test_f49.py"
     # F-43 review round 1: the seam itself and its vent wiring, the F-42
     # factory/attribution.py precedent — a factory-built PR must not be
     # able to weaken the C-1 fix (scrub_session_text returning its input,

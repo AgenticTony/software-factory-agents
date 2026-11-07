@@ -535,6 +535,12 @@ _EGRESS_MODULES = {
             "_abort_refusal", "plan_import", "apply_import", "render_summary",
             "ImportRefused", "ImportResult", "write", "read_text",
             "_refusal_suffix",
+            # F-49 AC-6 re-seat: the proposal-schema check inside
+            # plan_import — same guard as plan_import itself (the
+            # scrub-before-plan rule; run_import scrubs the parsed
+            # proposal before plan_import sees it, so the violation
+            # messages it renders are built from scrubbed values).
+            "iter_schema_violations",
         },
     },
     "factory/session.py": {

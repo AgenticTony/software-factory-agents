@@ -442,6 +442,38 @@ def now_iso() -> str:
 
 
 
+@contextlib.contextmanager
+def queue_writer_lock(queue_path: Path):
+    """Hold the exclusive writer lock on ``<queue>.lock`` — the ONE
+    primitive every writer of a queue file takes (F-49 AC-4, m-6).
+
+    ``TaskQueue.save`` serialises through it (:meth:`TaskQueue
+    ._exclusive_lock` delegates here), and the importer's fresh-queue
+    write takes it across its "no queue exists" check and its write, so
+    two concurrent fresh imports serialise: the second sees the first's
+    queue under the lock and refuses instead of overwriting it. The lock
+    file is never renamed, so every cooperating writer serialises on the
+    same path; ``tasks.json`` itself is replaced by rename and can't
+    carry a stable lock.
+
+    The lock is a blocking ``flock`` the OS releases when the holder
+    dies, so a crashed writer never wedges the queue; the caller is
+    responsible for re-checking queue state under the lock (that is the
+    point of taking it).
+
+    Args:
+        queue_path: The queue file path (the lock sits beside it). The
+            parent directory must already exist.
+    """
+    lock_path = queue_path.with_name(queue_path.name + ".lock")
+    with lock_path.open("w") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _atomic_write_json(path: Path, doc: dict) -> None:
     """Write ``doc`` to ``path`` atomically: temp file, then rename, then
     fsync of the parent DIRECTORY.
@@ -1238,17 +1270,12 @@ class TaskQueue:
     def _exclusive_lock(self):
         """Hold an exclusive advisory lock on ``<queue>.lock``.
 
-        The lock file is never renamed, so every cooperating writer
-        serialises on it; ``tasks.json`` itself is replaced by rename and
-        can't carry a stable lock.
+        Delegates to :func:`queue_writer_lock` — the one primitive every
+        queue writer takes (``TaskQueue.save`` and the importer's
+        fresh-queue write serialise on the same lock file; F-49 AC-4).
         """
-        lock_path = self.path.with_name(self.path.name + ".lock")
-        with lock_path.open("w") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        with queue_writer_lock(self.path):
+            yield
 
     def save(self) -> None:
         """Validate and atomically write the queue.

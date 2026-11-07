@@ -9,6 +9,14 @@ description = "Local agent software factory control plane"
 requires-python = ">=3.11"
 dependencies = [
     "jsonschema>=4",
+    # F-49 AC-2 (m-3): jsonschema's `format: date-time` check is silently
+    # a no-op without this optional dependency — the factory's schema
+    # validator passes a FormatChecker, so malformed timestamps must
+    # actually be refused (tests/test_f49.py fails if it goes missing).
+    # Exact pin: PyPI has only 0.1.x, and F-51's direction is exact pins
+    # (review round 1, finding 1 — ">=2" matched nothing and CI's
+    # `pip install -e ".[dev]"` failed before any test ran).
+    "rfc3339-validator==0.1.4",
     "PyYAML>=6",
     # Exact pin (BUILD-ORDER stack line). The runner is written against the
     # 0.2.x ResultMessage shape — model_usage, terminal_reason,

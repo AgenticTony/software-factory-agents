@@ -10,12 +10,24 @@ scope-matched to them (see the mirror notes below).
 
 Any failure — unreadable file, bad parse, semantic violation, schema
 violation — raises ContractError with a message a human can act on.
+
+F-49 adds the queue's integrity checks: every validator built here
+enforces ``format`` keywords (a malformed ``date-time`` used to be
+annotation-only), and :func:`resolve_test_ref` statically proves an
+acceptance ref names a function pytest would collect as a test — the CI
+guard (and any future caller, e.g. an approve-time check) resolves refs
+BEFORE the orchestrator can spend a session discovering a broken
+contract mid-run.
 """
 
+import ast
+import configparser
 import copy
+import fnmatch
 import functools
 import hashlib
 import json
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -193,6 +205,16 @@ def _schema_document(schema_path: Path) -> dict:
 def _validator(schema_path: Path) -> jsonschema.Draft202012Validator:
     """Build (once) the validator for a schema file.
 
+    The ONE place every factory-side validator is built. Every validator
+    carries the draft's format checker (F-49 AC-2, m-3): ``format`` is
+    annotation-only in draft 2020-12 unless a checker is passed, so a
+    malformed ``date-time`` (``updated_at``, attempts' ``started``/
+    ``ended``, ``approved_at``, ``done_at``) used to load silently. The
+    date-time check needs the optional ``rfc3339-validator`` dependency
+    — without it the checker silently accepts anything, which is why the
+    dependency is pinned in ``pyproject.toml`` and F-49's tests assert
+    the checker is live, not just passed.
+
     Args:
         schema_path: Path to the JSON Schema file.
 
@@ -202,7 +224,19 @@ def _validator(schema_path: Path) -> jsonschema.Draft202012Validator:
     Raises:
         ContractError: If the schema file is missing, unreadable, or not JSON.
     """
-    return jsonschema.Draft202012Validator(_schema_document(schema_path))
+    return _build_validator(_schema_document(schema_path))
+
+
+def _build_validator(schema: dict) -> jsonschema.Draft202012Validator:
+    """Build a format-checking validator for an already-parsed schema.
+
+    Split from :func:`_validator` so callers holding a schema DOCUMENT
+    (the importer's derived proposal schema) build through the same one
+    seam — same checker, same draft — as the file-backed schemas.
+    """
+    return jsonschema.Draft202012Validator(
+        schema, format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER
+    )
 
 
 def _validate(instance: Any, schema_path: Path, origin: str) -> None:
@@ -233,7 +267,9 @@ def validate_against_schema(instance: Any, schema_path: Path | str,
     _validate(instance, Path(schema_path), origin)
 
 
-def iter_schema_violations(instance: Any, schema_path: Path | str) -> list[str]:
+def iter_schema_violations(
+    instance: Any, schema: Path | str | dict
+) -> list[str]:
     """Every schema violation as ``"<path>: <message>"``, sorted by path.
 
     :func:`_validate` raises the single most relevant error — the right
@@ -246,15 +282,21 @@ def iter_schema_violations(instance: Any, schema_path: Path | str) -> list[str]:
 
     Args:
         instance: The parsed document to check.
-        schema_path: The JSON Schema file to check against.
+        schema: The JSON Schema to check against — a path to a schema
+            file (built once, cached) or an already-parsed schema
+            document (the importer's derived proposal schema, F-49).
 
     Returns:
         Every violation as ``"<path>: <message>"`` (``<root>`` for the
         document level), sorted by path; empty when the document is
         schema-valid.
     """
+    if isinstance(schema, dict):
+        validator = _build_validator(schema)
+    else:
+        validator = _validator(Path(schema))
     errors = sorted(
-        _validator(Path(schema_path)).iter_errors(instance),
+        validator.iter_errors(instance),
         key=lambda error: "/".join(str(part) for part in error.absolute_path),
     )
     return [
@@ -306,6 +348,324 @@ def load_tasks(path: Path | str, schema_path: Path | None = None) -> dict:
         raise ContractError(f"{origin}: invalid JSON: {exc}") from exc
     validate_queue(data, origin, schema_path)
     return data
+
+
+# --------------------------------------------------------- test-ref resolution --
+
+# pytest's own defaults for the collection knobs (pytest docs, "Changing
+# naming conventions"); a repo's config can only narrow or re-spell them.
+_PYTEST_DEFAULT_FILES = ("test_*.py", "*_test.py")
+_PYTEST_DEFAULT_FUNCTIONS = ("test*",)
+_PYTEST_DEFAULT_CLASSES = ("Test*",)
+
+
+def _pytest_collection_config(repo: Path) -> tuple | str:
+    """Read the repo's pytest collection config STATICALLY (F-49 review
+    round 1, finding 2).
+
+    Resolution proves a function pytest would COLLECT as a test, so the
+    collection rules come from the repo itself, read in pytest's own
+    config-discovery order (pytest.ini, then pyproject.toml's
+    ``[tool.pytest.ini_options]``, then tox.ini's ``[pytest]``, then
+    setup.cfg's ``[tool:pytest]`` — first file found wins).
+
+    Returns:
+        ``(testpaths, python_files, python_functions, python_classes)`` —
+        testpaths ``None`` when unset (no placement restriction), the
+        pattern tuples defaulting to pytest's — or a human-readable
+        error string when a config file exists but cannot be honoured
+        (unparseable): fail closed, never guess the rules.
+    """
+    def from_mapping(mapping: dict):
+        def split(raw) -> tuple[str, ...] | None:
+            if raw is None:
+                return None
+            if isinstance(raw, str):
+                parts = raw.split()
+            else:
+                parts = [str(item) for item in raw]
+            return tuple(parts) or None
+
+        return (
+            split(mapping.get("testpaths")),
+            split(mapping.get("python_files")) or _PYTEST_DEFAULT_FILES,
+            split(mapping.get("python_functions")) or _PYTEST_DEFAULT_FUNCTIONS,
+            split(mapping.get("python_classes")) or _PYTEST_DEFAULT_CLASSES,
+        )
+
+    def read_ini(path: Path, section: str | None) -> dict | str | None:
+        """One ini file → its pytest keys, ``None`` when it holds none.
+
+        A synthetic root section carries the file's root-level keys —
+        pytest.ini's convention is bare top-level keys, which a plain
+        configparser read rejects (they sit before any section header).
+        For tox.ini/setup.cfg only the named section counts (their root
+        keys belong to tox/setuptools, not pytest); for pytest.ini the
+        root keys ARE the config, with an explicit ``[pytest]`` section
+        also honoured. A parse failure comes back as a string — fail
+        closed, never guess.
+        """
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            return f"cannot read {path.name}: {exc}"
+        parser = configparser.ConfigParser()
+        try:
+            parser.read_string("[__root__]\n" + text, source=path.name)
+        except configparser.Error as exc:
+            return f"{path.name} does not parse ({exc})"
+        data: dict[str, str] = {}
+        if section is None:
+            if parser.has_section("__root__"):
+                data.update(parser["__root__"])
+            if parser.has_section("pytest"):
+                data.update(parser["pytest"])
+        elif parser.has_section(section):
+            data.update(parser[section])
+        return data or None
+
+    ini_candidates = (
+        ("pytest.ini", None),
+        ("tox.ini", "pytest"),
+        ("setup.cfg", "tool:pytest"),
+    )
+    for name, section in ini_candidates:
+        path = repo / name
+        if not path.is_file():
+            continue
+        parsed = read_ini(path, section)
+        if isinstance(parsed, str):
+            return (f"{parsed}; the pytest collection rules cannot be "
+                    "read statically")
+        if parsed is None:
+            continue  # not a pytest config — keep looking
+        return from_mapping(parsed)
+    pyproject = repo / "pyproject.toml"
+    if pyproject.is_file():
+        try:
+            doc = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+            return (
+                f"pyproject.toml exists but does not parse ({exc}); the "
+                "pytest collection rules cannot be read statically"
+            )
+        options = doc.get("tool", {}).get("pytest", {}).get("ini_options", {})
+        if isinstance(options, dict) and options:
+            return from_mapping(options)
+    return (None, _PYTEST_DEFAULT_FILES, _PYTEST_DEFAULT_FUNCTIONS,
+            _PYTEST_DEFAULT_CLASSES)
+
+
+def _top_level_bindings(
+    tree: ast.Module,
+) -> tuple[dict[str, str], dict[str, set[str]]]:
+    """What each TOP-LEVEL name of a module is finally bound to.
+
+    Walks the module body in order; the last binding wins:
+
+    * a (``async``) ``def`` binds ``"function"``;
+    * a ``class`` binds ``"class"`` and records its direct methods;
+    * a top-level assignment (``Assign``/``AnnAssign``/``AugAssign``
+      with a bare ``Name`` target) rebinds to ``"rebound"``.
+
+    Only DIRECT top-level statements count, on purpose: a ``def`` inside
+    ``if`` (a conditional hide), inside another function, or inside a
+    loop is not a statically-guaranteed top-level function — importing
+    the module might see it or might not, and a later top-level
+    assignment (``test_ac_1 = None``) shadows an earlier ``def`` exactly
+    as it would at run time.
+
+    Returns:
+        ``(bindings, class_methods)`` — the final binding kind per
+        top-level name, and the direct-method name set per top-level
+        class.
+    """
+    bindings: dict[str, str] = {}
+    methods: dict[str, set[str]] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            bindings[node.name] = "function"
+        elif isinstance(node, ast.ClassDef):
+            bindings[node.name] = "class"
+            methods[node.name] = {
+                sub.name
+                for sub in node.body
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    bindings[target.id] = "rebound"
+        elif isinstance(node, ast.AugAssign):
+            if isinstance(node.target, ast.Name):
+                bindings[node.target.id] = "rebound"
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name):
+                bindings[node.target.id] = "rebound"
+    return bindings, methods
+
+
+def resolve_test_ref(repo: Path | str, ref: Any) -> str | None:
+    """Resolve a contract test ref STATICALLY to a function pytest would
+    collect as a test (F-49 AC-1, M-10; review round 1, finding 2).
+
+    The module is never imported (importing runs module code and cannot
+    see a function a conditional hides); the file is parsed with ``ast``
+    instead:
+
+    * ``path::name`` — a top-level ``def``/``async def`` named exactly
+      ``name`` in that file, not shadowed by a later top-level
+      assignment;
+    * ``path::Class::name`` — a direct method of a top-level class.
+
+    AND the ref must be something pytest would collect — a top-level
+    function named ``resolve_test_ref`` in a production module is a real
+    function but not a test, and a ref the runner will not collect fails
+    at L1 mid-spend, which is exactly what this guard exists to prevent.
+    The collection rules are read statically from the repo's pytest
+    config (:func:`_pytest_collection_config`): the file's name matches
+    ``python_files`` (default ``test_*.py``/``*_test.py``) and sits
+    under ``testpaths`` when set; the function name matches
+    ``python_functions`` (default ``test*``); a class matches
+    ``python_classes`` (default ``Test*``) and defines no ``__init__``.
+
+    The file must exist under ``repo`` and stay inside it: absolute
+    paths, ``..`` climbs and symlinks resolving out are all refused — a
+    ref that names no file in this repo cannot be proven here.
+
+    Parametrised ids (``name[param]``) fail closed, consistent with F-46
+    AC-5's amendment (L1 treats a not-collected contract test as a
+    failure at both ends): the param cannot be proven to exist
+    statically, and a ref the runner can't collect is a mid-spend
+    failure exactly when the queue stops being cheap to fix. When the
+    queue carries one, name the bare function.
+
+    Args:
+        repo: The repo root the ref's path is relative to.
+        ref: The raw ``check.ref`` value.
+
+    Returns:
+        None when the ref resolves; a human-readable reason naming what
+        is wrong when it does not. Never raises for a bad ref — a reason
+        IS the answer.
+    """
+    if not isinstance(ref, str) or "::" not in ref:
+        return f"does not name a test (expected path::name): {ref!r}"
+    path_text, _, tail = ref.partition("::")
+    parts = tail.split("::")
+    path_text = path_text.strip()
+    if not path_text:
+        return f"ref has no test-file path: {ref!r}"
+    if any(not part.strip() for part in parts):
+        return f"ref names an empty test name: {ref!r}"
+    if len(parts) > 2:
+        return (
+            "ref is not a test node id (expected path::name or "
+            f"path::Class::name): {ref!r}"
+        )
+    name = parts[-1]
+    if name != name.strip():
+        return (
+            f"test name {name!r} is padded with whitespace; the ref must "
+            "name the function exactly as defined"
+        )
+    if "[" in name or "]" in name:
+        return (
+            f"parametrised test ids are not statically provable — name the "
+            f"bare function (fail closed, F-46 AC-5): {ref!r}"
+        )
+    raw = Path(path_text)
+    if raw.is_absolute():
+        return f"test file path must be repo-relative, not absolute: {path_text!r}"
+    if ".." in raw.parts:
+        return f"test file path must not climb out of the repo: {path_text!r}"
+    repo = Path(repo).resolve()
+    try:
+        resolved = (repo / raw).resolve(strict=True)
+    except OSError:
+        return f"test file {path_text!r} does not exist under the repo"
+    try:
+        resolved.relative_to(repo)
+    except ValueError:
+        return (
+            f"test file {path_text!r} resolves outside the repo "
+            "(symlink or climb) and cannot be proven"
+        )
+    if not resolved.is_file():
+        return f"test file {path_text!r} does not exist under the repo"
+    config = _pytest_collection_config(repo)
+    if isinstance(config, str):
+        return f"the repo's pytest config cannot be read: {config}"
+    testpaths, file_patterns, function_patterns, class_patterns = config
+
+    if not any(fnmatch.fnmatch(raw.name, pattern) for pattern in file_patterns):
+        return (
+            f"test file {path_text!r} does not match the repo's pytest "
+            f"python_files patterns ({', '.join(file_patterns)}) — pytest "
+            "would not collect it as a test module"
+        )
+    if testpaths is not None and not any(
+        raw == Path(tp) or tp in raw.parents or raw.is_relative_to(tp)
+        for tp in map(Path, testpaths)
+    ):
+        return (
+            f"test file {path_text!r} is outside the repo's pytest "
+            f"testpaths ({', '.join(testpaths)}) — pytest would not "
+            "collect it by default"
+        )
+    try:
+        tree = ast.parse(resolved.read_text(encoding="utf-8"))
+    except SyntaxError as exc:
+        return (
+            f"test file {path_text!r} does not parse: {exc.msg} "
+            f"(line {exc.lineno}) — a file the runner cannot collect is "
+            "not a contract test"
+        )
+    except (OSError, UnicodeDecodeError) as exc:
+        return f"test file {path_text!r} cannot be read: {exc}"
+    bindings, methods = _top_level_bindings(tree)
+    if len(parts) == 2:
+        cls = parts[0]
+        if not any(fnmatch.fnmatch(cls, pattern) for pattern in class_patterns):
+            return (
+                f"class {cls!r} does not match the repo's pytest "
+                f"python_classes patterns ({', '.join(class_patterns)}) — "
+                "pytest would not collect it"
+            )
+        if bindings.get(cls) != "class":
+            return f"{path_text} has no top-level class named {cls!r}"
+        if "__init__" in methods[cls]:
+            return (
+                f"{path_text}::{cls} defines __init__ — pytest does not "
+                "collect classes with a constructor"
+            )
+        if name not in methods[cls]:
+            return f"{path_text}::{cls} has no method named {name!r}"
+        if not any(fnmatch.fnmatch(name, pattern) for pattern in function_patterns):
+            return (
+                f"test name {name!r} does not match the repo's pytest "
+                f"python_functions patterns ({', '.join(function_patterns)})"
+            )
+        return None
+    binding = bindings.get(name)
+    if binding is None:
+        return (
+            f"{path_text} defines no top-level test function named {name!r} "
+            "(a def inside a conditional, a class or another function does "
+            "not count)"
+        )
+    if binding != "function":
+        return (
+            f"{path_text}::{name} is not a top-level function "
+            f"(its final binding is a {binding})"
+        )
+    if not any(fnmatch.fnmatch(name, pattern) for pattern in function_patterns):
+        return (
+            f"test name {name!r} does not match the repo's pytest "
+            f"python_functions patterns ({', '.join(function_patterns)}) — "
+            "pytest would not collect it as a test"
+        )
+    return None
 
 
 def _check_profile_semantics(data: dict, origin: str, *,
