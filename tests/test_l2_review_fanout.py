@@ -362,7 +362,9 @@ def test_seeded_eval_excludes_quota_voids_from_its_rates(tmp_path):
     """One seed and one clean diff hit quota: the seed leaves L2's catch
     denominator (0 of 5, not 0 of 6), the clean diff leaves the
     false-fail count (0 of 1, not 0 of 2), and both are counted on the
-    quota-voided line instead — never as verdicts."""
+    quota-voided line instead — never as verdicts. (F-48 re-seat: the
+    aggregates render per layer with a spread tail; the counts are the
+    same.)"""
     repo = _repo(tmp_path)
     report = run_seeded_eval(
         repo,
@@ -372,8 +374,8 @@ def test_seeded_eval_excludes_quota_voids_from_its_rates(tmp_path):
     assert report["l2_quota_voided"] == 2
     text = render_report(report)
     assert "L2 quota-voided: 2" in text
-    assert "(0 of 5 seeds)" in text      # L2's rate over non-void seeds
-    assert "L2 false-fail on clean diffs: 0 of 1" in text
+    assert "(pooled 0 of 5 seed runs" in text  # L2's rate over non-void seeds
+    assert "L2: 0 of 1 clean runs" in text
     # The voided records themselves carry no verdict.
     voided = [r for r in report["seeds"] + report["clean"]
               if (r.get("layers") or {}).get("L2", {}).get("quota_voided")]
@@ -433,7 +435,9 @@ def test_render_counts_l2_false_fails_on_clean_diffs():
         }
     )
     text = render_report(report)
-    assert "L2 false-fail on clean diffs: 1 of 2" in text
+    # F-48 re-seat: the aggregate is per layer now; the L2 count and the
+    # retry header are the same assertions.
+    assert "L2: 1 of 2 clean runs" in text
     assert "1 reviewer retry" in text  # the report says a retry fired
 
 
@@ -451,13 +455,13 @@ def test_render_false_fail_line_reads_zero_when_clean_passes():
         }
     )
     text = render_report(report)
-    assert "L2 false-fail on clean diffs: 0 of 2" in text
+    assert "L2: 0 of 2 clean runs" in text
     assert "retry" not in text  # and none fired
 
 
 def test_render_false_fail_line_is_na_when_l2_skipped():
     text = render_report(_report({}))
-    assert "L2 false-fail on clean diffs: n/a" in text
+    assert "- L2: n/a (0 judged)" in text
 
 
 def test_seeded_eval_json_counts_false_fails(tmp_path):
@@ -474,15 +478,17 @@ def test_seeded_eval_json_counts_false_fails(tmp_path):
         ]
     }
     report = run_seeded_eval(repo, session_runner=Seats(findings))
-    assert report["l2_false_fail_on_clean"] == 1
-    assert "L2 false-fail on clean diffs: 1 of 2" in render_report(report)
+    # F-48 re-seat: the aggregate is per layer ({"failed", "judged"}),
+    # no longer the L2-only integer.
+    assert report["false_fail_on_clean"]["L2"] == {"failed": 1, "judged": 2}
+    assert "L2: 1 of 2 clean runs" in render_report(report)
 
 
 def test_seeded_eval_json_false_fail_zero_and_na(tmp_path):
     repo = _repo(tmp_path)
     report = run_seeded_eval(repo, session_runner=Seats())
-    assert report["l2_false_fail_on_clean"] == 0
-    assert "L2 false-fail on clean diffs: 0 of 2" in render_report(report)
+    assert report["false_fail_on_clean"]["L2"] == {"failed": 0, "judged": 2}
+    assert "L2: 0 of 2 clean runs" in render_report(report)
     skipped = run_seeded_eval(repo)
-    assert skipped["l2_false_fail_on_clean"] is None
-    assert "L2 false-fail on clean diffs: n/a" in render_report(skipped)
+    assert skipped["false_fail_on_clean"]["L2"] is None
+    assert "- L2: n/a (0 judged)" in render_report(skipped)

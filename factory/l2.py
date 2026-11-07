@@ -103,6 +103,15 @@ delta review passes, one more full-diff review runs before publish.
 heavier does not (the minors reach the PR body within the nit budget),
 while an unparsable verdict still does.
 
+F-48 makes the chain one public entry point: :func:`settle_review_verdict`
+is the post-review verdict chain BOTH the orchestrator's review rounds
+and the seeded eval's ``run_l2_review`` render through — union, optional
+verifier vote, convergence, and (the final review only) F-41's failure
+rule. Before it, the eval stopped at :func:`apply_vote` and measured a
+verdict production never renders (review M-3: the eval over-reported
+false fails because it never ran the ``vote_rejected_fail`` branch that
+flips a verifier-vetoed declared fail to pass).
+
 Running the reviewer sessions themselves is F-10's wiring; everything here is
 pure parsing and judgement over the text sessions produced.
 """
@@ -1312,3 +1321,65 @@ def final_review_verdict(report: L2Report) -> L2Report:
     # A declared fail with nothing heavier than nits: the round passes,
     # and no stop may fire on the strength of the verdict it overturned.
     return replace(report, verdict="pass", no_progress=False, no_progress_reason=None)
+
+
+def settle_review_verdict(
+    union: L2Report,
+    prior: dict[str, str | None],
+    delta_files: set[str] | frozenset[str] | None,
+    *,
+    delta_mode: bool,
+    vote: VerifierOutcome | None = None,
+    reviewers: int = 1,
+    final: bool = False,
+) -> L2Report:
+    """The post-review verdict chain, as ONE function (F-48, review M-3):
+    the fan-out's union, the verifier's vote when one ran, F-23
+    convergence, and — for the final full review — F-41's failure rule.
+
+    Both the orchestrator's review sites (the per-round review and the
+    final review) and the seeded eval's ``run_l2_review`` render their
+    verdict through this function, so there are not two copies of the
+    chain for eval and production to drift apart on. The callers keep
+    everything around the chain — running the seats, the budget checks,
+    the quota aborts — because those differ by caller; what must not
+    differ is the arithmetic that turns reviews plus vote into a
+    verdict.
+
+    Args:
+        union: The merged reviewer verdicts (:func:`merge_reviews`
+            output) — or a single parsed verdict in a one-reviewer
+            pipeline, which is the same shape.
+        prior: F-23 convergence state — keys raised in earlier rounds,
+            -> their raise sha or None (empty for a single-round review,
+            which is the first-round mode with no history).
+        delta_files: Paths the delta changed since the last review;
+            ``None`` means "no delta to name" and is normalised to the
+            empty set, exactly as the orchestrator's first-round call
+            does.
+        delta_mode: Whether an earlier review in this run exists (the
+            per-round site passes ``delta is not None``).
+        vote: The parsed verifier vote, when a verifier session ran
+            (callers skip the verifier when the union has no findings or
+            failed to parse); ``None`` applies no vote, leaving the
+            union as convergence's input.
+        reviewers: The fan-out width (the unanimous rule's N).
+        final: True only for F-41's final full review, which wraps
+            convergence in :func:`final_review_verdict`.
+
+    Returns:
+        The settled :class:`L2Report` — the verdict the round (or the
+        eval's diff) is scored on.
+    """
+    report = union
+    if vote is not None:
+        report = apply_vote(report, vote, reviewers=reviewers)
+    report = apply_convergence(
+        report,
+        prior,
+        delta_files if delta_files is not None else frozenset(),
+        delta_mode=delta_mode,
+    )
+    if final:
+        report = final_review_verdict(report)
+    return report

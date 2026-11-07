@@ -38,8 +38,10 @@ fails them, by design. CI (`.github/workflows/ci.yml`) runs the same steps.
 The validator is measured, not assumed. `factory eval` seeds the known
 bug classes on branches of the SoloAdventurer fixture, runs every layer
 over each seeded diff plus known-clean diffs, and writes a per-diff
-report: which layers caught each seed, how many blocking findings each
-known-clean diff drew, and the catch rate per layer.
+report: which layers caught each seed, every layer's verdict on each
+known-clean diff (a clean diff a layer wrongly failed shows as that
+layer's false positive), and the catch rate per layer as the **mean and
+spread** over repeats — one run is a ratchet, not a measurement.
 
 - **On demand**: run `factory eval` whenever the validator changes
   (a gate, a prompt, the review fan-out) or after a run escaped it.
@@ -47,6 +49,12 @@ known-clean diff drew, and the catch rate per layer.
   re-tested is just another claim. It drives real model sessions, so it
   is never in CI or `factory run`/`loop`; this command is the only thing
   that starts it.
+- **Repeats**: `--repeats N` (default 3, pending owner confirmation
+  along with the cadence) runs each diff N times; every rate in the
+  report carries its mean, stdev and min–max over the repeats. Each
+  repeat is a full L2 pass — up to 24 real sessions per repeat (16
+  reviewers + 8 verifiers in the last baseline), so N multiplies the
+  model cost: 72 sessions at the default N=3 versus 24 at N=1.
 
 Owner steps per run: read the rendered report it prints and saves under
 `<factory-root>/eval/`, record it as tick evidence, and act on a layer
