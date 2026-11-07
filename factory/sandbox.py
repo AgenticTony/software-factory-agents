@@ -398,6 +398,7 @@ def _allow_write(
     read_only: bool,
     writable_roots: "Sequence[Path]",
     scratch_write: "Sequence[Path] | None",
+    record_write: Path | None = None,
 ) -> list[str]:
     """The settings' allowWrite list, by session shape:
 
@@ -408,14 +409,24 @@ def _allow_write(
       ``.home``/``.tmp`` spellings plus the caller's outside-the-run
       scratch dirs;
     * the implementer/gates: the run dir itself.
+
+    ``record_write`` (F-56): the session's own record dir, appended to
+    EVERY shape — the record file is the one thing every seat must be
+    able to write outside the clone (its atomic temp-and-rename lives
+    there), on a path the orchestrator named before the session started.
     """
     if read_only:
         if scratch_write is not None:
-            return [str(Path(root)) for root in scratch_write]
-        return [str(run_dir / ".home"), str(run_dir / ".tmp")] + [
-            str(Path(root)) for root in writable_roots
-        ]
-    return [str(run_dir)]
+            writable = [str(Path(root)) for root in scratch_write]
+        else:
+            writable = [str(run_dir / ".home"), str(run_dir / ".tmp")] + [
+                str(Path(root)) for root in writable_roots
+            ]
+    else:
+        writable = [str(run_dir)]
+    if record_write is not None:
+        writable.append(str(Path(record_write)))
+    return writable
 
 
 # System dirs every sandboxed command needs to read (exec, libc, the
@@ -479,6 +490,7 @@ def build_settings(
     read_only: bool = False,
     writable_roots: "Sequence[Path]" = (),
     scratch_write: "Sequence[Path] | None" = None,
+    record_write: Path | None = None,
     local_binding: bool = False,
 ) -> dict:
     """Build the srt settings dict for one run from the project profile.
@@ -527,6 +539,24 @@ def build_settings(
             clone would be a channel between "independent" reviewers) and
             not any other session's scratch (each session's settings name
             only its own). None is the single-session shape.
+        record_write: F-56 — the session's own record dir (the
+            ``<settings>-record/`` sibling). Appended to ``allowWrite``
+            in EVERY seat shape and to ``allowRead`` like the scratch.
+            What the binds do (review round 1, finding 4, proven by the
+            reviewer's Linux mutation): the WRITE bind is what persists
+            the file under the read-denied factory root on Linux —
+            without it a write "succeeds" into the deny's tmpfs and never
+            reaches the host (F-47 round 1, finding 1). The read bind is
+            belt-and-braces: nothing inside the sandbox needs to READ
+            the record (the entry writes it, the orchestrator reads it
+            outside), but on macOS a denyRead root also refuses writes
+            under it (the platform semantics in this module's
+            docstring), so the pair is kept together on both platforms.
+            The entry's atomic write (temp in the same dir, rename)
+            needs the dir writable, not just the file. The session can
+            write a record of its choosing there either way — the trust
+            boundary is the entry process, unchanged from the stdout
+            line it replaces (see session.py's F-56 notes).
 
     Returns:
         A settings dict accepted by ``srt --settings``.
@@ -657,8 +687,12 @@ def build_settings(
             # writable does not make it readable, and the CLI dies at startup
             # reading its own $HOME (runs 20261030T120742Z-75e6df, fan-out;
             # 20261030T134446Z-f57b83, the single-session verifier).
+            # The F-56 record dir joins the same carve-out list: the WRITE
+            # bind is what persists it on Linux (review round 1, finding 4);
+            # the read bind is belt-and-braces kept beside it.
             + [str(Path(entry).resolve())
-               for entry in (*(scratch_write or ()), *writable_roots)],
+               for entry in (*(scratch_write or ()), *writable_roots)]
+            + ([str(Path(record_write).resolve())] if record_write else []),
             # Read-only mode (the reviewer seat): the run dir itself is NOT
             # writable — only scratch. A reviewer that can write the repo it
             # reviews can "fix" the code, watch its own fix pass, and report
@@ -676,7 +710,8 @@ def build_settings(
             # degrade to warnings on unwritable caches, so read-only checks
             # still run.
             "allowWrite": _allow_write(
-                run_dir, read_only, writable_roots, scratch_write
+                run_dir, read_only, writable_roots, scratch_write,
+                record_write,
             ),
             # The run's git control files are not the agent's to edit: a hook
             # or core.hooksPath/fsmonitor redirect planted here executes later,

@@ -1029,7 +1029,9 @@ def test_review1_direct_call_does_not_leak_ambient_environment(monkeypatch):
 def _sandbox_stub(monkeypatch, captured):
     """Stub run_sandboxed inside factory.session: capture the spawn args
     (spec path = last argv element) and the written settings, and return a
-    completed-session record without spawning anything."""
+    completed-session record without spawning anything. F-56 re-seat: the
+    record now travels by the file the spec names (written here as the
+    in-sandbox entry would), and stdout carries no record line."""
 
     from factory import session as session_mod
 
@@ -1040,9 +1042,12 @@ def _sandbox_stub(monkeypatch, captured):
         captured["env"] = kwargs.get("env")
         captured["spec_path"] = cmd[-1]
         record = SessionRecord(seat="implementer", status="completed")
+        record_path = session_mod.record_path_for(Path(settings_path))
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        record_path.write_text(json.dumps(record.to_dict()))
         import subprocess as sp
 
-        return sp.CompletedProcess(cmd, 0, json.dumps(record.to_dict()) + "\n", "")
+        return sp.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(session_mod, "run_sandboxed", fake_run_sandboxed)
 

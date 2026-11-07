@@ -121,7 +121,12 @@ from factory.runs import (
     new_run_id,
 )
 from factory.sandbox import SandboxError
-from factory.session import SessionConfigError, run_session_sandboxed, seat_token
+from factory.session import (
+    SessionConfigError,
+    SessionRecordError,
+    run_session_sandboxed,
+    seat_token,
+)
 from factory.state import (
     TaskQueue,
     _atomic_write_json,
@@ -1698,10 +1703,12 @@ def sdk_import_session(
     Raises:
         ImportRefused: No model credential (review a prepared proposal
             with ``factory import --proposal`` instead), the clone or the
-            sandbox could not be set up, the session timed out, or it
-            ended other than ``completed`` (a reviewer that mutated its
-            clone ends ``failed``) — the last two salvage the scratch's
-            last proposal, when one exists.
+            sandbox could not be set up, the session timed out, it ended
+            other than ``completed`` (a reviewer that mutated its clone
+            ends ``failed``), or — F-56 — its RECORD was unusable though
+            the session ran (missing, unreadable, invalid; the error
+            names srt's exit path). The last three salvage the scratch's
+            last proposal, when one exists, before cleanup.
     """
     token = seat_token()
     if not token:
@@ -1737,6 +1744,24 @@ def sdk_import_session(
                     )
                 },
             )
+        except SessionRecordError as exc:
+            # F-56 AC-5: the session RAN — its record is what broke
+            # (missing, unreadable, invalid; srt's exit path named in the
+            # error). Whatever the session wrote to its scratch rides out
+            # exactly as an abort's does: the salvage (inside the raise's
+            # argument) runs BEFORE the finally's cleanup_run sweeps the
+            # scratch. The error text is already seam-scrubbed by the
+            # record-failure helper; it is scrubbed again here because it
+            # is session text in a message the terminal prints.
+            raise ImportRefused(_abort_refusal(
+                scrub_session_text(
+                    f"the importer session's record was unusable: {exc}",
+                    (token,),
+                ),
+                run=run, project=profile["name"], factory_root=root,
+                repo=repo, queue_path=Path(queue_path), docs_dir=docs_dir,
+                secrets=(token,),
+            )) from exc
         except (SessionConfigError, SandboxError, RunError) as exc:
             # Runner setup errors: no bundled CLI / token (SessionConfigError),
             # srt missing or not at the pin (SandboxError, from ensure_srt

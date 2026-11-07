@@ -194,6 +194,13 @@ paths:
     # announced truncation, the locked fresh-queue race) judge the
     # protected contract/state modules and the queue's own integrity.
     - "tests/test_f49.py"
+    # F-56: same precedent — the session-record-transport contract tests
+    # (file transport proven with real srt on both platforms, the
+    # self-explaining record failure, bounded permission_denials, the
+    # srt-kill reporting, the importer salvage) judge the protected
+    # session/sandbox/egress modules and the record channel every seat's
+    # result rides on.
+    - "tests/test_f56.py"
     # F-43 review round 1: the seam itself and its vent wiring, the F-42
     # factory/attribution.py precedent — a factory-built PR must not be
     # able to weaken the C-1 fix (scrub_session_text returning its input,

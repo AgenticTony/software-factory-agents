@@ -1022,9 +1022,8 @@ def test_review9_session_builds_read_only_settings_for_the_reviewer(
         return {}
 
     def fake_run_sandboxed(cmd, run_dir, settings_path, **kwargs):
-        return subprocess.CompletedProcess(
-            cmd, 0, stdout=json.dumps({"seat": "x", "status": "completed"}), stderr=""
-        )
+        _write_stub_record(settings_path, {"seat": "x", "status": "completed"})
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(session_module, "build_settings", fake_build)
     monkeypatch.setattr(session_module, "run_sandboxed", fake_run_sandboxed)
@@ -1065,14 +1064,11 @@ def test_review9_workspace_integrity_checked_after_review(tmp_path, monkeypatch)
             capture_output=True,
         )
         (repo / "src" / "smuggled.py").write_text("injected = True\n")
-        return subprocess.CompletedProcess(
-            cmd, 0,
-            stdout=json.dumps(
-                {"seat": "reviewer", "status": "completed",
-                 "result": '{"verdict": "pass", "findings": []}'}
-            ),
-            stderr="",
-        )
+        _write_stub_record(
+            settings_path,
+            {"seat": "reviewer", "status": "completed",
+             "result": '{"verdict": "pass", "findings": []}'})
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(session_module, "run_sandboxed", mutating_run)
     record = session_module.run_session_sandboxed(
@@ -1109,11 +1105,9 @@ def test_review9_clean_review_passes_the_integrity_check(tmp_path, monkeypatch):
     ).stdout
 
     def quiet_run(cmd, run_dir, settings_path, **kwargs):
-        return subprocess.CompletedProcess(
-            cmd, 0,
-            stdout=json.dumps({"seat": "x", "status": "completed", "num_turns": 2}),
-            stderr="",
-        )
+        _write_stub_record(
+            settings_path, {"seat": "x", "status": "completed", "num_turns": 2})
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(session_module, "run_sandboxed", quiet_run)
     for seat in ("reviewer", "implementer"):
@@ -1192,11 +1186,9 @@ def test_review10_review_leaves_real_scratch_dirs(tmp_path, monkeypatch):
     ).stdout
 
     def quiet_run(cmd, run_dir, settings_path, **kwargs):
-        return subprocess.CompletedProcess(
-            cmd, 0,
-            stdout=json.dumps({"seat": "reviewer", "status": "completed"}),
-            stderr="",
-        )
+        _write_stub_record(settings_path,
+                           {"seat": "reviewer", "status": "completed"})
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(session_module, "run_sandboxed", quiet_run)
     record = session_module.run_session_sandboxed(
@@ -1226,11 +1218,9 @@ def test_review10_implementer_scratch_writable_after_a_review(tmp_path, monkeypa
     repo, profile = _sandbox_repo(tmp_path)
 
     def quiet_run(cmd, run_dir, settings_path, **kwargs):
-        return subprocess.CompletedProcess(
-            cmd, 0,
-            stdout=json.dumps({"seat": "reviewer", "status": "completed"}),
-            stderr="",
-        )
+        _write_stub_record(settings_path,
+                           {"seat": "reviewer", "status": "completed"})
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(session_module, "run_sandboxed", quiet_run)
     session_module.run_session_sandboxed(
@@ -1337,11 +1327,21 @@ def test_review11_scratch_torn_down_when_setup_fails(tmp_path, monkeypatch):
         assert (repo / name).is_dir() and not (repo / name).is_symlink(), name
 
 
-def _quiet_record(cmd):
-    return subprocess.CompletedProcess(
-        cmd, 0, stdout=json.dumps({"seat": "reviewer", "status": "completed"}),
-        stderr="",
-    )
+def _write_stub_record(settings_path, payload):
+    """F-56 re-seat: the stub entry writes the record by FILE (the
+    stdout record line is gone); payload is the record dict."""
+    from factory.session import record_path_for
+
+    record_path = record_path_for(Path(settings_path))
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(json.dumps(payload))
+
+
+def _quiet_record(cmd, settings_path):
+    # F-56 re-seat: the record rides the file; stdout stays empty.
+    _write_stub_record(settings_path,
+                       {"seat": "reviewer", "status": "completed"})
+    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
 
 def test_review11_new_branch_counts_as_mutation(tmp_path, monkeypatch):
@@ -1354,7 +1354,7 @@ def test_review11_new_branch_counts_as_mutation(tmp_path, monkeypatch):
     def make_branch(cmd, run_dir, settings_path, **kwargs):
         subprocess.run(["git", "-C", str(repo), "branch", "smuggled"], check=True)
         subprocess.run(["git", "-C", str(repo), "tag", "smuggled-tag"], check=True)
-        return _quiet_record(cmd)
+        return _quiet_record(cmd, settings_path)
 
     monkeypatch.setattr(session_module, "run_sandboxed", make_branch)
     record = _review(session_module, repo, profile, tmp_path)
@@ -1372,7 +1372,7 @@ def test_review11_branch_switch_counts_as_mutation(tmp_path, monkeypatch):
 
     def switch(cmd, run_dir, settings_path, **kwargs):
         subprocess.run(["git", "-C", str(repo), "checkout", "-qb", "other"], check=True)
-        return _quiet_record(cmd)
+        return _quiet_record(cmd, settings_path)
 
     monkeypatch.setattr(session_module, "run_sandboxed", switch)
     record = _review(session_module, repo, profile, tmp_path)
@@ -1401,7 +1401,7 @@ def test_review11_ignored_artifact_counts_as_mutation(tmp_path, monkeypatch):
 
     def drop_artifact(cmd, run_dir, settings_path, **kwargs):
         (repo / "build" / "out.bin").write_text("smuggled")
-        return _quiet_record(cmd)
+        return _quiet_record(cmd, settings_path)
 
     monkeypatch.setattr(session_module, "run_sandboxed", drop_artifact)
     record = _review(session_module, repo, profile, tmp_path)
@@ -1426,7 +1426,7 @@ def test_review11_quiet_review_with_preexisting_ignored_files_passes(
     (repo / "build" / "keep.txt").write_text("warm cache")
     monkeypatch.setattr(
         session_module, "run_sandboxed",
-        lambda cmd, run_dir, settings_path, **kw: _quiet_record(cmd),
+        lambda cmd, run_dir, settings_path, **kw: _quiet_record(cmd, settings_path),
     )
     record = _review(session_module, repo, profile, tmp_path)
     assert record.status == "completed"

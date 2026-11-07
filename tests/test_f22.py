@@ -796,9 +796,12 @@ def test_ac_7(tmp_path: Path, monkeypatch):
     def fake_run_sandboxed(cmd, run_dir_arg, settings_arg, **kwargs):
         spec_seen["path"] = cmd[-1]
         spec_seen["settings"] = settings_arg
-        return subprocess.CompletedProcess(
-            cmd, 0, json.dumps(SessionRecord(
-                seat="implementer", status="completed").to_dict()) + "\n", "")
+        # F-56: the record travels by the file the spec names.
+        record_path = session_mod.record_path_for(Path(settings_arg))
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        record_path.write_text(json.dumps(SessionRecord(
+            seat="implementer", status="completed").to_dict()))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(session_mod, "run_sandboxed", fake_run_sandboxed)
     session_mod.run_session_sandboxed(
@@ -1012,9 +1015,12 @@ def test_staged_toolkit_is_cleaned_up(tmp_path: Path, monkeypatch):
     resolved = {"root": str(toolkit), "items": [_skill]}
 
     def fake_run_sandboxed(cmd, run_dir_arg, settings_arg, **kwargs):
-        return subprocess.CompletedProcess(
-            cmd, 0, json.dumps(SessionRecord(
-                seat="implementer", status="completed").to_dict()) + "\n", "")
+        # F-56: the record travels by the file the spec names.
+        record_path = session_mod.record_path_for(Path(settings_arg))
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        record_path.write_text(json.dumps(SessionRecord(
+            seat="implementer", status="completed").to_dict()))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(session_mod, "run_sandboxed", fake_run_sandboxed)
     session_mod.run_session_sandboxed(
@@ -1024,11 +1030,13 @@ def test_staged_toolkit_is_cleaned_up(tmp_path: Path, monkeypatch):
     )
     staged = settings_path.with_name(settings_path.name + "-toolkit")
     assert staged.is_dir() and (staged / "skills" / "demo-skill").is_dir()
+    assert session_mod.record_path_for(settings_path).is_file()
     cleanup_run(RunDir("demo", "20260101T000000Z-ab12cd", run_root,
                        settings_path))
     assert not staged.exists()
     assert not settings_path.exists()
     assert not settings_path.with_name(settings_path.name + "-runner").exists()
+    assert not settings_path.with_name(settings_path.name + "-record").exists()
 
 
 def test_reclaim_sweep_removes_a_stray_staged_toolkit(tmp_path: Path):

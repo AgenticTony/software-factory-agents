@@ -15,7 +15,6 @@ a refusal enumerates every violation class in one pass.
 
 from __future__ import annotations
 
-import builtins
 import copy
 import json
 import subprocess
@@ -320,9 +319,14 @@ def _git_repo(path: Path) -> Path:
 
 
 def test_unparsable_record_saves_full_stdout(tmp_path: Path, monkeypatch):
-    """A truncated record line raises SessionConfigError naming a file
-    that holds the full raw stdout (redacted, 0600) — the 56 turns are
-    never lost to a diagnosis again."""
+    """A record file that never arrived whole raises SessionRecordError
+    naming files that hold the full raw stdout AND stderr (redacted,
+    0600) — the 56 turns are never lost to a diagnosis again. F-56
+    re-seat: the record travels by file, so the truncated-stdout repro is
+    a session that died before writing it, with a cut stdout pipe as the
+    evidence the saved streams keep."""
+    from factory.session import SessionRecordError, record_path_for
+
     run_dir = _git_repo(tmp_path / "run")
     factory_root = tmp_path / "factory-root"
     settings_path = tmp_path / "sandbox" / "probe.json"
@@ -333,10 +337,13 @@ def test_unparsable_record_saves_full_stdout(tmp_path: Path, monkeypatch):
     )
 
     def fake_run_sandboxed(cmd, cwd, settings, **kwargs):
-        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        # The entry died before its atomic write: no record file, and a
+        # stdout the pipe cut mid-line (the 2026-11-05 shape).
+        return subprocess.CompletedProcess(
+            cmd, 1, stdout=stdout, stderr="boom: partial write")
 
     monkeypatch.setattr("factory.session.run_sandboxed", fake_run_sandboxed)
-    with pytest.raises(SessionConfigError) as excinfo:
+    with pytest.raises(SessionRecordError) as excinfo:
         run_session_sandboxed(
             "reviewer", "the prompt", run_dir,
             {"docs_allowlist": [], "network_allowlist": []},
@@ -345,28 +352,40 @@ def test_unparsable_record_saves_full_stdout(tmp_path: Path, monkeypatch):
             cli_path=tmp_path / "claude", protected=(),
         )
     message = str(excinfo.value)
+    assert "exit 1" in message
+    assert "boom: partial write" in message
     sessions_dir = factory_root / "sessions"
-    saved = list(sessions_dir.iterdir())
-    assert len(saved) == 1, f"expected one saved stdout, got {saved}"
-    path = saved[0]
-    assert str(path) in message, f"the refusal must name the saved file: {message}"
-    assert str(len('{"seat": "reviewer", "status": "compl')) in message
-    assert path.read_text(encoding="utf-8") == stdout  # the FULL stdout
-    assert "tool_call" in path.read_text(encoding="utf-8")
-    assert path.stat().st_mode & 0o777 == 0o600
+    saved = sorted(sessions_dir.iterdir())
+    assert len(saved) == 2, f"expected the saved stdout+stderr pair, got {saved}"
+    for path in saved:
+        assert str(path) in message, (
+            f"the refusal must name the saved file: {message}")
+        assert path.stat().st_mode & 0o777 == 0o600, path
+    stdout_saved = next(p for p in saved if p.name.endswith(".stdout.txt"))
+    stderr_saved = next(p for p in saved if p.name.endswith(".stderr.txt"))
+    assert stdout_saved.read_text(encoding="utf-8") == stdout  # FULL stdout
+    assert "tool_call" in stdout_saved.read_text(encoding="utf-8")
+    assert stderr_saved.read_text(encoding="utf-8") == "boom: partial write"
+    assert not record_path_for(settings_path).exists()
 
 
-def test_entry_final_print_flushes(tmp_path: Path, monkeypatch):
-    """The in-sandbox entry's final print (the record line the
-    orchestrator parses) flushes explicitly — a torn last line is the
-    unparsable-record failure mode this guards."""
+def test_entry_writes_the_record_atomically(tmp_path: Path, monkeypatch):
+    """The in-sandbox entry's final act is the ATOMIC record write
+    (temp-and-rename in the carved-out dir): stdout carries nothing
+    un-prefixed, and a torn write can never be observed. F-56 re-seat of
+    the old print-flush guard — same intent (the record lands whole),
+    new channel."""
     from factory import session as session_mod
+    from factory.session import record_path_for
 
+    settings_path = tmp_path / "sandbox" / "probe.json"
+    record_path = record_path_for(settings_path)
     spec = tmp_path / "spec.json"
     spec.write_text(json.dumps({
         "seat": "reviewer", "prompt": "p", "cwd": str(tmp_path),
         "max_turns": 1, "timeout_min": 0.05,
         "cli_path": str(tmp_path / "claude"),
+        "record_path": str(record_path),
     }))
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok")
 
@@ -374,21 +393,19 @@ def test_entry_final_print_flushes(tmp_path: Path, monkeypatch):
         return SessionRecord(seat="reviewer", status="completed")
 
     monkeypatch.setattr(session_mod, "run_session", fake_run_session)
-    calls: list[tuple[tuple, dict]] = []
-    real_print = builtins.print
+    import contextlib
+    import io
 
-    def spy(*args, **kwargs):
-        calls.append((args, kwargs))
-        return real_print(*args, **kwargs)
-
-    monkeypatch.setattr(builtins, "print", spy)
-    assert session_mod._main([str(spec)]) == 0
-    record_prints = [
-        (args, kwargs) for args, kwargs in calls
-        if args and isinstance(args[0], str) and '"seat"' in args[0]
-    ]
-    assert record_prints, "the entry never printed its record"
-    assert all(kwargs.get("flush") is True for _, kwargs in record_prints)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert session_mod._main([str(spec)]) == 0
+    assert out.getvalue() == "", (
+        f"stdout must carry only factory-trace lines: {out.getvalue()!r}")
+    assert json.loads(record_path.read_text()) == SessionRecord(
+        seat="reviewer", status="completed").to_dict()
+    leftovers = [p.name for p in record_path.parent.iterdir()
+                 if p.name != record_path.name]
+    assert not leftovers, leftovers
 
 
 # ================= round 2: the self-check works on its real target =========
@@ -482,9 +499,14 @@ def test_scratch_files_land_in_the_session_tmp(tmp_path: Path, monkeypatch):
     def fake_run_sandboxed(cmd, cwd, settings, **kwargs):
         staged = Path(cwd) / ".tmp" / "proposal.schema.json"
         seen["content"] = staged.read_text(encoding="utf-8")
+        # F-56: the record travels by the file the spec names.
+        from factory.session import record_path_for
+
+        record_path = record_path_for(Path(settings))
+        record_path.parent.mkdir(parents=True, exist_ok=True)
         record = SessionRecord(seat="reviewer", status="completed")
-        return subprocess.CompletedProcess(
-            cmd, 0, stdout=json.dumps(record.to_dict()), stderr="")
+        record_path.write_text(json.dumps(record.to_dict()))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr("factory.session.run_sandboxed", fake_run_sandboxed)
     run_session_sandboxed(

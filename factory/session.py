@@ -78,6 +78,26 @@ the runner never crashes on a session outcome. A bug in *this* code
 still raises: only :class:`claude_agent_sdk.ClaudeSDKError` and session
 outcomes are recorded.
 
+Record transport (F-56): the sandboxed entry writes its record to a
+FILE the orchestrator names in the spec — ``<settings>-record/
+record.json`` (:func:`record_path_for`), a per-session dir outside the
+clone, carved out of the sandbox's denies for writing on every seat
+shape (the WRITE bind is what persists it under the read-denied factory
+root on Linux; the read bind rides along as belt-and-braces — review
+round 1, finding 4), wiped fresh before the run and written atomically
+(temp-in-dir, fsync, rename). stdout carries only ``factory-trace``
+lines; a record-looking stdout line is a foreign line the forwarder
+ignores. The record crossed the srt stdout pipe as one JSON line until
+F-56 — three of four real jobfinderos importer runs lost a completed
+session to a truncated line (the fourth's line was exactly 81,920
+bytes, cut inside ``permission_denials``). A record that does not
+arrive whole is a :class:`SessionRecordError` that names the srt exit
+code, the signal if the process died by one, srt's own kill report when
+it made one, a seam-scrubbed stderr tail, and where the full streams
+were saved; ``permission_denials`` is bounded at record-build time
+(:data:`DENIAL_LIST_MAX` entries, :data:`DENIAL_TOOL_INPUT_MAX_CHARS`
+per tool_input, the dropped count on the record).
+
 Secrets: the session env is exactly three names — the Z.ai base URL,
 the Z.ai token (the one secret the sandbox holds, DESIGN D2/D3) and the
 API timeout. ``setting_sources=[]`` so no user/project Claude config is
@@ -95,6 +115,8 @@ import os
 import re
 import shlex
 import shutil
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -122,7 +144,7 @@ from factory.sandbox import (
     run_sandboxed,
     write_settings,
 )
-from factory.state import now_iso
+from factory.state import _atomic_write_json, now_iso
 from factory.toolkit import (
     ENV_SCRUB,
     STAGED_PLACEHOLDER,
@@ -160,6 +182,90 @@ ATTRIBUTION_OFF = {
 SANDBOX_DENY_REASON = (
     "dangerouslyDisableSandbox is not available: the sandbox is not "
     "negotiable — run the command without it"
+)
+
+# F-56 AC-1: the record file's name inside the session's own record dir
+# (see :func:`record_path_for`). One fixed name, one dir per session.
+RECORD_FILE_NAME = "record.json"
+
+
+def record_path_for(settings_path: Path) -> Path:
+    """The record file this session's result travels by (F-56 AC-1).
+
+    ``<settings>-record/record.json`` — a sibling of the srt settings,
+    OUTSIDE the clone (nothing there can ride a diff), named per session
+    (the fan-out's per-session settings give every seat its own), and a
+    path the orchestrator both wipes fresh and reads back through
+    :func:`_read_record_file`. The DIR is the sandbox carve-out
+    (``record_write`` in :func:`factory.sandbox.build_settings`): the
+    entry's atomic write (temp in the same dir, rename) needs the dir
+    writable, and on Linux only a bound path persists on the host.
+    """
+    settings_path = Path(settings_path)
+    return (settings_path.parent
+            / (settings_path.name + "-record")
+            / RECORD_FILE_NAME)
+
+
+# F-56 AC-3: permission_denials bounds, applied where the record is BUILT
+# (the entry's _carry, before anything is written or sent) so the file and
+# every consumer see the bounded form.
+#
+# The real jobfinderos evidence (2026-11-05): the reviewer's denied Bash
+# commands were echoed back in full and the fourth run's record line was
+# exactly 81,920 bytes, cut inside permission_denials. A denial's
+# tool_input is evidence of WHAT was denied, not a second copy of the
+# command stream: 2000 characters name any real command (the F-42 deny
+# reasons are ~140 chars; a 2000-char command is already pathological),
+# and the heaviest real session recorded single-digit denials, so 100
+# entries is an order of magnitude of headroom while capping the whole
+# list at ~100 x (2000 + entry overhead) — well under a quarter megabyte
+# of record no matter what the session did.
+DENIAL_TOOL_INPUT_MAX_CHARS = 2000
+DENIAL_LIST_MAX = 100
+# The per-ENTRY bound (review round 1, finding 3): any kept entry —
+# whatever its shape — serialises to at most the tool_input cap plus a
+# 400-char envelope for the entry's own keys (tool_name and kin), so the
+# total claim holds for non-dict entries and large non-tool_input fields
+# too: DENIAL_LIST_MAX x DENIAL_ENTRY_MAX_CHARS ~= 240 KB of denial list,
+# whatever the session did.
+DENIAL_ENTRY_MAX_CHARS = DENIAL_TOOL_INPUT_MAX_CHARS + 400
+
+# F-56 review round 1 (finding 2): the record READ is bounded. The record
+# file lives in the session's own writable carve-out, so a hostile or
+# wedged session can plant a file of any size; the orchestrator reads at
+# most RECORD_MAX_BYTES+1 and refuses (through the same SessionRecordError)
+# past it. 64 MiB is two orders of magnitude above any real record now
+# that permission_denials is bounded (AC-3): a legitimate record is a few
+# MB at most (a 2 MB result was the AC-1 test), so anything past this is
+# planted or broken, and the bound is refused, never silently truncated.
+RECORD_MAX_BYTES = 64 * 1024 * 1024
+
+# F-56 AC-2: how much of the (already seam-scrubbed) stderr tail the
+# record-failure message carries — the same cap the pre-F-56 no-record
+# message used, kept so a 50 KB stderr cannot flood the terminal or the
+# attempt notes; the full streams are in the saved file beside it.
+RECORD_STDERR_TAIL_CHARS = 2000
+
+# F-56 AC-4: srt's own words when IT killed the command, quoted from the
+# pinned cli.js (node_modules/@anthropic-ai/sandbox-runtime/dist/cli.js,
+# pinned 0.0.79) — matched against the RAW stderr (ASCII, srt-authored)
+# and reported as a distilled fact beside the raw tail by
+# :func:`_srt_kill_fact`. The factory's own spawn never passes
+# --control-fd (run_sandboxed builds ``srt --settings … -c …``), so the
+# dead-channel kill cannot fire in a factory run — pinned by
+# tests/test_f56.py; the signature is still recognised because a future
+# caller of run_sandboxed (or a changed srt) must not turn it back into a
+# silent truncation.
+_SRT_KILL_SIGNATURES = (
+    # cli.js onControlError (line 315): the control channel died before
+    # delivering a config update, so srt SIGTERM'd the command (SIGKILL
+    # after KILL_GRACE_MS) and exits 1 — the status it died with is not
+    # the run's result.
+    "failed before delivering an update",
+    # cli.js child-exit handler (line 458): the command died by a signal
+    # srt observed (any but SIGINT/SIGTERM, which srt maps to exit 0).
+    "Process killed by signal:",
 )
 
 
@@ -218,6 +324,30 @@ def _entry_bootstrap(runner_dir: Path) -> str:
 class SessionConfigError(Exception):
     """The session cannot be configured: unknown seat, missing token, or an
     unusable sandboxed-entry result. Raised before any session starts."""
+
+
+class SessionRecordError(SessionConfigError):
+    """The sandboxed entry ran, but the record it owed the orchestrator
+    at :func:`record_path_for` is missing, unreadable, or not a valid
+    record (F-56 AC-2).
+
+    Subclasses :class:`SessionConfigError` (the orchestrator-side fault
+    that must be loud) while naming the narrower fact — the session
+    STARTED, so callers with salvage to run before cleanup (the
+    importer's ``$TMPDIR/proposal.json``) key on this class. The message
+    is built by the one record-failure helper and names the srt exit
+    code, the signal if the process died by one, a scrubbed stderr tail,
+    whether srt itself reported killing the command, and the path the
+    full stdout and stderr were saved to.
+
+    ``exit_code`` is srt's returncode (None on the wall-clock path,
+    where the orchestrator's own kill left no code to read).
+    """
+
+    def __init__(self, message: str, *, exit_code: int | None = None) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+
 
 
 class _WallClock(Exception):
@@ -1084,6 +1214,13 @@ class SessionRecord:
     hook denied — the per-session number the orchestrator sums onto the
     attempt record and ``factory status`` totals for the week. Zero on
     every record built before F-42 (``from_dict`` defaults it).
+
+    ``permission_denials_dropped`` (F-56 AC-3) counts the denials past
+    :data:`DENIAL_LIST_MAX` that did not fit the bounded list — with the
+    per-entry truncation marked on each kept entry whose
+    ``tool_input`` exceeded :data:`DENIAL_TOOL_INPUT_MAX_CHARS`. Zero on
+    every record built before F-56 (``from_dict`` defaults it); the
+    bounded form is what the entry writes and every consumer sees.
     """
 
     seat: str
@@ -1101,6 +1238,7 @@ class SessionRecord:
     total_cost_usd: float | None = None
     result: str | None = None
     permission_denials: list[Any] | None = None
+    permission_denials_dropped: int = 0
     vents: list[dict[str, Any]] = field(default_factory=list)
     skills: list[str] = field(default_factory=list)
     sandbox_bypass_denials: int = 0
@@ -1157,6 +1295,57 @@ def _record_from(
         result=message.result,
         permission_denials=getattr(message, "permission_denials", None),
     )
+
+
+def _bound_permission_denials(record: SessionRecord) -> SessionRecord:
+    """Bound ``permission_denials`` in place (F-56 AC-3) and return the
+    record, so every exit path that carries a record ships the bounded
+    form — the entry writes it, the orchestrator reads it, no consumer
+    can be fed an unbounded list.
+
+    The CLI reports each permission denial as a free-form entry (the
+    SDK types it ``list[Any]``); a dict entry carrying ``tool_input``
+    gets that ONE field capped at :data:`DENIAL_TOOL_INPUT_MAX_CHARS`
+    (serialised first when it is not a string) and a visible
+    ``tool_input_truncated: true`` marker beside it. Entries of any
+    other shape pass through untouched — the list cap
+    (:data:`DENIAL_LIST_MAX`) is the bound for them, with the overflow
+    counted on ``permission_denials_dropped``. A denial list at or under
+    both caps rides through byte-identical.
+    """
+    denials = record.permission_denials
+    if not denials:
+        record.permission_denials_dropped = 0
+        return record
+    bounded: list[Any] = []
+    dropped = 0
+    for entry in denials:
+        if len(bounded) >= DENIAL_LIST_MAX:
+            dropped += 1
+            continue
+        if isinstance(entry, dict) and "tool_input" in entry:
+            entry = dict(entry)
+            value = entry["tool_input"]
+            text = value if isinstance(value, str) else json.dumps(
+                value, ensure_ascii=False, default=str)
+            if len(text) > DENIAL_TOOL_INPUT_MAX_CHARS:
+                entry["tool_input"] = (
+                    text[:DENIAL_TOOL_INPUT_MAX_CHARS])
+                entry["tool_input_truncated"] = True
+        # The per-entry bound covers EVERY shape (review round 1, finding
+        # 3): a non-dict entry, or a dict whose other fields carry the
+        # bulk, is replaced by its capped serialisation with the visible
+        # marker — the total claim is then true for any input.
+        text = json.dumps(entry, ensure_ascii=False, default=str)
+        if len(text) > DENIAL_ENTRY_MAX_CHARS:
+            entry = {
+                "entry_truncated": True,
+                "text": text[:DENIAL_TOOL_INPUT_MAX_CHARS],
+            }
+        bounded.append(entry)
+    record.permission_denials = bounded
+    record.permission_denials_dropped = dropped
+    return record
 
 
 # --------------------------------------------------- the F-30 stream tap --
@@ -1391,6 +1580,11 @@ async def run_session(
         # Every exit path ships the vents (F-27 AC-3): outcome untouched,
         # friction never lost — including aborts.
         record.vents = list(vent_collector.vents)
+        # ...and the bounded denial list (F-56 AC-3): the bound is applied
+        # where the record is BUILT, so whatever carries it — the file the
+        # entry writes, the in-process return — is already the bounded
+        # form every consumer sees.
+        _bound_permission_denials(record)
         # ...and the loaded-toolkit stamp (F-22 AC-8): what the session
         # was configured with rides out whatever the outcome, so F-19
         # can attribute failures to toolkit versions.
@@ -1719,11 +1913,19 @@ def run_session_sandboxed(
 
     Raises:
         SessionConfigError: No token, no bundled CLI, an underivable
-            layout, an unreadable run-dir git state (reviewer seat), or an
-            entry that produced no parsable record (an orchestrator-side
-            fault that must be loud).
+            layout, or an unreadable run-dir git state (reviewer seat).
+        SessionRecordError: The entry ran but its record file is missing,
+            unreadable, or not a valid record (F-56 AC-2) — the message
+            names the srt exit code, the signal if any, srt's own kill
+            report if it made one, a scrubbed stderr tail, and the saved
+            full streams. A subclass of SessionConfigError, so every
+            existing except still catches it.
         subprocess.TimeoutExpired: The outer wall clock expired — the
-            runner process itself hung past its teardown grace.
+            runner process itself hung past its teardown grace. A record
+            already written by then is returned instead (a completed
+            session is never lost to what happened around it); only a
+            recordless timeout raises, carrying the failure helper's
+            facts as a note.
     """
     token = token if token is not None else seat_token()
     if not token:
@@ -2039,6 +2241,8 @@ def _fanout_sandboxed(
                               ignore_errors=True)
                 shutil.rmtree(settings.with_name(settings.name + "-toolkit"),
                               ignore_errors=True)  # F-22 sibling
+                shutil.rmtree(settings.with_name(settings.name + "-record"),
+                              ignore_errors=True)  # F-56 sibling
                 shutil.rmtree(home.parent, ignore_errors=True)
     return [record for record in records if record is not None]
 
@@ -2098,6 +2302,14 @@ def _run_prepared(
         )
 
     runner_dir = _stage_runner(settings_path.with_name(settings_path.name + "-runner"))
+    # F-56: the record file's dir — fresh for THIS session (a fan-out
+    # retry reuses the per-session settings, so a stale record from the
+    # first attempt must never be read as the retry's), outside the
+    # clone, and the one dir beside the scratch the settings carve out
+    # for writing on every seat shape (build_settings' record_write).
+    record_path = record_path_for(settings_path)
+    shutil.rmtree(record_path.parent, ignore_errors=True)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
     # F-22: the toolkit stages the same way — a read-only copy OUTSIDE
     # the clone (the runner-staging pattern), next to the settings. The
     # sandbox re-allows reading exactly this dir; nothing under it is
@@ -2136,6 +2348,11 @@ def _run_prepared(
                 # F-22: the staged toolkit — the in-sandbox runner wires
                 # it into the session's options (see _apply_toolkit).
                 "toolkit": toolkit_spec,
+                # F-56 AC-1: where the entry writes its record — named by
+                # the orchestrator before the session started, wiped fresh
+                # above, read back once below. stdout carries only
+                # factory-trace lines from here on.
+                "record_path": str(record_path),
             }
         )
     )
@@ -2150,6 +2367,7 @@ def _run_prepared(
         read_only=read_only,
         writable_roots=writable_roots,
         scratch_write=scratch,
+        record_write=record_path.parent,
     )
     write_settings(settings, settings_path)
 
@@ -2167,7 +2385,11 @@ def _run_prepared(
             srt_bin_path=srt_bin_path,
             scratch=scratch,
             # F-30: tool_call events stream out as prefixed lines while the
-            # session runs; the record stays the last un-prefixed line.
+            # session runs. Since F-56 that is ALL stdout carries — the
+            # record travels by the file named in the spec, and a stray
+            # record-looking stdout line is just a foreign line the
+            # forwarder ignores (transport can only lose events, never
+            # crash a run; the file is the one record).
             on_stdout_line=(
                 trace_line_forwarder(trace_sink, secret=token)
                 if trace_sink is not None else None
@@ -2176,38 +2398,212 @@ def _run_prepared(
     except subprocess.TimeoutExpired as exc:
         _report_escapee(seat, exc, True, trace_sink, run_dir, factory_root,
                         run_id, task_id, token)
+        # The outer wall clock fired. The record file is still read
+        # first: a session that finished and delivered its record before
+        # the runner hung (teardown, a straggler in the drain) is a
+        # session the factory keeps — the goal is never to lose a
+        # completed session, whatever happened to the process around it.
+        saved_record = _read_record_quietly(record_path)
+        if saved_record is not None:
+            # Review round 1 (the classify item): the record is USED but
+            # never silently — one event names the fact, so a record that
+            # only exists because the runner hung (and the file was
+            # planted rather than written) is observable, not buried in
+            # the return value. Same tiers as _report_escapee: the sink,
+            # else the run's own trace file, else stderr.
+            _report_timeout_record(
+                seat, saved_record, trace_sink, run_dir, factory_root,
+                run_id, task_id)
+            return saved_record
+        tail = scrub_session_text(exc.stderr or "", (token,))[:RECORD_STDERR_TAIL_CHARS]
+        saved = _save_session_stdout(
+            exc.output or "", run_dir, factory_root,
+            secrets=(token,), stderr=exc.stderr or "",
+        )
+        exc.add_note(_record_failure_text(
+            "the sandboxed session entry was killed at the orchestrator's "
+            "wall clock before its record was written",
+            exit_code=None, stderr_tail=tail,
+            kill_fact=_srt_kill_fact(tail), saved=saved,
+        ))
         raise
     _report_escapee(seat, proc, False, trace_sink, run_dir, factory_root,
                     run_id, task_id, token)
 
-    lines = [line for line in proc.stdout.splitlines() if line.strip()]
-    record_line = next(
-        (line for line in reversed(lines)
-         if not line.startswith(STREAM_PREFIX)),
-        None,
-    )
-    if record_line is None:
-        # F-43 review round 1 (finding 5): the runner's stderr is session-
-        # text-adjacent (a tool can write to it) and this message is
-        # printed to the owner's terminal and rides into attempt notes —
-        # seam-scrubbed with the session's own token, THEN capped, like
-        # every other boundary (F-56 AC-2 will generalize this to the
-        # abort paths).
-        raise SessionConfigError(
-            "the sandboxed session entry produced no record "
-            f"(exit {proc.returncode}): "
-            f"{scrub_session_text(proc.stderr or '', (token,))[:2000]}"
-        )
-    try:
-        record = SessionRecord.from_dict(json.loads(record_line))
-    except (json.JSONDecodeError, TypeError) as exc:
-        raise SessionConfigError(
-            "the sandboxed session entry produced an unparsable record "
-            f"({exc}); record line length {len(record_line)}; full stdout "
-            f"saved to {_save_session_stdout(proc.stdout, run_dir, factory_root, secrets=(token,))}"
-        ) from exc
+    return _read_record(record_path, proc, run_dir, factory_root, token)
 
-    return record
+
+def _open_record_once(path: Path) -> "tuple[str | None, str | None]":
+    """Open the record path ONCE and read it to EOF: ``(text, None)`` or
+    ``(None, why)`` (F-56 AC-1).
+
+    One open, no re-open: there is no stat-then-read window a session
+    could race. ``O_NOFOLLOW`` refuses a symlink at the path;
+    ``O_NONBLOCK`` plus a regular-file :func:`os.fstat` check refuses a
+    FIFO (a plain open would block until a reader-planting session chose
+    to speak) or a directory without reading a byte of either; the single
+    read is the one copy the orchestrator judges.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None, "is missing"
+    except OSError as exc:
+        # ELOOP (symlink), EACCES, … — name the kernel's own words.
+        return None, f"cannot be opened ({exc.strerror or exc})"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None, "is not a regular file (symlink, FIFO or directory)"
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1  # fdopen owns the descriptor from here
+            # Bounded (review round 1, finding 2): read at most the cap
+            # plus one byte — a planted huge file is refused by the size
+            # check below, never read whole into orchestrator memory.
+            raw = handle.read(RECORD_MAX_BYTES + 1)
+        if len(raw) > RECORD_MAX_BYTES:
+            return None, (
+                f"exceeds the record size bound ({RECORD_MAX_BYTES} bytes)")
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    try:
+        return raw.decode("utf-8"), None
+    except UnicodeDecodeError:
+        return None, "is not valid UTF-8"
+
+
+def _read_record(
+    record_path: Path,
+    proc: subprocess.CompletedProcess,
+    run_dir: Path,
+    factory_root: Path | None,
+    token: str,
+) -> SessionRecord:
+    """Read and parse the session's record file; every failure is the ONE
+    record-failure error (F-56 AC-2), naming the srt exit code, the
+    signal if the process died by one, srt's own kill report if it made
+    one, a seam-scrubbed stderr tail, and where the full streams were
+    saved."""
+    text, why = _open_record_once(record_path)
+    if why is None and not text.strip():
+        why = "is empty"
+    if why is None:
+        try:
+            return SessionRecord.from_dict(json.loads(text))
+        except (json.JSONDecodeError, TypeError, ValueError,
+                RecursionError) as exc:
+            # RecursionError: a planted record can nest arbitrarily deep
+            # (the F-49 parse-boundary rule — the record file is
+            # session-writable, so its parse must refuse, never crash).
+            why = f"does not hold a valid record ({exc})"
+    # The raw streams pass the seam HERE (the tail for the message, the
+    # pair for the saved files) — nothing session-derived reaches the
+    # error unscrubbed, and the srt-kill signatures are read from the
+    # already-scrubbed tail (srt's own words are plain ASCII; the seam
+    # keeps ordinary text and only a literal secret or a control byte
+    # could alter them, neither of which srt emits).
+    tail = scrub_session_text(proc.stderr or "", (token,))[:RECORD_STDERR_TAIL_CHARS]
+    saved = _save_session_stdout(
+        proc.stdout, run_dir, factory_root,
+        secrets=(token,), stderr=proc.stderr or "",
+    )
+    raise SessionRecordError(
+        _record_failure_text(
+            f"the sandboxed session entry's record file ({record_path}) {why}",
+            exit_code=proc.returncode, stderr_tail=tail,
+            kill_fact=_srt_kill_fact(tail), saved=saved,
+        ),
+        exit_code=proc.returncode,
+    )
+
+
+def _read_record_quietly(record_path: Path) -> SessionRecord | None:
+    """The timeout path's read: a record that opens and parses is the
+    session's delivered result (used, never discarded); anything else
+    returns None — the timeout itself stays the failure being raised."""
+    text, why = _open_record_once(record_path)
+    if why is not None or not text.strip():
+        return None
+    try:
+        return SessionRecord.from_dict(json.loads(text))
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
+        return None
+
+
+def _record_failure_text(
+    what: str, *, exit_code: int | None, stderr_tail: str,
+    kill_fact: str | None, saved: str,
+) -> str:
+    """The ONE record-failure message (F-56 AC-2), used by every branch:
+    the read/parse failure, and (as the note on the timeout) the
+    wall-clock kill. Names the srt exit code, the signal if the process
+    died by one, srt's own kill report when it made one, the scrubbed
+    stderr tail, and where the full streams are saved — everything an
+    owner needs to diagnose or salvage the session."""
+    parts = [what]
+    if exit_code is None:
+        parts.append("srt exit: unknown (the orchestrator killed the "
+                     "process group at its wall clock)")
+    elif exit_code < 0:
+        try:
+            name = signal.Signals(-exit_code).name
+        except ValueError:
+            name = f"signal {-exit_code}"
+        parts.append(f"srt exit {exit_code} (died by signal {name})")
+    else:
+        parts.append(f"srt exit {exit_code}")
+    if kill_fact:
+        parts.append(kill_fact)
+    if stderr_tail.strip():
+        parts.append(f"stderr tail: {stderr_tail}")
+    if saved.startswith("<"):
+        parts.append(f"full streams not saved ({saved})")
+    else:
+        # The pair's stderr spelling (Path.suffix would only see ".txt"):
+        # swap the stdout file's own suffix in the NAME — and name the
+        # stderr file only when it exists (review round 1, finding 1): a
+        # failed stderr write must leave the message pointing only at
+        # files that are there.
+        stderr_name = saved[: -len(".stdout.txt")] + ".stderr.txt"
+        if os.path.exists(stderr_name):
+            parts.append(
+                f"full stdout and stderr saved to {saved} and {stderr_name}")
+        else:
+            parts.append(
+                f"full stdout saved to {saved} "
+                "(the stderr copy was not written)")
+    return "; ".join(parts)
+
+
+def _srt_kill_fact(stderr_tail: str) -> str | None:
+    """The distilled fact when srt's own stderr says IT killed the
+    command (F-56 AC-4), or None. The signatures are quoted from the
+    pinned cli.js in :data:`_SRT_KILL_SIGNATURES`; the fact lands in the
+    message beside the raw tail so the owner reads the mechanism, not
+    only srt's words."""
+    if "failed before delivering an update" in stderr_tail:
+        return ("srt reported killing the command over a dead control "
+                "channel")
+    if "Process killed by signal:" in stderr_tail:
+        return "srt reported the command was killed by a signal"
+    return None
+
+
+def _write_record_file(record: SessionRecord, path: Path) -> None:
+    """The entry's half of the F-56 transport: write the record
+    atomically through the factory's ONE atomic-write helper
+    (:func:`factory.state._atomic_write_json` — same-dir temp, fsync,
+    rename, dir fsync; F-45 AC-6's rule that no module renames on its
+    own holds here too). A torn write cannot be observed: the reader
+    sees either no record or the whole record, never a prefix — the
+    failure mode the stdout line had.
+
+    (Private import, like importer.py's — F-55's promotion list grows by
+    one consumer; the helper is protected and unchanged.)
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(path, record.to_dict())
 
 
 def _report_escapee(
@@ -2242,30 +2638,71 @@ def _report_escapee(
           f"{run_dir}; no trace to record it in)", file=sys.stderr)
 
 
+def _report_timeout_record(
+    seat: str, record: SessionRecord,
+    trace_sink: "Callable[[dict[str, Any]], None] | None",
+    run_dir: Path, factory_root: Path | None,
+    run_id: str | None, task_id: str | None,
+) -> None:
+    """Review round 1 (the classify item): the timeout path ACCEPTS
+    whatever record the file holds — if the entry never wrote one, the
+    file can only be one the session planted. The use is correct (a
+    delivered record is the session's result; the gates still judge the
+    diff), but it must be VISIBLE: one ``record_used_after_timeout``
+    event through the same tiers as :func:`_report_escapee` (the trace
+    sink, else the run's own trace file when the ids are known, else
+    stderr). Never raises — the record is already the outcome."""
+    event = {
+        "type": "record_used_after_timeout",
+        "seat": seat,
+        "status": record.status,
+    }
+    try:
+        if trace_sink is not None:
+            trace_sink(event)
+            return
+        root = Path(factory_root) if factory_root is not None else None
+        if root is not None and run_id:
+            TraceWriter(root, run_dir.parent.name, run_id, task_id or "-",
+                        ).append(event)
+            return
+    except Exception:  # noqa: BLE001 — the alarm never steers the run
+        pass
+    print(f"factory: record used after the wall-clock kill — "
+          f"{json.dumps(event)} (run dir {run_dir}; no trace to record it "
+          f"in)", file=sys.stderr)
+
+
 def _save_session_stdout(
     stdout: str, run_dir: Path, factory_root: Path | None,
-    *, secrets: "Sequence[str]" = (),
+    *, secrets: "Sequence[str]" = (), stderr: str = "",
 ) -> str:
-    """Keep the full raw stdout of a session whose record would not parse.
+    """Keep the full raw stdout — and, since F-56, the stderr beside it —
+    of a session whose record did not arrive whole.
 
     The once-observed "Unterminated string" record (2026-11-01, 56 turns
     lost) left nothing to diagnose: the run dir is deleted on every exit
     path, and the truncated tail in the error message said nothing about
-    what the whole stream looked like. The copy passes the F-43 egress
-    seam (:func:`factory.egress.scrub_session_text` with the session's
+    what the whole stream looked like. F-56: a missing record needs the
+    stderr just as much (the srt exit path's own words — including its
+    kill reports), so both streams are saved as a pair,
+    ``unparsable-record-<id>.stdout.txt`` / ``.stderr.txt``, one id, one
+    dir. Each copy passes the F-43 egress seam
+    (:func:`factory.egress.scrub_session_text` with the session's
     ``secrets`` — the M-8 gap was the literal token, which pattern
     redaction alone never caught — then the control-sequence strip), is
     written with mode 0600, create-only (O_EXCL), under
     ``<factory-root>/sessions/`` — beside the runs, outside the clone that
     is about to disappear.
 
-    Returns the saved path as text, or ``<not saved: …>`` — the save is
-    diagnostics for a SessionConfigError already on its way out, and a
-    failed save must never mask it. A :class:`TypeError` from the secrets
-    guard (round 3: a bare ``str`` or a non-str element) is a programming
-    error and deliberately wins — raised while the caller handles the
-    original failure, the original stays reachable as the
-    ``__context__``.
+    Returns the saved stdout path as text, or ``<not saved: …>`` — the
+    save is diagnostics for a SessionRecordError already on its way out,
+    and a failed save must never mask it (the stderr half failing leaves
+    the stdout path in hand: half the evidence beats none). A
+    :class:`TypeError` from the secrets guard (round 3: a bare ``str`` or
+    a non-str element) is a programming error and deliberately wins —
+    raised while the caller handles the original failure, the original
+    stays reachable as the ``__context__``.
     """
     secrets = check_secrets(secrets)
     try:
@@ -2275,10 +2712,25 @@ def _save_session_stdout(
             root = runs_root.parent if runs_root.name == "runs" else FACTORY_ROOT_DEFAULT
         directory = root / "sessions"
         directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"unparsable-record-{new_run_id()}.stdout.txt"
+        run_id = new_run_id()
+        path = directory / f"unparsable-record-{run_id}.stdout.txt"
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(scrub_session_text(stdout, secrets))
+        # The stderr half is ALWAYS written (review round 1, finding 1):
+        # empty is honest — the pair the error names exists as a pair. A
+        # failed stderr write is swallowed (half the evidence beats none,
+        # the stdout path stands); _record_failure_text names the stderr
+        # file only when it exists, so the message never points at a
+        # path that is not there.
+        try:
+            err_path = directory / f"unparsable-record-{run_id}.stderr.txt"
+            err_fd = os.open(
+                err_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(err_fd, "w", encoding="utf-8") as handle:
+                handle.write(scrub_session_text(stderr, secrets))
+        except OSError:
+            pass
         return str(path)
     except OSError as exc:
         return f"<not saved: {exc}>"
@@ -2301,6 +2753,13 @@ def _main(argv: list[str] | None = None) -> int:
                 "no ANTHROPIC_AUTH_TOKEN in the environment — the orchestrator "
                 f"passes the Z.ai token via the sandbox env (keychain item "
                 f"{KEYCHAIN_SERVICE!r})"
+            )
+        if not spec.get("record_path"):
+            raise SessionConfigError(
+                "the spec names no record_path — the orchestrator and the "
+                "staged runner disagree on the F-56 record transport; "
+                "re-stage the runner (the factory package copies itself "
+                "per session, so both halves always match)"
             )
         record = asyncio.run(
             run_session(
@@ -2325,15 +2784,18 @@ def _main(argv: list[str] | None = None) -> int:
                 trace_sink=stdout_trace_sink(),
             )
         )
+        # F-56 AC-1: the record travels by FILE, not stdout. Stdout
+        # carries only factory-trace lines from here on — the pipe can be
+        # cut at any byte without touching the record, and the atomic
+        # write (temp in the same carve-out dir, fsync, rename) means the
+        # orchestrator reads either nothing or the whole record, never a
+        # torn prefix. The 2026-11-05 jobfinderos losses (a record line
+        # cut at exactly 81,920 bytes inside permission_denials) were the
+        # stdout transport's last word.
+        _write_record_file(record, Path(spec["record_path"]))
     except (OSError, json.JSONDecodeError, KeyError, SessionConfigError) as exc:
         print(f"factory.session: {exc}", file=sys.stderr)
         return 2
-    # flush=True: this line IS the session's record — the orchestrator
-    # parses it off our stdout. An unflushed buffer torn by teardown is
-    # the truncated-record failure mode (_save_session_stdout guards the
-    # orchestrator side); the explicit flush makes the write land before
-    # anything else can happen to this process.
-    print(json.dumps(record.to_dict()), flush=True)
     return 0
 
 

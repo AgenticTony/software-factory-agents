@@ -41,6 +41,16 @@ STOCKHOLM = ZoneInfo("Europe/Stockholm")
 OFF_PEAK = datetime(2026, 10, 18, 15, 0, tzinfo=STOCKHOLM)
 REF = "tests/test_feature.py::test_ac_1"
 
+def _write_stub_record(settings_path, payload):
+    """F-56 re-seat: the stub entry writes the record by FILE (the stdout
+    record line is gone); payload is the record dict."""
+    from factory.session import record_path_for
+
+    record_path = record_path_for(Path(settings_path))
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(json.dumps(payload))
+
+
 TEST_SOURCE = textwrap.dedent(
     """
     from impl import answer
@@ -760,14 +770,11 @@ def test_fanout_guard_covers_every_reviewer_session(tmp_path, monkeypatch):
         calls["n"] += 1
         if calls["n"] == 1:  # the first reviewer mutates: a smuggled file
             (repo / "src" / "smuggled.py").write_text("injected = True\n")
-        return subprocess.CompletedProcess(
-            cmd, 0,
-            stdout=json.dumps(
-                {"seat": "reviewer", "status": "completed",
-                 "result": '{"verdict": "pass", "findings": []}'}
-            ),
-            stderr="",
-        )
+        _write_stub_record(
+            settings_path,
+            {"seat": "reviewer", "status": "completed",
+             "result": '{"verdict": "pass", "findings": []}'})
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(session_module, "run_sandboxed", mutating_run)
     records = session_module.run_sessions_parallel(
@@ -1033,13 +1040,10 @@ def test_review1_fanout_scratch_is_per_session(tmp_path, monkeypatch):
             Path(settings_path).read_text()
         )["filesystem"]["allowWrite"]
         captured.append((scratch, allow_write))
-        return subprocess.CompletedProcess(
-            cmd, 0,
-            stdout=json.dumps(
-                {"seat": "reviewer", "status": "completed", "result": "{}"}
-            ),
-            stderr="",
-        )
+        _write_stub_record(
+            settings_path,
+            {"seat": "reviewer", "status": "completed", "result": "{}"})
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(session_module, "run_sandboxed", fake_run)
     session_module.run_sessions_parallel(
@@ -1442,13 +1446,10 @@ def test_review6_fanout_sessions_carry_the_toolkit(tmp_path, monkeypatch):
             ),
             "scratch": scratch,
         })
-        return subprocess.CompletedProcess(
-            cmd, 0,
-            stdout=json.dumps(
-                {"seat": "reviewer", "status": "completed", "result": "{}"}
-            ),
-            stderr="",
-        )
+        _write_stub_record(
+            settings_path,
+            {"seat": "reviewer", "status": "completed", "result": "{}"})
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(session_module, "run_sandboxed", fake_run)
     session_module.run_sessions_parallel(
@@ -1533,12 +1534,10 @@ def test_review7_toolkit_dirs_torn_down_even_on_exception(tmp_path, monkeypatch)
             calls["n"] += 1
             if exc and calls["n"] == 2:
                 raise RuntimeError("session 2 blew up mid-fan-out")
-            return subprocess.CompletedProcess(
-                cmd, 0,
-                stdout=json.dumps({"seat": "reviewer", "status": "completed",
-                                   "result": "{}"}),
-                stderr="",
-            )
+            _write_stub_record(
+                settings_path,
+                {"seat": "reviewer", "status": "completed", "result": "{}"})
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         monkeypatch.setattr(session_module, "run_sandboxed", fake_run)
 
