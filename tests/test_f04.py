@@ -155,7 +155,12 @@ def test_ac_2(tmp_path):
     path = _queue_file(
         tmp_path,
         [
-            _task(id="T-DEP", status="done", acceptance_hash="x", approved_at="y"),
+            # F-49 AC-2 re-seat: approved_at was the placeholder "y" —
+            # schema-invalid all along (the schema always declared
+            # date-time; the checker just never enforced it). A real
+            # stamp now, so the fixture loads under the format checker.
+            _task(id="T-DEP", status="done", acceptance_hash="x",
+                  approved_at="2026-01-01T00:00:00Z"),
             _task(id="T-2", depends_on=["T-DEP"]),
         ],
     )

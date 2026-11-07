@@ -67,6 +67,24 @@ its scratch's last ``$TMPDIR/proposal.json`` copied out before the run
 is cleaned up (:func:`_abort_refusal`): three full jobfinderos sessions
 were lost to fixed budgets and cleanup-deleted proposals before either
 existed.
+
+F-49 hardening, from the 2026-11-05 review (m-4, m-6, m-7, I-18):
+
+* the planning-doc listing ANNOUNCES its cap — ``+N more`` in the
+  prompt, the dropped docs named in the import summary the owner
+  confirms (:class:`PlanningDocs`), and the budget scales with the docs
+  actually listed;
+* the fresh-queue write takes :func:`factory.state.queue_writer_lock`
+  across its no-queue check and its write, so two concurrent fresh
+  imports serialise (one writes, one refuses) instead of racing;
+* EVERY parse/validate failure the session output can provoke —
+  RecursionError from deep nesting, ValueError from a huge integer
+  literal, a document past :data:`MAX_PROPOSAL_DEPTH` — is a refusal
+  through the keep-refused path, never a crash past it;
+* the proposal is judged by :func:`plan_side_proposal_schema` — the
+  same shapes the session self-checks — so a proposal without a
+  non-empty ``project`` key, an extra key, or a handed ``status`` is
+  refused before planning.
 """
 
 from __future__ import annotations
@@ -82,7 +100,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, NamedTuple, Sequence
 
 from factory.contract import (
     SCHEMA_DIR,
@@ -104,7 +122,12 @@ from factory.runs import (
 )
 from factory.sandbox import SandboxError
 from factory.session import SessionConfigError, run_session_sandboxed, seat_token
-from factory.state import TaskQueue, _atomic_write_json, now_iso
+from factory.state import (
+    TaskQueue,
+    _atomic_write_json,
+    now_iso,
+    queue_writer_lock,
+)
 
 OUT_OF_SCOPE_DIR = ".factory/out-of-scope"
 DEFAULT_DOCS_DIR = "docs"
@@ -177,17 +200,56 @@ class ImportRefused(ContractError):
 
 # --------------------------------------------------------------- proposal --
 
+# A proposal's own nesting ceiling. The deepest legitimate proposal is
+# ~6 levels (queue -> tasks -> task -> acceptance -> check); anything
+# past this is hostile or broken, and every downstream consumer of a
+# parsed proposal RECURSES over its structure (the egress scrub, the
+# schema check, canonical_json, the queue write), so the parse boundary
+# bounds what they can be fed — never a RecursionError downstream.
+MAX_PROPOSAL_DEPTH = 64
+
+
+def _max_nesting(value: Any) -> int:
+    """Deepest list/dict nesting in a parsed value, computed ITERATIVELY.
+
+    A recursive depth walk could itself be the RecursionError this check
+    exists to prevent, so it carries its own stack.
+    """
+    depth = 0
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        node, level = stack.pop()
+        if level > depth:
+            depth = level
+        if isinstance(node, dict):
+            stack.extend((item, level + 1) for item in node.values())
+        elif isinstance(node, list):
+            stack.extend((item, level + 1) for item in node)
+    return depth
+
 
 def parse_proposal(text: str) -> dict:
     """Parse the importer session's output into a proposal document.
 
     A fenced code block is stripped first (sessions habitually wrap
     their JSON in one); what remains must be a JSON object with a
-    ``tasks`` list.
+    ``tasks`` list, nested no deeper than :data:`MAX_PROPOSAL_DEPTH`.
+
+    F-49 AC-5 (m-7): EVERY failure the text can provoke in the parse is
+    a refusal, never an escape past the keep-refused path —
+
+    * ``RecursionError`` (json's recursive descent on deeply nested
+      arrays/objects),
+    * ``ValueError`` from an integer literal past the 3.11+ int/str
+      conversion limit (a plain ValueError, not a JSONDecodeError),
+    * a document that parses but nests beyond the ceiling — bounded
+      here so no downstream consumer (scrub, schema, the write) can be
+      crashed by structure the parse accepted.
 
     Raises:
-        ImportRefused: The output is not JSON, not an object, or has no
-            ``tasks`` list — the proposal never reaches the queue.
+        ImportRefused: The output is not JSON, not an object, has no
+            ``tasks`` list, or nests too deeply — the proposal never
+            reaches the queue, and the caller keeps the raw output.
     """
     text = text.strip()
     match = _FENCE.search(text)
@@ -199,6 +261,26 @@ def parse_proposal(text: str) -> dict:
         raise ImportRefused(
             f"the importer session's output is not valid JSON: {exc}"
         ) from exc
+    except RecursionError as exc:
+        raise ImportRefused(
+            "the importer session's output is nested too deeply to parse "
+            "(RecursionError) — no proposal can be read from it"
+        ) from exc
+    except ValueError as exc:
+        # Not a JSONDecodeError: Python 3.11+ refuses integer literals
+        # over the int/str conversion limit (4300 digits) like this.
+        raise ImportRefused(
+            f"the importer session's output is not valid JSON "
+            f"(hostile or broken value: {exc})"
+        ) from exc
+    depth = _max_nesting(data)
+    if depth > MAX_PROPOSAL_DEPTH:
+        raise ImportRefused(
+            f"the importer session's output nests {depth} levels deep; a "
+            f"proposal is at most {MAX_PROPOSAL_DEPTH} — deeply nested "
+            "output is refused at the parse boundary so no later consumer "
+            "of the proposal can be crashed by it"
+        )
     if not isinstance(data, dict):
         raise ImportRefused(
             "the importer session's output must be a JSON object with a "
@@ -311,7 +393,10 @@ def build_proposal_schema(schema: dict) -> dict:
     proposal["required"] = ["project", "tasks"]
     proposal["additionalProperties"] = False
     proposal["properties"] = {
-        "project": proposal["properties"]["project"],
+        # minLength 1 (F-49 AC-6): the queue schema only says "string" —
+        # an empty project name is not a name, and this is the one schema
+        # that ever sees the proposal's own project value.
+        "project": {**proposal["properties"]["project"], "minLength": 1},
         "tasks": proposal["properties"]["tasks"],
     }
     task = proposal["$defs"]["task"]
@@ -361,6 +446,38 @@ def _if_reads_status(rule: dict) -> bool:
         return node == "status"
 
     return reads(rule.get("if"))
+
+
+# The task fields a proposal may omit because _new_task defaults them
+# for a fresh task (F-12): the plan-side schema check drops exactly
+# these from the task's required list, so the defaults behaviour is
+# unchanged while every OTHER shape the session self-checks, the factory
+# side checks too (F-49 AC-6).
+_NEW_TASK_DEFAULT_FIELDS = ("depends_on", "risk", "gates")
+
+
+def plan_side_proposal_schema(schema: dict) -> dict:
+    """The proposal schema :func:`plan_import` judges the proposal by
+    (F-49 AC-6, I-18): :func:`build_proposal_schema`, minus the three
+    task fields a proposal may leave to the F-12 defaults.
+
+    One schema, both sides: the session self-checks its output against
+    ``build_proposal_schema`` (staged in its scratch) and the factory
+    re-judges the same shapes here — a missing or empty ``project``, an
+    extra top-level key, a task key outside the spec fields, a handed
+    ``status`` — so a proposal that skips naming its project is refused
+    BEFORE planning, by the schema, not by a second hand-written check.
+    The staged check stays the stricter of the two (it demands the
+    defaults-able trio too); a proposal that passes it always passes
+    here, which keeps the agreement one-directional exactly as before.
+    """
+    derived = build_proposal_schema(schema)
+    task = derived["$defs"]["task"]
+    task["required"] = [
+        name for name in task["required"]
+        if name not in _NEW_TASK_DEFAULT_FIELDS
+    ]
+    return derived
 
 
 def _resolve_ref(prop: dict, schema: dict) -> dict:
@@ -435,9 +552,25 @@ def _schema_contract_lines(schema: dict) -> list[str]:
     return lines
 
 
-def _list_planning_docs(repo: Path, docs_dir: str) -> list[str]:
+class PlanningDocs(NamedTuple):
+    """The planning-doc listing split at the cap (F-49 AC-3, m-4).
+
+    ``kept`` is what the prompt lists (and what the budget scales with);
+    ``dropped`` is what the cap left out — announced, never silent: the
+    prompt says ``+N more``, and the import summary names the dropped
+    docs, so tasks defined only in them cannot quietly vanish from the
+    proposal.
+    """
+
+    kept: list[str]
+    dropped: list[str]
+
+
+def _list_planning_docs(repo: Path, docs_dir: str) -> PlanningDocs:
     """The repo-relative planning docs the prompt lists: markdown files
-    under ``docs_dir``, sorted, capped at :data:`MAX_DOC_FILES`.
+    under ``docs_dir``, sorted; the first :data:`MAX_DOC_FILES` are kept
+    and the rest are dropped — the dropped names ride along so the
+    truncation is announced (:class:`PlanningDocs`, F-49 AC-3).
 
     One listing for two consumers — the prompt (:func:`build_import_prompt`)
     and the budget (:func:`scaled_import_budget`) — so the number the
@@ -445,12 +578,13 @@ def _list_planning_docs(repo: Path, docs_dir: str) -> list[str]:
     was actually told to read."""
     docs = Path(repo) / docs_dir
     if not docs.is_dir():
-        return []
-    return sorted(
+        return PlanningDocs([], [])
+    all_docs = sorted(
         str(path.relative_to(repo))
         for path in docs.rglob("*")
         if path.is_file() and path.suffix in {".md", ".markdown"}
-    )[:MAX_DOC_FILES]
+    )
+    return PlanningDocs(all_docs[:MAX_DOC_FILES], all_docs[MAX_DOC_FILES:])
 
 
 def scaled_import_budget(doc_count: int) -> tuple[int, float]:
@@ -515,7 +649,9 @@ def validate_budget(
 
 
 def build_import_prompt(
-    repo: Path, docs_dir: str, records: list[dict], *, project: str | None = None
+    repo: Path, docs_dir: str, records: list[dict], *,
+    project: str | None = None,
+    files: PlanningDocs | None = None,
 ) -> str:
     """The importer session's prompt: which docs to read, the register
     to match against, and the exact output contract.
@@ -529,6 +665,12 @@ def build_import_prompt(
             literally; without it (the pre-name contract arm, kept for
             direct calls) the placeholder stays and the session is back
             to guessing — :func:`run_import` always passes it.
+        files: The planning-doc listing, when the caller already holds
+            the ONE computation (:func:`run_import` does — the prompt,
+            the budget and the summary must all describe the same docs,
+            so the listing is computed once and threaded through; F-49
+            review round 1, finding 3). None computes it here, for
+            direct callers.
 
     The name is stated, not described: a placeholder like
     ``"<project name>"`` left the session to guess from the repository
@@ -551,17 +693,28 @@ def build_import_prompt(
     the proposal and the check outputs live under ``$TMPDIR``.
     """
     repo = Path(repo)
-    files = _list_planning_docs(repo, docs_dir)
+    if files is None:
+        files = _list_planning_docs(repo, docs_dir)
     lines = [
         "You are the factory's importer seat. Read the project's planning",
         "documents and propose a tasks.json queue for them.",
         "",
         "Planning documents (read them from the repo):",
     ]
-    if files:
-        lines.extend(f"- {name}" for name in files)
+    if files.kept:
+        lines.extend(f"- {name}" for name in files.kept)
     else:
         lines.append("- (none found under the docs directory)")
+    if files.dropped:
+        # F-49 AC-3 (m-4): the cap is announced, never silent — the
+        # session knows docs exist it was not told to read (and can rglob
+        # for them if it chooses; the budget was sized for the listing),
+        # and the summary the owner confirms names the dropped docs.
+        lines.append(
+            f"- (+{len(files.dropped)} more planning docs under {docs_dir}/ "
+            "exist but are not listed; the listing above is what this "
+            "import was sized for)"
+        )
     lines += ["", "Out-of-scope register (TASK-CONTRACT §5) — concepts the",
               "owner already rejected. Match by concept, not keyword:"]
     if records:
@@ -684,6 +837,11 @@ class ImportPlan:
     # write refuses if the disk queue no longer matches it, so a change
     # made while the confirm prompt waits is never silently reverted.
     base_doc: dict | None = None
+    # Planning docs the listing cap dropped (F-49 AC-3, m-4): the
+    # summary names them, so the owner knows the proposal was built from
+    # a capped view. Set by run_import (which sees the repo); a directly
+    # built plan has none.
+    truncated_docs: list[str] = field(default_factory=list)
 
 
 def _task_from_proposal(raw: Any, index: int, record_paths: set[str]) -> tuple[dict, str | None]:
@@ -703,9 +861,15 @@ def _task_from_proposal(raw: Any, index: int, record_paths: set[str]) -> tuple[d
         raise ImportRefused(f"proposal task #{index} is not an object")
     task_id = raw.get("id")
     if not isinstance(task_id, str) or not task_id.strip():
+        try:
+            shown = json.dumps(raw, default=str)[:200]
+        except (RecursionError, ValueError):
+            # Hostile structure in the entry itself (F-49 AC-5's class:
+            # json.dumps recurses too): name the type, never crash the
+            # refusal path on the thing it is refusing.
+            shown = f"<unserialisable {type(raw).__name__}>"
         raise ImportRefused(
-            f"proposal task #{index} has no readable id: "
-            f"{json.dumps(raw, default=str)[:200]}"
+            f"proposal task #{index} has no readable id: {shown}"
         )
     for banned in FORBIDDEN_FIELDS:
         if banned in raw:
@@ -776,6 +940,17 @@ def _merge_task(existing: dict, proposed: dict) -> tuple[dict, list[str]]:
     return merged, changed
 
 
+def _format_violations(head: str, lines: list[str]) -> str:
+    """One refusal from a violation list: the count, every line capped
+    at :data:`MAX_SHOWN_VIOLATIONS` with a ``+N more`` tail."""
+    plural = "" if len(lines) == 1 else "s"
+    parts = [f"{head}: {len(lines)} schema violation{plural}:"]
+    parts.extend(f"- {line}" for line in lines[:MAX_SHOWN_VIOLATIONS])
+    if len(lines) > MAX_SHOWN_VIOLATIONS:
+        parts.append(f"- (+{len(lines) - MAX_SHOWN_VIOLATIONS} more)")
+    return "\n".join(parts)
+
+
 def _refusal_listing_every_violation(exc: ContractError, doc: dict) -> str:
     """The refusal message for a merged document that fails validation:
     every schema violation, capped at :data:`MAX_SHOWN_VIOLATIONS` with a
@@ -795,14 +970,7 @@ def _refusal_listing_every_violation(exc: ContractError, doc: dict) -> str:
     parts: list[str] = []
     if not any(f"at {line}" in head for line in lines):
         parts.append(head)
-    plural = "" if len(lines) == 1 else "s"
-    parts.append(
-        f"the proposed tasks.json is refused: {len(lines)} schema "
-        f"violation{plural}:"
-    )
-    parts.extend(f"- {line}" for line in lines[:MAX_SHOWN_VIOLATIONS])
-    if len(lines) > MAX_SHOWN_VIOLATIONS:
-        parts.append(f"- (+{len(lines) - MAX_SHOWN_VIOLATIONS} more)")
+    parts.append(_format_violations("the proposed tasks.json is refused", lines))
     return "\n".join(parts)
 
 
@@ -827,10 +995,11 @@ def plan_import(
             the profile for a fresh one.
 
     Raises:
-        ImportRefused: The proposal names another project, duplicates an
-            id, carries forbidden fields or statuses, names an unknown
-            out-of-scope record — or the merged document would not
-            validate (AC-1).
+        ImportRefused: The proposal names another project, omits or
+            misspells the ``project`` key (F-49 AC-6 — the proposal
+            schema requires it), duplicates an id, carries forbidden
+            fields or statuses, names an unknown out-of-scope record —
+            or the merged document would not validate (AC-1).
     """
     proposed_project = proposal.get("project")
     if proposed_project is not None and proposed_project != project:
@@ -854,6 +1023,33 @@ def plan_import(
         proposed_tasks.append(task)
         if match:
             matches.append(OutOfScopeMatch(task_id=task["id"], record=match))
+
+    # F-49 AC-6 (I-18): the ONE schema check the session's self-check and
+    # the factory share. The semantic rules above keep their readable,
+    # task-naming messages (status, forbidden fields, duplicate ids,
+    # unknown records — checked first, on purpose); everything the schema
+    # expresses better — a missing/empty/mistyped ``project``, an extra
+    # top-level key, a task key outside the spec fields — is refused
+    # here, BEFORE the merge, so a proposal cannot skip naming its
+    # project and a typo'd task field cannot be silently dropped by the
+    # merge's spec-field copy.
+    try:
+        violations = iter_schema_violations(
+            proposal, plan_side_proposal_schema(_load_tasks_schema())
+        )
+    except RecursionError as exc:
+        # A directly-driven plan (parse_proposal's depth bound not taken
+        # on this path): refuse, never crash past the keep-refused path.
+        raise ImportRefused(
+            "the proposal is nested too deeply to check against the "
+            "proposal schema (RecursionError)"
+        ) from exc
+    if violations:
+        raise ImportRefused(_format_violations(
+            "the proposal does not match the importer's proposal schema "
+            "(the same shape check the session runs on its own output)",
+            violations,
+        ))
 
     existing_tasks = existing_doc.get("tasks", []) if existing_doc else []
     by_id = {task.get("id"): task for task in existing_tasks}
@@ -898,6 +1094,14 @@ def plan_import(
     except ContractError as exc:
         raise ImportRefused(
             _refusal_listing_every_violation(exc, proposed_doc)
+        ) from exc
+    except RecursionError as exc:
+        # Defence in depth behind the proposal-schema check (which bounds
+        # what can reach the merge): a refusal, never a crash past the
+        # keep-refused path.
+        raise ImportRefused(
+            "the proposed tasks.json is nested too deeply to validate "
+            "(RecursionError)"
         ) from exc
 
     before = _doc_text(existing_doc) if existing_doc else ""
@@ -960,6 +1164,21 @@ def render_summary(plan: ImportPlan) -> str:
     lines.append(
         "- every proposed task is draft; approval stays yours (factory approve)"
     )
+    if plan.truncated_docs:
+        # F-49 AC-3 (m-4): the proposal was built from a capped view —
+        # the owner confirming it must know which docs the session never
+        # saw, because no task defined only in them could have been
+        # proposed.
+        lines += [
+            "",
+            "## Planning docs not listed",
+            "",
+            f"The session was shown the first {MAX_DOC_FILES} planning "
+            f"docs; {len(plan.truncated_docs)} more exist and were not "
+            "listed, so no task defined only in these could have been "
+            "proposed:",
+        ]
+        lines.extend(f"- {name}" for name in plan.truncated_docs)
     lines += ["", "## Out-of-scope matches", ""]
     if not plan.matches:
         lines.append("- none")
@@ -991,11 +1210,16 @@ def apply_import(
 
     An existing queue is written through :class:`TaskQueue.save`
     (validation, the writer lock, the append-only attempts check); a
-    fresh queue is validated once more and written atomically. Either
-    way the queue on disk must still be the one the plan was built from
-    (``plan.base_doc``): a change made in between — an approval, a
-    status move, a queue created by another writer — refuses the write
-    rather than being overwritten with the stale plan.
+    fresh queue is validated once more and written atomically UNDER THE
+    QUEUE WRITER LOCK (:func:`factory.state.queue_writer_lock` — F-49
+    AC-4, m-6): the "no queue exists" decision and the write happen
+    inside the same lock every other queue writer takes, so two
+    concurrent fresh imports serialise — one writes, the other finds the
+    winner's queue under the lock and refuses instead of overwriting it.
+    Either way the queue on disk must still be the one the plan was
+    built from (``plan.base_doc``): a change made in between — an
+    approval, a status move, a queue created by another writer — refuses
+    the write rather than being overwritten with the stale plan.
 
     Args:
         plan: The plan to apply.
@@ -1007,6 +1231,8 @@ def apply_import(
 
     Raises:
         ImportRefused: The queue changed since the plan was built.
+        OSError: The write itself failed (the previous contents, if any,
+            are intact).
     """
     if not confirm():
         return False
@@ -1038,10 +1264,19 @@ def apply_import(
         doc["updated_at"] = now_iso()
         validate_queue(doc, str(path))
         path.parent.mkdir(parents=True, exist_ok=True)
-        # The package's own atomic writer (factory.state); a fresh queue
-        # has no TaskQueue instance yet, so the temp+rename write is used
-        # directly — same-package use of the one writer primitive.
-        _atomic_write_json(path, doc)
+        # F-49 AC-4 (m-6): the lock TaskQueue.save serialises on, taken
+        # across the check and the write. The re-check inside the lock is
+        # the race's loser detector — a queue that appeared meanwhile was
+        # created by another writer, and overwriting it would silently
+        # drop that writer's fresh queue.
+        with queue_writer_lock(path):
+            if path.is_file():
+                raise stale  # created by another writer while we planned
+            # The package's own atomic writer (factory.state); a fresh
+            # queue has no TaskQueue instance yet, so the temp+rename
+            # write is used directly — same-package use of the one writer
+            # primitive, now under the one writer lock.
+            _atomic_write_json(path, doc)
     return True
 
 
@@ -1051,14 +1286,19 @@ def apply_import(
 def _refusal_suffix(text: str) -> str:
     """``.json`` when the session's output is JSON (fence stripped, as
     :func:`parse_proposal` reads it), ``.txt`` when it is not — the
-    extension says what there is to fix."""
+    extension says what there is to fix.
+
+    The same parse failures :func:`parse_proposal` converts (deep
+    nesting's RecursionError, the huge-int ValueError) are caught here
+    too: the keep-refused path must never crash on the very input that
+    made it necessary (F-49 AC-5)."""
     stripped = text.strip()
     match = _FENCE.search(stripped)
     if match:
         stripped = match.group(1).strip()
     try:
         json.loads(stripped)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError, RecursionError):
         return ".txt"
     return ".json"
 
@@ -1323,7 +1563,14 @@ def run_import(
     else:
         profile = load_profile(repo / ".factory" / "project.yaml")
         project = profile["name"]
-    prompt = build_import_prompt(repo, docs_dir, records, project=project)
+    # The ONE listing for the whole run (F-49 review round 1, finding 3):
+    # the prompt, the scaled budget and the summary's truncated-doc names
+    # all describe the same docs — computed before the session runs, so
+    # a docs change DURING the session cannot make the summary name a
+    # different capped set than the prompt offered.
+    listing = _list_planning_docs(repo, docs_dir)
+    prompt = build_import_prompt(repo, docs_dir, records, project=project,
+                                 files=listing)
     if session is not None:
         text = session(prompt)
     else:
@@ -1333,7 +1580,7 @@ def run_import(
             profile = load_profile(repo / ".factory" / "project.yaml")
         if max_turns is None or timeout_min is None:
             scaled_turns, scaled_timeout = scaled_import_budget(
-                len(_list_planning_docs(repo, docs_dir))
+                len(listing.kept)
             )
         text = sdk_import_session(
             prompt, repo, profile=profile, queue_path=queue_path,
@@ -1364,6 +1611,10 @@ def run_import(
         # judges the scrubbed values, not the raw ones.
         proposal = scrub_session_value(parse_proposal(text), egress_secrets)
         plan = plan_import(existing_doc, proposal, records, project=project)
+        # F-49 AC-3: the plan carries the docs the ONE listing (computed
+        # before the session) dropped, so the summary the owner confirms
+        # names them — the same capped set the prompt described.
+        plan.truncated_docs = listing.dropped
         summary = render_summary(plan)
         applied = False
         if confirm is not None:

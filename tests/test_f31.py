@@ -50,6 +50,11 @@ REF = "tests/test_feature.py::test_ac_1"
 # adds nothing to what the factory already shipped.
 KNOWN_DEPENDENCIES = {
     "jsonschema>=4",
+    # F-49 AC-2 re-seat: the format checker's date-time backend (contract
+    # validation, not a dashboard dependency — the dashboard's "no new
+    # dependency" contract is unchanged by it). Exact pin: PyPI has only
+    # 0.1.x (review round 1, finding 1).
+    "rfc3339-validator==0.1.4",
     "PyYAML>=6",
     "claude-agent-sdk==0.2.168",
 }
