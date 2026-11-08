@@ -1274,3 +1274,210 @@ def run_on_demand_eval(
             settings_path.unlink()
         if not keep_fixture:
             shutil.rmtree(fixture_dir, ignore_errors=True)
+
+
+# ------------------------------------------------- F-57: the importer eval --
+
+# The oversized prose work order (AC-3/AC-4): the doc the split rule is
+# measured against.
+IMPORTER_OVERSIZED_DOC = "docs/offline-mode.md"
+
+# The prose-import fixture's checkout location. The second allowed
+# __file__-escape beside the sandbox's srt runtime lookup (both pinned
+# in tests/test_f51.py's allowlist): this eval is an owner-run command
+# from the checkout, and the fixture — deliberately test data, protected
+# under tests/fixtures/** — is not package data (a wheel ships no
+# tests/, and the eval's refusal says so).
+_IMPORTER_FIXTURE_ROOT = (
+    Path(__file__).resolve().parent.parent / "tests" / "fixtures"
+    / "prose-import"
+)
+
+
+def _importer_fixture_source() -> Path:
+    """The prose-import fixture's home in the checkout (see
+    :data:`_IMPORTER_FIXTURE_ROOT` — why it is not package data)."""
+    return _IMPORTER_FIXTURE_ROOT
+
+
+def _build_importer_fixture(dest: Path) -> Path:
+    """Copy the prose fixture into ``dest`` and commit it: a real git
+    repo (the sandboxed importer session clones committed HEAD), with
+    NO queue — the import proposes one."""
+    source = _importer_fixture_source()
+    if not source.is_dir():
+        raise EvalError(
+            f"the prose-import fixture is missing at {source} — the "
+            "importer eval runs from the factory checkout"
+        )
+    shutil.copytree(source, dest)
+    for args in (
+        ("init", "-q", "-b", "main"),
+        ("config", "user.email", "eval@factory.local"),
+        ("config", "user.name", "factory eval"),
+        ("add", "-A"),
+        ("commit", "-q", "-m", "prose fixture"),
+    ):
+        _git(dest, *args)
+    return dest
+
+
+def _importer_eval_refusal(refusal: str) -> dict:
+    """The refused arm of the AC-4 report: schema_valid False with the
+    refusal text — a faked clean bill is never rendered."""
+    return {
+        "fixture": "prose-import",
+        "schema_valid": False,
+        "refusal": refusal,
+        "task_count": 0,
+        "oversized_doc": IMPORTER_OVERSIZED_DOC,
+        "tasks_from_oversized": 0,
+        "oversized_split": None,
+        "tool_used": False,
+        "propose_calls": 0,
+        "accepted_tasks": 0,
+        "repair": None,
+        "precedence_note": None,
+    }
+
+
+def _importer_eval_report(result) -> dict:
+    """The succeeded arm of the AC-4 report: schema validity (judged by
+    the real pipeline — the import, its refusal and the ONE repair all
+    included), task count, whether the oversized work order came out
+    split, and HOW the plan was produced (S2, review round 1: the
+    propose tool's use, the repair's outcome and turns, the precedence
+    note) — first-pass success and a repaired one never read the same."""
+    tasks = result.plan.proposed_doc.get("tasks", [])
+    from_oversized = [
+        task for task in tasks
+        if str(task.get("source", "")).startswith(IMPORTER_OVERSIZED_DOC)
+    ]
+    repair = dict(result.repair) if result.repair else None
+    return {
+        "fixture": "prose-import",
+        "schema_valid": True,
+        "refusal": None,
+        "task_count": len(tasks),
+        "oversized_doc": IMPORTER_OVERSIZED_DOC,
+        "tasks_from_oversized": len(from_oversized),
+        "oversized_split": (
+            len(from_oversized) > 1 if tasks else None
+        ),
+        # S2: what produced the plan
+        "tool_used": result.propose_calls > 0,
+        "propose_calls": result.propose_calls,
+        "accepted_tasks": result.accepted_count,
+        "repair": repair,
+        "precedence_note": result.precedence_note or None,
+    }
+
+
+def _render_importer_report(report: dict) -> str:
+    """The owner-facing tick evidence: one block, the three facts."""
+    lines = [
+        f"Importer eval — fixture: {report['fixture']} "
+        f"(oversized doc: {report['oversized_doc']})",
+        "",
+        f"- schema_valid: {report['schema_valid']}",
+        f"- task_count: {report['task_count']}",
+    ]
+    if report["schema_valid"]:
+        split = ("split into "
+                 f"{report['tasks_from_oversized']} tasks"
+                 if report["oversized_split"] else "NOT split")
+        lines.append(f"- oversized work order: {split}")
+    else:
+        lines.append("- oversized work order: n/a (the import was refused)")
+        lines.append(f"- refusal: {report['refusal']}")
+    produced = (
+        f"propose_task: {'yes' if report['tool_used'] else 'no'} "
+        f"({report['propose_calls']} call(s), "
+        f"{report['accepted_tasks']} accepted)"
+    )
+    if report["repair"]:
+        turns = report["repair"].get("turns")
+        turns_text = (
+            f"{turns} turns" if isinstance(turns, int)
+            else "an unknown number of turns"
+        )
+        produced += (
+            f"; repaired (outcome {report['repair'].get('outcome')}, "
+            f"{turns_text})"
+        )
+    lines.append(f"- produced by: {produced}")
+    if report["precedence_note"]:
+        lines.append(f"- precedence: {report['precedence_note']}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def run_importer_eval(
+    factory_root: Path | None = None,
+    out_path: Path | None = None,
+    *,
+    scripted: bool = False,
+) -> dict:
+    """ONE real import against the prose fixture (F-57 AC-4) — the
+    owner's on-demand measurement, never routine CI.
+
+    ``factory eval --importer`` is the only caller on the real path, and
+    the real path refuses to run without the explicit live opt-in —
+    exactly ``FACTORY_LIVE_TESTS=1``, the f06 convention: the value
+    semantics are the contract, so a credential alone (or an org runner
+    exporting it) can never turn a paid session on. ``scripted=True`` is
+    the offline test seam: the caller has patched the session runner, so
+    nothing can spend — the gate stands down for that shape only.
+
+    The report names the three facts AC-4 asks for: whether the proposal
+    was schema-valid (judged by the real pipeline — the import, its
+    refusal, and the ONE repair all included), how many tasks it
+    proposed, and whether the oversized work order came out split (the
+    prompt's rule: a task too big for size M is split, never sized above
+    the enum). Nothing is written to any queue — the import proposes
+    only.
+
+    Returns:
+        ``{"report", "report_path", "rendered_path"}``.
+    """
+    import os
+
+    from factory.importer import ImportRefused, run_import
+    from factory.runs import FACTORY_ROOT_DEFAULT
+
+    if not scripted and os.environ.get("FACTORY_LIVE_TESTS") != "1":
+        raise EvalError(
+            "the importer eval drives ONE real model session: opt in "
+            "with FACTORY_LIVE_TESTS=1 (a credential alone never turns "
+            "it on)"
+        )
+    root = Path(factory_root) if factory_root else FACTORY_ROOT_DEFAULT
+    eval_root = root / "eval"
+    eval_root.mkdir(parents=True, exist_ok=True)
+    # S3+S6 (review rounds): ONE run id for the whole invocation — the
+    # fixture dir AND the report file — so two evals, however close in
+    # time, never touch each other's anything (run ids are unique per
+    # mint).
+    from factory.runs import new_run_id
+
+    run_stamp = new_run_id()
+    fixture_dir = eval_root / f"importer-fixture-{run_stamp}"
+    if fixture_dir.exists():
+        shutil.rmtree(fixture_dir)
+    fixture = _build_importer_fixture(fixture_dir)
+    try:
+        try:
+            result = run_import(fixture, factory_root=root)
+            report = _importer_eval_report(result=result)
+        except ImportRefused as exc:
+            report = _importer_eval_refusal(str(exc))
+        out = Path(out_path) if out_path else (
+            eval_root / f"importer-eval-{run_stamp}.json"
+        )
+        out.write_text(json.dumps(report, indent=2) + "\n")
+        rendered_path = out.with_suffix(".md")
+        rendered_path.write_text(_render_importer_report(report))
+        return {"report": report, "report_path": out,
+                "rendered_path": rendered_path}
+    finally:
+        shutil.rmtree(fixture_dir, ignore_errors=True)

@@ -161,6 +161,39 @@ CONTRACT_FROZEN_STATUSES = frozenset(POST_APPROVAL_STATUSES | {"blocked", "needs
 ContractAudit = namedtuple("ContractAudit", ["demoted", "flagged_done"])
 
 
+def contract_change_action(status: str) -> str:
+    """What happens to a task in ``status`` whose approved CONTRACT
+    changed (acceptance, risk or gates — F-03's one X→draft reason).
+
+    ONE rule, two callers (F-57 review round 2): the queue audit
+    (:meth:`TaskQueue.demote_changed_contracts`, a stale hash) and the
+    importer's merge (:func:`factory.importer.plan_import`, a proposal
+    that changes a contract field) — never a second copy.
+
+    * ``"demote"`` — a contract-frozen status whose ``(status, draft)``
+      edge is legal: back to ``draft`` through the contract-changed
+      edge. The stale hash and approval fields STAY as history;
+      re-approval overwrites them.
+    * ``"flag"`` — ``done``: merged work is flagged for the owner's
+      review; reopening verified work is a human decision, never
+      automatic (the module docstring, TASK-CONTRACT's acceptance row).
+    * ``"leave"`` — anything else: ``draft`` itself, and
+      ``not_buildable`` (never executable; the change is visible in the
+      import diff and the task is already in human hands).
+
+    Raises:
+        TransitionError: A contract-frozen status without a legal
+            ``(status, draft)`` edge — an impossible state in the table,
+            loud rather than silently demoted.
+    """
+    if status == "done":
+        return "flag"
+    if status in CONTRACT_FROZEN_STATUSES:
+        check_transition(status, "draft")
+        return "demote"
+    return "leave"
+
+
 class StateError(ContractError):
     """Invalid queue-state operation (unknown task, append-only or
     concurrency violation). Subclasses ContractError so callers that
@@ -1122,10 +1155,12 @@ class TaskQueue:
             if status not in CONTRACT_FROZEN_STATUSES or not frozen_hash:
                 continue
             if acceptance_hash(task.get("acceptance", [])) != frozen_hash:
-                if status == "done":
+                action = contract_change_action(status)
+                if action == "flag":
                     flagged_done.append(task.get("id"))
                     continue
-                check_transition(status, "draft")
+                # the shared rule's check_transition has already asserted
+                # the edge is legal for every frozen, non-done status
                 task["status"] = "draft"
                 demoted.append(task.get("id"))
         if demoted:

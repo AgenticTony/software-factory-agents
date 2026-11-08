@@ -1122,6 +1122,13 @@ def _apply_toolkit(options: ClaudeAgentOptions, toolkit: dict) -> None:
     # Finding 2: the granted pairs are the enforced set, not a wish.
     if VENT_TOOL_NAME in cast("dict[str, object]", options.mcp_servers or {}):
         granted.add((VENT_TOOL_NAME, VENT_TOOL_NAME))
+    # F-57: the importer's in-process propose_task server is granted the
+    # same way when a collector attached it (imported lazily — importer
+    # imports this module at load).
+    from factory.importer import PROPOSE_TOOL_NAME
+
+    if PROPOSE_TOOL_NAME in cast("dict[str, object]", options.mcp_servers or {}):
+        granted.add((PROPOSE_TOOL_NAME, PROPOSE_TOOL_NAME))
     if options.hooks is None:  # SDK default is {}; None never occurs here
         options.hooks = {}
     options.hooks["PreToolUse"].append(mcp_guard_hook(frozenset(granted)))
@@ -1142,6 +1149,7 @@ def build_options(
     vent_collector: VentCollector | None = None,
     toolkit: dict | None = None,
     bypass_denials: BypassDenials | None = None,
+    propose_collector: Any = None,
 ) -> ClaudeAgentOptions:
     """Build the per-seat ClaudeAgentOptions (WO F-06 options list).
 
@@ -1163,6 +1171,14 @@ def build_options(
     ``allowed_tools`` (a grant, no restriction); without a collector no
     server is attached and the grant is inert — the option-shape tests
     build this way.
+
+    ``propose_collector`` (F-57 AC-1): attach the importer's in-process
+    ``propose_task`` tool the same way — a server plus its
+    ``allowed_tools`` grant (and its mcp-guard grant under a toolkit).
+    Only the importer's session passes a collector: the three real seats
+    never do, so the tool rides the importer's options and no one
+    else's. (Typed ``Any`` — importing the collector's type here would
+    cycle: the importer imports this module.)
 
     ``toolkit`` (F-22): the resolved, staged toolkit spec (``{"staged":
     <path>, "items": [...]}`` — see
@@ -1200,6 +1216,22 @@ def build_options(
     )
     if vent_collector is not None:
         options.mcp_servers = {VENT_TOOL_NAME: vent_server(vent_collector)}
+    if propose_collector is not None:
+        # Lazy import: factory.importer imports this module at load, so
+        # the tool's constructors are reached only at call time.
+        from factory.importer import (
+            PROPOSE_QUALIFIED_NAME,
+            PROPOSE_TOOL_NAME,
+            propose_server,
+        )
+
+        merged: dict[str, Any] = (
+            dict(options.mcp_servers)
+            if isinstance(options.mcp_servers, dict) else {}
+        )
+        merged[PROPOSE_TOOL_NAME] = propose_server(propose_collector)
+        options.mcp_servers = merged
+        options.allowed_tools = [*options.allowed_tools, PROPOSE_QUALIFIED_NAME]
     if toolkit is not None:
         _apply_toolkit(options, toolkit)
     if cli_path is not None:
@@ -1240,6 +1272,13 @@ class SessionRecord:
     ``tool_input`` exceeded :data:`DENIAL_TOOL_INPUT_MAX_CHARS`. Zero on
     every record built before F-56 (``from_dict`` defaults it); the
     bounded form is what the entry writes and every consumer sees.
+
+    ``proposed_tasks`` / ``propose_facts`` (F-57 AC-1) carry the importer
+    seat's ``propose_task`` accepted set (first-proposal order) and its
+    recorded bound-hits out of the sandbox — the same role ``vents``
+    plays for the vent tool. Empty on every record built before F-57
+    and on every session that ran no collector (``from_dict`` defaults
+    them; ``_carry`` stamps them only when a collector was given).
     """
 
     seat: str
@@ -1261,6 +1300,12 @@ class SessionRecord:
     vents: list[dict[str, Any]] = field(default_factory=list)
     skills: list[str] = field(default_factory=list)
     sandbox_bypass_denials: int = 0
+    proposed_tasks: list[dict[str, Any]] = field(default_factory=list)
+    propose_facts: list[dict[str, Any]] = field(default_factory=list)
+    # F-57 review round 1 (S1): how many propose_task calls the session
+    # made, accepted or refused — zero calls and all-refused calls lead
+    # the factory to different places.
+    propose_calls: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1268,6 +1313,85 @@ class SessionRecord:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SessionRecord":
         return cls(**data)
+
+
+# F-57 review round 3 (R3-1): the record file is session-writable, and
+# ``from_dict`` is ``cls(**data)`` with no type checks — every consumer
+# inherited whatever shapes a forged record carried (a non-string
+# ``result`` crashed the importer's ``.strip``; a dict ``reason`` crashed
+# the quota regex; a dict ``status`` was one repr away from printing the
+# seat token). ONE validator, applied at the ONE place records enter the
+# orchestrator (``_read_record`` / ``_read_record_quietly`` — every seat,
+# not just the importer's) and, as defence in depth, wherever a caller
+# consumes a record object it did not build itself (the importer's two
+# session calls). ``num_turns``-style counts are non-bool ints >= 0.
+_RECORD_STATUSES = ("completed", "failed", "aborted")
+_RECORD_STR_OR_NONE = ("reason", "subtype", "terminal_reason", "session_id",
+                       "model", "result")
+
+
+def record_field_error(record: SessionRecord) -> str | None:
+    """Why ``record`` cannot be a record this factory trusts — the first
+    field that breaks its declared type, as ``"<field>: <problem>"``, or
+    None when every field is sound. Checked by value, never by trust:
+    the file a record travels by is written inside the sandbox."""
+
+    def bad(field: str, problem: str) -> str:
+        return f"{field}: {problem}"
+
+    if not isinstance(record.seat, str) or not record.seat:
+        return bad("seat", "not a non-empty string")
+    if record.status not in _RECORD_STATUSES:
+        # type-only, never the value: a forged status may carry the seat
+        # token, and this message reaches the terminal.
+        return bad("status", f"a {type(record.status).__name__} or an "
+                             f"unknown status, not one of "
+                             f"{list(_RECORD_STATUSES)}")
+    for name in _RECORD_STR_OR_NONE:
+        value = getattr(record, name)
+        if value is not None and not isinstance(value, str):
+            return bad(name, f"a {type(value).__name__}, not a string")
+    for name in ("num_turns", "duration_ms"):
+        value = getattr(record, name)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return bad(name, f"a {type(value).__name__}, not a "
+                              "non-negative integer")
+    if not isinstance(record.is_error, bool):
+        return bad("is_error", "not a boolean")
+    for name in ("permission_denials_dropped", "sandbox_bypass_denials",
+                  "propose_calls"):
+        value = getattr(record, name)
+        if (isinstance(value, bool) or not isinstance(value, int)
+                or value < 0):
+            return bad(name, f"a {type(value).__name__}, not a "
+                              "non-negative integer")
+    for name, item_type in (("models", str), ("skills", str),
+                             ("vents", dict), ("proposed_tasks", dict),
+                             ("propose_facts", dict)):
+        value = getattr(record, name)
+        if not isinstance(value, list):
+            return bad(name, f"a {type(value).__name__}, not a list")
+        for item in value:
+            if not isinstance(item, item_type):
+                return bad(name, f"holds a {type(item).__name__}, not a "
+                                  f"{item_type.__name__}")
+    if record.tokens is not None and not isinstance(record.tokens, dict):
+        return bad("tokens", f"a {type(record.tokens).__name__}, not an "
+                             "object")
+    if record.total_cost_usd is not None and (
+        isinstance(record.total_cost_usd, bool)
+        or not isinstance(record.total_cost_usd, (int, float))
+    ):
+        return bad("total_cost_usd", "not a number")
+    if record.permission_denials is not None and not isinstance(
+        record.permission_denials, list
+    ):
+        return bad("permission_denials",
+                   f"a {type(record.permission_denials).__name__}, not a "
+                   "list")
+    return None
 
 
 def _primary_model(model_usage: dict[str, Any] | None) -> str | None:
@@ -1514,6 +1638,7 @@ async def run_session(
     vent_collector: VentCollector | None = None,
     trace_sink: Callable[[dict[str, Any]], None] | None = None,
     toolkit: dict | None = None,
+    propose_collector: Any = None,
 ) -> SessionRecord:
     """Run one seat's session and return what it recorded.
 
@@ -1558,6 +1683,11 @@ async def run_session(
             here only. The record's ``skills`` lists what this session
             loaded as ``<name>@<content-hash>`` (AC-8), on every exit
             path.
+        propose_collector: F-57 — the importer session's propose_task
+            collector; its accepted set and bound-hit facts ride the
+            record out (``proposed_tasks`` / ``propose_facts``) on every
+            exit path. ``Any``-typed for the same cycle reason as in
+            :func:`build_options`.
 
     Returns:
         The record: ``completed`` / ``failed`` (with reason) / ``aborted``
@@ -1595,6 +1725,7 @@ async def run_session(
         vent_collector=vent_collector,
         toolkit=toolkit,
         bypass_denials=bypass_denials,
+        propose_collector=propose_collector,
     )
 
     def _carry(record: SessionRecord) -> SessionRecord:
@@ -1617,6 +1748,13 @@ async def run_session(
         # outcome, the attempts the session made to leave the sandbox
         # reach the attempt record, not only the trace.
         record.sandbox_bypass_denials = bypass_denials.count
+        # ...and the propose tool's accepted set (F-57 AC-1): whatever
+        # the outcome, the tasks the session proposed through the tool
+        # ride out with it — an aborted session's partial set included.
+        if propose_collector is not None:
+            record.proposed_tasks = propose_collector.tasks()
+            record.propose_facts = propose_collector.facts()
+            record.propose_calls = propose_collector.calls
         return record
 
     result_message: ResultMessage | None = None
@@ -1873,6 +2011,8 @@ def run_session_sandboxed(
     task_id: str | None = None,
     trace_sink: Callable[[dict[str, Any]], None] | None = None,
     toolkit: dict | None = None,
+    propose: dict | None = None,
+    deny_read: "Sequence[Path]" = (),
     scratch_files: "Mapping[str, str] | None" = None,
 ) -> SessionRecord:
     """Run one session with the whole runner process inside the F-05 sandbox.
@@ -1918,6 +2058,13 @@ def run_session_sandboxed(
             read-only copy next to the settings (outside the clone, the
             runner-staging pattern) and carried in the spec; None gives
             the pre-F-22 session shape (no skills, no MCP servers).
+        propose: F-57 — the importer's propose_task configuration
+            (``{"project", "schema", "record_paths"}``), carried in the
+            spec so the sandboxed entry builds the session's collector
+            and attaches the tool; None runs the session without it.
+        deny_read: F-57 review round 1 (F3) — extra paths denied for
+            reading in the session's srt settings (resolved). The repair
+            seat denies the source repo it must not re-read.
         scratch_files: ``{bare filename: text}`` staged into the
             session's writable scratch — its ``$TMPDIR`` — before the
             session starts (F-12 round 2: the importer stages the
@@ -2012,7 +2159,7 @@ def run_session_sandboxed(
             teardown_grace_sec=teardown_grace_sec,
             read_only=review_guard, writable_roots=reviewer_writable,
             run_id=run_id, task_id=task_id, trace_sink=trace_sink,
-            toolkit=toolkit,
+            toolkit=toolkit, propose=propose, deny_read=deny_read,
         )
     finally:
         try:
@@ -2302,6 +2449,8 @@ def _run_prepared(
     task_id: str | None = None,
     trace_sink: Callable[[dict[str, Any]], None] | None = None,
     toolkit: dict | None = None,
+    propose: dict | None = None,
+    deny_read: "Sequence[Path]" = (),
 ) -> SessionRecord:
     """Stage the runner, write settings, run the sandboxed entry and parse
     its record — the ONE per-session prepare/run/parse step every sandboxed
@@ -2377,6 +2526,10 @@ def _run_prepared(
                 # F-22: the staged toolkit — the in-sandbox runner wires
                 # it into the session's options (see _apply_toolkit).
                 "toolkit": toolkit_spec,
+                # F-57: the propose_task tool's configuration — the
+                # in-sandbox runner builds the collector from it (see
+                # _main).
+                "propose": propose,
                 # F-56 AC-1: where the entry writes its record — named by
                 # the orchestrator before the session started, wiped fresh
                 # above, read back once below. stdout carries only
@@ -2397,6 +2550,7 @@ def _run_prepared(
         writable_roots=writable_roots,
         scratch_write=scratch,
         record_write=record_path.parent,
+        deny_read=deny_read,
     )
     write_settings(settings, settings_path)
 
@@ -2526,7 +2680,13 @@ def _read_record(
         why = "is empty"
     if why is None:
         try:
-            return SessionRecord.from_dict(json.loads(cast(str, text)))
+            record = SessionRecord.from_dict(json.loads(cast(str, text)))
+            # R3-1: every field to its declared type — a forged record is
+            # a record that does not hold, the same SessionRecordError.
+            field_error = record_field_error(record)
+            if field_error is not None:
+                raise ValueError(f"record field {field_error}")
+            return record
         except (json.JSONDecodeError, TypeError, ValueError,
                 RecursionError) as exc:
             # RecursionError: a planted record can nest arbitrarily deep
@@ -2562,9 +2722,10 @@ def _read_record_quietly(record_path: Path) -> SessionRecord | None:
     if why is not None or not (text or "").strip():
         return None
     try:
-        return SessionRecord.from_dict(json.loads(cast(str, text)))
+        record = SessionRecord.from_dict(json.loads(cast(str, text)))
     except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
         return None
+    return None if record_field_error(record) is not None else record
 
 
 def _record_failure_text(
@@ -2798,6 +2959,26 @@ def _main(argv: list[str] | None = None) -> int:
                 "re-stage the runner (the factory package copies itself "
                 "per session, so both halves always match)"
             )
+        # F-57: the importer session's propose_task collector, built
+        # from the spec's configuration (the staged proposal schema, the
+        # register's record paths, the queue's project) and writing its
+        # crash-safe accepted set into the session's own writable scratch
+        # ($TMPDIR/proposal.json — the file the abort salvage copies out).
+        propose_collector = None
+        if spec.get("propose"):
+            from factory.importer import ProposeCollector
+
+            propose_cfg = spec["propose"]
+            scratch = Path(
+                os.environ.get("TMPDIR") or tempfile.gettempdir()
+            )
+            propose_collector = ProposeCollector(
+                project=propose_cfg["project"],
+                schema=propose_cfg["schema"],
+                record_paths=tuple(propose_cfg.get("record_paths") or ()),
+                secrets=(token,),
+                scratch_dir=scratch,
+            )
         record = asyncio.run(
             run_session(
                 spec["seat"],
@@ -2819,6 +3000,7 @@ def _main(argv: list[str] | None = None) -> int:
                 # the orchestrator's on_stdout_line callback appends them
                 # to the trace (the trace path is not writable in here).
                 trace_sink=stdout_trace_sink(),
+                propose_collector=propose_collector,
             )
         )
         # F-56 AC-1: the record travels by FILE, not stdout. Stdout

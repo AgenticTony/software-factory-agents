@@ -96,11 +96,14 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Sequence
+
+from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from factory.contract import (
     SCHEMA_DIR,
@@ -114,6 +117,7 @@ from factory.contract import (
 from factory.egress import check_secrets, scrub_session_text, scrub_session_value
 from factory.runs import (
     FACTORY_ROOT_DEFAULT,
+    GIT_HARDENING,
     RunDir,
     RunError,
     cleanup_run,
@@ -123,16 +127,20 @@ from factory.runs import (
 from factory.sandbox import SandboxError
 from factory.session import (
     SessionConfigError,
+    SessionRecord,
     SessionRecordError,
     run_session_sandboxed,
     seat_token,
 )
 from factory.state import (
+    RunInProgressError,
     TaskQueue,
     _atomic_write_json,
+    contract_change_action,
     now_iso,
     queue_writer_lock,
 )
+from factory.trace import TraceWriter
 
 OUT_OF_SCOPE_DIR = ".factory/out-of-scope"
 DEFAULT_DOCS_DIR = "docs"
@@ -190,6 +198,37 @@ TASKS_SCHEMA = SCHEMA_DIR / "tasks.schema.json"
 # three seams.
 PROPOSAL_SCHEMA_NAME = "proposal.schema.json"
 PROPOSAL_OUTPUT_NAME = "proposal.json"
+# The refused output as staged into the repair session's scratch (F-57
+# AC-2): the repair reads exactly what was judged, never the docs.
+REFUSED_OUTPUT_NAME = "refused.json"
+
+# ------------------------------------------------------ F-57: propose_task --
+
+# The importer session's per-task tool (AC-1). One task per call,
+# validated AS IT IS WRITTEN against the same staged proposal schema the
+# session self-checks with — the 2026-11-05 import broke on every shape
+# at once because the only check came after a 47 KB answer.
+PROPOSE_TOOL_NAME = "propose_task"
+# What the CLI calls the tool (and so what ``allowed_tools`` names): SDK
+# MCP tools are exposed as ``mcp__<server>__<tool>``, the server named
+# for the tool like vent's.
+PROPOSE_QUALIFIED_NAME = f"mcp__{PROPOSE_TOOL_NAME}__{PROPOSE_TOOL_NAME}"
+# Bounds on model-controlled input (the session is untrusted): a call
+# past the cap is a refusal message plus a recorded fact, never a crash
+# and never a lost accepted set.
+PROPOSE_MAX_CALLS = 1000
+PROPOSE_MAX_TASKS = 200
+PROPOSE_TASK_MAX_CHARS = 200_000
+
+# ------------------------------------------------------- F-57: the repair --
+
+# ONE bounded repair session per refused import (AC-2): a quarter of the
+# import's own budget, floored so a small import still gets a real
+# repair, and always under validate_budget's ceilings by construction
+# (it is a fraction of a budget those ceilings already bound).
+REPAIR_BUDGET_FRACTION = 4
+REPAIR_TURN_FLOOR = 8
+REPAIR_TIMEOUT_FLOOR = 5.0
 
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
@@ -577,18 +616,39 @@ def _list_planning_docs(repo: Path, docs_dir: str) -> PlanningDocs:
     and the rest are dropped — the dropped names ride along so the
     truncation is announced (:class:`PlanningDocs`, F-49 AC-3).
 
+    The traversal is explicit and interpreter-independent (F-57, the
+    F-49/F-51 re-routed item): ``os.walk(followlinks=False)`` — never a
+    directory symlink followed, never a symlink loop — so the listing
+    cannot depend on pathlib glob internals that differ across Python
+    versions. A FILE symlink is listed only when its target resolves
+    INSIDE the repo: one whose target escapes is excluded, so the listing
+    never contradicts the read boundary the clone's committed tree and
+    F-47's sandbox deny actually enforce (containment is theirs; this
+    merely refuses to advertise a path they would deny).
+
     One listing for two consumers — the prompt (:func:`build_import_prompt`)
     and the budget (:func:`scaled_import_budget`) — so the number the
     budget scales with is by construction the number of docs the session
     was actually told to read."""
-    docs = Path(repo) / docs_dir
+    repo = Path(repo)
+    docs = repo / docs_dir
     if not docs.is_dir():
         return PlanningDocs([], [])
-    all_docs = sorted(
-        str(path.relative_to(repo))
-        for path in docs.rglob("*")
-        if path.is_file() and path.suffix in {".md", ".markdown"}
-    )
+    resolved_repo = repo.resolve()
+    found: list[str] = []
+    for dirpath, _dirnames, filenames in os.walk(docs, followlinks=False):
+        for name in filenames:
+            path = Path(dirpath) / name
+            if path.suffix not in {".md", ".markdown"} or not path.is_file():
+                continue
+            try:
+                inside = path.resolve().is_relative_to(resolved_repo)
+            except OSError:  # a dangling or unreadable link: not ours to list
+                continue
+            if not inside:
+                continue
+            found.append(str(path.relative_to(repo)))
+    all_docs = sorted(found)
     return PlanningDocs(all_docs[:MAX_DOC_FILES], all_docs[MAX_DOC_FILES:])
 
 
@@ -777,11 +837,25 @@ def build_import_prompt(
         "- Propose every task the documents define, including tasks already",
         "  in the queue; unchanged tasks produce no diff.",
         "",
+        "Propose each task as you finalise it, with the propose_task tool:",
+        "- propose_task(task): ONE task per call, validated immediately",
+        "  against the same schema and rules as above. The answer is",
+        "  'accepted <id>' or every violation that task broke — fix what it",
+        "  names and re-propose. Re-proposing an id REPLACES it",
+        "  (first-proposal order is kept).",
+        "- The accepted set IS the proposal: once you have called the tool",
+        "  at all, it wins over any text answer — finish with a one-line",
+        "  confirmation, not the JSON. If you never call it, your final",
+        "  text answer is the proposal (the contract above, as one JSON",
+        "  object and nothing else).",
+        "",
         "Before you answer, check your own output (the interpreter named",
         "below is the pinned one your sandbox already runs, and jsonschema",
         "is importable there):",
-        f"- Write the finished JSON to {proposal_ref}, in your writable",
-        "  scratch (the repo cwd is read-only).",
+        f"- propose_task keeps {proposal_ref} written for you as the",
+        "  accepted set grows. If you never called it, write the finished",
+        f"  JSON to {proposal_ref} yourself, in your writable scratch (the",
+        "  repo cwd is read-only).",
         "- Parse check:",
         f"  {parse_cmd}",
         f"- Shape check against {schema_ref} — the factory's tasks schema,",
@@ -790,13 +864,272 @@ def build_import_prompt(
         "  or orchestrator keys):",
         f"  {shape_cmd}",
         "- Fix everything those print, re-check, and only then answer.",
-        "  Your final answer is the JSON object itself, and nothing else.",
+        "  If you used propose_task, your final answer is one line",
+        "  confirming you are done (the tool's accepted set is checked",
+        "  again by the factory); without it, your final answer is the",
+        "  JSON object itself, and nothing else.",
         "- What the shape check cannot see, and is still refused after you",
         "  answer: the project name spelled exactly as stated above, task",
         "  ids unique and non-blank, and out_of_scope_match naming a real",
         "  record from the register.",
     ]
     return "\n".join(lines)
+
+
+# --------------------------------------------------- F-57: the propose tool --
+
+
+def _task_violations(
+    task: dict, schema: dict, record_paths: "Sequence[str]",
+) -> list[str]:
+    """EVERY violation one proposed task breaks (F-57 AC-1): the
+    per-task import rules first (readable id, forbidden fields, status,
+    a real out-of-scope record), then every shape violation the staged
+    proposal schema reports for it — the same shapes the session
+    self-checks with and :func:`plan_import` judges the whole proposal
+    by, so a task the tool accepts is never refused for a per-task shape
+    later, and a task it refuses names everything at once.
+    """
+    lines: list[str] = []
+    task_id = task.get("id")
+    if not isinstance(task_id, str) or not task_id.strip():
+        try:
+            shown = json.dumps(task, default=str)[:200]
+        except (RecursionError, ValueError):
+            shown = f"<unserialisable {type(task).__name__}>"
+        lines.append(f"the task has no readable id: {shown}")
+        name = "the task"
+    else:
+        name = f"task {task_id}"
+    for banned in FORBIDDEN_FIELDS:
+        if banned in task:
+            lines.append(
+                f"{name}: a proposal must not carry {banned!r} — approval "
+                "fields, attempts, links and out_of_scope are written by "
+                "you and the orchestrator, never by the importer"
+            )
+    status = task.get("status")
+    if status is not None and status != DRAFT:
+        lines.append(
+            f"{name}: proposed status {status!r}; every imported task is "
+            f"{DRAFT} — approval is yours (factory approve)"
+        )
+    match = task.get("out_of_scope_match")
+    if match is not None and (
+        not isinstance(match, str) or match not in set(record_paths)
+    ):
+        known = ", ".join(sorted(record_paths)) or "none"
+        lines.append(
+            f"{name}: out_of_scope_match {match!r} names no record under "
+            f"{OUT_OF_SCOPE_DIR}/ (known records: {known})"
+        )
+    # The staged proposal schema over a one-task document: every shape
+    # violation is about this task (the project key is filled in).
+    lines.extend(iter_schema_violations(
+        {"project": "-", "tasks": [task]}, schema
+    ))
+    return lines
+
+
+class ProposeCollector:
+    """The in-memory propose_task sink living inside one importer
+    session's runner process (the vent pattern, F-27).
+
+    One call validates ONE task against the staged proposal schema and
+    the per-task import rules; an accepted task is stored (re-proposing
+    an id replaces it, first-proposal order kept) and the accepted set
+    is persisted — atomically, on every accept — to the session's
+    writable scratch as ``$TMPDIR/proposal.json``: the very file the
+    self-check prompt names and the F-56 abort salvage copies out, so a
+    crash, timeout or quota mid-session keeps what was proposed.
+
+    Everything about a call is bounded (the session is untrusted): past
+    the calls cap, the accepted-task cap, the per-task size cap or the
+    nesting ceiling, a call is a refusal message to the model plus a
+    fact on :attr:`facts` — never a crash, never a lost set. The
+    collector rides the :class:`~factory.session.SessionRecord` out of
+    the sandbox (``proposed_tasks`` / ``propose_facts``); the accepted
+    set is an EARLY WARNING, never the authority — the final set goes
+    through the same full :func:`plan_import` a text answer faces.
+    """
+
+    def __init__(
+        self,
+        *,
+        project: str,
+        schema: dict,
+        record_paths: "Sequence[str]" = (),
+        secrets: "Sequence[str]" = (),
+        scratch_dir: Path | str | None = None,
+    ) -> None:
+        self.project = project
+        self.schema = schema
+        self.record_paths = tuple(record_paths)
+        # F-43: the literal secrets this session's runner holds (the seat
+        # token), so a task is seam-scrubbed the moment it is accepted.
+        self.secrets = tuple(
+            secret for secret in check_secrets(secrets) if secret
+        )
+        self.scratch_dir = (
+            Path(scratch_dir) if scratch_dir is not None else None
+        )
+        self.calls = 0
+        self._facts: list[dict[str, Any]] = []
+        self._tasks: dict[str, dict] = {}
+        self._order: list[str] = []
+
+    def facts(self) -> list[dict[str, Any]]:
+        """The recorded bound-hits (one per capped call class), as a
+        copy — what rides the record out of the sandbox."""
+        return [dict(fact) for fact in self._facts]
+
+    def tasks(self) -> list[dict]:
+        """The accepted set, in first-proposal order (a replaced task
+        keeps its first-proposed position with its newest value)."""
+        return [copy.deepcopy(self._tasks[task_id]) for task_id in self._order]
+
+    def _fact(self, kind: str, detail: str) -> None:
+        self._facts.append({"kind": kind, "detail": detail, "at": now_iso()})
+
+    def _persist(self) -> None:
+        """Keep the accepted set crash-safe: the atomic writer, the file
+        the self-check prompt names and the abort salvage copies."""
+        if self.scratch_dir is None:
+            return
+        self.scratch_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(
+            self.scratch_dir / PROPOSAL_OUTPUT_NAME,
+            {"project": self.project, "tasks": self.tasks()},
+        )
+
+    def propose(self, task: Any) -> str:
+        """Validate, cap and store one proposed task; the tool's text
+        answer — ``accepted <id>`` or every violation it broke.
+
+        Raises:
+            ValueError: ``task`` is not an object — a malformed call the
+                SDK's tool wrapper answers as an isError result the
+                model can read and retry, never a protocol error.
+        """
+        if not isinstance(task, dict):
+            raise ValueError(
+                "propose_task takes one task object: id plus exactly the "
+                "spec fields the output contract states"
+            )
+        self.calls += 1
+        if self.calls > PROPOSE_MAX_CALLS:
+            self._fact(
+                "calls_capped", f"call {self.calls} past {PROPOSE_MAX_CALLS}"
+            )
+            return (
+                f"refused: the propose_task call cap ({PROPOSE_MAX_CALLS}) "
+                f"is reached; the accepted set stands at {len(self._tasks)} "
+                "tasks — finish with your answer"
+            )
+        # Depth first, iteratively: nothing downstream may recurse over
+        # hostile structure (the parse boundary's own rule).
+        depth = _max_nesting(task)
+        if depth > MAX_PROPOSAL_DEPTH:
+            self._fact("task_too_deep", f"nesting depth {depth}")
+            return (
+                f"refused: the task nests {depth} levels deep; a task is at "
+                f"most {MAX_PROPOSAL_DEPTH} — propose it flatter"
+            )
+        try:
+            size = len(json.dumps(task, ensure_ascii=False, default=str))
+        except (RecursionError, ValueError) as exc:
+            self._fact("task_too_large", f"unserialisable ({exc})")
+            return (
+                "refused: the task cannot be measured for size "
+                f"({type(exc).__name__}) — propose it smaller"
+            )
+        if size > PROPOSE_TASK_MAX_CHARS:
+            self._fact("task_too_large", f"{size} characters")
+            return (
+                f"refused: the task serialises to {size} characters; one "
+                f"task is at most {PROPOSE_TASK_MAX_CHARS} — propose it "
+                "smaller"
+            )
+        # The egress seam (vent's clean_text rule: redact, then anything
+        # else — never store a raw credential or control sequence), then
+        # validation judges the scrubbed values exactly as the text
+        # answer's will be judged after its own scrub.
+        task = scrub_session_value(task, self.secrets)
+        violations = _task_violations(task, self.schema, self.record_paths)
+        if violations:
+            task_id = task.get("id")
+            head = (
+                f"task {task_id} refused"
+                if isinstance(task_id, str) and task_id.strip()
+                else "task refused"
+            )
+            return _format_violations(head, violations)
+        task_id = task["id"]
+        if (
+            task_id not in self._tasks
+            and len(self._tasks) >= PROPOSE_MAX_TASKS
+        ):
+            self._fact(
+                "tasks_capped", f"id {task_id} past {PROPOSE_MAX_TASKS}"
+            )
+            return (
+                f"refused: the accepted-task cap ({PROPOSE_MAX_TASKS}) is "
+                "reached; re-propose an existing id or finish"
+            )
+        if task_id not in self._tasks:
+            self._order.append(task_id)
+        self._tasks[task_id] = task
+        self._persist()
+        return f"accepted {task_id}"
+
+
+def make_propose_tool(collector: ProposeCollector) -> Any:
+    """The in-process ``propose_task(task)`` SDK tool (F-57 AC-1).
+
+    One per importer session, closed over that session's collector: the
+    handler can do exactly one thing — validate and store one task —
+    and has no path to any file (except the collector's own atomic
+    scratch write), environment or network.
+    """
+
+    @tool(
+        PROPOSE_TOOL_NAME,
+        "Propose ONE task of the importer's queue. Each call validates "
+        "that task against the proposal schema and the import rules, and "
+        "answers 'accepted <id>' or every violation it broke — fix and "
+        "re-propose. Re-proposing an id replaces it (first-proposal order "
+        "is kept); the accepted set is the proposal: once you have called "
+        "this tool at all it wins over any text answer, so finish with a "
+        "one-line confirmation instead of the JSON. If you never call it, "
+        "your final text answer is the proposal.",
+        {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "object",
+                    "description": "One task: id plus exactly the spec "
+                    "fields the output contract states.",
+                }
+            },
+            "required": ["task"],
+            "additionalProperties": False,
+        },
+    )
+    async def _propose(args: dict[str, Any]) -> dict[str, Any]:
+        answer = collector.propose(args["task"])
+        return {"content": [{"type": "text", "text": answer}]}
+
+    return _propose
+
+
+def propose_server(collector: ProposeCollector) -> Any:
+    """The in-process MCP server carrying the propose tool, for
+    ``ClaudeAgentOptions.mcp_servers`` (the tool is additionally listed
+    in ``allowed_tools`` under its qualified name, and granted under the
+    toolkit's mcp guard, exactly like vent's)."""
+    return create_sdk_mcp_server(
+        name=PROPOSE_TOOL_NAME, tools=[make_propose_tool(collector)]
+    )
 
 
 # -------------------------------------------------------------------- plan --
@@ -811,13 +1144,20 @@ class TaskChange:
     * ``new`` — not in the queue; proposed as ``draft``.
     * ``unchanged`` — in the queue, proposed spec identical: no diff.
     * ``changed`` — proposed spec differs in ``fields``; only those
-      fields are updated, state is preserved.
+      fields are updated, state is preserved — unless a CONTRACT field
+      (``acceptance``, ``risk``, ``gates``) changed on a non-draft task,
+      which sends the task back to ``draft`` with its approval cleared
+      (``demoted``; F-03's one X→draft reason — the approved contract
+      changed — and F-57 review round 1, F4: a risk/gates relaxation can
+      never ride an existing approval).
     * ``missing`` — in the queue but not proposed; carried untouched.
     """
 
     task_id: str
     kind: str
     fields: tuple[str, ...] = ()
+    demoted: bool = False
+    flagged: bool = False
 
 
 @dataclass(frozen=True)
@@ -923,11 +1263,32 @@ def _new_task(proposed: dict) -> dict:
     return task
 
 
-def _merge_task(existing: dict, proposed: dict) -> tuple[dict, list[str]]:
+# The spec fields that ARE the approved contract: changing one on a
+# non-draft task changes what the owner approved (F-03's X→draft reason).
+# acceptance rides the recomputed hash; risk and gates ride the schema's
+# risk⇒human-merge rule — a proposal that relaxes either must never keep
+# the task's approval (F-57 review round 1, F4).
+CONTRACT_FIELDS = ("acceptance", "risk", "gates")
+
+
+def _merge_task(
+    existing: dict, proposed: dict
+) -> tuple[dict, list[str], bool, bool]:
     """Merge a proposal into an existing task: only the spec fields the
     proposal carries *and* changes are updated, so status, attempts,
     approval fields, links and every spec field the proposal leaves out
-    survive untouched (AC-3)."""
+    survive untouched (AC-3).
+
+    One exception (F4, review round 2): a proposal that CHANGES a
+    contract field (:data:`CONTRACT_FIELDS`) on a task follows the ONE
+    shared rule (:func:`factory.state.contract_change_action` — the same
+    rule the queue audit applies to a stale hash): a contract-frozen
+    status goes back to ``draft`` THROUGH THE LEGAL EDGE with its hash
+    and approval fields KEPT as history (re-approval overwrites them);
+    ``done`` is FLAGGED for the owner's review, never reopened
+    automatically; ``draft`` and ``not_buildable`` are left as they are.
+    The owner re-approves (or reopens) after reading the diff — the
+    import proposes, the owner disposes."""
     changed = [
         spec_field
         for spec_field in SPEC_FIELDS
@@ -938,11 +1299,19 @@ def _merge_task(existing: dict, proposed: dict) -> tuple[dict, list[str]]:
     merged = copy.deepcopy(existing)
     for spec_field in changed:
         merged[spec_field] = copy.deepcopy(proposed[spec_field])
+    demoted = flagged = False
+    if any(field in changed for field in CONTRACT_FIELDS):
+        action = contract_change_action(existing.get("status", DRAFT))
+        if action == "demote":
+            demoted = True
+            merged["status"] = DRAFT  # hash/approval fields stay (history)
+        elif action == "flag":
+            flagged = True  # done: kept, surfaced for the owner's review
     # Same normalisation as a fresh task (_new_task): a queue
     # written before the key existed (or by hand) still merges out with a
     # list, not a missing key.
     merged.setdefault("attempts", [])
-    return merged, changed
+    return merged, changed, demoted, flagged
 
 
 def _format_violations(head: str, lines: list[str]) -> str:
@@ -1069,13 +1438,17 @@ def plan_import(
             changes.append(TaskChange(task_id=task_id, kind="missing"))
             merged.append(copy.deepcopy(existing))
             continue
-        new_task, changed_fields = _merge_task(existing, proposed)
+        new_task, changed_fields, demoted, flagged = _merge_task(
+            existing, proposed
+        )
         merged.append(new_task)
         changes.append(
             TaskChange(
                 task_id=task_id,
                 kind="changed" if changed_fields else "unchanged",
                 fields=tuple(changed_fields),
+                demoted=demoted,
+                flagged=flagged,
             )
         )
     for task in proposed_tasks:
@@ -1083,6 +1456,52 @@ def plan_import(
             continue
         merged.append(_new_task(task))
         changes.append(TaskChange(task_id=task["id"], kind="new"))
+
+    # F5 (review round 1): a LOCAL dependency (no ``repo:`` prefix)
+    # naming no task in the merged document is a broken proposal —
+    # dependency and attempt records would be ambiguous. Cross-repo
+    # ``repo:id`` deps are never judged here (the queue cannot see
+    # another repo's ids). Checked on the MERGED ids, so a dep on a task
+    # the queue already carries is fine; only the PROPOSED tasks' own
+    # deps are judged (a pre-existing dangling dep is the queue's
+    # problem, not this import's claim).
+    merged_ids = {task.get("id") for task in merged}
+    for task in proposed_tasks:
+        for raw_dep in task.get("depends_on") or []:
+            dep = raw_dep
+            if not isinstance(dep, str) or not dep.strip():
+                raise ImportRefused(
+                    f"task {task['id']}: depends_on {dep!r} is malformed "
+                    "— a dependency is a task id or repo:id"
+                )
+            repo_part, sep, id_part = dep.partition(":")
+            if sep:
+                if not repo_part or not id_part:
+                    # "x:", ":y", ":" — neither a local id nor a real
+                    # cross-repo reference
+                    raise ImportRefused(
+                        f"task {task['id']}: depends_on {dep!r} is "
+                        "malformed — a cross-repo dependency is repo:id "
+                        "with both parts non-empty"
+                    )
+                if repo_part == project:
+                    # this queue's OWN project prefix: a local dependency
+                    # by another spelling — judged against the merged ids
+                    dep = id_part
+                else:
+                    continue  # a real cross-repo reference: never judged here
+            if dep == task["id"]:
+                raise ImportRefused(
+                    f"task {task['id']}: depends_on names itself — a "
+                    "task can never satisfy its own dependency"
+                )
+            if dep not in merged_ids:
+                raise ImportRefused(
+                    f"task {task['id']}: depends_on names {dep!r}, which "
+                    "is neither in the proposal nor in the queue — a "
+                    "local dependency must name a real task id "
+                    "(cross-repo dependencies use repo:id)"
+                )
 
     if existing_doc is not None:
         # The existing document, tasks swapped in place: its key order
@@ -1160,7 +1579,18 @@ def render_summary(plan: ImportPlan) -> str:
     ]
     for change in plan.changes:
         if change.kind == "changed":
-            lines.append(f"  - {change.task_id}: {', '.join(change.fields)}")
+            if change.demoted:
+                suffix = (" -> draft (the approved contract changed; the "
+                          "old hash and approval stay as history; "
+                          "re-approve after review)")
+            elif change.flagged:
+                suffix = (" — contract changed on a DONE task: flagged "
+                          "for your review, not reopened")
+            else:
+                suffix = ""
+            lines.append(
+                f"  - {change.task_id}: {', '.join(change.fields)}{suffix}"
+            )
     if missing:
         lines.append(
             f"- not in the proposal, kept as is ({len(missing)}): "
@@ -1471,6 +1901,519 @@ def _abort_refusal(
            f"review it with {command}"
 
 
+# --------------------------------------------------- F-57: the ONE repair --
+
+
+def repair_budget(max_turns: int, timeout_min: float) -> tuple[int, float]:
+    """The ONE repair session's ``(max_turns, timeout_min)`` (F-57 AC-2):
+    a quarter of the import's own budget, floored at
+    :data:`REPAIR_TURN_FLOOR` turns / :data:`REPAIR_TIMEOUT_FLOOR`
+    minutes so a small import still gets a real repair, and always
+    inside :func:`validate_budget`'s ceilings by construction (it is a
+    fraction of a budget those ceilings already bound).
+    """
+    return (
+        max(REPAIR_TURN_FLOOR, int(max_turns) // REPAIR_BUDGET_FRACTION),
+        max(REPAIR_TIMEOUT_FLOOR,
+            round(float(timeout_min) / REPAIR_BUDGET_FRACTION, 1)),
+    )
+
+
+def build_repair_prompt(*, project: str, violations: str) -> str:
+    """The ONE repair session's prompt (F-57 AC-2): the saved refused
+    output, the FULL violation list and the output contract — never the
+    planning docs. The repair's workspace is an empty repository
+    (structurally: there is nothing to read — see
+    :func:`_repair_refused_proposal`), so fixing needs none: everything
+    the violations name is in the refused proposal itself.
+    """
+    interpreter = shlex.quote(sys.executable)
+    proposal_ref = f"$TMPDIR/{PROPOSAL_OUTPUT_NAME}"
+    schema_ref = f"$TMPDIR/{PROPOSAL_SCHEMA_NAME}"
+    refused_ref = f"$TMPDIR/{REFUSED_OUTPUT_NAME}"
+    parse_cmd = (
+        f"{interpreter} -c \"import json; json.load(open('{proposal_ref}'))\""
+    )
+    shape_cmd = (
+        f"{interpreter} -c \"import json, jsonschema; "
+        f"d=json.load(open('{proposal_ref}')); "
+        f"s=json.load(open('{schema_ref}')); "
+        f"[print(e.json_path + ': ' + e.message) for e in "
+        f"jsonschema.Draft202012Validator(s).iter_errors(d)]\""
+    )
+    lines = [
+        "You are the factory's importer-repair seat. A refused importer",
+        "proposal is repaired in ONE pass — this one.",
+        "",
+        "You have no access to the planning documents and must not try to",
+        "read them: your workspace is an empty repository that holds none.",
+        "Everything you need is in the refused proposal and the violations.",
+        "",
+        f"- the refused proposal: {refused_ref}",
+        "- the proposal schema (narrowed to a proposal's own fields):",
+        f"  {schema_ref}",
+        "",
+        "Fix ONLY what the violation list names. Do not invent, drop or",
+        "rename tasks: a task the violations do not name passes through",
+        "unchanged. The full violation list, verbatim:",
+        "",
+        *(f"  {line}" for line in violations.splitlines()),
+        "",
+        f'The proposal must name project exactly "{project}". Each task',
+        "carries exactly these field shapes, generated from the factory's",
+        "tasks schema (a proposal outside them is refused, however",
+        "plausible it reads):",
+    ]
+    lines.extend(_schema_contract_lines(_load_tasks_schema()))
+    lines += [
+        "- gates.merge is always \"human\" — the owner merges; the importer",
+        "  never proposes an auto merge.",
+        "- budget.size tops out at M: a task too big for size M is split",
+        "  into slices or proposed as separate tasks, never sized above",
+        "  the enum.",
+        "- priority is P1–P3 only — the values listed above; P0 is not a",
+        "  priority level this queue knows.",
+        '- a check whose type is anything but "manual" must carry ref.',
+        "- Never set status, acceptance_hash, approved_at, approved_by,",
+        "  attempts, links or out_of_scope. Every task is imported as",
+        "  draft; approval is the owner's act (factory approve).",
+        "",
+        "Before you answer, check your own output (the interpreter named",
+        "below is the pinned one your sandbox already runs, and jsonschema",
+        "is importable there):",
+        f"- Write the corrected JSON to {proposal_ref}, in your writable",
+        "  scratch (the repo cwd is read-only).",
+        "- Parse check:",
+        f"  {parse_cmd}",
+        f"- Shape check against {schema_ref}:",
+        f"  {shape_cmd}",
+        "- Fix everything those print, re-check, and only then answer.",
+        "  Your final answer is the JSON object itself, and nothing else.",
+    ]
+    return "\n".join(lines)
+
+
+def _repair_workspace(root: Path, project: str, run_id: str) -> Path | None:
+    """An EMPTY git repository for the repair session, under the
+    project's own runs dir (created and swept under the queue's run
+    lease, exactly like the import's clone). No planning docs,
+    structurally: the session can read its workspace all it likes and
+    find nothing of the repo the import read. One commit so the reviewer
+    guard's git-state snapshot has a HEAD. None if git cannot make it
+    (the repair is skipped, never wedged)."""
+    workspace = root / "runs" / project / run_id
+    workspace.mkdir(parents=True)
+    for args in (
+        ("init", "-q", "-b", "main"),
+        ("-c", "user.name=factory-repair",
+         "-c", "user.email=repair@factory.invalid",
+         "commit", "-q", "--allow-empty", "-m", "repair workspace (empty)"),
+    ):
+        proc = subprocess.run(
+            ["git", *GIT_HARDENING, "-C", str(workspace), *args],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            shutil.rmtree(workspace, ignore_errors=True)
+            return None
+    return workspace
+
+
+def _record_turns(record: SessionRecord) -> int | None:
+    """R2-2 (review round 2): a turn count the factory renders (summary,
+    trace, the eval report) — only a non-bool int >= 0 counts; anything
+    else a forged record carries renders as ``None`` ("turns unknown"),
+    never raw. The repair already ran by the time its record is read, so
+    a garbage count costs the number, not the session."""
+    turns = record.num_turns
+    if (
+        isinstance(turns, bool)
+        or not isinstance(turns, int)
+        or turns < 0
+    ):
+        return None
+    return turns
+
+
+def _repair_not_started(original: Path) -> dict:
+    """The facts of a repair that could not start: the original is
+    kept, nothing was spent, nothing is claimed."""
+    return {"ran": False, "outcome": "could_not_start",
+            "original_saved": str(original)}
+
+
+def _repair_refused_proposal(
+    exc: ImportRefused,
+    *,
+    payload: str,
+    project: str,
+    repo: Path,
+    queue_path: Path,
+    docs_dir: str,
+    factory_root: Path | str | None,
+    profile: dict,
+    records: list[dict],
+    existing_doc: dict | None,
+    import_turns: int,
+    import_timeout: float,
+    secrets: "Sequence[str]",
+) -> "tuple[ImportPlan | None, dict, ImportRefused | None]":
+    """Run the ONE repair session for a refused real-session proposal
+    (F-57 AC-2). Returns ``(plan, facts, final_refusal)`` — exactly one
+    of plan/final_refusal is meaningful.
+
+    The order of operations is the contract: the original output is
+    saved FIRST (the keep-refused writer); the repair then runs — in an
+    empty repository (no doc re-reading, structurally), under a budget
+    that is a fraction of the import's (:func:`repair_budget`), holding
+    the queue's run lease like the import's own session does; and its
+    answer goes through the SAME :func:`parse_proposal` → egress scrub →
+    :func:`plan_import` chain the original faced — a repair is a second
+    chance to be valid, never a second door. A still-refused repair (or
+    one that dies, or hits quota — :func:`factory.orchestrator._is_quota`,
+    the one quota seam, reused here as F-48 reused it) names BOTH saved
+    files. Never a repair of the repair: this function is called once
+    per import, from one place.
+
+    A repair that cannot even START — no token, no sandbox, no run dir,
+    an unsaveable original — returns ``(None, facts, None)`` (facts
+    naming the kept original, or empty when even that failed) and the
+    caller falls back to today's keep-refused path exactly: nothing was
+    spent, so nothing is claimed.
+    """
+    # Deferred like eval.py's (F-48): the orchestrator is the seam's
+    # owner; F-54 owns promoting it. Recorded in the F-57 ledger.
+    from factory.orchestrator import _is_quota
+
+    secrets = check_secrets(secrets)
+    root = Path(factory_root) if factory_root else FACTORY_ROOT_DEFAULT
+    # The original output is kept FIRST — the repair's whole premise is
+    # that the expensive answer survives.
+    try:
+        original = _save_refused_output(
+            payload, project, factory_root, secrets=secrets
+        )
+    except OSError:
+        # The original could not be kept: the repair's premise failed
+        # before anything was spent — today's refusal path instead.
+        return None, {}, None
+    run_id = new_run_id()
+    writer = TraceWriter(root, project, run_id, "-")
+    writer.append({
+        "type": "import_repair", "outcome": "started",
+        "original_saved": str(original),
+    })
+    r_turns, r_timeout = repair_budget(import_turns, import_timeout)
+    queue = TaskQueue(queue_path) if queue_path.is_file() else None
+    # F2 (review round 1): the lease is taken through an ExitStack so a
+    # busy queue (RunInProgressError raises on ENTER) is a terminal trace
+    # outcome plus the could-not-start fallback — never an error class
+    # the CLI does not catch, and never a trace left at "started".
+    lease_stack = contextlib.ExitStack()
+    try:
+        lease_stack.enter_context(
+            queue.idle_lease() if queue is not None
+            else contextlib.nullcontext()
+        )
+    except RunInProgressError:
+        writer.append({"type": "import_repair", "outcome": "lease_busy"})
+        return None, _repair_not_started(original), None
+    final: ImportRefused | None = None
+    plan: ImportPlan | None = None
+    facts: dict = {}
+    run: RunDir | None = None
+    with lease_stack:
+        # The workspace is created AND swept inside the lease: reclaim
+        # empties runs/<project>/ the moment the lease is free, exactly
+        # as it would the import's own clone.
+        workspace = _repair_workspace(root, project, run_id)
+        if workspace is None:
+            writer.append({"type": "import_repair",
+                           "outcome": "workspace_failed"})
+            # The workspace could not be made; nothing was spent. The
+            # original is already on disk — the caller wraps the
+            # refusal naming it, never saving a second copy.
+            return None, _repair_not_started(original), None
+        run = RunDir(project, run_id, workspace,
+                     root / "sandbox" / f"{project}-{run_id}.json")
+        try:
+            record = run_session_sandboxed(
+                "reviewer",
+                build_repair_prompt(project=project, violations=str(exc)),
+                workspace, profile,
+                factory_root=root, settings_path=run.settings_path,
+                max_turns=r_turns, timeout_min=r_timeout,
+                protected=list(
+                    (profile.get("paths") or {}).get("protected") or []
+                ),
+                token=next((s for s in secrets if s), None),
+                run_id=run_id,
+                # F3 (review round 1): the settings half of "no doc
+                # re-reading" — the source repo and its docs dir are
+                # denied for reading wherever they live (the empty
+                # workspace is the structural half; the home-wide deny
+                # says nothing about a repo outside $HOME).
+                deny_read=(
+                    repo.resolve(), (repo / docs_dir).resolve(),
+                ),
+                scratch_files={
+                    PROPOSAL_SCHEMA_NAME: json.dumps(
+                        build_proposal_schema(_load_tasks_schema()), indent=2
+                    ),
+                    REFUSED_OUTPUT_NAME: payload,
+                },
+            )
+        except SessionRecordError as session_exc:
+            # The repair session RAN but its record never arrived
+            # (F-56's failure class): the turns were spent, there is no
+            # answer to validate, and the trace says so. Today's
+            # refusal path carries the refusal.
+            writer.append({
+                "type": "import_repair", "outcome": "record_lost",
+                "detail": str(session_exc)[:200],
+            })
+            return None, _repair_not_started(original), None
+        except (SessionConfigError, SandboxError, RunError) as session_exc:
+            # The repair session could not START (no token, no bundled
+            # CLI, srt missing, a run-dir fault): nothing was spent —
+            # fall back to today's refusal path.
+            writer.append({
+                "type": "import_repair", "outcome": "could_not_start",
+                "detail": str(session_exc)[:200],
+            })
+            return None, _repair_not_started(original), None
+        except subprocess.TimeoutExpired as session_exc:
+            # The repair session hung past its teardown grace: something
+            # ran and died — say so, naming the kept original.
+            writer.append({"type": "import_repair", "outcome": "failed"})
+            final = ImportRefused(
+                f"{exc}; the repair session timed out after "
+                f"{session_exc.timeout:.0f}s; the original output is "
+                f"saved at {original}; review it with "
+                f"{_import_fix_command(original, repo, queue_path, docs_dir)}"
+            )
+        else:
+            # R3-1: the repair's record, validated the same way (the file
+            # boundary is the primary; this catches object-carried
+            # records) — the repair ran, so the original stays named.
+            from factory.session import record_field_error
+
+            field_error = record_field_error(record)
+            if field_error is not None:
+                writer.append({
+                    "type": "import_repair", "outcome": "record_unusable",
+                })
+                final = ImportRefused(
+                    f"{exc}; the repair session ran but its record is "
+                    f"unusable (record field {field_error}); the original "
+                    f"output is saved at {original}; review it with "
+                    f"{_import_fix_command(original, repo, queue_path, docs_dir)}"
+                )
+            elif _is_quota(record):
+                turns = _record_turns(record)
+                writer.append({
+                    "type": "import_repair", "outcome": "quota_stopped",
+                    "turns": turns,
+                })
+                kept = ""
+                partial_text = record.result or ""
+                if partial_text.strip():
+                    with contextlib.suppress(OSError):
+                        partial = _save_refused_output(
+                            partial_text, project, factory_root,
+                            secrets=secrets,
+                        )
+                        kept = (f"; the repair's partial output was saved "
+                                f"to {partial}")
+                final = ImportRefused(
+                    f"{exc}; one repair session was attempted and stopped "
+                    "on quota ("
+                    + scrub_session_text(
+                        f"{record.status}: {record.reason or ''}", secrets)
+                    + f"); the original output is saved at {original}; "
+                    f"review it with {_import_fix_command(original, repo, queue_path, docs_dir)}"
+                    + kept
+                )
+            elif record.status != "completed":
+                turns = _record_turns(record)
+                writer.append({
+                    "type": "import_repair", "outcome": "failed",
+                    "turns": turns,
+                })
+                final = ImportRefused(
+                    f"{exc}; one repair session was attempted and ended "
+                    + scrub_session_text(
+                        f"{record.status}: {record.reason or ''}", secrets)
+                    + f"; the original output is saved at {original}; "
+                    f"review it with {_import_fix_command(original, repo, queue_path, docs_dir)}"
+                )
+            else:
+                turns = _record_turns(record)
+                text = record.result or ""
+                try:
+                    # EXACTLY the chain the original proposal faced —
+                    # the same parse, the same scrub, the same plan.
+                    proposal = scrub_session_value(
+                        parse_proposal(text), secrets
+                    )
+                    plan = plan_import(
+                        existing_doc, proposal, records, project=project
+                    )
+                except ImportRefused as second:
+                    writer.append({
+                        "type": "import_repair", "outcome": "still_refused",
+                        "turns": turns,
+                    })
+                    try:
+                        repair_saved = _save_refused_output(
+                            text, project, factory_root, secrets=secrets
+                        )
+                        original_cmd = _import_fix_command(
+                            original, repo, queue_path, docs_dir)
+                        repair_cmd = _import_fix_command(
+                            repair_saved, repo, queue_path, docs_dir)
+                        final = ImportRefused(
+                            f"{exc}; one repair session ran but its "
+                            f"proposal was still refused: {second}; the "
+                            f"original output is saved at {original} "
+                            f"(review: {original_cmd}); the repair's "
+                            f"output is saved at {repair_saved} "
+                            f"(review: {repair_cmd})"
+                        )
+                    except OSError as save_exc:
+                        final = ImportRefused(
+                            f"{exc}; one repair session ran but its "
+                            f"proposal was still refused: {second}; the "
+                            f"original output is saved at {original}; the "
+                            f"repair's output could not be saved "
+                            f"({save_exc})"
+                        )
+                else:
+                    writer.append({
+                        "type": "import_repair", "outcome": "repaired",
+                        "turns": turns,
+                    })
+                    facts = {
+                        "ran": True, "outcome": "repaired",
+                        "turns": turns,
+                        # the judged document, for the caller's keep path
+                        "output": text,
+                    }
+        finally:
+            if run is not None:
+                cleanup_run(run)
+    return plan, facts, final
+
+
+def _accepted_set_proposal(accepted: Any, project: str) -> dict:
+    """The accepted set as a proposal document — through the SAME parse
+    boundary the text answer faces (review round 1, F1).
+
+    The record file is session-writable, so ``proposed_tasks`` is
+    untrusted structure: a forged record carries the same hostility as a
+    forged text answer and must hit the same wall. The set is rendered
+    to the same JSON form and pushed through :func:`parse_proposal`
+    (JSON shape, ``tasks`` a list, nesting ≤ MAX_PROPOSAL_DEPTH — all
+    before any host-side deepcopy, ``canonical_json`` or scrub could
+    recurse over it), then the sandbox's own caps are re-applied
+    host-side (task count, per-task size): advisory in the sandbox,
+    enforced where the record is read.
+
+    Raises:
+        ImportRefused: The set is not a bounded, proposal-shaped list of
+            tasks — the refusal goes through keep and repair exactly like
+            a refused text answer, never a traceback.
+    """
+    try:
+        rendered = json.dumps(
+            {"project": project, "tasks": accepted},
+            ensure_ascii=False, default=str,
+        )
+    except (RecursionError, ValueError, TypeError) as exc:
+        raise ImportRefused(
+            "the session's proposed_tasks cannot be serialised into a "
+            f"proposal ({type(exc).__name__}) — no proposal can be read "
+            "from it"
+        ) from exc
+    proposal = parse_proposal(rendered)  # the SAME boundary, literally
+    tasks = proposal["tasks"]
+    if len(tasks) > PROPOSE_MAX_TASKS:
+        raise ImportRefused(
+            f"the accepted set holds {len(tasks)} tasks; the cap is "
+            f"{PROPOSE_MAX_TASKS}"
+        )
+    for index, task in enumerate(tasks):
+        try:
+            size = len(json.dumps(task, ensure_ascii=False, default=str))
+        except (RecursionError, ValueError, TypeError) as exc:
+            raise ImportRefused(
+                f"accepted task #{index} cannot be measured for size "
+                f"({type(exc).__name__})"
+            ) from exc
+        if size > PROPOSE_TASK_MAX_CHARS:
+            raise ImportRefused(
+                f"accepted task #{index} serialises to {size} characters; "
+                f"one task is at most {PROPOSE_TASK_MAX_CHARS}"
+            )
+    return proposal
+
+
+def _session_proposal(
+    accepted: Any, text: str, project: str, *, calls: int = 0,
+) -> "tuple[dict, str]":
+    """The ONE precedence decision (F-57 AC-1): zero propose_task calls
+    → the session's text answer is the proposal, exactly today; calls
+    made → the accepted set is the proposal and wins over any text
+    answer, with the divergence stated for the owner to see (the note
+    rides the summary on success and the refusal message on failure).
+
+    ``calls`` (review round 1, S1) is how many propose_task calls the
+    session made, accepted or refused. Calls made with NOTHING accepted
+    is its own visible fact: the text answer still is the proposal, but
+    the note (or, when the text does not parse either, the refusal
+    itself) says that every proposed task was refused — the owner is not
+    left to wonder why the tool's set is empty.
+    """
+    if not accepted:
+        if not calls:
+            return parse_proposal(text), ""
+        try:
+            proposal = parse_proposal(text)
+        except ImportRefused as exc:
+            raise ImportRefused(
+                f"{exc}; the session made {calls} propose_task call(s), "
+                "all refused — every task it proposed broke a rule, and "
+                "its text answer does not parse either"
+            ) from exc
+        return proposal, (
+            f"the session made {calls} propose_task call(s), none "
+            "accepted; the text answer is the proposal"
+        )
+    proposal = _accepted_set_proposal(accepted, project)
+    tasks = proposal["tasks"]
+    if not text.strip():
+        return proposal, (
+            f"the session made {calls} propose_task call(s) and answered "
+            f"no text; the accepted set ({len(tasks)} tasks) is the "
+            "proposal"
+        )
+    try:
+        answer = parse_proposal(text)
+    except ImportRefused:
+        return proposal, (
+            f"the session made propose_task calls and its text answer was "
+            f"not valid JSON; the accepted set ({len(tasks)} tasks) is "
+            f"the proposal"
+        )
+    if canonical_json(answer.get("tasks", [])) != canonical_json(tasks):
+        return proposal, (
+            f"the session made propose_task calls and its text answer "
+            f"differs from the accepted set ({len(tasks)} tasks); the "
+            "accepted set is the proposal"
+        )
+    return proposal, ""
+
+
 # ------------------------------------------------------------------- entry --
 
 
@@ -1481,7 +2424,15 @@ class ImportResult:
 
     ``raw_output`` travels to the caller (the CLI holds the interactive
     apply outside run_import) so a refusal at *its* apply can still keep
-    the output through :func:`keep_refused_import_output`.
+    the output through :func:`keep_refused_import_output`. It is the
+    proposal that was judged: the session's text answer, or — when the
+    propose tool's accepted set or a repair's answer won (F-57) — that
+    winning document, rendered as JSON.
+
+    ``repair`` (F-57 AC-2) carries the repair facts when the ONE repair
+    session ran (``{"ran": True, "outcome": …, "turns": N}``); empty
+    otherwise. ``precedence_note`` (AC-1) states the accepted-set/text
+    divergence when the tool's set won over a differing text answer.
     """
 
     plan: ImportPlan
@@ -1489,6 +2440,12 @@ class ImportResult:
     queue_path: Path
     applied: bool
     raw_output: str = ""
+    repair: dict = field(default_factory=dict)
+    precedence_note: str = ""
+    # F-57 review round 1 (S2): what produced the plan, for the eval's
+    # report and any caller that measures the tool.
+    propose_calls: int = 0
+    accepted_count: int = 0
 
 
 def run_import(
@@ -1510,6 +2467,18 @@ def run_import(
     summary and — only when ``confirm`` is given and returns True —
     writes the queue. With ``confirm=None`` this is a pure proposal:
     nothing is written, whatever the summary says.
+
+    The real session gets the ``propose_task`` tool (F-57 AC-1): each
+    task is validated as the model writes it, the accepted set is the
+    proposal once any call was made (the text answer then only a
+    confirmation; a divergence between the two is stated in the summary
+    and the refusal), and zero calls keep today's text-answer path
+    exactly. A refused proposal from the real session then gets ONE
+    bounded repair session (F-57 AC-2) — the saved output, the full
+    violation list and the contract, no doc re-reading — whose answer
+    goes through the same parse/scrub/plan validation; a still-refused
+    repair refuses the import naming both saved files. An injected
+    ``session`` never triggers a repair (a stub re-runs free).
 
     Args:
         repo: The project repo root (the planning docs and the register
@@ -1535,19 +2504,23 @@ def run_import(
 
     Returns:
         The :class:`ImportResult` — plan, summary, resolved queue path,
-        whether the queue was written, and the session's raw output.
+        whether the queue was written, the session's raw output, and the
+        repair/precedence facts.
 
     Raises:
         ImportRefused: An explicit budget is outside its bounds (before
             any session starts); no session output could be parsed or
-            merged into a schema-valid, all-draft proposal (AC-1/AC-2);
-            or the apply was refused (the queue changed while the
-            confirm waited). When the output was expensive (the real
-            session, or ``keep_refused``), the raw output is saved
-            (redacted, 0600) under ``<factory-root>/import/`` and the
-            message names the file and the full re-review command. A
-            write ``OSError`` after the session keeps its type — the
-            copy is still saved, noted on the exception.
+            merged into a schema-valid, all-draft proposal (AC-1/AC-2)
+            — including, for the real session, a repair that did not fix
+            it, naming both saved files; or the apply was refused (the
+            queue changed while the confirm waited; a repair is never
+            spent on this — the output was valid). When the output was
+            expensive (the real session, or ``keep_refused``), the raw
+            output is saved (redacted, 0600) under
+            ``<factory-root>/import/`` and the message names the file
+            and the full re-review command. A write ``OSError`` after
+            the session keeps its type — the copy is still saved,
+            noted on the exception.
     """
     validate_budget(max_turns, timeout_min)
     repo = Path(repo)
@@ -1576,6 +2549,26 @@ def run_import(
     listing = _list_planning_docs(repo, docs_dir)
     prompt = build_import_prompt(repo, docs_dir, records, project=project,
                                  files=listing)
+    keep = session is None or keep_refused
+
+    def _keep(exc: BaseException, payload: str) -> BaseException:
+        """Today's keep-refused wrapper: an ImportRefused comes back with
+        the saved file's path and the full re-review command; anything
+        else keeps its type with a note. ``exc`` itself when ``keep`` is
+        off (a stub keeps nothing)."""
+        if not keep or not isinstance(exc, (ImportRefused, OSError)):
+            return exc
+        return keep_refused_import_output(
+            exc, text=payload, project=project, repo=repo,
+            queue_path=queue_path, docs_dir=docs_dir,
+            factory_root=factory_root, secrets=egress_secrets,
+        )
+
+    accepted: Any = None
+    propose_calls = 0
+    raw_calls: Any = 0
+    effective_turns = max_turns or DEFAULT_MAX_TURNS
+    effective_timeout = timeout_min or DEFAULT_TIMEOUT_MIN
     if session is not None:
         text = session(prompt)
     else:
@@ -1587,58 +2580,177 @@ def run_import(
             scaled_turns, scaled_timeout = scaled_import_budget(
                 len(listing.kept)
             )
+        effective_turns = max_turns if max_turns is not None else scaled_turns
+        effective_timeout = (
+            timeout_min if timeout_min is not None else scaled_timeout
+        )
+        sink_records: list[SessionRecord] = []
+
+        def _sink(record: SessionRecord) -> None:
+            sink_records.append(record)
+
         text = sdk_import_session(
             prompt, repo, profile=profile, queue_path=queue_path,
             factory_root=factory_root,
-            max_turns=max_turns if max_turns is not None else scaled_turns,
-            timeout_min=(timeout_min if timeout_min is not None
-                         else scaled_timeout),
+            max_turns=effective_turns, timeout_min=effective_timeout,
             docs_dir=docs_dir,
+            # F-57 AC-1: the real session gets the per-task tool, built
+            # from the same staged schema, the same register and the
+            # queue's own project name; the accepted set rides the
+            # record back out of the sandbox.
+            propose={
+                "project": project,
+                "schema": build_proposal_schema(_load_tasks_schema()),
+                "record_paths": [record["path"] for record in records],
+            },
+            record_sink=_sink,
         )
-    keep = session is None or keep_refused
+        if sink_records:
+            # F1 (review round 1): the record file is session-writable,
+            # so its fields are UNTRUSTED — taken raw here; the parse
+            # boundary in _accepted_set_proposal makes the list safe and
+            # the scalar checks inside the try (below) make the counts
+            # safe. Nothing structural happens before those.
+            accepted = sink_records[-1].proposed_tasks
+            raw_calls = sink_records[-1].propose_calls
+
+    raw_output = text
+    repair_final: ImportRefused | None = None
+    precedence_note = ""
+    repair: dict = {}
+    accepted_count = 0
     try:
-        # Everything after the session returns: parse, plan, and the
-        # apply a changed queue or failed write can refuse. The
-        # session's output is the expensive part (a real run's clone is
-        # already deleted by now) — on any of these refusals it is
-        # kept, and the refusal says where, so the fix is a file edit
-        # plus one command, not another session. A stub re-runs free
-        # and keeps nothing (unless keep_refused).
-        #
-        # The proposal passes the egress seam BEFORE plan_import and
-        # validation (review round 1, finding 1): every session-derived
-        # string — titles, sources, AC text, owner steps, keys included —
-        # loses the seat token, the credential shapes and control
-        # sequences first, so (a) nothing reaches tasks.json (which the
-        # owner commits and pushes) or the printed plan unscrubbed, and
-        # (b) a redaction cannot produce a schema-valid-looking but
-        # different task without the plan diff showing it — validation
-        # judges the scrubbed values, not the raw ones.
-        proposal = scrub_session_value(parse_proposal(text), egress_secrets)
-        plan = plan_import(existing_doc, proposal, records, project=project)
+        # The ONE precedence decision (F-57 AC-1) — zero propose_task
+        # calls: the text answer, today's path exactly. Calls made: the
+        # accepted set is the proposal and wins over any text answer,
+        # the divergence stated. Then the proposal passes the egress
+        # seam BEFORE plan_import and validation (review round 1,
+        # finding 1): every session-derived string — titles, sources,
+        # AC text, owner steps, keys included — loses the seat token,
+        # the credential shapes and control sequences first, so (a)
+        # nothing reaches tasks.json (which the owner commits and
+        # pushes) or the printed plan unscrubbed, and (b) a redaction
+        # cannot produce a schema-valid-looking but different task
+        # without the plan diff showing it — validation judges the
+        # scrubbed values, not the raw ones.
+        refused: ImportRefused | None = None
+        try:
+            # R2-2 (review round 2): the record's propose_calls is
+            # rendered into messages — only a non-bool int >= 0 is a
+            # count; anything else (a string carrying the seat token, a
+            # dict, a bool, a negative) is a forged record, refused
+            # THROUGH keep and repair like every other broken session
+            # product. Never interpolated raw.
+            if (
+                isinstance(raw_calls, bool)
+                or not isinstance(raw_calls, int)
+                or raw_calls < 0
+            ):
+                raise ImportRefused(
+                    "the session's record carries a malformed "
+                    "propose_calls field "
+                    f"({type(raw_calls).__name__}) — the record is "
+                    "unusable; no proposal can be trusted from it"
+                )
+            propose_calls = raw_calls
+            proposal, precedence_note = _session_proposal(
+                accepted, text, project, calls=propose_calls
+            )
+            accepted_count = len(proposal["tasks"]) if accepted else 0
+            proposal = scrub_session_value(proposal, egress_secrets)
+            if accepted:
+                raw_output = (
+                    json.dumps(proposal, indent=2, ensure_ascii=False) + "\n"
+                )
+            plan = plan_import(existing_doc, proposal, records,
+                               project=project)
+        except ImportRefused as exc:
+            refused = exc
+        if refused is not None:
+            if session is not None:
+                # A stub re-runs free: today's path exactly — the outer
+                # keep wraps the refusal as before.
+                raise refused
+            # The real session: keep the output, then the ONE repair
+            # (F-57 AC-2). Its answer faces the SAME validation; a
+            # still-refused repair's final refusal names BOTH saved
+            # files — it already kept them, so the outer keep must not
+            # save a third copy (the identity check below).
+            plan, repair, final = _repair_refused_proposal(
+                refused, payload=raw_output, project=project, repo=repo,
+                queue_path=queue_path, docs_dir=docs_dir,
+                factory_root=factory_root, profile=profile or {},
+                records=records, existing_doc=existing_doc,
+                import_turns=effective_turns,
+                import_timeout=effective_timeout,
+                secrets=egress_secrets,
+            )
+            if plan is None:
+                if final is None:
+                    # The repair could not even start. When the helper
+                    # had already kept the original, wrap the refusal
+                    # exactly as the keep path would — naming THAT file,
+                    # never saving a second copy (the identity check in
+                    # the outer except recognises this exception).
+                    saved_path = repair.get("original_saved")
+                    if saved_path:
+                        command = _import_fix_command(
+                            Path(saved_path), repo, queue_path, docs_dir
+                        )
+                        repair_final = ImportRefused(
+                            f"{refused}; saved to {saved_path}; fix it and "
+                            f"review with {command}"
+                        )
+                        raise repair_final from refused
+                    # Nothing was kept (the save itself failed): today's
+                    # exact refusal — the outer keep wraps it.
+                    raise refused
+                repair_final = (
+                    final if not precedence_note
+                    else ImportRefused(f"{final}; ({precedence_note})")
+                )
+                raise repair_final from refused
+            raw_output = repair.get("output", raw_output)
         # F-49 AC-3: the plan carries the docs the ONE listing (computed
         # before the session) dropped, so the summary the owner confirms
         # names them — the same capped set the prompt described.
         plan.truncated_docs = listing.dropped
         summary = render_summary(plan)
+        if repair:
+            turns_text = (
+                f"{repair['turns']} turns"
+                if isinstance(repair.get("turns"), int)
+                else "an unknown number of turns"
+            )
+            summary += (
+                f"\n(one repair session ran after the first proposal was "
+                f"refused: outcome {repair['outcome']}, {turns_text} — "
+                "the repaired proposal is what you are confirming)\n"
+            )
+        if precedence_note:
+            summary += f"\n({precedence_note})\n"
         applied = False
         if confirm is not None:
             applied = apply_import(
                 plan, queue_path, confirm=lambda: bool(confirm(summary))
             )
     except (ImportRefused, OSError) as exc:
-        if keep:
-            kept = keep_refused_import_output(
-                exc, text=text, project=project, repo=repo,
-                queue_path=queue_path, docs_dir=docs_dir,
-                factory_root=factory_root, secrets=egress_secrets,
-            )
-            if kept is not exc:
-                raise kept from exc
+        if exc is repair_final:
+            # The repair's own final refusal: both files already saved
+            # and named by it — never a second keep.
+            raise
+        kept = _keep(exc, raw_output)
+        if kept is not exc:
+            if precedence_note and isinstance(kept, ImportRefused):
+                kept = ImportRefused(f"{kept}; ({precedence_note})")
+            raise kept from exc
         raise
     return ImportResult(
         plan=plan, summary=summary, queue_path=queue_path, applied=applied,
-        raw_output=text,
+        raw_output=raw_output, repair=repair,
+        precedence_note=precedence_note,
+        propose_calls=propose_calls,
+        accepted_count=accepted_count,
     )
 
 
@@ -1652,6 +2764,8 @@ def sdk_import_session(
     max_turns: int = DEFAULT_MAX_TURNS,
     timeout_min: float = DEFAULT_TIMEOUT_MIN,
     docs_dir: str = DEFAULT_DOCS_DIR,
+    propose: dict | None = None,
+    record_sink: "Callable[[SessionRecord], None] | None" = None,
 ) -> str:
     """The default importer session: the reviewer seat, sandboxed.
 
@@ -1678,14 +2792,24 @@ def sdk_import_session(
     repo, which has no schema/ of its own, and the narrowed schema is
     what its own output is judged against.
 
+    ``propose`` (F-57 AC-1) wires the per-task ``propose_task`` tool into
+    the session (``{"project", "schema", "record_paths"}`` — what the
+    sandboxed entry builds its collector from); None runs the session
+    without it. ``record_sink``, when given, is called with the
+    session's :class:`~factory.session.SessionRecord` on the completed
+    path — the channel the accepted set rides out on
+    (``record.proposed_tasks``), the same role the return value plays for
+    the text answer.
+
     A session that does not complete — ``aborted`` (wall clock, turn
     cap), ``failed``, or the outer wall clock (``TimeoutExpired``) — has
     its scratch's ``$TMPDIR/proposal.json`` (the file the self-check
-    prompt tells it to write) copied out through the one refused-output
-    writer BEFORE ``cleanup_run`` sweeps the scratch, and the refusal
-    names the saved file and the re-review command, or says no proposal
-    was written (:func:`_abort_refusal`). The third full jobfinderos
-    session was lost to exactly this gap.
+    prompt tells it to write, and — F-57 — the one the propose tool
+    keeps written as the accepted set grows) copied out through the one
+    refused-output writer BEFORE ``cleanup_run`` sweeps the scratch, and
+    the refusal names the saved file and the re-review command, or says
+    no proposal was written (:func:`_abort_refusal`). The third full
+    jobfinderos session was lost to exactly this gap.
 
     Args:
         prompt: The importer prompt (:func:`build_import_prompt`).
@@ -1699,6 +2823,11 @@ def sdk_import_session(
             passes the scaled default or the caller's explicit values.
         docs_dir: The planning-docs directory, for the re-review command
             in an abort refusal (rides along only when non-default).
+        propose: The propose tool's configuration (F-57 AC-1); None for
+            no tool.
+        record_sink: Called with the completed session's record, so the
+            caller can read ``proposed_tasks`` (F-57 AC-1) without
+            changing this function's text return.
 
     Raises:
         ImportRefused: No model credential (review a prepared proposal
@@ -1725,8 +2854,22 @@ def sdk_import_session(
         TaskQueue(queue_path)
         if queue_path is not None and Path(queue_path).is_file() else None
     )
-    lease = queue.idle_lease() if queue is not None else contextlib.nullcontext()
-    with lease:
+    # F2 (review round 1): a busy queue here is an ImportRefused (the
+    # CLI's caught class), naming the holder — the same conversion the
+    # repair applies to its own lease. Pre-existing behaviour for the
+    # import session, same file, same round.
+    lease_stack = contextlib.ExitStack()
+    try:
+        lease_stack.enter_context(
+            queue.idle_lease() if queue is not None
+            else contextlib.nullcontext()
+        )
+    except RunInProgressError as exc:
+        raise ImportRefused(
+            f"the import refuses to race a live run ({exc}); retry when "
+            "the run ends"
+        ) from exc
+    with lease_stack:
         try:
             run = create_run(profile["name"], Path(repo), factory_root=root)
         except RunError as exc:
@@ -1743,6 +2886,7 @@ def sdk_import_session(
                         build_proposal_schema(_load_tasks_schema()), indent=2
                     )
                 },
+                propose=propose,
             )
         except SessionRecordError as exc:
             # F-56 AC-5: the session RAN — its record is what broke
@@ -1780,6 +2924,24 @@ def sdk_import_session(
                 secrets=(token,),
             )) from exc
         else:
+            # R3-1 (review round 3): the runner-returned record is
+            # validated at the file boundary (_read_record) — this is the
+            # defence-in-depth half for records that arrive as objects
+            # (a harness seam), and it fails exactly like the F-56 record
+            # error: salvaged, scrubbed, named.
+            from factory.session import record_field_error
+
+            field_error = record_field_error(record)
+            if field_error is not None:
+                raise ImportRefused(_abort_refusal(
+                    scrub_session_text(
+                        "the importer session's record is unusable "
+                        f"(record field {field_error})", (token,),
+                    ),
+                    run=run, project=profile["name"], factory_root=root,
+                    repo=repo, queue_path=Path(queue_path), docs_dir=docs_dir,
+                    secrets=(token,),
+                ))
             if record.status != "completed":
                 # The salvage (inside the raise's argument) runs BEFORE
                 # the finally's cleanup_run sweeps the scratch: any other
@@ -1798,4 +2960,6 @@ def sdk_import_session(
                 ))
         finally:
             cleanup_run(run)
+    if record_sink is not None:
+        record_sink(record)
     return record.result or ""

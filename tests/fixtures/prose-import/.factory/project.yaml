@@ -1,0 +1,32 @@
+# The prose-import fixture project (F-57 AC-3/AC-4): a repo whose planning
+# docs are PROSE — no JSON, no contract field names — so the importer must
+# derive every queue field itself. Three work orders: one plain buildable,
+# one owner-only (certificate renewal + provider decision), one far too
+# large for a single mid-size task (offline mode, eight deliverables).
+name: prose-demo
+
+repo:
+  path: .
+  default_branch: main
+  remote: https://example.invalid/prose-demo.git
+  merge_method: squash
+
+commands:
+  setup: "true"
+  test: "true"
+
+paths:
+  risk: {}
+  protected: []
+
+dependency_manifests: []
+
+deploy:
+  mechanism: none
+  auto_on_merge: false
+
+live_checks: {}
+
+docs_allowlist: []
+
+network_allowlist: []

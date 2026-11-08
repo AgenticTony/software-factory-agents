@@ -630,10 +630,16 @@ def _uses_dunder_file(node: ast.AST) -> bool:
     )
 
 
-# Round 2, finding 4: the srt runtime lookup is the ONE allowed
+# Round 2, finding 4: the srt runtime lookup is an allowed
 # __file__-escape, pinned to its exact assignment — anything else in
-# sandbox.py (or anywhere) is flagged.
-_PACKAGE_ESCAPE_ALLOWLIST = {("sandbox.py", "_REPO_ROOT")}
+# sandbox.py (or anywhere) is flagged. F-57 added the SECOND: the
+# importer eval's prose-fixture lookup (eval.py, _IMPORTER_FIXTURE_ROOT)
+# — the eval is an owner-run command from the checkout and the fixture
+# is deliberately test data under tests/fixtures/**, not package data
+# (the eval refuses, naming the path, when run where the fixture is
+# absent); pinned to its exact assignment the same way.
+_PACKAGE_ESCAPE_ALLOWLIST = {("sandbox.py", "_REPO_ROOT"),
+                             ("eval.py", "_IMPORTER_FIXTURE_ROOT")}
 _RESOURCE_DIR_PREFIXES = ("schema/", "toolkit/", "prompts/", "data/",
                           "factory/", "factory/data/")
 

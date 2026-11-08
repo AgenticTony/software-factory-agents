@@ -541,6 +541,12 @@ _EGRESS_MODULES = {
             # proposal before plan_import sees it, so the violation
             # messages it renders are built from scrubbed values).
             "iter_schema_violations",
+            # F-57 re-seat: the ONE precedence decision — the session's
+            # text answer and the propose tool's accepted set meet here;
+            # the text flows onward only through parse_proposal (this
+            # allow set) and the accepted set was seam-scrubbed in the
+            # sandbox at accept time, so both paths are guarded.
+            "_session_proposal",
         },
     },
     "factory/session.py": {

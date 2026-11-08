@@ -492,6 +492,7 @@ def build_settings(
     scratch_write: "Sequence[Path] | None" = None,
     record_write: Path | None = None,
     local_binding: bool = False,
+    deny_read: "Sequence[Path]" = (),
 ) -> dict:
     """Build the srt settings dict for one run from the project profile.
 
@@ -532,6 +533,11 @@ def build_settings(
             the session seats (implementer, reviewer, the importer's
             reviewer seat) and the SDK probe must never ask, whatever the
             profile says — see below for why.
+        deny_read: Extra paths denied for reading (resolved). F-57's
+            repair seat denies the source repo and its docs dir — the
+            session must not re-read what it is repairing, wherever the
+            repo lives (the home-wide deny says nothing about a repo
+            outside $HOME).
         scratch_write: F-38 review finding 1 — the per-session scratch
             dirs of a fan-out session. When given (with ``read_only``),
             the writable list is EXACTLY these paths: not the run dir's
@@ -679,6 +685,14 @@ def build_settings(
                 str(Path("~/.ssh").expanduser()),
                 str(Path("~/.config/gh").expanduser()),
                 str(runs_root),
+                # F-57 (review round 1, F3): caller-named extra denies —
+                # resolved, so a symlinked spelling cannot slip past. The
+                # repair seat denies the SOURCE repo it must not re-read
+                # (the empty workspace is the structural half; this is the
+                # settings half, and it holds wherever the repo lives —
+                # outside $HOME included, where the home-wide deny above
+                # says nothing).
+                *[str(Path(entry).resolve()) for entry in deny_read],
             ],
             "allowRead": [str(run_dir), str(srt_package)]
             + [str(entry) for entry in toolchain_reads]
