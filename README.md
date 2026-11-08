@@ -27,7 +27,7 @@ proves it against CI's `runs-on` in both directions):
 | Host | Status | Install |
 |---|---|---|
 | macOS | supported — the factory's own host, verified by the owner's local gate (CI has no macOS job) | none (uses the built-in `sandbox-exec`) |
-| Ubuntu 24.04 | supported — verified by CI (`test-ubuntu-24.04` and the other 24.04 jobs) | `sudo apt-get install -y bubblewrap socat ripgrep` and `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (AppArmor otherwise blocks bubblewrap's user namespaces) |
+| Ubuntu 24.04 | supported — verified by CI (`test (ubuntu-24.04)` and the other 24.04 jobs) | `sudo apt-get install -y bubblewrap socat ripgrep` and `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (AppArmor otherwise blocks bubblewrap's user namespaces) |
 | Ubuntu 26.04 | NOT supported — srt's nested user namespace fails (`apply-seccomp: write /proc/self/setgroups … Permission denied`, PR #97) and the sysctl does not lift it; deferred to the proposed F-61 work order (`.factory/BOOTSTRAP.md` §F-58) | — |
 
 Then `ruff check . && pytest -q -n auto` (parallel via pytest-xdist; plain

@@ -47,7 +47,7 @@ agents do the volume. Architecture and reasoning: `DESIGN-LOCAL-FACTORY.md`.
   runtime `srt` from `package-lock.json`; needs Node >= 22.12). Supported hosts
   (exactly these — `tests/test_f58.py::test_ac_6` pins the list against CI):
   macOS — the factory's own host, verified by the owner's local gate (CI has no
-  macOS job), no system deps; Ubuntu 24.04 — CI's `test-ubuntu-24.04` host,
+  macOS job), no system deps; Ubuntu 24.04 — CI's `test (ubuntu-24.04)` host,
   needs `bubblewrap socat ripgrep` plus `sudo sysctl -w
   kernel.apparmor_restrict_unprivileged_userns=0`.
   Ubuntu 26.04 is NOT supported (srt nested-userns failure, PR #97) — deferred

@@ -293,12 +293,16 @@ def test_ac_3():
     jobs = _ci_jobs()
 
     # Every job names its host: a runner-image change then fails a NAMED
-    # job (the amended AC-3).
+    # job (the amended AC-3). The ID cannot carry dots (GitHub rejects
+    # them — R3), so the DISPLAY name carries the exact host string and
+    # the id carries it dot-free.
     for job_id, job in jobs.items():
         runs_on = job.get("runs-on")
         assert runs_on, f"job {job_id!r} has no runs-on"
-        assert runs_on in job_id, (
-            f"job {job_id!r} does not name its runs-on host {runs_on!r}"
+        display = job.get("name") or job_id
+        assert runs_on in display, (
+            f"job {job_id!r} (display {display!r}) does not name its "
+            f"runs-on host {runs_on!r}"
         )
     assert all(j["runs-on"] == "ubuntu-24.04" for j in jobs.values()), (
         "the verified CI host is ubuntu-24.04 only (26.04 is deferred; "
@@ -1378,3 +1382,39 @@ def test_r2_failed_beats_pending():
          "total_count": 2},
     ))
     assert state.state == "failed"
+
+
+# ============================================================ round 3 ======
+# Reviewer round 3 (2026-11-08, caught on the real PR): GitHub REJECTED
+# ci.yml — the dotted job ids are invalid on GitHub (ids match
+# [A-Za-z_][A-Za-z0-9_-]*), so zero jobs ran on 0eb733c. The YAML parses
+# locally, which is why every shape test passed: the file was never
+# checked against GitHub's ACCEPTANCE rules, only against ours.
+
+def test_r3_github_accepts_the_workflow():
+    """Every offline-checkable GitHub workflow rule: job ids fully match
+    ``[A-Za-z_][A-Za-z0-9_-]*`` (a dot anywhere → GitHub rejects the
+    whole file and NO job runs), each job has a ``runs-on``, ``steps``
+    is a non-empty list, and every step has exactly one of ``run`` /
+    ``uses``. This is the test that would have caught R3 before the PR.
+    """
+    jobs = _ci_jobs()
+    assert jobs, "the workflow has no jobs"
+    for job_id, job in jobs.items():
+        assert re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", job_id), (
+            f"job id {job_id!r} is not GitHub-valid: ids start with a "
+            "letter or _ and contain only alphanumerics, - and _ — a dot "
+            "makes GitHub reject the whole workflow and no job runs"
+        )
+        assert isinstance(job.get("runs-on"), str) and job["runs-on"], (
+            f"{job_id}: no runs-on"
+        )
+        steps = job.get("steps")
+        assert isinstance(steps, list) and steps, f"{job_id}: no steps"
+        for index, step in enumerate(steps, 1):
+            assert isinstance(step, dict), f"{job_id} step {index}: not a map"
+            has = [key for key in ("run", "uses") if key in step]
+            assert len(has) == 1, (
+                f"{job_id} step {index}: exactly one of run/uses required, "
+                f"got {has}"
+            )
