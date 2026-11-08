@@ -39,6 +39,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import yaml
+from _support.tokens import fake_token
 from claude_agent_sdk import AssistantMessage
 
 from factory.contract import acceptance_hash
@@ -78,6 +79,9 @@ REVIEW_PASS = json.dumps({"verdict": "pass", "findings": []})
 PROTECTED_STRICT = Protection(checked=True, strict=True)
 
 RUN_ID = "20260101T000000Z-ab12cd"
+# F-58 AC-G (round 1): a GitHub-token-shaped fake, built at runtime
+# (ghp_ + 40 chars) — the shape is what the scrub tests exercise.
+GHP = fake_token("f27-ghp", prefix="ghp_", body_len=40)
 
 
 def _result_message(**overrides):
@@ -405,7 +409,7 @@ def test_ac_2(tmp_path: Path):
         long_text = "x" * (VENT_TEXT_CAP + 5_000)
         _call(tool, category="flaky_check", text=long_text)
         _call(tool, category="environment",
-              text="the sandbox leaked ghp_0123456789012345678901234567890123456789")
+              text=f"the sandbox leaked {GHP}")
         after = _tree_hashes(tmp_path)
     assert before == after, "the vent tool wrote something other than its record"
     assert len(collector.vents) == 2
@@ -647,7 +651,7 @@ def test_review1(tmp_path: Path):
                    seat="reviewer", turn="9"),
         _vent_dict(category="grievance"),  # not one of the five
         "not a dict",
-        _vent_dict(text="leak ghp_0123456789012345678901234567890123456789"),
+        _vent_dict(text=f"leak {GHP}"),
         _vent_dict(text=12345),  # text must be a string
     ]
     stored = flush_vents(log, forged, run_id=RUN_ID, task_id="T-1", seat="implementer")

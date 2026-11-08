@@ -242,7 +242,8 @@ def test_ac_2():
     jobs = ci["jobs"]
 
     # The main job deselects exactly live_network — nothing else.
-    test_steps = _ci_run_steps(jobs["test"])
+    # F-58 (AC-3): the sandbox job is named for its host.
+    test_steps = _ci_run_steps(jobs["test-ubuntu-24.04"])
     pytest_cmd = next((s for s in test_steps if s.strip().startswith("pytest")), "")
     assert '-m "not live_network"' in pytest_cmd, (
         "the main test job does not deselect live_network; an endpoint "
@@ -257,7 +258,7 @@ def test_ac_2():
     live_jobs = [
         (name, steps)
         for name, job in jobs.items()
-        if name != "test"
+        if name != "test-ubuntu-24.04"
         for steps in _ci_run_steps(job)
         if "-m live_network" in steps or "-m 'live_network'" in steps
     ]
@@ -442,7 +443,8 @@ def test_ac_4():
         )
 
     # node-version comes from the setup-node `with:` block, not run steps.
-    test_job = _ci()["jobs"]["test"]
+    # F-58 (AC-3): the sandbox job is named for its host.
+    test_job = _ci()["jobs"]["test-ubuntu-24.04"]
     node_version = None
     for step in test_job["steps"]:
         with_step = step.get("with") or {}
@@ -921,7 +923,7 @@ def test_review_the_ci_wheel_job_steps_actually_run(tmp_path: Path):
     job's fresh-venv ``pip install dist/*.whl`` resolves the runtime
     deps from the index — the real wheel job runs every PR regardless;
     the mandatory no-network guarantees live in test_ac_8."""
-    wheel_job = _ci()["jobs"]["wheel"]
+    wheel_job = _ci()["jobs"]["wheel-ubuntu-24.04"]
     steps = [s["run"] for s in wheel_job["steps"] if "run" in s]
     assert len(steps) == 4, f"expected the 4 known run steps, got {len(steps)}"
 
@@ -1206,12 +1208,14 @@ def test_review_the_new_ci_jobs_are_pinned_exactly():
     ``echo pyright``, a ``pyright || true`` or an ``if: false`` job all
     fail here. (f24's guard covers the main test job's steps only.)"""
     jobs = _ci()["jobs"]
+    # F-58 (AC-3): the jobs are named for their host (test-ubuntu-24.04,
+    # live-network-ubuntu-24.04, …); the pins below follow the rename.
     pins = {
-        "live-network": ["pytest -q -rs -m live_network"],
-        "typecheck": ["pyright --warnings"],
+        "live-network-ubuntu-24.04": ["pytest -q -rs -m live_network"],
+        "typecheck-ubuntu-24.04": ["pyright --warnings"],
         # the wheel job's exact steps are EXECUTED by
         # test_review_the_ci_wheel_job_steps_actually_run; here: shape.
-        "wheel": ["python -m build --wheel --no-isolation"],
+        "wheel-ubuntu-24.04": ["python -m build --wheel --no-isolation"],
     }
     for name, required_commands in pins.items():
         assert name in jobs, f"the {name} job is gone"

@@ -37,17 +37,20 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Sequence
 
 from factory.contract import ContractError
 from factory.publish import PublishError, github_slug
 
 __all__ = [
+    "CIState",
     "MergeOrderError",
     "Protection",
     "admission",
+    "classify_ci",
     "classify_protection",
     "gh_branch_protection",
+    "gh_ci_state",
     "gh_pr_state",
 ]
 
@@ -217,6 +220,261 @@ def gh_pr_state(
             "unresolvable, never guessed"
         )
     return state.strip().lower()
+
+
+# --- F-58 AC-5: the self-enforced green-CI check ----------------------------
+#
+# A repo that declares ``repo.branch_protection: unavailable`` (a private
+# repo on a free plan, F-26 AC-1's exception) has nothing on GitHub's
+# side forcing CI green before a merge — the 2026-10-24 incident: main
+# red for 11 days while PRs #90–#95 merged. The factory enforces the
+# equivalent itself, the same way it already enforces up-to-date: the
+# default branch's checks must be green (or pending — a run merges
+# nothing) before ``factory run`` starts, and an open PR is never
+# reported ready while its checks fail or run. ALL checks count,
+# live-network and GitGuardian included (F-51 open question 1): the
+# message names the job, so "endpoint down" reads as ``live-network``
+# failing, not as a broken PR.
+
+# A completed check's non-green conclusions that mean FAILED.
+_CI_FAILED_CONCLUSIONS = frozenset(
+    {"failure", "cancelled", "timed_out", "action_required", "stale"}
+)
+# A completed check's green conclusions.
+_CI_GREEN_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
+# A not-yet-completed check's statuses — queued/in_progress, and the
+# awaiting states (waiting/requested/pending, e.g. a required
+# environment approval). Any other is unknown → refuse.
+_CI_PENDING_STATUSES = frozenset(
+    {"queued", "in_progress", "waiting", "requested", "pending"}
+)
+# A status ENTRY's failed states (the combined API's per-context truth).
+_CI_STATUS_FAILED = frozenset({"failure", "error"})
+
+_CI_PER_PAGE = 100
+_CI_MAX_PAGES = 30  # 3000 checks; beyond that the answer is refused, not cut
+
+
+@dataclass(frozen=True)
+class CIState:
+    """GitHub's answer about ONE commit SHA's checks (F-58 AC-5).
+
+    ``state``: ``success`` (every check green), ``failed`` (any failure,
+    cancelled, timed_out, action_required or stale), ``pending`` (checks
+    still running), ``none`` (no checks reported at all), or
+    ``unresolvable`` — gh failed or printed junk (the F-45 rule: never
+    guessed, never success).
+
+    ``checks``: every check as ``(name, conclusion-or-state)`` — what the
+    refusal messages name, so "live-network failed" is legible.
+    """
+
+    state: str
+    checks: "tuple[tuple[str, str], ...]" = ()
+    detail: str = ""
+
+
+def classify_ci(
+    check_runs: "Sequence[dict]", status_doc: "dict | None"
+) -> CIState:
+    """Classify one SHA's fetched facts (pure; unit-tested directly).
+
+    Args:
+        check_runs: The check-runs API's ``check_runs`` entries — the
+            LATEST attempt per name (``filter=latest``, so a re-run that
+            went green is green; the older failed attempt is history).
+        status_doc: The combined commit-status document — judged by its
+            ENTRIES (``statuses``), never its rollup ``state``: GitHub
+            answers ``{"state": "pending", "statuses": [], …}`` for
+            every commit with no legacy statuses, so reading the rollup
+            would call every green commit pending (review round 1,
+            R1-1). Zero entries contribute nothing.
+
+    Returns:
+        The :class:`CIState`.
+
+    Unknown is never ok: a completed check with no conclusion, an
+    unrecognised conclusion or status, a malformed status entry (not a
+    dict, or without a context/state), or an unrecognised entry state
+    all return ``unresolvable``.
+    """
+    checks: list[tuple[str, str]] = []
+    failed = False
+    pending = False
+    for run in check_runs:
+        if not isinstance(run, dict):
+            return CIState("unresolvable",
+                           detail=f"a check run is not an object: {run!r}"[:200])
+        name = run.get("name")
+        if not isinstance(name, str) or not name:
+            return CIState("unresolvable",
+                           detail="a check run has no usable name")
+        status = run.get("status")
+        conclusion = run.get("conclusion")
+        if status == "completed":
+            if not isinstance(conclusion, str):
+                return CIState(
+                    "unresolvable",
+                    detail=f"check {name!r} completed with no conclusion",
+                )
+            if conclusion in _CI_FAILED_CONCLUSIONS:
+                failed = True
+            elif conclusion not in _CI_GREEN_CONCLUSIONS:
+                return CIState(
+                    "unresolvable",
+                    detail=f"check {name!r} has unknown conclusion {conclusion!r}",
+                )
+            checks.append((name, conclusion))
+        else:
+            if status not in _CI_PENDING_STATUSES:
+                return CIState(
+                    "unresolvable",
+                    detail=f"check {name!r} has unknown status {status!r}",
+                )
+            checks.append((name, str(status)))
+            pending = True
+    if status_doc is not None:
+        entries = status_doc.get("statuses")
+        if entries is None:
+            entries = []  # no statuses field: nothing reported this way
+        if not isinstance(entries, list):
+            return CIState("unresolvable",
+                           detail="the status answer's statuses is not a list")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                return CIState("unresolvable",
+                               detail=f"a status entry is not an object: {entry!r}"[:200])
+            context, state = entry.get("context"), entry.get("state")
+            if not isinstance(context, str) or not context:
+                return CIState("unresolvable",
+                               detail="a status entry has no usable context")
+            if not isinstance(state, str):
+                return CIState("unresolvable",
+                               detail=f"status entry {context!r} has no state")
+            checks.append((context, state))
+            if state in _CI_STATUS_FAILED:
+                failed = True
+            elif state == "pending":
+                pending = True
+            elif state != "success":
+                return CIState(
+                    "unresolvable",
+                    detail=f"status entry {context!r} has unknown state {state!r}",
+                )
+    if failed:
+        return CIState("failed", tuple(checks))
+    if pending:
+        return CIState("pending", tuple(checks))
+    if not checks:
+        return CIState("none")
+    return CIState("success", tuple(checks))
+
+
+def _gh_api(gh: str, args: list[str], _run: Callable) -> subprocess.CompletedProcess:
+    """One ``gh api`` call, with gh's own failures refused loudly."""
+    try:
+        return _run([gh, "api", *args], capture_output=True, text=True)
+    except OSError as exc:
+        raise PublishError(
+            f"cannot check CI state: gh could not be executed ({exc}) — "
+            "the self-enforced green-CI check needs gh"
+        ) from exc
+
+
+def gh_ci_state(
+    remote_url: str, sha: str, *, gh_bin: str | None = None,
+    _run: Callable = subprocess.run,
+) -> CIState:
+    """Ask GitHub about every check reported for exactly ``sha``.
+
+    Reads the check-runs API for the exact SHA — latest attempt per
+    check name (``filter=latest``), paginated to 100 per page so a repo
+    with more checks than one page is judged on ALL of them — and the
+    combined commit-status API, since a repo can report through either.
+
+    Args:
+        remote_url: The profile's ``repo.remote`` URL.
+        sha: The exact commit the answer must be about (never a branch
+            name: a moving head cannot be judged).
+        gh_bin: gh path override (default: ``shutil.which``).
+        _run: subprocess seam for tests (canned gh output).
+
+    Returns:
+        The classified :class:`CIState`. gh errors, rc-0 junk and
+        non-object JSON return ``unresolvable`` — never guessed.
+
+    Raises:
+        factory.publish.PublishError: gh is missing or cannot be
+            executed — the CI answer is required, not optional.
+    """
+    gh = gh_bin or shutil.which("gh")
+    if not gh:
+        raise PublishError(
+            "cannot check CI state: gh is not installed (the factory reads "
+            "a SHA's checks with `gh api` for the self-enforced green-CI rule)"
+        )
+    slug = github_slug(remote_url)
+    runs: list[dict] = []
+    for page in range(1, _CI_MAX_PAGES + 1):
+        proc = _gh_api(
+            gh,
+            ["-X", "GET", f"repos/{slug}/commits/{sha}/check-runs",
+             "-f", "filter=latest", "-f", "per_page=100", "-f", f"page={page}"],
+            _run,
+        )
+        if proc.returncode != 0:
+            return CIState(
+                "unresolvable",
+                detail=f"gh api (check-runs) exited {proc.returncode}: "
+                       f"{proc.stderr.strip()[:200]}",
+            )
+        try:
+            doc = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return CIState(
+                "unresolvable",
+                detail=f"gh api printed no JSON: {proc.stdout.strip()[:120]}",
+            )
+        if not isinstance(doc, dict):
+            return CIState(
+                "unresolvable",
+                detail=f"gh api printed non-object JSON "
+                       f"({type(doc).__name__}): {proc.stdout.strip()[:120]}",
+            )
+        batch = doc.get("check_runs")
+        if not isinstance(batch, list):
+            return CIState("unresolvable",
+                           detail="the check-runs answer has no check_runs list")
+        runs.extend(batch)
+        if len(batch) < _CI_PER_PAGE:
+            break
+    else:
+        return CIState(
+            "unresolvable",
+            detail=f"more than {_CI_MAX_PAGES * _CI_PER_PAGE} check runs for "
+                   f"{sha[:12]} — refusing to judge a subset",
+        )
+    proc = _gh_api(gh, [f"repos/{slug}/commits/{sha}/status"], _run)
+    if proc.returncode != 0:
+        return CIState(
+            "unresolvable",
+            detail=f"gh api (status) exited {proc.returncode}: "
+                   f"{proc.stderr.strip()[:200]}",
+        )
+    try:
+        status_doc = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return CIState(
+            "unresolvable",
+            detail=f"gh api (status) printed no JSON: {proc.stdout.strip()[:120]}",
+        )
+    if not isinstance(status_doc, dict):
+        return CIState(
+            "unresolvable",
+            detail=f"gh api (status) printed non-object JSON "
+                   f"({type(status_doc).__name__}): {proc.stdout.strip()[:120]}",
+        )
+    return classify_ci(runs, status_doc)
 
 
 def admission(

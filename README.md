@@ -21,12 +21,14 @@ and installed from the committed lockfile; the factory verifies `srt --version`
 (once per process) before sandboxing anything and refuses to run on a
 mismatch. System dependencies (per srt's own README):
 
-| Platform | Install |
-|---|---|
-| macOS | none (uses the built-in `sandbox-exec`) |
-| Linux | `sudo apt-get install -y bubblewrap socat ripgrep` |
-| Ubuntu 24.04 | also `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (AppArmor otherwise blocks bubblewrap's user namespaces) |
-| Ubuntu 26.04 | not supported yet: srt's nested user namespace fails (`apply-seccomp: write /proc/self/setgroups … Permission denied`) and the sysctl above does not lift it; CI pins 24.04 |
+The verified hosts (this table lists exactly them — `tests/test_f58.py::test_ac_6`
+proves it against CI's `runs-on` in both directions):
+
+| Host | Status | Install |
+|---|---|---|
+| macOS | supported — the factory's own host, verified by the owner's local gate (CI has no macOS job) | none (uses the built-in `sandbox-exec`) |
+| Ubuntu 24.04 | supported — verified by CI (`test-ubuntu-24.04` and the other 24.04 jobs) | `sudo apt-get install -y bubblewrap socat ripgrep` and `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (AppArmor otherwise blocks bubblewrap's user namespaces) |
+| Ubuntu 26.04 | NOT supported — srt's nested user namespace fails (`apply-seccomp: write /proc/self/setgroups … Permission denied`, PR #97) and the sysctl does not lift it; deferred to the proposed F-61 work order (`.factory/BOOTSTRAP.md` §F-58) | — |
 
 Then `ruff check . && pytest -q -n auto` (parallel via pytest-xdist; plain
 `pytest -q` works too). The sandbox tests attempt the forbidden

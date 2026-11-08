@@ -743,7 +743,9 @@ def test_conftest_probe_failure_stops_the_suite(tmp_path: Path):
 # gap stays on the record until F-58 adds Linux nesting detection.
 @pytest.mark.skipif(
     sys.platform != "darwin",
-    reason="INC-007 nesting is macOS-seatbelt-only; Linux nesting detection is F-58",
+    reason="INC-007 nesting is macOS-seatbelt-only; Linux nesting "
+           "detection is deferred to the proposed F-61 (owner scope "
+           "decision 2026-11-08, .factory/BOOTSTRAP.md §F-58)",
 )
 def test_nested_suite_skips_instead_of_failing(tmp_path: Path):
     """The L0 shape end to end: this suite run inside a sandbox skips

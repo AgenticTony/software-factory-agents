@@ -35,6 +35,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from contextlib import suppress
 from functools import lru_cache
@@ -110,6 +111,129 @@ _GITHUB_TOKEN_NAMES = frozenset(
 
 class SandboxError(Exception):
     """The sandbox cannot be used: srt missing, wrong version, or unusable."""
+
+
+class HostPreflightError(SandboxError):
+    """The host cannot run the sandbox at all (F-58 AC-4): one named
+    refusal raised before a task is picked, the queue is read or anything
+    is recorded. Subclasses :class:`SandboxError` so the CLI's existing
+    handling (one message line, exit 2) applies with no new wiring."""
+
+
+# The one string a healthy probe prints: the proof carries the command's
+# OUTPUT back through the sandbox boundary, not just its exit code.
+HOST_PROBE_SENTINEL = "factory-host-probe-ok"
+
+# Seconds a healthy host needs, with huge margin: one srt boot plus a
+# trivial echo. A host that cannot answer in this window is hanging, not
+# slow (the process group is killed before the refusal).
+HOST_PROBE_TIMEOUT_SEC = 60.0
+
+# PR #97's 26.04 failure head, the stable prefix of ``apply-seccomp:
+# write /proc/self/setgroups (nested userns is capability-restricted;
+# caller must provide CAP_SYS_ADMIN): Permission denied``. Matched
+# anywhere in the output; the tail's capability detail varies by kernel.
+LINUX_SETGROUPS_DENIAL = "apply-seccomp: write /proc/self/setgroups"
+
+
+def preflight_host(
+    *,
+    srt_bin_path: Path | None = None,
+    timeout_sec: float = HOST_PROBE_TIMEOUT_SEC,
+) -> None:
+    """Prove THIS host can sandbox one command (F-58 AC-4).
+
+    Runs the pinned srt (:func:`srt_bin` — absolute, pin-checked, no
+    environment override, so a PATH shim cannot stand in for it) on a
+    trivial command with a minimal settings file built by the same
+    :func:`build_settings` a real session uses, in a fresh temp dir,
+    under a wall-clock timeout. The orchestrator calls this on every
+    ``factory run`` whose session runner is the real one, AFTER
+    admission and BEFORE the queue is read, reclaimed, picked or
+    anything is recorded: a host that cannot sandbox refuses with ONE
+    named message instead of a cascade of session failures.
+
+    Outcomes — unknown is never "ok" (the INC-007 rule):
+
+    * exit 0 with the sentinel on stdout → return (the host is fine);
+    * the Linux setgroups denial (PR #97's exact failure) →
+      :class:`HostPreflightError` naming the missing host setting and
+      the README section;
+    * a macOS seatbelt refusal (``sandbox_apply``) → the same error
+      class, naming the seatbelt — ``factory run`` is never legitimately
+      nested, so this is a refusal, not a skip;
+    * anything else — srt missing or unpinned (:class:`SandboxError`
+      from :func:`ensure_srt`, naming the ``npm ci`` fix), a timeout,
+      another exit code, or exit 0 without the expected output —
+      refuses, naming what failed.
+
+    Args:
+        srt_bin_path: srt override for tests (still pin-checked). There
+            is no production override path.
+        timeout_sec: Wall-clock cap for the probe.
+
+    Raises:
+        HostPreflightError: the host cannot run the sandbox.
+        SandboxError: srt is missing or not at the pinned version.
+    """
+    with tempfile.TemporaryDirectory(prefix="factory-host-probe-") as tmp:
+        root = Path(tmp)
+        # Canonical runs layout so build_settings derives the factory
+        # root (its holdouts deny must name a real path shape) — the
+        # same shape the SDK probe uses.
+        run_dir = root / "runs" / "probe" / "host-preflight"
+        run_dir.mkdir(parents=True)
+        settings = build_settings({}, run_dir, model_endpoint="preflight.invalid")
+        settings_path = write_settings(settings, run_dir / "probe-settings.json")
+        try:
+            proc = run_sandboxed(
+                ["/bin/echo", HOST_PROBE_SENTINEL],
+                run_dir,
+                settings_path,
+                timeout=timeout_sec,
+                srt_bin_path=srt_bin_path,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise HostPreflightError(
+                f"host preflight timed out after {timeout_sec:g}s: the pinned "
+                "srt did not finish a trivial sandboxed echo — the host's "
+                "sandbox stack is unusable or hanging (README 'Setup'); the "
+                "run refuses to start, nothing was picked or recorded"
+            ) from exc
+    output = proc.stdout + proc.stderr
+    if proc.returncode == 0 and HOST_PROBE_SENTINEL in proc.stdout:
+        return
+    tail = (proc.stderr.strip() or proc.stdout.strip())[:400]
+    if LINUX_SETGROUPS_DENIAL in output:
+        raise HostPreflightError(
+            "this host cannot run the sandbox: srt's nested user namespace "
+            "is denied (apply-seccomp: write /proc/self/setgroups … "
+            "Permission denied — the Ubuntu 26.04 failure, PR #97). The "
+            "host is missing the setting that permits unprivileged user "
+            "namespaces: on Ubuntu 24.04 run `sudo sysctl -w "
+            "kernel.apparmor_restrict_unprivileged_userns=0`; Ubuntu 26.04 "
+            "is NOT supported (README 'Setup', the host table). `factory "
+            "run` refuses to start here — nothing was picked or recorded"
+        )
+    if "sandbox_apply" in output:
+        raise HostPreflightError(
+            "this host cannot run the sandbox: the macOS seatbelt refused "
+            "to apply the sandbox profile (sandbox_apply: Operation not "
+            "permitted) — `factory run` cannot run nested inside another "
+            "sandbox; run it on the host (README 'Setup'). Refusing to "
+            "start: nothing was picked or recorded"
+        )
+    if proc.returncode == 0:
+        raise HostPreflightError(
+            f"host preflight: srt exited 0 but the probe command's expected "
+            f"output did not come back ({HOST_PROBE_SENTINEL!r} missing "
+            f"from stdout; got {tail!r}) — an unverified sandbox stack is "
+            "never ok (README 'Setup')"
+        )
+    raise HostPreflightError(
+        f"host preflight failed: srt exited {proc.returncode}: {tail!r} "
+        "(README 'Setup') — refusing to start, nothing was picked or recorded"
+    )
 
 
 def srt_bin() -> Path:

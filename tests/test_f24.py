@@ -311,7 +311,16 @@ def test_ac_4():
             "CI must not filter which PR files trigger the suite"
         )
 
-    steps = workflow["jobs"]["test"]["steps"]
+    # F-58 (AC-3): the sandbox job is named for its host; find it by its
+    # content (bubblewrap + npm ci), not by a hard-coded id, so a future
+    # host rename re-seats this test deliberately.
+    steps = None
+    for job in workflow["jobs"].values():
+        run_text = "\n".join(s.get("run", "") for s in job["steps"])
+        if "bubblewrap" in run_text and "npm ci" in run_text:
+            steps = job["steps"]
+            break
+    assert steps is not None, "the sandbox job (bubblewrap + npm ci) is gone"
     pytest_steps = [s for s in steps if "pytest" in (s.get("run") or "")]
     assert pytest_steps, "CI must run pytest"
     for step in pytest_steps:

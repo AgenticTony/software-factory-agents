@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import yaml
+from _support.tokens import fake_aws_key, fake_stripe_key
 
 from factory.contract import SCHEMA_DIR, ContractError, acceptance_hash, load_profile
 from factory.gates import FileChange
@@ -40,6 +41,12 @@ from factory.sentinels import (
 STOCKHOLM = ZoneInfo("Europe/Stockholm")
 # A Sunday afternoon: outside every default peak window, so runs may start.
 OFF_PEAK = datetime(2026, 10, 18, 15, 0, tzinfo=STOCKHOLM)
+
+# Runtime-built fake credentials (F-58 AC-G): shapes preserved (AKIA +
+# 16 uppercase/digits; sk_live_ + a 24-char body), no high-entropy
+# literal in the source.
+AWS_KEY = fake_aws_key("f25-aws")
+STRIPE_KEY = fake_stripe_key("f25-stripe")
 
 BASE_PROFILE = {
     "name": "fixture",
@@ -111,7 +118,7 @@ def _result_for(report, name: str) -> dict:
 def test_ac_1(tmp_path):
     # (a) credential-shaped string added in a NON-test file
     repo = _repo(tmp_path, "cred", {"src/config.py": "x = 1\n"})
-    _change(repo, {"src/config.py": 'x = 2\nKEY = "AKIAIOSFODNN7EXAMPLE"\n'})
+    _change(repo, {"src/config.py": f'x = 2\nKEY = "{AWS_KEY}"\n'})
     report = _run(repo)
     assert report.verdict == "fail"
     assert "credential_added" in _finding_ids(report)
@@ -255,7 +262,7 @@ _SENTINEL_CASES = {
         "risk": {},
         "task_risk": [],
         "base": {"src/config.py": "x = 1\n"},
-        "flagged": {"src/config.py": 'x = 2\nKEY = "AKIAIOSFODNN7EXAMPLE"\n'},
+        "flagged": {"src/config.py": f'x = 2\nKEY = "{AWS_KEY}"\n'},
         "clean": {"src/config.py": "x = 2\n"},
     },
     "skip_marker_added": {
@@ -648,7 +655,7 @@ def test_credential_patterns_flag_known_shapes_and_ignores_prose():
     short values and env lookups do not."""
     flagged = [
         'key = "-----BEGIN RSA PRIVATE KEY-----"',
-        "aws_key = AKIAIOSFODNN7EXAMPLE",
+        f"aws_key = {AWS_KEY}",
         'token = "ghp_' + "a" * 36 + '"',
         'stripe = "sk_live_' + "b" * 24 + '"',
         'api_key: "super-secret-value-123456"',
@@ -670,7 +677,7 @@ def test_credential_patterns_flag_known_shapes_and_ignores_prose():
     # reports, prompts and PR bodies, so the text names the shape only
     secrets = [
         "-----BEGIN RSA PRIVATE KEY-----",
-        "AKIAIOSFODNN7EXAMPLE",
+        AWS_KEY,
         "a" * 36,  # the ghp_ token body
         "b" * 24,  # the sk_live_ key body
         "super-secret-value-123456",
@@ -754,14 +761,14 @@ def test_review2_lint_finding_never_echoes_a_credential_line(tmp_path):
     """A line carrying BOTH a credential and a suppression comment must not
     leak the secret through the lint finding's echo (review finding 2)."""
     repo = _repo(tmp_path, "r2", {"src/pay/x.py": "x = 1\n"})
-    _change(repo, {"src/pay/x.py": 'STRIPE_KEY = "sk_live_abcdefghijklmnopqrst"  # noqa\n'})
+    _change(repo, {"src/pay/x.py": f'STRIPE_KEY = "{STRIPE_KEY}"  # noqa\n'})
     profile = dict(BASE_PROFILE)
     profile["paths"] = {"risk": {"payments": ["src/pay/**"]}, "protected": []}
     report = _run(repo, profile, task={"id": "T-1", "risk": ["payments"]})
     assert "credential_added" in _finding_ids(report)
     assert "lint_suppression_added" in _finding_ids(report)
     dumped = json.dumps(report.to_dict())
-    assert "sk_live_abcdefghijklmnopqrst" not in dumped
+    assert STRIPE_KEY not in dumped
 
 
 def test_review3_sentinel_output_is_redacted(tmp_path):
@@ -773,13 +780,13 @@ def test_review3_sentinel_output_is_redacted(tmp_path):
     profile = dict(BASE_PROFILE)
     profile["paths"] = {"risk": {"payments": ["src/pay/**"]}, "protected": []}
     profile["sentinels"] = {"payments": [{
-        "command": "echo found sk_live_abcdefghijklmnopqrst && exit 1",
+        "command": f"echo found {STRIPE_KEY} && exit 1",
         "description": "payments scan",
     }]}
     report = _run(repo, profile, task={"id": "T-1", "risk": ["payments"]})
     assert "sentinel_failed" in _finding_ids(report)
     dumped = json.dumps(report.to_dict())
-    assert "sk_live_abcdefghijklmnopqrst" not in dumped
+    assert STRIPE_KEY not in dumped
     assert "[redacted]" in dumped
 
 
@@ -789,7 +796,7 @@ def test_review4_a_committed_credential_escalates_with_no_retry(tmp_path):
     escalate immediately (review finding 4)."""
     # L0 half: the escalation is on the report
     repo = _repo(tmp_path, "r4l0", {"src/config.py": "x = 1\n"})
-    _change(repo, {"src/config.py": 'KEY = "AKIAIOSFODNN7EXAMPLE"\n'})
+    _change(repo, {"src/config.py": f'KEY = "{AWS_KEY}"\n'})
     report = _run(repo)
     assert "credential_added" in _finding_ids(report)
     assert "credential_added" in report.escalations
@@ -802,7 +809,7 @@ def test_review4_a_committed_credential_escalates_with_no_retry(tmp_path):
 
     # orchestrator half: needs_human on round 1 — no implementer retries
     env = Env(tmp_path, name="r4e2e")
-    seats = Seats(extra_files={"src/config.py": 'KEY = "AKIAIOSFODNN7EXAMPLE"\n'})
+    seats = Seats(extra_files={"src/config.py": f'KEY = "{AWS_KEY}"\n'})
     result = env.run(seats)
     assert result.outcome == "needs_human"
     assert result.escalation == "credential_added"
@@ -980,17 +987,17 @@ def test_review11_redaction_happens_before_the_output_cut(tmp_path):
     profile = dict(BASE_PROFILE)
     profile["paths"] = {"risk": {"payments": ["src/pay/**"]}, "protected": []}
     profile["sentinels"] = {"payments": [{
-        # output = "AKIAIOSFODNN7EXAMPLE Z*189" (210 chars): the old
-        # cut-then-redact order kept the last 200 — "NN7EXAMPLE Z*189" —
+        # output = "<aws key> Z*189" (210 chars): the old cut-then-
+        # redact order kept the last 200 — the key's tail plus filler —
         # a key fragment no shape matches, leaked unredacted
-        "command": f'echo "AKIAIOSFODNN7EXAMPLE {filler}" && exit 1',
+        "command": f'echo "{AWS_KEY} {filler}" && exit 1',
         "description": "payments scan",
     }]}
     report = _run(repo, profile, task={"id": "T-1", "risk": ["payments"]})
     assert "sentinel_failed" in _finding_ids(report)
     dumped = json.dumps(report.to_dict())
-    assert "AKIAIOSFODNN7EXAMPLE" not in dumped
-    assert "NN7EXAMPLE" not in dumped, "the cut landed inside the key and leaked its tail"
+    assert AWS_KEY not in dumped
+    assert AWS_KEY[-9:] not in dumped, "the cut landed inside the key and leaked its tail"
     assert "[redacted]" in dumped
 
 

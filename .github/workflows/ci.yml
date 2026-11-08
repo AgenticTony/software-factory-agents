@@ -6,12 +6,15 @@ on:
     branches: [main]
 
 jobs:
-  test:
-    # Pinned, not ubuntu-latest: from 2026-10-24 that label resolved to
-    # ubuntu-26.04, where srt's nested user namespace is capability-
-    # restricted (`apply-seccomp: write /proc/self/setgroups ...
-    # Permission denied`) and the AppArmor sysctl below does not lift it —
-    # every sandbox test failed. 24.04 is the verified sandbox host.
+  test-ubuntu-24.04:
+    # Pinned to ubuntu-24.04, never a floating alias: from 2026-10-24 the
+    # moving label resolved to ubuntu-26.04, a known-broken sandbox host —
+    # srt's nested user namespace is capability-restricted there
+    # (`apply-seccomp: write /proc/self/setgroups ... Permission denied`,
+    # PR #97) and the AppArmor sysctl below does not lift it. 26.04
+    # support is deferred to the proposed Linux-host work order (F-61,
+    # .factory/BOOTSTRAP.md §F-58); changing this image must be a
+    # deliberate edit, not a label drift.
     runs-on: ubuntu-24.04
     strategy:
       # Both interpreters always report in full: with fail-fast on, one
@@ -60,7 +63,7 @@ jobs:
       # every PR).
       - run: pytest -q -n auto -m "not live_network"
 
-  live-network:
+  live-network-ubuntu-24.04:
     # F-51 (m-20): the tests that need the PUBLIC INTERNET (api.z.ai
     # reachability; the raw-socket deny to a public IP, where "denied"
     # can only be told apart from "offline" on a live network). Selecting
@@ -88,7 +91,7 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: pytest -q -rs -m live_network
 
-  typecheck:
+  typecheck-ubuntu-24.04:
     # F-51 (A-7): pyright basic over the factory package, exactly pinned
     # in the dev extra. Its own job: no sandbox stack needed, and a
     # type error must fail a NAMED job, not hide inside a matrix leg.
@@ -105,7 +108,7 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: pyright --warnings
 
-  wheel:
+  wheel-ubuntu-24.04:
     # F-51 (I-1): the package works as a WHEEL, not only from this
     # checkout. Build it, install it into a fresh venv, then run from
     # OUTSIDE the checkout (so the source tree cannot shadow the
