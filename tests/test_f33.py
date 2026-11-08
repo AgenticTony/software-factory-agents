@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from _support.tokens import fake_token
 
 from factory.cli import main as cli_main
 from factory.contract import load_profile
@@ -605,7 +606,8 @@ def test_review5_the_env_exemption_covers_only_the_lookup_itself():
     flagged = [
         'api_key = "abcdefghijklmnopqrstuv"  # os.getenv("KEY")',
         'password = os.environ.get("PW") or "hunter2hunter2hunter2"',
-        'secret = os.getenv("SERVICE_SECRET", "fallback-secret-12345678")',
+        # built at runtime (F-58 AC-G): a 16+ token-shaped fallback value
+        f'secret = os.getenv("SERVICE_SECRET", "{fake_token("f33-fallback")}")',
     ]
     clean = [
         'token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")',

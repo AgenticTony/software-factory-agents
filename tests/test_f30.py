@@ -31,6 +31,7 @@ from _support.f30 import (
     Seats,
     _task,
 )
+from _support.tokens import fake_token
 from claude_agent_sdk import (
     AssistantMessage,
     ResultMessage,
@@ -59,7 +60,9 @@ REVIEW_FAIL = json.dumps({
 })
 # The seat token for the redaction tests: deliberately NOT shaped like any
 # F-25 credential pattern, so only the token-literal scrub can catch it.
-SEAT_TOKEN = "SEAT-TOKEN-zq91wjk27fp48dnv0123456789"
+# Built at runtime (F-58 AC-G): the shape — prefix + 24-char body, 35
+# chars — is preserved; no high-entropy literal lives in the source.
+SEAT_TOKEN = fake_token("f30-seat")
 
 EVENT_TYPES = {"phase_start", "phase_end", "tool_call", "gate_check",
                "session_end", "run_end"}

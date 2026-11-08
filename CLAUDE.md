@@ -44,10 +44,14 @@ agents do the volume. Architecture and reasoning: `DESIGN-LOCAL-FACTORY.md`.
   credential they fail loudly, and a credential alone never turns them on — so
   no `--deselect` is needed anywhere.
 - Setup: `pip install -e ".[dev]"` **and** `npm ci` (installs the pinned sandbox
-  runtime `srt` from `package-lock.json`; needs Node >= 22.12). System deps:
-  none on macOS; Linux `bubblewrap socat ripgrep`, and on Ubuntu
-  24.04 `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (26.04 is
-  not supported yet; CI pins `ubuntu-24.04`). Without
-  them the F-05 sandbox tests fail (never skip) — see README "Setup".
+  runtime `srt` from `package-lock.json`; needs Node >= 22.12). Supported hosts
+  (exactly these — `tests/test_f58.py::test_ac_6` pins the list against CI):
+  macOS — the factory's own host, verified by the owner's local gate (CI has no
+  macOS job), no system deps; Ubuntu 24.04 — CI's `test (ubuntu-24.04)` host,
+  needs `bubblewrap socat ripgrep` plus `sudo sysctl -w
+  kernel.apparmor_restrict_unprivileged_userns=0`.
+  Ubuntu 26.04 is NOT supported (srt nested-userns failure, PR #97) — deferred
+  to the proposed F-61 work order (`.factory/BOOTSTRAP.md` §F-58). Without the
+  deps the F-05 sandbox tests fail (never skip) — see README "Setup".
 - Bootstrap phase: one work order per session (F-01 to F-11, BUILD-ORDER.md).
 - CI (`.github/workflows/ci.yml`) runs ruff + pytest on every PR.

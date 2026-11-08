@@ -26,6 +26,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
+from _support.tokens import fake_jwt, fake_token, fake_zai_key
 
 from factory.contract import acceptance_hash, load_profile
 from factory.gates import FileChange
@@ -53,20 +54,19 @@ TEST_SOURCE = (
     "    assert answer() == 42\n"
 )
 
-# The planted seat token (C-1): a long literal no pattern shape matches, so
+# The planted seat token (C-1): a long value no pattern shape matches, so
 # only the literal scrub can catch it — the exact exfiltration the review
 # proved. The echo (M-8) is a bare ANTHROPIC_AUTH_TOKEN=<value> assignment;
 # review round 1 (finding 8) added the Z.ai-shaped value — the production
 # key is <id>.<secret>, NOT a JWT — so the tests cover both shapes.
-SEAT_TOKEN = "seat-tok-0f1e2d3c4b5a6978879601525354555657585960"
-JWT = (
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
-    ".eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkphbmUgRG9lIn0"
-    ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
-)
+# Built at runtime (F-58 AC-G): the shapes are preserved exactly (the
+# token's no-pattern body, the JWT's two eyJ segments, the Z.ai
+# <hex24>.<alnum20> key); no high-entropy literal lives in the source.
+SEAT_TOKEN = fake_token("f43-seat", prefix="seat-tok-", body_len=48)
+JWT = fake_jwt("f43-jwt")
 ENV_ECHO = f"ANTHROPIC_AUTH_TOKEN={JWT}"
 # A Z.ai credential's real shape: <id>.<secret>, no eyJ, no known prefix.
-ZAI_KEY = "d1f4a9c2e8b37d65f0a2.Sk7VmQ2xP9wL4TtN6bZ"
+ZAI_KEY = fake_zai_key("f43-zai")
 ENV_ECHO_ZAI = f"ANTHROPIC_AUTH_TOKEN={ZAI_KEY}"
 
 # m-16's three injection shapes: a screen clear, an OSC-8 hyperlink and a
@@ -370,12 +370,11 @@ def _shape_findings(line: str, path: str = "src/conf.py"):
 def test_ac_5():
     from factory.sentinels import redact_credentials
 
-    jwt2 = ("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0."
-            "dozjgNryP4J3jVmNHl0w5N65Yv-mYv_z7XvvVXyL0eI")
+    jwt2 = fake_jwt("f43-ac5")
+    bearer = fake_token("f43-bearer", prefix="", body_len=40)
     shapes = {
         "JSON web token": f"auth = getconf_token('{jwt2}')",
-        "bearer token": 'curl -H "Authorization: Bearer '
-                        "0f1e2d3c4b5a6978879601525354555657585960\" url",
+        "bearer token": f'curl -H "Authorization: Bearer {bearer}" url',
         "unquoted YAML password": "  password: hunter2hunter2hunter2x",
     }
     for shape, line in shapes.items():
@@ -383,13 +382,13 @@ def test_ac_5():
         redacted = redact_credentials(line)
         assert "hunter2" not in redacted or shape != "unquoted YAML password"
         assert not re.search(r"eyJ[A-Za-z0-9_-]{7,}\.", redacted), shape
-        assert "0f1e2d3c4b5a6978" not in redacted, shape
+        assert bearer[:16] not in redacted, shape
         # … and the credential sentinel flags the added line, naming the
         # shape without echoing the value.
         findings = [f for f in _shape_findings(line) if f.id == "credential_added"]
         assert findings, f"{shape}: the sentinel missed the shape"
         assert shape in findings[0].text, findings[0].text
-        for secret in (jwt2, "0f1e2d3c4b5a69788796", "hunter2hunter2"):
+        for secret in (jwt2, bearer[:20], "hunter2hunter2"):
             assert secret not in findings[0].text, "the finding echoes the value"
 
     # One F-33 attack diff per shape: each file flags credential_added

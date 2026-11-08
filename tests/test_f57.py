@@ -45,6 +45,7 @@ from _support.f57 import (
     _prose_repo,
     _wo,
 )
+from _support.tokens import fake_token
 
 from factory.contract import load_tasks
 from factory.importer import (
@@ -62,7 +63,7 @@ from factory.session import SessionRecord, build_options
 
 REPO = Path(__file__).resolve().parent.parent
 PROJECT = "prose-demo"
-SEAT_TOKEN = "SEAT-TOKEN-zq91wjk27fp48dnv0123456789"
+SEAT_TOKEN = fake_token("f57-seat")
 
 
 # ------------------------------------------------------------- helpers --
@@ -1332,7 +1333,7 @@ def test_g1_repair_answer_passes_the_egress_seam(tmp_path, monkeypatch):
     and control sequences it carries never reach the plan, the queue or
     the summary (the scrub runs BEFORE plan_import, like the original
     proposal's)."""
-    token = "SEAT-TOKEN-f57g1noq3w8"
+    token = fake_token("f57-g1")
     monkeypatch.setattr("factory.importer.seat_token", lambda: token)
     monkeypatch.setattr("factory.importer.run_session_sandboxed",
                         ScriptedRunner([
@@ -1546,8 +1547,8 @@ def test_r2_1_not_buildable_and_draft_are_left(tmp_path):
 
 
 @pytest.mark.parametrize("calls", [
-    "SEAT-TOKEN-f57r2xq91wjk27fp48dnv",
-    {"x": "SEAT-TOKEN-f57r2xq91wjk27fp48dnv"},
+    fake_token("f57-r2-2"),
+    {"x": fake_token("f57-r2-2")},
     True,
     -1,
 ])
@@ -1556,7 +1557,7 @@ def test_r2_2_forged_propose_calls_never_render(tmp_path, monkeypatch, calls):
     rendered into messages — anything but a non-bool int >= 0 is a forged
     record, refused through keep and repair; the token never appears in
     the message, the saved file, or anything else the factory writes."""
-    token = "SEAT-TOKEN-f57r2xq91wjk27fp48dnv"
+    token = fake_token("f57-r2-2")
     monkeypatch.setattr("factory.importer.seat_token", lambda: token)
     record = _completed("not json")
     record.propose_calls = calls
@@ -1578,7 +1579,7 @@ def test_r2_2_forged_repair_turns_never_render(tmp_path, monkeypatch):
     eval report) — a valid-but-null count renders as unknown, never raw;
     a DICT count (round 3) is a forged record, refused unusable; the
     token never reaches the eval report or its markdown either way."""
-    token = "SEAT-TOKEN-f57r2xq91wjk27fp48dnv"
+    token = fake_token("f57-r2-2")
     import factory.eval as eval_mod
 
     monkeypatch.setattr("factory.importer.seat_token", lambda: token)
@@ -1776,7 +1777,7 @@ def test_r3_1_forged_import_record_field(tmp_path, monkeypatch, forged):
     as int/list/dict) is refused through the record-unusable path — the
     salvage runs, no AttributeError, and a token-shaped value never
     reaches the message."""
-    token = "SEAT-TOKEN-f57r3noq3w8"
+    token = fake_token("f57-r3")
     monkeypatch.setattr("factory.importer.seat_token", lambda: token)
     values = {"TOK": token}
     forged = {
@@ -1804,7 +1805,7 @@ def test_r3_1_forged_repair_record_field(tmp_path, monkeypatch, forged):
     """The repair's record, same wall: any forged field refuses the
     import naming the KEPT ORIGINAL (the repair ran; its output is not
     trusted), never a traceback, never the token."""
-    token = "SEAT-TOKEN-f57r3noq3w8"
+    token = fake_token("f57-r3")
     monkeypatch.setattr("factory.importer.seat_token", lambda: token)
     values = {"TOK": token}
     forged = {
@@ -1911,7 +1912,7 @@ def _planted_timeout_run(monkeypatch, tmp_path, record_doc):
 
 @pytest.mark.parametrize("forged", [
     {"result": 5},
-    {"status": {"x": "SEAT-TOKEN-f57q03noq3w8"}, "reason": None},
+    {"status": {"x": fake_token("f57-q03")}, "reason": None},
 ])
 def test_t1_forged_record_at_timeout_is_absent(tmp_path, monkeypatch, forged):
     """T1/q03: the TIMEOUT path's read (_read_record_quietly) honours the
@@ -1919,7 +1920,7 @@ def test_t1_forged_record_at_timeout_is_absent(tmp_path, monkeypatch, forged):
     ABSENT: the timeout stays the error (TimeoutExpired raised, never the
     forged record returned), and the token never reaches the exception's
     message or notes."""
-    token = "SEAT-TOKEN-f57q03noq3w8"
+    token = fake_token("f57-q03")
     doc = {"seat": "reviewer", "status": "completed", "result": "x",
            "num_turns": 2}
     doc.update(forged)

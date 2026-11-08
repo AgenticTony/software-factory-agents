@@ -29,6 +29,7 @@ from pathlib import Path
 import pytest
 from _support.f05 import _child, _fixture_repo
 from _support.f12 import _git_repo
+from _support.tokens import fake_token
 from claude_agent_sdk import ResultMessage
 
 from factory.sandbox import SRT_PIN
@@ -247,7 +248,7 @@ def test_ac_2(tmp_path: Path, monkeypatch):
 
     # 1. Exit 1 with stderr: all three facts in the message, both streams
     # saved together, the planted token in neither.
-    token = "tok-secret-value-0123456789"
+    token = fake_token("f56-record", prefix="tok-secret-")
     _entry_stub(monkeypatch, {}, returncode=1, write_record=False,
                 stderr=f"boom: the command failed with {token}\n")
     with pytest.raises(SessionConfigError) as excinfo:

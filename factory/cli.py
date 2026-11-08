@@ -697,12 +697,18 @@ def _run_orchestrator(args: argparse.Namespace) -> int:
             # what this run reported ready.
             for line in result.ready_prs:
                 print(f"  ready: {line}")
+            # F-58 AC-5: the counterpart — PRs the sweep refused to call
+            # ready (CI red/pending/unknown), visible, never silent.
+            for line in result.not_ready_prs:
+                print(f"  not ready: {line}")
             return _EXIT[result.outcome]
         loop = run_loop(Path(args.queue), profile_path=args.profile, **kwargs)
         for result in loop.results:
             print(f"  {result.task_id or '-'}: {result.outcome} {_run_extra(result)}".rstrip())
             for line in result.ready_prs:
                 print(f"    ready: {line}")
+            for line in result.not_ready_prs:
+                print(f"    not ready: {line}")
         print(f"factory loop: stopped ({loop.stop_reason}) after {len(loop.results)} run(s)")
         return _EXIT[loop.stop_reason]
     except _RUN_ERRORS as exc:

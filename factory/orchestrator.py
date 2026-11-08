@@ -85,7 +85,7 @@ from factory.l2 import (
     parse_verifier_vote,
     settle_review_verdict,
 )
-from factory.mergeorder import admission, gh_branch_protection, gh_pr_state
+from factory.mergeorder import admission, gh_branch_protection, gh_ci_state, gh_pr_state
 from factory.prbody import PRBodyError, build_pr_body, check_pr_body
 from factory.progress import ProgressLog
 from factory.prompts import (
@@ -118,6 +118,7 @@ from factory.runs import (
 from factory.sandbox import (
     build_settings,
     escapee_event,
+    preflight_host,
     run_sandboxed,
     write_settings,
 )
@@ -215,6 +216,10 @@ class RunResult:
     # remote default head — as ``<url> against <branch>@<sha12>``. Set on
     # every outcome reached after the sweep; empty when it didn't run.
     ready_prs: list[str] = field(default_factory=list)
+    # F-58 AC-5: the sweep's counterpart list — open PRs it REFUSED to
+    # report ready because their CI is red, pending, checkless or
+    # unresolvable, as ``<url>: <reason>``. Visible, never silent.
+    not_ready_prs: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1022,6 +1027,8 @@ def run_once(
     protection: Callable | None = None,
     pr_state: Callable | None = None,
     sdk_probe: Callable | None = None,
+    host_probe: Callable | None = None,
+    ci_state: Callable | None = None,
 ) -> RunResult:
     """Pick the next task and take it to a PR, an escalation or a stop.
 
@@ -1052,6 +1059,21 @@ def run_once(
             None when tests inject stub seats). Called with the profile
             once a task is picked, just before the session starts; a
             raising probe refuses the run before anything is recorded.
+        host_probe: Host-preflight seam (default: auto —
+            :func:`factory.sandbox.preflight_host` when real sessions
+            would run, i.e. the session runner is the default; None when
+            tests inject stub seats). Called with ``srt_bin_path`` after
+            admission and BEFORE the queue is read, reclaimed, picked or
+            anything is recorded: a host whose sandbox cannot start
+            refuses with ONE named message (F-58 AC-4).
+        ci_state: Green-CI seam (default: :func:`factory.mergeorder.
+            gh_ci_state`). Used only while ``repo.branch_protection:
+            unavailable`` (F-58 AC-5): a red default branch refuses the
+            run after the peak-window return (R1-6: no gh lookups
+            inside the window) and before anything is acted on or
+            recorded, and the stale-PR sweep never reports a PR ready
+            whose checks are failed or pending. With real branch
+            protection it is never called.
 
     Returns:
         The :class:`RunResult`.
@@ -1067,6 +1089,28 @@ def run_once(
     config = config if config is not None else load_config(factory_root / CONFIG_FILE)
     now = now or (lambda: datetime.now(timezone.utc))
     admission(profile, protection or gh_branch_protection)
+    # F-58 AC-4: prove the host can sandbox BEFORE the queue is read,
+    # reclaimed, picked or anything is recorded — a host whose sandbox
+    # cannot start (srt missing/unpinned/hanging, the 26.04 setgroups
+    # denial, a nested seatbelt refusal) is ONE named refusal, not a
+    # cascade of session failures. Automatic only when real sessions
+    # would run (tests inject stub seats and no probe), mirroring
+    # sdk_probe; an explicit probe seam always runs.
+    host_preflight = host_probe or (
+        preflight_host if session_runner in (None, run_session_sandboxed) else None
+    )
+    if host_preflight is not None:
+        host_preflight(srt_bin_path=srt_bin_path)
+    # F-58 AC-5: the self-enforced green-CI guard runs AFTER the
+    # peak-window return (review round 1, R1-6): F-26 round-1 finding 5
+    # keeps every gh lookup out of the window — an in-window tick makes
+    # no network call at all, and a red default branch is enforced at
+    # the first off-peak tick. Off-peak the guard still precedes every
+    # side effect: the sweep, the concurrency lookups, any recording.
+    # Only for a repo that declares branch_protection unavailable (real
+    # protection makes this GitHub's job; the seam is then never called,
+    # proven by call count).
+    ci_state = ci_state or gh_ci_state
     pr_state = pr_state or gh_pr_state
 
     queue = TaskQueue(queue_path)
@@ -1086,9 +1130,13 @@ def run_once(
         # Round-2 finding 8: a drained queue is done whatever the clock
         # says — idle/queue_empty, never peak_window — and the window
         # still gates the sweep itself (round-1 finding 5): no gate work,
-        # no gh lookups, no re-validation escalations inside it.
+        # no gh lookups, no re-validation escalations inside it. F-58
+        # R1-6: the green-CI guard sits below this return for the same
+        # reason — it is two-plus gh calls, so it waits for off-peak too.
         return RunResult("idle" if pick is None else "peak_window",
                          task_id=pick.task["id"] if pick else None)
+    if (profile.get("repo") or {}).get("branch_protection") == "unavailable":
+        _refuse_over_red_ci(profile, ci_state)
     # Round-3 findings 1+7: the sweep runs on EVERY off-peak run, with or
     # without pickable work (AC-3's "every run" — F-27 waiting on F-26's
     # open PR must still see it go stale or closed), and an idle tick
@@ -1103,6 +1151,12 @@ def run_once(
         _pr_urls(queue, ("in_review",), skip_merged=True)
         + [task["links"]["pr"] for task in recovery])), pr_state)
     ready: list[str] = []
+    not_ready: list[str] = []
+    # F-58 AC-5: the sweep gates every ready line on green CI only under
+    # the self-enforced rule (real protection → no CI calls at all).
+    ci_for_sweep = ci_state if (
+        (profile.get("repo") or {}).get("branch_protection") == "unavailable"
+    ) else None
     # F-45 AC-1 (M-5): the sweep creates run dirs (its scratch and clean
     # clones), so it runs under the run lease — reclaim_runs trusts the
     # invariant "every run dir under runs/<project>/ is created or deleted
@@ -1117,13 +1171,15 @@ def run_once(
         stale = _sweep_stale_prs(
             queue, profile, factory_root=factory_root,
             srt_bin_path=srt_bin_path, gate_timeout_sec=gate_timeout_sec,
-            states=states, recovery=recovery, ready=ready, config=config,
+            states=states, recovery=recovery, ready=ready,
+            ci_state=ci_for_sweep, not_ready=not_ready, config=config,
         )
     if stale is not None:
         stale.ready_prs = ready
+        stale.not_ready_prs = not_ready
         return stale
     if pick is None:
-        return RunResult("idle", ready_prs=ready)
+        return RunResult("idle", ready_prs=ready, not_ready_prs=not_ready)
     task_id = pick.task["id"]
     # F-26 AC-2: at most `repo.concurrency` (default 1) open factory PRs
     # per repo — counted on GitHub's word, not the queue's statuses: an
@@ -1146,7 +1202,7 @@ def run_once(
     if len(open_urls) + len(unresolved_urls) >= limit:
         return RunResult("concurrency_wait", task_id=task_id,
                          open_prs=open_urls, unresolved_prs=unresolved_urls,
-                         ready_prs=ready)
+                         ready_prs=ready, not_ready_prs=not_ready)
 
     # The F-31 incident (run 20261029T130912Z-1e4eb9): a venv interpreter
     # whose own files the sandbox denied started as its bare base, and
@@ -1177,6 +1233,7 @@ def run_once(
             result = (_finish_unrecorded_publish(queue, task_id, pick.slice)
                       or _run_task(ctx, pick.slice))
             result.ready_prs = ready
+            result.not_ready_prs = not_ready
             return result
         except BaseException:
             # The run didn't reach a recorded end state: re-queue it (the
@@ -1388,6 +1445,107 @@ def _count_open_prs(queue: TaskQueue, states: dict) -> tuple[list[str], list[str
     return open_urls, unresolved_urls
 
 
+# F-58 AC-5: a check detail that does not count as green in the
+# messages (the classification itself lives in mergeorder.classify_ci).
+_CI_GREEN_DETAILS = frozenset({"success", "neutral", "skipped"})
+
+
+def _ci_bad_names(state) -> str:
+    """The non-green checks as ``name=detail`` pairs for a refusal
+    message — the message names the job, so 'endpoint down' reads as
+    ``live-network`` failing, not as a broken PR."""
+    bad = [f"{name}={detail}" for name, detail in state.checks
+           if detail not in _CI_GREEN_DETAILS]
+    return ", ".join(bad) if bad else (state.detail or "no green checks")[:200]
+
+
+def _refuse_over_red_ci(profile: dict, ci_state: Callable) -> None:
+    """F-58 AC-5: refuse to start while the default branch's CI is red.
+
+    For a repo that declares ``repo.branch_protection: unavailable``
+    (checked by the caller — with real protection this never runs and
+    the seam is never called), resolves the REMOTE default head — never
+    the local checkout's HEAD, which can be arbitrarily stale — and
+    asks about exactly that SHA:
+
+    * failed → refuse, naming the SHA and every failing check;
+    * unresolvable → refuse (fail closed, the F-45 rule: never guessed);
+    * none → refuse as the owner's policy question (this repo runs CI on
+      every PR; a SHA with no checks means the answer is missing, and
+      "green" must not be silently assumed);
+    * success or pending → proceed (a run merges nothing).
+
+    Raises:
+        RunError: per above — one named refusal before the queue is read.
+    """
+    repo = profile.get("repo") or {}
+    branch = repo.get("default_branch", "main")
+    heads = _ls_remote_heads(repo.get("remote", ""), (branch,))
+    sha = heads.get(branch)
+    if not sha:
+        raise RunError(
+            f"cannot resolve the remote default head of {branch!r} at "
+            f"{repo.get('remote', '')!r}: the self-enforced green-CI check "
+            "(repo.branch_protection: unavailable) refuses to judge an "
+            "unknown base — check the remote and gh credentials, then retry"
+        )
+    state = ci_state(repo["remote"], sha)
+    if state.state == "failed":
+        raise RunError(
+            f"default branch {branch}@{sha[:12]} has failing CI "
+            f"({_ci_bad_names(state)}): with repo.branch_protection: "
+            "unavailable the factory enforces green CI itself — fix or "
+            "re-run the failing checks before `factory run` starts "
+            "(nothing was picked or recorded)"
+        )
+    if state.state == "unresolvable":
+        raise RunError(
+            f"CI state for {branch}@{sha[:12]} is unresolvable "
+            f"({state.detail[:200]}): never guessed (F-45) — fix gh and "
+            "retry; the self-enforced green-CI check refuses to assume green"
+        )
+    if state.state == "none":
+        raise RunError(
+            f"no CI checks are reported for {branch}@{sha[:12]}: the "
+            "self-enforced green-CI rule (repo.branch_protection: "
+            "unavailable) has nothing to verify — if this repo truly runs "
+            "no CI, that needs an explicit owner decision (a future "
+            "repo.required_checks setting), not a silent pass. Refusing"
+        )
+
+
+def _pr_ready_or_not(ci_state: Callable | None, remote: str, pr_url: str,
+                     sha: str, ready: list, not_ready: list, line: str) -> None:
+    """F-58 AC-5: report one open PR ready ONLY on green CI.
+
+    The sweep's last word on every PR it proved up to date or
+    re-validated: with the self-enforced rule active, the PR's checks
+    for exactly its head SHA must be green before ``ready`` carries it.
+    A red, pending, checkless or unresolvable answer lands on
+    ``not_ready`` instead — visible, never silent, and never "ready".
+    ``ci_state`` None (real branch protection) keeps today's behaviour.
+    """
+    if ci_state is None:
+        ready.append(line)
+        return
+    try:
+        state = ci_state(remote, sha)
+    except PublishError as exc:
+        not_ready.append(f"{pr_url}: CI state unresolvable ({exc})")
+        return
+    if state.state == "success":
+        ready.append(line)
+    elif state.state == "failed":
+        not_ready.append(f"{pr_url}: CI failed ({_ci_bad_names(state)})")
+    elif state.state == "pending":
+        not_ready.append(f"{pr_url}: CI pending ({_ci_bad_names(state)})")
+    elif state.state == "none":
+        not_ready.append(f"{pr_url}: no CI checks reported for its head yet")
+    else:
+        not_ready.append(
+            f"{pr_url}: CI state unresolvable ({state.detail[:200]})")
+
+
 def _ls_remote_heads(remote: str, refs: tuple[str, ...]) -> dict[str, str]:
     """``{refname: sha}`` for the named refs via one ``git ls-remote``.
 
@@ -1561,6 +1719,7 @@ def _sweep_stale_prs(
     queue: TaskQueue, profile: dict, *, factory_root: Path,
     srt_bin_path: Path | None, gate_timeout_sec: int, states: dict,
     recovery: list[dict], ready: list[str],
+    ci_state: Callable | None = None, not_ready: list[str] | None = None,
     config: FactoryConfig | None = None,
 ) -> RunResult | None:
     """F-26 AC-3: bring every open factory PR's readiness up to date.
@@ -1602,7 +1761,14 @@ def _sweep_stale_prs(
     <branch>@<sha12>`` (round-7 finding 2): the report AC-3 and F-28's
     owner step ("merge only after `factory run` has reported them
     ready against the current main") need. A PR with an unknown state,
-    or one that fails re-validation, is never reported ready.
+    or one that fails re-validation, is never reported ready. F-58 AC-5
+    adds the CI gate on top: under ``repo.branch_protection:
+    unavailable`` a PR whose checks for its head SHA are failed,
+    pending, checkless or unresolvable lands on ``not_ready`` instead
+    (visible, never silent) — CI state changes without the SHAs moving,
+    so the gate runs on every tick, cached or not. ``ci_state`` None
+    (real branch protection) keeps today's behaviour, with zero CI
+    calls.
 
     Returns:
         A ``needs_human`` result when a stale PR failed re-validation, or
@@ -1714,8 +1880,14 @@ def _sweep_stale_prs(
         cached = links.get("revalidated")
         if (cached and heads.get(branch) == cached["pr"]
                 and heads.get(default_branch) == cached["default"]):
-            ready.append(f"{links['pr']} against "
-                         f"{default_branch}@{cached['default'][:12]}")
+            # F-58 AC-5: cached up-to-date is necessary, not sufficient —
+            # CI state changes without the SHAs moving (a re-run), so the
+            # CI gate runs on every tick, cached or not.
+            _pr_ready_or_not(
+                ci_state, repo_cfg["remote"], links["pr"], cached["pr"],
+                ready, not_ready if not_ready is not None else [],
+                f"{links['pr']} against {default_branch}@{cached['default'][:12]}",
+            )
             continue  # cached pair unchanged on the remote: nothing to redo
         work = create_run(project, source, factory_root=factory_root,
                           ref=default_branch)
@@ -1731,12 +1903,18 @@ def _sweep_stale_prs(
                                                 "default": default_sha}:
                     links["revalidated"] = {"pr": pr_sha, "default": default_sha}
                     queue.save()
-                ready.append(f"{links['pr']} against "
-                             f"{default_branch}@{default_sha[:12]}")
+                _pr_ready_or_not(
+                    ci_state, repo_cfg["remote"], links["pr"], pr_sha,
+                    ready, not_ready if not_ready is not None else [],
+                    f"{links['pr']} against {default_branch}@{default_sha[:12]}",
+                )
                 continue  # the PR branch already contains the default head
             if links.get("revalidated") == {"pr": pr_sha, "default": default_sha}:
-                ready.append(f"{links['pr']} against "
-                             f"{default_branch}@{default_sha[:12]}")
+                _pr_ready_or_not(
+                    ci_state, repo_cfg["remote"], links["pr"], pr_sha,
+                    ready, not_ready if not_ready is not None else [],
+                    f"{links['pr']} against {default_branch}@{default_sha[:12]}",
+                )
                 continue  # already re-validated against exactly this base
 
             # Stale: merge the PR onto the new base; a conflict is itself
@@ -1854,8 +2032,11 @@ def _sweep_stale_prs(
                           f"({report_path.name})")},
                 task_id,
             )
-            ready.append(f"{links['pr']} against "
-                         f"{default_branch}@{default_sha[:12]}")
+            _pr_ready_or_not(
+                ci_state, repo_cfg["remote"], links["pr"], pr_sha,
+                ready, not_ready if not_ready is not None else [],
+                f"{links['pr']} against {default_branch}@{default_sha[:12]}",
+            )
         finally:
             cleanup_run(work)
     return None
