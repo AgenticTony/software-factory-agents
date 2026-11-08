@@ -85,6 +85,11 @@ EVENT_TYPES = (
     # the session runner's timeout path, never accepted from stdout (the
     # forwarder still passes tool_call only).
     "record_used_after_timeout",
+    # F-57 AC-2: the importer's ONE repair session — start and outcome
+    # (repaired / still_refused / failed / quota_stopped /
+    # workspace_failed) with its turns. Written orchestrator-side only
+    # (the importer module's TraceWriter), never accepted from stdout.
+    "import_repair",
 )
 PHASES = ("setup", "implementer", "L0", "L1", "L2", "publish")
 RUN_END_OUTCOMES = ("published", "failed", "aborted")

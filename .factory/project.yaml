@@ -214,6 +214,14 @@ paths:
     # condition waits, the shared tests/_support package, the wheel
     # install, pyright) judge the gate every other WO is judged by.
     - "tests/test_f51.py"
+    # F-57: same precedent — the importer-robustness contract tests (the
+    # propose_task tool's per-task validation and bounds, the ONE repair
+    # session, the prose fixture's offline proof, the importer eval's
+    # live gate) judge the import path every queue is born from. The
+    # prose fixture itself is the evidence those tests and the owner's
+    # paid eval run against — protected with them.
+    - "tests/test_f57.py"
+    - "tests/fixtures/**"
     # F-43 review round 1: the seam itself and its vent wiring, the F-42
     # factory/attribution.py precedent — a factory-built PR must not be
     # able to weaken the C-1 fix (scrub_session_text returning its input,

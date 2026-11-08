@@ -191,6 +191,13 @@ def build_parser() -> argparse.ArgumentParser:
     eval_cmd.add_argument(
         "--keep-fixture", action="store_true",
         help="keep the fixture repo after the run for inspection")
+    eval_cmd.add_argument(
+        "--importer", action="store_true",
+        help="run ONE real import against the prose fixture (F-57) and "
+             "report schema validity, task count and whether the "
+             "oversized work order was split; needs the explicit "
+             "FACTORY_LIVE_TESTS=1 opt-in (a credential alone never "
+             "turns it on)")
 
     sentinels = sub.add_parser(
         "sentinels", help="built-in sentinel utilities")
@@ -544,17 +551,23 @@ def _run_sentinels_replay(args: argparse.Namespace) -> int:
 
 
 def _run_eval(args: argparse.Namespace) -> int:
-    """Dispatch the seeded-bug validator eval (F-16 AC-3's owner step).
+    """Dispatch the seeded-bug validator eval (F-16 AC-3's owner step),
+    or — with ``--importer`` (F-57 AC-4) — the one real import against
+    the prose fixture.
 
-    It drives real model sessions, so it only ever runs explicitly, by
-    this command — never from ``run``/``loop`` or CI. The reviewer
-    fan-out width is the factory config's (the same
-    ``load_config(factory_root / CONFIG_FILE)`` read the orchestrator
-    does, so the eval certifies the width the queue actually runs);
-    ``--reviewers`` overrides it. ``--repeats`` (F-48) runs each seed N
-    times — default 3 — so the report carries each metric's mean and
-    spread; a repeats below 1 is refused here, exit 2. Known failures
-    exit 2 with a message, not a traceback."""
+    Both drive real model sessions, so they only ever run explicitly, by
+    this command — never from ``run``/``loop`` or CI. The importer eval
+    additionally requires the explicit ``FACTORY_LIVE_TESTS=1`` opt-in
+    (refused here otherwise, exit 2, zero spend — a credential alone
+    never turns it on). The reviewer fan-out width is the factory
+    config's (the same ``load_config(factory_root / CONFIG_FILE)`` read
+    the orchestrator does, so the eval certifies the width the queue
+    actually runs); ``--reviewers`` overrides it. ``--repeats`` (F-48)
+    runs each seed N times — default 3 — so the report carries each
+    metric's mean and spread; a repeats below 1 is refused here, exit 2.
+    Known failures exit 2 with a message, not a traceback."""
+    if args.importer:
+        return _run_importer_eval(args)
     factory_root = (Path(args.factory_root) if args.factory_root
                     else FACTORY_ROOT_DEFAULT)
     repeats = args.repeats if args.repeats is not None else DEFAULT_REPEATS
@@ -575,6 +588,26 @@ def _run_eval(args: argparse.Namespace) -> int:
         )
     except (ConfigError, EvalError, GateError, RunError, SandboxError,
             SessionConfigError) as exc:
+        print(f"factory eval: {exc}", file=sys.stderr)
+        return 2
+    print(result["rendered_path"].read_text(), end="")
+    print(f"factory eval: report written to {result['report_path']}")
+    return 0
+
+
+def _run_importer_eval(args: argparse.Namespace) -> int:
+    """Dispatch ``factory eval --importer`` (F-57 AC-4): ONE real import
+    against the prose fixture, on demand. The live gate (exactly
+    ``FACTORY_LIVE_TESTS=1``) is enforced inside the eval itself; a
+    refusal prints the variable's name and exits 2 — zero spend, never a
+    traceback. Success prints the rendered report."""
+    from factory.eval import run_importer_eval
+
+    try:
+        result = run_importer_eval(
+            Path(args.factory_root) if args.factory_root else None
+        )
+    except EvalError as exc:
         print(f"factory eval: {exc}", file=sys.stderr)
         return 2
     print(result["rendered_path"].read_text(), end="")

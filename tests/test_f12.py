@@ -964,11 +964,12 @@ def test_sandboxed_import_holds_the_run_lease(tmp_path: Path, monkeypatch):
     run_import(repo, factory_root=factory_root)
     assert spy.lease_held is True
 
-    from factory.state import RunInProgressError
-
-    # A live factory run holds the same lease (one exclusive lock).
+    # A live factory run holds the same lease (one exclusive lock). The
+    # refusal is an ImportRefused (F-57 review round 1, F2: the CLI's
+    # caught class, never a RunInProgressError traceback) whose message
+    # still names the run in progress.
     with TaskQueue(queue_path).idle_lease():
-        with pytest.raises(RunInProgressError, match="run is in progress"):
+        with pytest.raises(ImportRefused, match="run is in progress"):
             run_import(repo, factory_root=factory_root)
     assert len(spy.calls) == 1  # the refused import never started a session
 

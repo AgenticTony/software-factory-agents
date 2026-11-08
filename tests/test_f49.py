@@ -802,10 +802,11 @@ def test_review_timestamp_hostile_shapes():
 
 def test_review_doc_listing_edges(tmp_path: Path):
     """The doc listing's own edges, pinned: a markdown symlink that
-    escapes the repo is still listed (containment is the clone's and the
-    sandbox read boundary's job — F-47 — where its target does not
-    exist; classified in the ledger), and a non-UTF-8 file name never
-    crashes the prompt build."""
+    escapes the repo is EXCLUDED from the listing (F-57, the re-routed
+    F-49 3b item: the listing must not advertise a path the committed
+    tree and F-47's read boundary would deny — the earlier pin that
+    listed it is superseded there, owner-directed; see the F-57 ledger
+    entry), and a non-UTF-8 file name never crashes the prompt build."""
     repo = tmp_path / "proj"
     docs = repo / "docs"
     docs.mkdir(parents=True)
@@ -814,7 +815,7 @@ def test_review_doc_listing_edges(tmp_path: Path):
     (docs / "lure.md").symlink_to(tmp_path / "lure.md")
     prompt = build_import_prompt(repo, "docs", [])
     assert "docs/plan.md" in prompt
-    assert "docs/lure.md" in prompt  # pinned: listed; see the ledger
+    assert "docs/lure.md" not in prompt  # F-57: an escaping link is not listed
     # A file whose name is not decodable UTF-8 must not crash the build.
     # macOS refuses to CREATE such a name (Errno 92 — the probe runs its
     # full course on Linux CI); an astral-plane name stands in here.
