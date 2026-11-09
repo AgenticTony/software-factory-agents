@@ -237,15 +237,12 @@ class CIRecorder:
 
 def _fake_srt(directory: Path, name: str, body: str) -> Path:
     """An executable fake srt: answers ``--version`` with the pin, then
-    runs ``body`` (the pin check is part of the honest preflight)."""
-    script = directory / name
-    script.write_text(
-        "#!/bin/sh\n"
-        "case \"$1\" in --version) echo 'srt 0.0.79'; exit 0;; esac\n"
-        + body
-    )
-    script.chmod(0o755)
-    return script
+    runs ``body`` (JS — F-62 exec's [node, cli.js, …], so the stand-in
+    is JavaScript with the real cli.js shebang; the pin check is part
+    of the honest preflight)."""
+    from _support.srt import write_srt
+
+    return write_srt(directory / name, version="0.0.79", body=body)
 
 
 _OK_SRT: Path | None = None
@@ -261,8 +258,13 @@ def _ok_srt() -> Path:
         directory = Path(tempfile.mkdtemp(prefix="f58-ok-srt-"))
         _OK_SRT = _fake_srt(
             directory, "srt",
-            'while [ "$1" != "-c" ] && [ $# -gt 0 ]; do shift; done\n'
-            'shift\nexec sh -c "$1"\n',
+            "const cp = require(\"child_process\");\n"
+            "const i = args.indexOf(\"-c\");\n"
+            "if (i >= 0) {\n"
+            "  const r = cp.spawnSync(\"/bin/sh\", [\"-c\", args[i + 1]],\n"
+            "                         { stdio: \"inherit\" });\n"
+            "  process.exit(r.status === null ? 127 : r.status);\n"
+            "}\n",
         )
     return _OK_SRT
 
@@ -397,7 +399,8 @@ def test_ac_4(tmp_path: Path):
 
     # The exact PR #97 Linux failure → one refusal naming the setting.
     setgroups_srt = _fake_srt(tmp_path, "srt-setgroups",
-                              f"echo '{_SETGROUPS}' >&2\nexit 1\n")
+                              f"console.error({_SETGROUPS!r});\n"
+                              "process.exit(1);\n")
     with pytest.raises(HostPreflightError, match="setgroups") as excinfo:
         env.run(srt_bin_path=setgroups_srt)
     message = str(excinfo.value)
@@ -418,8 +421,8 @@ def test_ac_4(tmp_path: Path):
     # A macOS seatbelt refusal → the same class, naming the seatbelt.
     seatbelt_srt = _fake_srt(
         tmp_path, "srt-seatbelt",
-        "echo 'sandbox-exec: sandbox_apply: Operation not permitted' >&2\n"
-        "exit 71\n")
+        'console.error("sandbox-exec: sandbox_apply: Operation not '
+        'permitted");\nprocess.exit(71);\n')
     with pytest.raises(HostPreflightError, match="sandbox_apply") as excinfo:
         env.run(srt_bin_path=seatbelt_srt)
     assert "seatbelt" in str(excinfo.value).lower(), (
@@ -488,11 +491,10 @@ def test_ac_4(tmp_path: Path):
     shim_dir = tmp_path / "shim"
     shim_dir.mkdir()
     _fake_srt(shim_dir, "srt",
-              'while [ "$1" != "-c" ] && [ $# -gt 0 ]; do shift; done\n'
-              'shift\necho probe-ok\nexit 0\n')
+              'console.log("probe-ok");\nprocess.exit(0);\n')
     broken = _fake_srt(tmp_path, "srt-broken",
-                       "echo 'apply-seccomp: write /proc/self/setgroups: "
-                       "Permission denied' >&2\nexit 1\n")
+                       'console.error("apply-seccomp: write /proc/self/'
+                       'setgroups: Permission denied");\nprocess.exit(1);\n')
     monkey = pytest.MonkeyPatch()
     monkey.setattr(sandbox_module, "srt_bin", lambda: broken)
     monkey.setenv("PATH", f"{shim_dir}:{os.environ['PATH']}")
@@ -513,19 +515,21 @@ def test_ac_4_failures(tmp_path: Path):
     HostPreflightError = _ac_import("factory.sandbox", "HostPreflightError")
 
     # rc 0 but not the probe's expected output → refused.
-    silent = _fake_srt(tmp_path, "srt-silent", "exit 0\n")
+    silent = _fake_srt(tmp_path, "srt-silent", "process.exit(0);\n")
     with pytest.raises(HostPreflightError, match="output"):
         preflight_host(srt_bin_path=silent, timeout_sec=10)
 
     # Some other failure → refused, naming what failed.
-    weird = _fake_srt(tmp_path, "srt-weird", "echo 'kaboom' >&2\nexit 3\n")
+    weird = _fake_srt(tmp_path, "srt-weird",
+                      'console.error("kaboom");\nprocess.exit(3);\n')
     with pytest.raises(HostPreflightError, match="kaboom"):
         preflight_host(srt_bin_path=weird, timeout_sec=10)
 
     # A hang → timeout refusal, and no child left running afterwards.
     pidfile = tmp_path / "hang.pid"
     hang = _fake_srt(tmp_path, "srt-hang",
-                     f"echo $$ > {pidfile}\nsleep 300\n")
+                     f'require("fs").writeFileSync({str(pidfile)!r}, '
+                     "String(process.pid));\nsetInterval(() => {}, 100000);\n")
     with pytest.raises(HostPreflightError, match="timed out"):
         preflight_host(srt_bin_path=hang, timeout_sec=3)
     pid = int(pidfile.read_text().strip())

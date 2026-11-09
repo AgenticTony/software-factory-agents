@@ -8,7 +8,7 @@
   "additionalProperties": false,
   "properties": {
     "version": { "const": 1 },
-    "project": { "type": "string", "description": "Matches project.yaml `name`." },
+    "project": { "type": "string", "pattern": "^[a-z0-9-]+$", "minLength": 1, "description": "Matches project.yaml `name`; the slug every factory-root path component is built from (F-62)." },
     "updated_at": { "type": "string", "format": "date-time" },
     "tasks": { "type": "array", "items": { "$ref": "#/$defs/task" } }
   },

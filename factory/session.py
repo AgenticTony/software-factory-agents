@@ -138,7 +138,13 @@ from claude_agent_sdk import (
 from claude_agent_sdk import query as sdk_query
 
 from factory.egress import check_secrets, scrub_session_text
-from factory.runs import FACTORY_ROOT_DEFAULT, GIT_HARDENING, RunError, new_run_id
+from factory.runs import (
+    FACTORY_ROOT_DEFAULT,
+    GIT_HARDENING,
+    RunError,
+    new_run_id,
+    sandbox_settings_path,
+)
 from factory.sandbox import (
     build_settings,
     default_toolchain,
@@ -2229,9 +2235,11 @@ def _derive_settings_path(
                     "cleanup_run never looks at."
                 )
             factory_root = runs_root.parent
-        settings_path = (
-            Path(factory_root) / "sandbox"
-            / f"{run_dir.parent.name}-{run_dir.name}.json"
+        # F-62 AC-3: the project component of the run dir's own layout
+        # is revalidated — the run dir may come from a caller (the
+        # importer's repair workspace names the queue's project).
+        settings_path = sandbox_settings_path(
+            factory_root, run_dir.parent.name, run_dir.name
         )
     return (
         Path(factory_root) if factory_root is not None else None,

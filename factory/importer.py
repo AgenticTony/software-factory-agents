@@ -123,6 +123,8 @@ from factory.runs import (
     cleanup_run,
     create_run,
     new_run_id,
+    project_component,
+    sandbox_settings_path,
 )
 from factory.sandbox import SandboxError
 from factory.session import (
@@ -1770,9 +1772,10 @@ def _save_refused_output(
     root = Path(factory_root) if factory_root is not None else FACTORY_ROOT_DEFAULT
     directory = root / "import"
     directory.mkdir(parents=True, exist_ok=True)
-    # Schema names are slugs (^[a-z0-9-]+$); the sanitiser is defence in
-    # depth for a hand-edited queue, whose project still reaches here.
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", project)
+    # F-62 AC-3: the project component is validated, never sanitised —
+    # a sanitised ``../x`` would silently move the saved refusal; the
+    # queue that named it is state the owner must see refused.
+    safe = project_component(project)
     path = directory / f"{safe}-{new_run_id()}.proposal{_refusal_suffix(text)}"
     # O_EXCL: create-only, never overwriting an earlier refusal; the
     # mode is set at creation, not by a later chmod.
@@ -2001,7 +2004,9 @@ def _repair_workspace(root: Path, project: str, run_id: str) -> Path | None:
     find nothing of the repo the import read. One commit so the reviewer
     guard's git-state snapshot has a HEAD. None if git cannot make it
     (the repair is skipped, never wedged)."""
-    workspace = root / "runs" / project / run_id
+    # F-62 AC-3: a validated slug — this mkdir and the sandboxed
+    # session it hosts must stay inside <root>/runs/<project>/.
+    workspace = root / "runs" / project_component(project) / run_id
     workspace.mkdir(parents=True)
     for args in (
         ("init", "-q", "-b", "main"),
@@ -2135,7 +2140,7 @@ def _repair_refused_proposal(
             # refusal naming it, never saving a second copy.
             return None, _repair_not_started(original), None
         run = RunDir(project, run_id, workspace,
-                     root / "sandbox" / f"{project}-{run_id}.json")
+                     sandbox_settings_path(root, project, run_id))
         try:
             record = run_session_sandboxed(
                 "reviewer",
@@ -2576,6 +2581,19 @@ def run_import(
             # The sandbox settings (docs/network allowlists, protected
             # paths) come from the profile; no profile, no session.
             profile = load_profile(repo / ".factory" / "project.yaml")
+            # F-62 AC-3: with an existing queue, the session runs under
+            # the QUEUE's project (the namespace every path builder
+            # uses); the profile must agree — a queue naming another
+            # project's namespace under this repo's contract is
+            # refused before anything is spent.
+            if existing_doc is not None and project != profile["name"]:
+                raise ImportRefused(
+                    f"the queue at {queue_path} names project "
+                    f"{project!r} but the profile at "
+                    f"{repo / '.factory' / 'project.yaml'} names "
+                    f"{profile['name']!r}: a queue and profile that "
+                    "disagree cannot name one project's namespace"
+                )
         if max_turns is None or timeout_min is None:
             scaled_turns, scaled_timeout = scaled_import_budget(
                 len(listing.kept)

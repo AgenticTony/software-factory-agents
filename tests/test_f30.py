@@ -549,15 +549,16 @@ def test_sandboxed_stdout_events_cross_the_pipe(tmp_path: Path):
 def test_run_sandboxed_streams_lines_to_the_callback(tmp_path: Path):
     """run_sandboxed's on_stdout_line sees complete lines as they arrive
     (before the child exits), and the captured output is unchanged."""
-    fake = tmp_path / "fake-srt"
-    fake.write_text(
-        "#!/bin/sh\n"
-        'if [ "$1" = "--version" ]; then echo "0.0.79"; exit 0; fi\n'
-        "shift 2\n"
-        'printf "factory-trace {\\"a\\": 1}\\n"\n'
-        'echo "{\\"seat\\": \\"implementer\\"}"\n'
+    from _support.srt import write_srt
+
+    fake = write_srt(
+        tmp_path / "fake-srt", version="0.0.79",
+        body=(
+            'process.stdout.write("factory-trace {\\"a\\": 1}\\n");\n'
+            'process.stdout.write("{\\"seat\\": \\"implementer\\"}\\n");\n'
+            "process.exit(0);\n"
+        ),
     )
-    fake.chmod(0o755)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     settings = tmp_path / "settings.json"
@@ -737,17 +738,19 @@ def test_review5_trace_files_are_private_and_expire(tmp_path: Path):
 def test_review6_pump_handles_lines_split_across_chunks(tmp_path: Path):
     """A line arriving in several reads is delivered once, whole — the
     pump accumulates the partial without recopying it per chunk."""
-    fake = tmp_path / "fake-srt"
-    fake.write_text(
-        "#!/bin/sh\n"
-        'if [ "$1" = "--version" ]; then echo "0.0.79"; exit 0; fi\n'
-        "shift 2\n"
-        'printf "factory-trace {\\"a\\": "\n'
-        "sleep 0.4\n"
-        'printf "1}\\n"\n'
-        'echo "{\\"seat\\": \\"implementer\\"}"\n'
+    from _support.srt import write_srt
+
+    fake = write_srt(
+        tmp_path / "fake-srt", version="0.0.79",
+        body=(
+            'process.stdout.write("factory-trace {\\"a\\": ");\n'
+            "setTimeout(() => {\n"
+            '  process.stdout.write("1}\\n");\n'
+            '  process.stdout.write("{\\"seat\\": \\"implementer\\"}\\n");\n'
+            "  process.exit(0);\n"
+            "}, 400);\n"
+        ),
     )
-    fake.chmod(0o755)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     settings = tmp_path / "settings.json"

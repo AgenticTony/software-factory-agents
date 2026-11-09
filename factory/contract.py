@@ -36,6 +36,8 @@ import jsonschema
 import yaml
 from jsonschema.exceptions import best_match
 
+from factory.runs import ProjectSlugError, project_component
+
 # F-51 (I-1): the schemas ship INSIDE the package (factory/data/schema)
 # and are resolved through importlib.resources — the ONE resolver — so a
 # wheel install reads exactly what this checkout reads. No
@@ -319,7 +321,8 @@ def iter_schema_violations(
 def validate_queue(
     data: Any, origin: str = "tasks", schema_path: Path | None = None
 ) -> None:
-    """Validate a parsed queue document: semantics, then schema.
+    """Validate a parsed queue document: semantics, then schema, then
+    the project slug.
 
     The write path (F-03) uses this before persisting so invalid queue
     state can never be written; ``load_tasks`` uses it after parsing.
@@ -330,10 +333,23 @@ def validate_queue(
         schema_path: Optional override for the tasks schema path.
 
     Raises:
-        ContractError: On the first semantic or schema violation found.
+        ContractError: On the first semantic or schema violation found,
+            or when ``project`` is not a ``[a-z0-9-]+`` slug (F-62
+            AC-3). The schema's ``^…$`` pattern is not enough on its
+            own: Python's ``$`` matches before a trailing newline, so
+            ``"abc\\n"`` is schema-valid — the fullmatch here is the
+            load-bearing check, and the builders' own
+            :func:`factory.runs.project_component` is the same rule
+            again one layer down (defence in depth, never the only
+            layer).
     """
     _check_semantics(data.get("tasks") if isinstance(data, dict) else None, origin)
     _validate(data, schema_path or SCHEMA_DIR / "tasks.schema.json", origin)
+    if isinstance(data, dict) and "project" in data:
+        try:
+            project_component(data["project"])
+        except ProjectSlugError as exc:
+            raise ContractError(f"{origin}: {exc}") from exc
 
 
 def load_tasks(path: Path | str, schema_path: Path | None = None) -> dict:
@@ -701,6 +717,15 @@ def _check_profile_semantics(data: dict, origin: str, *,
                 f"paths.risk.{flag} globs or drop the sentinels key "
                 "(a skipped-forever sentinel reads as checked when it can't be)"
             )
+    # F-62 AC-3: the profile's name feeds the same factory-root path
+    # builders the queue's project does; the schema's ``^…$`` pattern
+    # admits a trailing newline (Python re ``$``), so the fullmatch
+    # here is the load-bearing spelling (queue-side: validate_queue).
+    if "name" in data:
+        try:
+            project_component(data["name"])
+        except ProjectSlugError as exc:
+            raise ContractError(f"{origin}: {exc}") from exc
     _check_profile_toolkit(data.get("toolkit"), origin,
                            toolkit_root=toolkit_root)
 

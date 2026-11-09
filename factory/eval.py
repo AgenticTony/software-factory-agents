@@ -1226,7 +1226,7 @@ def run_on_demand_eval(
         ``{"report", "report_path", "rendered_path"}``.
     """
     from factory.orchestrator import _gate_settings, sandboxed_runner
-    from factory.runs import FACTORY_ROOT_DEFAULT, RunDir
+    from factory.runs import FACTORY_ROOT_DEFAULT, RunDir, project_component
     # The reach-ins above (with run_l2_review's _review_prompt /
     # _verifier_prompt) are deliberate: AC-3 measures the pipeline the
     # queue actually runs, so the eval calls the orchestrator's own
@@ -1238,14 +1238,18 @@ def run_on_demand_eval(
     eval_root = factory_root / "eval"
     eval_root.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    fixture_dir = eval_root / "soloadventurer"
+    # F-62 AC-3: the fixture project is a literal today, but it is a
+    # project name reaching a factory-root builder — routed through the
+    # same validated-slug rule as every other one.
+    fixture_project = project_component("soloadventurer")
+    fixture_dir = eval_root / fixture_project
     if fixture_dir.exists():
         shutil.rmtree(fixture_dir)
     fixture = build_soloadventurer_fixture(fixture_dir)
     settings_path = eval_root / f"srt-settings-{stamp}.json"
     profile = eval_profile(fixture)
     if command_runner is None:
-        _gate_settings(profile, RunDir("soloadventurer", stamp, fixture,
+        _gate_settings(profile, RunDir(fixture_project, stamp, fixture,
                                        settings_path), factory_root)
         command_runner = sandboxed_runner(fixture, settings_path)
     try:

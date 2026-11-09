@@ -30,6 +30,8 @@ import os
 import re
 from pathlib import Path
 
+from factory.runs import project_component
+
 GENESIS = "0" * 64
 
 
@@ -56,9 +58,15 @@ class ProgressLog:
 
     @classmethod
     def for_task(cls, factory_root: Path | str, project: str, task_id: str) -> "ProgressLog":
-        """The canonical log location for a task (outside every clone)."""
+        """The canonical log location for a task (outside every clone).
+
+        The project is a validated slug (F-62 AC-3) — refused, never
+        sanitised: a sanitised ``../x`` would silently move the log,
+        not stop the queue that named it. Task ids keep
+        :func:`safe_name` (they are not project names; the queue schema
+        types them)."""
         return cls(
-            Path(factory_root) / "progress" / safe_name(project)
+            Path(factory_root) / "progress" / project_component(project)
             / f"{safe_name(task_id)}.jsonl"
         )
 
