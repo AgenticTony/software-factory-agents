@@ -28,6 +28,8 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from _support.f63 import ledger_approve
+
 from factory.config import ConfigError, FactoryConfig, load_config
 from factory.contract import acceptance_hash
 from factory.l2 import (
@@ -192,6 +194,9 @@ class Env:
         return [json.loads(line) for line in path.read_text().splitlines() if line]
 
     def run(self, session_runner, **kwargs):
+        # F-63: record the fixture's owner approvals (profile + frozen
+        # tasks) before the run — the ledger every run consults.
+        ledger_approve(self.root, self.queue_path)
         from factory.mergeorder import Protection
 
         kwargs.setdefault("now", lambda: OFF_PEAK)

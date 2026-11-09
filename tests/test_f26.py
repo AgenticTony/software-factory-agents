@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import yaml
+from _support.f63 import ledger_approve
 
 from factory.contract import SCHEMA_DIR, ContractError, acceptance_hash, load_profile
 from factory.mergeorder import (
@@ -171,6 +172,10 @@ class Env:
         return ProgressLog.for_task(self.root, "fixture", task_id)
 
     def run(self, session_runner, **kwargs):
+        # F-63: record the fixture's approvals before each run (tests
+        # mutate the profile/tasks between runs; approval precedes the
+        # run, as in production).
+        ledger_approve(self.root, self.queue_path)
         kwargs.setdefault("now", lambda: OFF_PEAK)
         kwargs.setdefault("protection", _protection(PROTECTED_STRICT))
         kwargs.setdefault("pr_state", lambda url: "open")

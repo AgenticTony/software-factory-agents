@@ -671,6 +671,10 @@ def _conftest_harness(
                     ignore=shutil.ignore_patterns("__pycache__"))
     (root / "tests").mkdir(parents=True)
     shutil.copy2(REPO_ROOT / "tests" / "conftest.py", root / "tests" / "conftest.py")
+    # F-63 R1: the conftest's factory-root pin imports tests/_support —
+    # the harness must carry it or its copy of the conftest cannot load.
+    shutil.copytree(REPO_ROOT / "tests" / "_support", root / "tests" / "_support",
+                    ignore=shutil.ignore_patterns("__pycache__"))
     if probe == "raise":
         forced = (
             "def _broken():\n"

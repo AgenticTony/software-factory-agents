@@ -28,6 +28,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
+from _support.f63 import ledger_approve
 from claude_agent_sdk import ResultMessage
 
 from factory.attribution import attribution_match
@@ -492,6 +493,8 @@ class _Env:
     def run(self, seats):
         from factory.mergeorder import Protection
 
+        # F-63: record the fixture's owner approvals before the run.
+        ledger_approve(self.root, self.queue_path)
         return run_once(
             self.queue_path, factory_root=self.root, session_runner=seats,
             open_pr=self.open_pr, now=lambda: OFF_PEAK,

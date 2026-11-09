@@ -43,6 +43,7 @@ from _support.f22 import (
     _write_index,
     _write_reports,
 )
+from _support.f63 import ledger_approve
 
 from factory.contract import SCHEMA_DIR, ContractError, acceptance_hash, load_profile
 from factory.mergeorder import Protection
@@ -802,6 +803,8 @@ def test_ac_8(tmp_path: Path, monkeypatch):
         return SessionRecord(seat=name, status="completed", skills=loaded,
                              result=review_pass)
 
+    # F-63: record the fixture's owner approvals (profile + frozen tasks).
+    ledger_approve(tmp_path / "factory-root", factory_dir / "tasks.json")
     result = run_once(
         factory_dir / "tasks.json",
         factory_root=tmp_path / "factory-root",

@@ -71,8 +71,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Sequence, cast
 
+from factory.approvals import ApprovalLedger, require_profile_approval
 from factory.config import CONFIG_FILE, FactoryConfig, in_peak_window, load_config
-from factory.contract import load_profile
+from factory.contract import contract_hash, load_profile
 from factory.egress import scrub_session_text, scrub_session_value
 from factory.gates import CommandResult, diff_name_status, git_rc
 from factory.gates import git as hardened_git
@@ -222,6 +223,11 @@ class RunResult:
     # report ready because their CI is red, pending, checkless or
     # unresolvable, as ``<url>: <reason>``. Visible, never silent.
     not_ready_prs: list[str] = field(default_factory=list)
+    # F-63 AC-1: every task in a frozen-contract status whose current
+    # contract has no owner ledger entry — the ready ones were demoted to
+    # draft, the rest were not acted on (not swept, not re-validated, not
+    # closed) and are named here so the refusal is visible, never silent.
+    unledgered: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1094,6 +1100,15 @@ def run_once(
     factory_root = Path(factory_root) if factory_root else FACTORY_ROOT_DEFAULT
     config = config if config is not None else load_config(factory_root / CONFIG_FILE)
     now = now or (lambda: datetime.now(timezone.utc))
+    # F-63 AC-2: the profile's security-relevant content must match an
+    # owner approval BEFORE anything else happens — before admission's gh
+    # call, before the host probe, before the queue is even read. The
+    # check hashes THIS in-memory dict; nothing downstream re-reads the
+    # file (the TOCTOU rule), so the settings every seat builds and every
+    # gate runs under are exactly the content the owner approved.
+    require_profile_approval(profile, factory_root, origin=str(profile_path))
+    # F-63 AC-1: the owner ledger this run's every acting path consults.
+    ledger = ApprovalLedger.for_project(factory_root, profile["name"])
     admission(profile, protection or gh_branch_protection)
     # F-58 AC-4: prove the host can sandbox BEFORE the queue is read,
     # reclaimed, picked or anything is recorded — a host whose sandbox
@@ -1135,16 +1150,17 @@ def run_once(
         )
     reclaim_runs(queue, profile["name"], factory_root)
     queue.reclaim_abandoned()
-    queue.demote_changed_contracts()
+    audit = queue.demote_changed_contracts(ledger)
+    unledgered = list(audit.unledgered)
     # Before the pick, and needing no gh round-trip: close merged tasks
     # on a no-deploy profile (links.merged is stamped terminal, so this
     # also unstucks tasks merged before the fix), then re-route
     # ready/blocked against the dependencies those closes just met —
     # sync_readiness is F-03's own reconciliation, wired here so a run
     # sees the post-merge queue instead of idling on it.
-    _close_merged_tasks(queue, profile, factory_root)
+    _close_merged_tasks(queue, profile, factory_root, ledger=ledger)
     queue.sync_readiness()
-    pick = queue.pick()
+    pick = queue.pick(ledger)
     if in_peak_window(now(), config.peak_window):
         # Round-2 finding 8: a drained queue is done whatever the clock
         # says — idle/queue_empty, never peak_window — and the window
@@ -1153,7 +1169,8 @@ def run_once(
         # R1-6: the green-CI guard sits below this return for the same
         # reason — it is two-plus gh calls, so it waits for off-peak too.
         return RunResult("idle" if pick is None else "peak_window",
-                         task_id=pick.task["id"] if pick else None)
+                         task_id=pick.task["id"] if pick else None,
+                         unledgered=unledgered)
     if (profile.get("repo") or {}).get("branch_protection") == "unavailable":
         _refuse_over_red_ci(profile, ci_state)
     # Round-3 findings 1+7: the sweep runs on EVERY off-peak run, with or
@@ -1192,13 +1209,16 @@ def run_once(
             srt_bin_path=srt_bin_path, gate_timeout_sec=gate_timeout_sec,
             states=states, recovery=recovery, ready=ready,
             ci_state=ci_for_sweep, not_ready=not_ready, config=config,
+            ledger=ledger,
         )
     if stale is not None:
         stale.ready_prs = ready
         stale.not_ready_prs = not_ready
+        stale.unledgered = unledgered
         return stale
     if pick is None:
-        return RunResult("idle", ready_prs=ready, not_ready_prs=not_ready)
+        return RunResult("idle", ready_prs=ready, not_ready_prs=not_ready,
+                         unledgered=unledgered)
     task_id = pick.task["id"]
     # F-26 AC-2: at most `repo.concurrency` (default 1) open factory PRs
     # per repo — counted on GitHub's word, not the queue's statuses: an
@@ -1221,7 +1241,8 @@ def run_once(
     if len(open_urls) + len(unresolved_urls) >= limit:
         return RunResult("concurrency_wait", task_id=task_id,
                          open_prs=open_urls, unresolved_prs=unresolved_urls,
-                         ready_prs=ready, not_ready_prs=not_ready)
+                         ready_prs=ready, not_ready_prs=not_ready,
+                         unledgered=unledgered)
 
     # The F-31 incident (run 20261029T130912Z-1e4eb9): a venv interpreter
     # whose own files the sandbox denied started as its bare base, and
@@ -1247,12 +1268,13 @@ def run_once(
         open_pr=open_pr or gh_pr_create, config=config, now=now,
         srt_bin_path=srt_bin_path, gate_timeout_sec=gate_timeout_sec,
     )
-    with queue.begin_run(task_id):
+    with queue.begin_run(task_id, ledger=ledger):
         try:
             result = (_finish_unrecorded_publish(queue, task_id, pick.slice)
                       or _run_task(ctx, pick.slice))
             result.ready_prs = ready
             result.not_ready_prs = not_ready
+            result.unledgered = unledgered
             return result
         except BaseException:
             # The run didn't reach a recorded end state: re-queue it (the
@@ -1675,6 +1697,7 @@ def _no_deploy_target(profile: dict) -> bool:
 
 def _close_merged_tasks(
     queue: TaskQueue, profile: dict, factory_root: Path,
+    ledger: "ApprovalLedger | None" = None,
 ) -> list[tuple[str, str]]:
     """Close merged ``in_review`` tasks on a no-deploy profile (the fix).
 
@@ -1714,6 +1737,10 @@ def _close_merged_tasks(
         links = task.get("links") or {}
         if task.get("status") != "in_review" or not _is_merged(links):
             continue
+        if ledger is not None and not ledger.has_contract(
+            task.get("id", ""), contract_hash(task)
+        ):
+            continue  # F-63: closing a task is acting on it; no approval, no close
         if any(s.get("status") != "merged" for s in (task.get("slices") or [])):
             continue
         target = "awaiting_owner" if open_owner_steps(task) else "done"
@@ -1740,6 +1767,7 @@ def _sweep_stale_prs(
     recovery: list[dict], ready: list[str],
     ci_state: Callable | None = None, not_ready: list[str] | None = None,
     config: FactoryConfig | None = None,
+    ledger: "ApprovalLedger | None" = None,
 ) -> RunResult | None:
     """F-26 AC-3: bring every open factory PR's readiness up to date.
 
@@ -1800,6 +1828,17 @@ def _sweep_stale_prs(
     project = profile["name"]
     source = Path(repo_cfg["path"]).expanduser()
     default_branch = repo_cfg["default_branch"]
+    # F-63 AC-1: the sweep ACTS on tasks (recovery edges from GitHub's
+    # PR state, stale-base re-validation, merged closes) — every acted-on
+    # task needs a ledger match for its current contract. Unledgered ones
+    # are skipped here and reported by run_once's audit; an unapproved
+    # contract gets no automatic transition, whatever GitHub says.
+    def _approved(task: dict) -> bool:
+        return ledger is None or ledger.has_contract(
+            task.get("id", ""), contract_hash(task)
+        )
+
+    recovery = [task for task in recovery if _approved(task)]
     for task in recovery:
         state = states.get(task["links"]["pr"])
         escalation = task["attempts"][-1].get("escalation")
@@ -1848,13 +1887,14 @@ def _sweep_stale_prs(
         )
     # Recovery stamps are merged-terminal: on a no-deploy profile the
     # tasks they returned to in_review close now, in this run.
-    _close_merged_tasks(queue, profile, factory_root)
+    _close_merged_tasks(queue, profile, factory_root, ledger=ledger)
     open_prs = [
         task for task in queue.doc.get("tasks", [])
         if task.get("status") == "in_review"
         and (task.get("links") or {}).get("pr")
         and (task.get("links") or {}).get("branch")
         and not _is_merged(task.get("links") or {})
+        and _approved(task)
     ]
     if not open_prs:
         return None
@@ -1872,7 +1912,7 @@ def _sweep_stale_prs(
             # takes it to done/awaiting_owner in this same run.
             links["merged"] = links["pr"]
             queue.save()
-            _close_merged_tasks(queue, profile, factory_root)
+            _close_merged_tasks(queue, profile, factory_root, ledger=ledger)
             continue
         if state == "closed":
             # Round-2 finding 5: closed without merging — surface the

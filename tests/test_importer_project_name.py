@@ -38,10 +38,13 @@ import json
 from pathlib import Path
 
 import pytest
+from _support.f63 import importer_fixture_approve
 
+import factory.importer as importer
 from factory.cli import main
 from factory.contract import load_tasks
-from factory.importer import ImportRefused, plan_import, run_import
+from factory.importer import ImportRefused, plan_import
+from factory.importer import run_import as _run_import
 from factory.state import TaskQueue
 
 QUEUE_NAME = "jobfinderos"       # the profile/queue name (schema slug)
@@ -49,6 +52,17 @@ REPO_DIR = "JobFinderOS"         # the repo directory's spelling
 
 
 # ------------------------------------------------------------- fixtures --
+
+
+def run_import(repo, *args, **kwargs):
+    """F-63: the real session path checks the profile against the owner
+    ledger — approve this fixture's profile under the factory root this
+    call uses (the importer's own default when none was passed, so a
+    monkeypatched default is honoured), then delegate to the real one."""
+    root = kwargs.get("factory_root") or importer.FACTORY_ROOT_DEFAULT
+    if kwargs.get("session") is None:  # only the real path checks the ledger
+        importer_fixture_approve(root, repo)
+    return _run_import(repo, *args, **kwargs)
 
 
 def _profile_yaml(name: str) -> str:
@@ -306,6 +320,7 @@ def test_cli_stale_apply_on_a_real_session_keeps_the_output(
         return "y"
 
     monkeypatch.setattr("builtins.input", approve_meanwhile)
+    importer_fixture_approve(home, repo)  # F-63: the CLI's real session
     rc = main(["import", "--repo", str(repo)])
     assert rc == 1
     err = capsys.readouterr().err

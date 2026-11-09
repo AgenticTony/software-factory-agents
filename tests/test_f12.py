@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 from _support.f12 import _git_repo, _repo
+from _support.f63 import importer_fixture_approve
 
 from factory.cli import main
 from factory.contract import load_tasks
@@ -700,6 +701,7 @@ def test_default_import_session_runs_sandboxed_never_in_process(
     in-process on the live checkout (DESIGN D3)."""
     repo = _git_repo(tmp_path)
     factory_root = tmp_path / "factory-root"
+    importer_fixture_approve(factory_root, repo)  # F-63: the session's profile
     spy = _SandboxedRunnerSpy(_proposal(_wo("WO-1")))
     _forbid_in_process_session(monkeypatch)
     monkeypatch.setattr("factory.importer.run_session_sandboxed", spy,
@@ -729,6 +731,7 @@ def test_default_import_session_runs_sandboxed_never_in_process(
         ".pytest.ini", "**/.pytest.ini",
         "pytest.toml", "**/pytest.toml",
         ".pytest.toml", "**/.pytest.toml",
+        ".factory/**",  # F-63 AC-4: the factory-control default joined
     ]
     # The clone and its sandbox files are disposable: gone afterwards.
     assert not run_dir.exists()
@@ -740,6 +743,7 @@ def test_cli_default_import_goes_through_the_sandboxed_runner(
     """#61 finding 1, at the CLI: ``factory import`` with no --proposal
     reaches the sandboxed runner (never run_session)."""
     repo = _git_repo(tmp_path)
+    importer_fixture_approve(tmp_path / "factory-root", repo)  # F-63
     spy = _SandboxedRunnerSpy(_proposal(_wo("WO-1")))
     _forbid_in_process_session(monkeypatch)
     monkeypatch.setattr("factory.importer.run_session_sandboxed", spy,
@@ -763,6 +767,7 @@ def test_sandboxed_import_session_failure_refuses(tmp_path: Path, monkeypatch,
 
     repo = _git_repo(tmp_path)
     factory_root = tmp_path / "factory-root"
+    importer_fixture_approve(factory_root, repo)  # F-63
     _forbid_in_process_session(monkeypatch)
     monkeypatch.setattr(
         "factory.importer.run_session_sandboxed",
@@ -960,6 +965,7 @@ def test_sandboxed_import_holds_the_run_lease(tmp_path: Path, monkeypatch):
     _forbid_in_process_session(monkeypatch)
     monkeypatch.setattr("factory.importer.run_session_sandboxed", spy,
                         raising=False)
+    importer_fixture_approve(factory_root, repo)  # F-63
 
     run_import(repo, factory_root=factory_root)
     assert spy.lease_held is True
@@ -987,6 +993,7 @@ def test_cli_import_srt_unusable_refuses_exit_1_never_traceback(
 
     repo = _git_repo(tmp_path)
     factory_root = tmp_path / "factory-root"
+    importer_fixture_approve(factory_root, repo)  # F-63
     _forbid_in_process_session(monkeypatch)
     monkeypatch.setattr("factory.sandbox.ensure_srt", srt_missing)
 
@@ -1014,6 +1021,7 @@ def test_cli_import_runner_setup_error_refuses_exit_1(
 
     repo = _git_repo(tmp_path)
     factory_root = tmp_path / "factory-root"
+    importer_fixture_approve(factory_root, repo)  # F-63
     _forbid_in_process_session(monkeypatch)
     monkeypatch.setattr("factory.importer.run_session_sandboxed", broken,
                         raising=False)

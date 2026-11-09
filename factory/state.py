@@ -54,6 +54,7 @@ from factory.contract import (
     ContractError,
     acceptance_hash,
     canonical_json,
+    contract_hash,
     load_tasks,
     validate_queue,
 )
@@ -156,9 +157,14 @@ PRIORITY_ORDER = {"P1": 0, "P2": 1, "P3": 2}
 # except done, which is flagged for review instead (see module docstring).
 CONTRACT_FROZEN_STATUSES = frozenset(POST_APPROVAL_STATUSES | {"blocked", "needs_human"})
 
-# Outcome of a contract audit: which tasks were demoted to draft, and
-# which done tasks have a stale hash and need your review.
-ContractAudit = namedtuple("ContractAudit", ["demoted", "flagged_done"])
+# Outcome of a contract audit: which tasks were demoted to draft, which
+# done tasks have a stale hash and need your review, and which tasks the
+# owner ledger does not cover (F-63: a ready one of those was demoted —
+# the list names every unledgered task, whatever its status, so the run
+# can report the not-acted-on reason for the rest).
+ContractAudit = namedtuple(
+    "ContractAudit", ["demoted", "flagged_done", "unledgered"], defaults=([],)
+)
 
 
 def contract_change_action(status: str) -> str:
@@ -1128,8 +1134,10 @@ class TaskQueue:
         task.setdefault("attempts", []).append(attempt)
         self.save()
 
-    def demote_changed_contracts(self) -> ContractAudit:
-        """Audit approved contracts against their stored hashes.
+    def demote_changed_contracts(self, ledger=None) -> ContractAudit:
+        """Audit approved contracts against their stored hashes — and,
+        when a ledger is given, against the owner's recorded approvals
+        (F-63 AC-1).
 
         A task in a contract-frozen status whose recomputed acceptance
         hash no longer matches its stored ``acceptance_hash`` goes back to
@@ -1143,21 +1151,48 @@ class TaskQueue:
         approval fields are left in place as history; re-approval
         overwrites them.
 
+        With ``ledger`` (an :class:`factory.approvals.ApprovalLedger`),
+        the same pass also checks every frozen-contract task's CURRENT
+        :func:`factory.contract.contract_hash` against the ledger: a
+        ``ready`` task with no matching entry is demoted to ``draft``
+        (the forged-approval case — a queue that mints its own approved
+        task mints no owner approval), and EVERY unledgered task's id is
+        returned in ``unledgered`` so the caller can report the
+        not-acted-on reason for the statuses it must not touch.
+
+        Args:
+            ledger: Optional approval ledger; without one this is exactly
+                the pre-F-63 hash audit (the direct state-layer callers).
+
         Returns:
-            ``ContractAudit(demoted, flagged_done)`` — task ids in queue
-            order whose contract changed, split by what happened to them.
+            ``ContractAudit(demoted, flagged_done, unledgered)`` — task
+            ids in queue order, split by what happened to them.
         """
         demoted: list[str] = []
         flagged_done: list[str] = []
+        unledgered: list[str] = []
         for task in self.doc.get("tasks", []):
             status = task.get("status")
             frozen_hash = task.get("acceptance_hash")
             if status not in CONTRACT_FROZEN_STATUSES or not frozen_hash:
                 continue
-            if acceptance_hash(task.get("acceptance", [])) != frozen_hash:
+            changed = acceptance_hash(task.get("acceptance", [])) != frozen_hash
+            unapproved = (
+                ledger is not None
+                and not ledger.has_contract(task.get("id", ""),
+                                            contract_hash(task))
+            )
+            if unapproved and status != "done":
+                # done needs no entry (merged work rests on the owner's
+                # merge, not on a pickable approval); every other frozen
+                # status is reported so the run can name what it refused
+                # to act on.
+                unledgered.append(task.get("id"))
+            if changed or (unapproved and status == "ready"):
                 action = contract_change_action(status)
                 if action == "flag":
-                    flagged_done.append(task.get("id"))
+                    if changed:
+                        flagged_done.append(task.get("id"))
                     continue
                 # the shared rule's check_transition has already asserted
                 # the edge is legal for every frozen, non-done status
@@ -1165,10 +1200,11 @@ class TaskQueue:
                 demoted.append(task.get("id"))
         if demoted:
             self.save()
-        return ContractAudit(demoted=demoted, flagged_done=flagged_done)
+        return ContractAudit(demoted=demoted, flagged_done=flagged_done,
+                             unledgered=unledgered)
 
     @contextlib.contextmanager
-    def begin_run(self, task_id: str):
+    def begin_run(self, task_id: str, ledger=None):
         """Take the run lease and move a task to ``in_progress``.
 
         The run lease is an exclusive OS lock on ``<queue>.run.lock``,
@@ -1179,8 +1215,14 @@ class TaskQueue:
         The lease is taken *before* the transition, so no window exists
         where a task is ``in_progress`` without a live holder.
 
+        With ``ledger`` (F-63 AC-1), run start itself requires a matching
+        owner approval for the task's CURRENT contract hash — the
+        enforcement point behind the picker, re-reading the ledger so an
+        approval cannot have been the product of a race.
+
         Args:
             task_id: Task to start (must be ``ready``).
+            ledger: Optional approval ledger (the run-entry check).
 
         Yields:
             None. The lease is released when the block exits; the task's
@@ -1188,9 +1230,20 @@ class TaskQueue:
 
         Raises:
             RunInProgressError: If another session holds the lease.
-            StateError: If the task doesn't exist.
+            StateError: If the task doesn't exist, or (with ``ledger``)
+                its contract has no owner approval on record.
             TransitionError: If the task isn't ``ready``.
         """
+        if ledger is not None:
+            task = self.get(task_id)
+            chash = contract_hash(task)
+            if not ledger.has_contract(task_id, chash):
+                raise StateError(
+                    f"{task_id}: refusing to start — its current contract "
+                    "has no owner approval in the ledger; approve it with "
+                    "`factory approve` (or adopt it: `factory approve "
+                    "--adopt`)"
+                )
         with self._run_lease(holder=task_id):
             self.transition(task_id, "in_progress")
             yield
@@ -1305,9 +1358,25 @@ class TaskQueue:
             self.save()
         return changed
 
-    def pick(self) -> Pick | None:
-        """Pick the next task to work on (see :func:`pick_next`)."""
-        return pick_next(self.doc.get("tasks", []))
+    def pick(self, ledger=None) -> Pick | None:
+        """Pick the next task to work on (see :func:`pick_next`).
+
+        With ``ledger`` (F-63 AC-1), only tasks whose CURRENT
+        :func:`factory.contract.contract_hash` matches an owner ledger
+        entry are eligible: the picker itself enforces the approval rule,
+        not just the demote pass before it (a task that reached ``ready``
+        between the two — a dependency met by ``sync_readiness`` — is
+        still refused here, and the next run's audit demotes it).
+        """
+        tasks = self.doc.get("tasks", [])
+        if ledger is not None:
+            tasks = [
+                task for task in tasks
+                if ledger.has_contract(task.get("id", ""),
+                                       contract_hash(task))
+                or task.get("status") not in CONTRACT_FROZEN_STATUSES
+            ]
+        return pick_next(tasks)
 
     @contextlib.contextmanager
     def _exclusive_lock(self):

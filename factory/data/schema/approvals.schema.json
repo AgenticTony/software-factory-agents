@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factory.local/schema/approvals.schema.json",
+  "title": "Owner approval ledger line (factory/approvals.py, F-63)",
+  "description": "One line of <factory_root>/approvals/<project>.jsonl. The ledger is the source of approval truth: outside every repo and sandbox, append-only and hash-chained the way progress.py chains. This schema is the per-line backstop the loader enforces (F-02 rule) on top of the chain: a line that is valid JSON and chains correctly but has the wrong shape refuses the load with the line named.",
+  "type": "object",
+  "required": ["n", "prev", "kind", "project", "approved_by", "approved_at"],
+  "additionalProperties": false,
+  "properties": {
+    "n": { "type": "integer", "minimum": 1, "description": "Entry number; set by the ledger, must equal the line number." },
+    "prev": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the previous line (genesis 0*64 for line 1); set by the ledger." },
+    "kind": { "enum": ["task", "profile"], "description": "task: this exact contract (contract_hash) is approved to act on. profile: these per-group hashes of the profile's security-relevant content are approved." },
+    "project": { "type": "string", "pattern": "^[a-z0-9-]+$", "description": "The project this approval binds to; must equal the file's own project — a ledger copied from another project's file refuses to load." },
+    "approved_by": { "type": "string", "minLength": 1 },
+    "approved_at": { "type": "string", "format": "date-time" },
+    "task_id": { "type": "string", "minLength": 1, "description": "kind=task: the approved task's id." },
+    "contract_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "kind=task: factory.contract.contract_hash(task) at approval time." },
+    "groups": {
+      "type": "object",
+      "description": "kind=profile: group name -> SHA-256 of that group's canonical content (a missing key hashes as null). Group names: factory.approvals.PROFILE_SECURITY_GROUPS.",
+      "additionalProperties": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "task" } }, "required": ["kind"] },
+      "then": { "required": ["task_id", "contract_hash"] }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "profile" } }, "required": ["kind"] },
+      "then": { "required": ["groups"] }
+    }
+  ]
+}

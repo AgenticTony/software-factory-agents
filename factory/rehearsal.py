@@ -55,7 +55,13 @@ from pathlib import Path
 import yaml
 
 from factory import sandbox
-from factory.contract import acceptance_hash, apply_profile_defaults
+from factory.approvals import ApprovalLedger, ensure_fixture_profile_approval
+from factory.contract import (
+    acceptance_hash,
+    apply_profile_defaults,
+    load_profile,
+    load_tasks,
+)
 from factory.gates import git as hardened_git
 from factory.mergeorder import Protection
 from factory.orchestrator import run_once
@@ -499,6 +505,21 @@ def run_rehearsal(
     def open_pr(pr: PullRequest) -> str:
         prs.append(pr)
         return f"https://github.com/rehearsal/fixture/pull/{len(prs)}"
+
+    # F-63: the fixture's profile and its one hand-minted task are
+    # factory-owned source (this module — the same reviewed-PR chain as
+    # the schema consts); their approvals are recorded under the root
+    # the rehearsal was given before the run, so the ledger gates this
+    # run exactly as it gates a client run. The fixture/owner mixing
+    # guard (approvals.py R2-3) refuses these appends in any ledger that
+    # already holds owner entries. Explicit, not an exemption: the run
+    # below reads what this block recorded.
+    root = Path(factory_root)
+    loaded = load_profile(fixture.profile_path)
+    ensure_fixture_profile_approval(root, loaded)
+    ApprovalLedger.for_project(root, loaded["name"]).record_task_for(
+        load_tasks(fixture.queue_path)["tasks"][0], approved_by="factory-fixture"
+    )
 
     result = run_once(
         fixture.queue_path,

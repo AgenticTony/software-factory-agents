@@ -39,6 +39,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import yaml
+from _support.f63 import ledger_approve
 from _support.tokens import fake_token
 from claude_agent_sdk import AssistantMessage
 
@@ -227,6 +228,9 @@ class Env:
         return ProgressLog.for_task(self.root, "fixture", task_id)
 
     def run(self, session_runner):
+        # F-63: record the fixture's owner approvals (profile + frozen
+        # tasks) before the run — the ledger every run consults.
+        ledger_approve(self.root, self.queue_path)
         return run_once(
             self.queue_path,
             factory_root=self.root,

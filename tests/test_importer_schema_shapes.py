@@ -25,6 +25,7 @@ from typing import Any
 
 import pytest
 from _support import no_bare_python3
+from _support.f63 import importer_fixture_approve
 from jsonschema import Draft202012Validator
 
 from factory.cli import main
@@ -567,6 +568,7 @@ def test_real_import_session_stages_the_proposal_schema(
 
     monkeypatch.setattr("factory.importer.run_session_sandboxed", fake)
     monkeypatch.setattr("factory.importer.seat_token", lambda: "tok")
+    importer_fixture_approve(tmp_path / "froot", repo)  # F-63
     result = run_import(repo, factory_root=tmp_path / "froot")
     assert result.plan.project == "proj"
     staged = json.loads(captured["scratch_files"]["proposal.schema.json"])

@@ -47,7 +47,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from factory.contract import apply_profile_defaults
+from factory.approvals import ensure_fixture_profile_approval
+from factory.contract import apply_profile_defaults, load_profile
 from factory.gates import git as hardened_git
 from factory.l0 import run_l0
 from factory.l1 import run_l1
@@ -1248,6 +1249,14 @@ def run_on_demand_eval(
     fixture = build_soloadventurer_fixture(fixture_dir)
     settings_path = eval_root / f"srt-settings-{stamp}.json"
     profile = eval_profile(fixture)
+    # F-63 AC-2: the eval's profile is factory-owned source (defined in
+    # this module, admitted by the same reviewed-PR chain as the schema
+    # consts); its approval is recorded under the root the eval was
+    # given — which DEFAULTS to ~/factory for an owner-run eval. The
+    # append itself refuses to mix a fixture entry into a ledger that
+    # holds owner entries (approvals.py R2-3), so the default root is
+    # safe; an explicit, reported code path, never a silent exemption.
+    ensure_fixture_profile_approval(factory_root, profile)
     if command_runner is None:
         _gate_settings(profile, RunDir(fixture_project, stamp, fixture,
                                        settings_path), factory_root)
@@ -1469,6 +1478,14 @@ def run_importer_eval(
     if fixture_dir.exists():
         shutil.rmtree(fixture_dir)
     fixture = _build_importer_fixture(fixture_dir)
+    # F-63 AC-2 (same trust chain as the seeded eval's fixture profile
+    # above): the prose fixture's committed profile is factory-owned
+    # test data (protected tests/fixtures/**); record its approval
+    # before the import session starts. Root defaults to ~/factory —
+    # the fixture/owner mixing guard (R2-3) keeps owner ledgers clean.
+    ensure_fixture_profile_approval(
+        root, load_profile(fixture / ".factory" / "project.yaml")
+    )
     try:
         try:
             result = run_import(fixture, factory_root=root)

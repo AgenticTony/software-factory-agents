@@ -205,3 +205,43 @@ def _scrub_value(value: Any, secrets: tuple) -> Any:
     if isinstance(value, tuple):
         return tuple(_scrub_value(item, secrets) for item in value)
     return value
+
+
+# F-63 R2-1: the control classes approval OUTPUT must never emit raw —
+# the same families strip_control_sequences removes, PLUS the bidi and
+# isolate controls that seam keeps by design (a redaction seam that
+# reordered its own evidence would shred it; an approval prompt that
+# lets them through lets a spoof reorder what the owner reads), and
+# newline/carriage-return/tab: a VALUE carrying them can rewrite the
+# prompt from inside (the R2-1 spoof).
+_BIDI_CONTROLS = "\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c"
+
+
+def escape_approval_text(text: str, *, escape_non_ascii: bool = False) -> str:
+    """Escape every character an approval prompt must show literally.
+
+    The strip seam (:func:`strip_control_sequences`) REMOVES commands and
+    keeps structure — right for redactions, wrong for approval output,
+    where silently dropping bytes would hide exactly the oddity the owner
+    must see. This escaper makes every control character VISIBLE as a
+    ``\\xNN``/``\\uNNNN`` escape: C0 (newline, carriage return and tab
+    included), DEL, the C1 range, and the bidi/isolate controls. With
+    ``escape_non_ascii`` (repo.remote and repo.path), every non-ASCII
+    character escapes too, so a homoglyph remote reads as its codepoints.
+
+    Composed, not forked: the class definitions live beside the strip
+    patterns; the two seams share the module's one notion of "control".
+    """
+    out: list[str] = []
+    for char in text:
+        code = ord(char)
+        if code < 0x20 or 0x7F <= code <= 0x9F:
+            out.append(f"\\x{code:02x}")
+        elif 0x202A <= code <= 0x202E or 0x2066 <= code <= 0x2069 \
+                or code in (0x200E, 0x200F, 0x061C):
+            out.append(f"\\u{code:04x}")
+        elif escape_non_ascii and code > 0x7E:
+            out.append(f"\\u{code:04x}")
+        else:
+            out.append(char)
+    return "".join(out)
