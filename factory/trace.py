@@ -60,7 +60,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
 from factory.egress import check_secrets, strip_control_sequences
-from factory.runs import RUN_ID_RE
+from factory.runs import RUN_ID_RE, project_component
 from factory.sentinels import redact_credentials, scrub_literal
 from factory.state import now_iso
 
@@ -132,8 +132,14 @@ _L0_DIFF_FINDING_IDS = frozenset(
 
 def trace_path(factory_root: Path | str, project: str, run_id: str) -> Path:
     """The trace file of one run — outside every clone (``runs/``) and
-    outside the sandbox write allowlist by construction."""
-    return Path(factory_root) / "trace" / project / f"{run_id}.jsonl"
+    outside the sandbox write allowlist by construction. The project is
+    a validated slug (F-62 AC-3): an unvalidated component here puts
+    the trace (and the reader that follows it) outside the project's
+    namespace, outside the factory root, or inside another project's."""
+    return (
+        Path(factory_root) / "trace" / project_component(project)
+        / f"{run_id}.jsonl"
+    )
 
 
 def snippet(text: str, secret: str | None = None, *,
@@ -538,7 +544,7 @@ def prune_traces(factory_root: Path | str, project: str, *,
     Returns:
         The files removed.
     """
-    directory = Path(factory_root) / "trace" / project
+    directory = Path(factory_root) / "trace" / project_component(project)
     if not directory.is_dir():
         return []
     cutoff = (time.time() if now is None else now) - days * 86400.0

@@ -246,6 +246,162 @@ def srt_bin() -> Path:
     return _REPO_ROOT / "node_modules" / ".bin" / "srt"
 
 
+@lru_cache(maxsize=None)
+def _resolved_on_path(name: str) -> "str | None":
+    """``name`` resolved ONCE per process from the orchestrator's own
+    ``PATH`` — never a child env, never a venv (F-62 AC-1), and never
+    through a RELATIVE entry (round 1): ``shutil.which`` resolves a
+    relative entry against this process's cwd — the client checkout
+    the owner runs ``factory`` from — so a client
+    ``node_modules/.bin/node`` would become the trusted launcher node.
+    Only absolute, non-empty entries are searched.
+
+    The lookup is cached the way the srt pin cache works: a PATH lookup
+    costs a stat walk, and the orchestrator's PATH does not change
+    mid-process. "Not found" is returned as None (not cached-raised) so
+    the caller phrases the refusal; ``cache_clear`` (tests that
+    monkeypatch PATH) re-resolves honestly.
+    """
+    found = shutil.which(
+        name,
+        path=":".join(_absolute_path_entries(os.environ.get("PATH", ""))),
+    )
+    return str(Path(found).resolve()) if found else None
+
+
+def _absolute_path_entries(path: str) -> "list[str]":
+    """The entries of ``path`` that are absolute and non-empty.
+
+    Round 1 (F-62): a relative entry resolves against the READER's cwd
+    — the orchestrator's checkout for the resolver, srt's run dir at
+    lookup time for the launcher — so neither may ever see one: ``.``,
+    ``bin`` or ``node_modules/.bin`` on the owner's PATH would let a
+    planted run-dir binary stand in for whatever looks it up (srt's
+    own ``which bash/env`` on macOS; the launcher's node here)."""
+    return [
+        entry for entry in path.split(":")
+        if entry and Path(entry).is_absolute()
+    ]
+
+
+def _orchestrator_node() -> str:
+    """The orchestrator's own node, or the named refusal (F-62 AC-1).
+
+    Shared by :func:`_verified_srt` (which has no run dir to contain
+    against — the launch path refuses untrusted locations before the
+    pin check runs) and :func:`trusted_binary`."""
+    node = _resolved_on_path("node")
+    if node is None:
+        raise SandboxError(
+            "node is not on the orchestrator's PATH: the sandbox "
+            "launcher exec's the pinned srt through an explicitly "
+            "resolved node (F-62) — install it and retry; a PATH "
+            "lookup at exec time would let a sandboxed command choose "
+            "its own interpreter"
+        )
+    return node
+
+
+def trusted_binary(name: str, run_dir: Path, *, required: bool = True) -> "str | None":
+    """Resolve ``name`` from the orchestrator's PATH and refuse anything
+    a sandboxed command could have written (F-62 AC-1).
+
+    The invariant: nothing a sandboxed command writes can change what
+    executes outside the sandbox. A binary whose realpath lies inside
+    the run dir (the writable root of every seat and gate — ``<run>/
+    .venv/bin`` is on the confined child's PATH by design) or inside
+    the factory root (derived exactly as :func:`build_settings`
+    derives it: the parent of the ``runs/`` dir) is refused with the
+    boundary named.
+
+    Args:
+        name: Binary name to resolve (``node``, ``bwrap``, ``socat``,
+            ``rg``).
+        run_dir: The run the launch belongs to — the containment root.
+        required: Refuse when the binary is not on PATH at all (node:
+            no launch without it). When False, a missing binary returns
+            None and the caller keeps srt's own default behaviour.
+
+    Returns:
+        The absolute resolved path, or None (only when ``required`` is
+        False and the binary is not on the orchestrator's PATH).
+
+    Raises:
+        SandboxError: The binary resolves inside the run dir or the
+            factory root (the message names which), or ``required`` and
+            it is not on the PATH at all.
+    """
+    found = _resolved_on_path(name)
+    if found is None:
+        if name == "node" and required:
+            # _orchestrator_node phrases the node-specific refusal.
+            return _orchestrator_node()
+        if required:
+            raise SandboxError(
+                f"{name} is not on the orchestrator's PATH (F-62) — "
+                "install it and retry; a PATH lookup at exec time would "
+                "let a sandboxed command choose its own interpreter"
+            )
+        return None
+    real = Path(found)
+    run_real = Path(run_dir).resolve()
+    inside_run = real == run_real or run_real in real.parents
+    runs_root = run_real.parent.parent
+    factory_real = runs_root.parent.resolve() if runs_root.name == "runs" else None
+    inside_root = bool(
+        factory_real is not None
+        and (real == factory_real or factory_real in real.parents)
+    )
+    if inside_run:
+        raise SandboxError(
+            f"refusing to launch: {name} resolves to {real}, inside the "
+            f"run dir {run_real} — the confined child can write there, "
+            "and nothing it writes may execute outside the sandbox "
+            "(F-62 AC-1); remove the run-dir PATH entry or install "
+            f"{name} outside it"
+        )
+    if inside_root:
+        raise SandboxError(
+            f"refusing to launch: {name} resolves to {real}, inside the "
+            f"factory root {factory_real} — the factory root holds "
+            "factory state, not executables, and a binary there is a "
+            "misconfigured host (F-62 AC-1); install it outside the "
+            "factory root"
+        )
+    return found
+
+
+def srt_launch_argv(run_dir: Path, srt_bin_path: Path | None = None) -> list[str]:
+    """THE one argv prefix that launches srt: ``[node, cli.js]`` (F-62
+    AC-1), used by :func:`run_sandboxed` (then ``--settings … -c …``)
+    and by the pin check (:func:`_verified_srt`, then ``--version``)
+    — one code path, so the interpreter the pin check exercises IS the
+    interpreter that launches.
+
+    ``node`` is :func:`trusted_binary` — resolved once from the
+    orchestrator's PATH, realpath'd, refused inside the run dir and the
+    factory root. The cli script is the realpath of the srt entry
+    (``node_modules/.bin/srt`` is a symlink to the package's
+    ``dist/cli.js``): passing the realpath means node's module
+    resolution anchors exactly where the shebang exec would have put
+    it, and a ``srt_bin_path`` that realpaths into the run dir is
+    refused like the node would be.
+    """
+    node = trusted_binary("node", run_dir, required=True)
+    assert node is not None  # required=True: the refusal raised above
+    cli = Path(srt_bin_path) if srt_bin_path else srt_bin()
+    cli_real = cli.resolve()
+    run_real = Path(run_dir).resolve()
+    if cli_real == run_real or run_real in cli_real.parents:
+        raise SandboxError(
+            f"refusing to launch: the srt binary {cli} resolves to "
+            f"{cli_real}, inside the run dir {run_real} — the confined "
+            "child can write there, and nothing it writes may execute "
+            "outside the sandbox (F-62 AC-1)"
+        )
+    return [node, str(cli_real)]
+
+
 def ensure_srt(srt_bin_path: Path | None = None) -> str:
     """Check ``srt --version`` against the pin and return the version string.
 
@@ -278,10 +434,21 @@ def ensure_srt(srt_bin_path: Path | None = None) -> str:
 @lru_cache(maxsize=None)
 def _verified_srt(binary: str, fingerprint: tuple[int, int]) -> str:
     """Run the actual version check once per binary state. ``fingerprint``
-    (mtime, size) busts the cache if the binary is replaced on disk."""
+    (mtime, size) busts the cache if the binary is replaced on disk.
+
+    F-62 AC-1: the check exec's exactly the argv the launch uses —
+    ``[trusted node, realpath of the cli script, --version]`` — so the
+    interpreter the pin exercises IS the interpreter that launches the
+    sandbox (a shebang exec would PATH-resolve a different one). The
+    node resolution is the cached orchestrator-PATH lookup; the launch
+    path refuses untrusted locations BEFORE this runs."""
     try:
         proc = subprocess.run(
-            [binary, "--version"],
+            [
+                _orchestrator_node(),
+                str(Path(binary).resolve()),
+                "--version",
+            ],
             capture_output=True,
             text=True,
             timeout=60,
@@ -472,6 +639,28 @@ def _path_outside_home(path: str, keep: "Sequence[Path] | None" = None) -> str:
         entry for entry in path.split(":")
         if entry and (not under_home(entry) or kept(entry))
     )
+
+
+def _path_without_run_dir(path: str, run_dir: Path) -> str:
+    """``path`` minus every entry that is relative/empty or whose
+    realpath lies inside ``run_dir`` (F-62 AC-1) — the run dir is the
+    one tree a sandboxed command can write, so no lookup the launcher
+    performs may search it; and srt runs with cwd=run_dir, so a
+    RELATIVE entry (round 1: ``.``, ``bin``, ``node_modules/.bin``)
+    would search the run dir at srt's own lookup time. Order is kept;
+    an absolute entry that cannot be resolved (a dangling PATH entry)
+    stays: nothing can be planted in a directory that does not exist,
+    and the entry may be a deliberate caller choice re-allowed by
+    ``build_settings``."""
+    run_real = Path(run_dir).resolve()
+    kept: list[str] = []
+    for entry in _absolute_path_entries(path):
+        with suppress(OSError):
+            real = Path(entry).resolve()
+            if real == run_real or run_real in real.parents:
+                continue
+        kept.append(entry)
+    return ":".join(kept)
 
 
 def home_path_keep() -> frozenset[Path]:
@@ -786,7 +975,7 @@ def build_settings(
         # settings ever ask, so the session seats keep srt's default deny
         # (see the docstring for exactly what the flag permits).
         network["allowLocalBinding"] = True
-    return {
+    settings: dict = {
         "network": network,
         "filesystem": {
             # F-47 (M-9): the factory root ITSELF is denied — trace/,
@@ -878,6 +1067,31 @@ def build_settings(
             "envVars": [{"mode": "deny", "name": name} for name in denied_names]
         },
     }
+    # F-62 AC-1 (Linux): srt 0.0.79 resolves bwrap and socat through
+    # its own ``which`` (linux-sandbox-utils.js: whichSync('bwrap') /
+    # ('socat')) and spawns ripgrep by name (ripgrep.js: spawn('rg'))
+    # — inside the launcher's PATH. The launcher PATH is already
+    # stripped of run-dir entries, but the settings pin them absolutely
+    # as well (the keys exist in 0.0.79's SandboxRuntimeConfigSchema:
+    # bwrapPath, socatPath, ripgrep.command), resolved from the
+    # orchestrator's PATH by the same trusted rule as node. A helper
+    # that resolves inside the run dir or the factory root refuses the
+    # whole settings build (named); one that is not installed at all is
+    # simply not pinned — srt answers for a missing bwrap itself, exactly
+    # as it did before. macOS needs no pins: sandbox-exec is invoked by
+    # absolute path (/usr/bin/sandbox-exec) and ripgrep is unused there;
+    # its PATH-resolved helpers (bash/env/which/log) are covered by the
+    # stripped launcher PATH (no settings key exists for them in
+    # 0.0.79 — the launcher env is the control).
+    if sys.platform == "linux":
+        for binary_name, key in (("bwrap", "bwrapPath"), ("socat", "socatPath")):
+            pinned = trusted_binary(binary_name, run_dir, required=False)
+            if pinned is not None:
+                settings[key] = pinned
+        rg = trusted_binary("rg", run_dir, required=False)
+        if rg is not None:
+            settings["ripgrep"] = {"command": rg}
+    return settings
 
 
 def write_settings(settings: dict, path: Path) -> Path:
@@ -1055,8 +1269,12 @@ def run_sandboxed(
             is dead (or force-detached) by the time it propagates.
     """
     binary = Path(srt_bin_path) if srt_bin_path else srt_bin()
-    ensure_srt(srt_bin_path=binary)
     run_dir = Path(run_dir)
+    # F-62 AC-1: the trust check runs BEFORE the pin check exec's
+    # anything — a node (or srt) inside the run dir is refused before
+    # one instruction of it can run.
+    launch_argv = srt_launch_argv(run_dir, srt_bin_path=binary)
+    ensure_srt(srt_bin_path=binary)
     if scratch is None:
         tmp = run_dir / ".tmp"
         tmp.mkdir(parents=True, exist_ok=True)
@@ -1072,15 +1290,48 @@ def run_sandboxed(
     # run-dir TMPDIR as a shell assignment prefix instead — same environment
     # for the command, short socket paths for srt.
     child_env.pop("TMPDIR", None)
-    command = f"TMPDIR={shlex.quote(str(tmp))} {shlex.join(cmd)}"
+    # F-62 AC-1: srt NEVER runs with the confined child's environment.
+    # The old shape exec'd the srt entry (shebang ``#!/usr/bin/env
+    # node``) with the child's PATH — whose first entry is the
+    # run-writable ``<run>/.venv/bin`` — so a gate command that planted
+    # a ``node`` there ran unsandboxed as the owner on the next launch.
+    # Now srt is exec'd as ``[trusted node, realpath(cli.js), ...]``
+    # (:func:`srt_launch_argv`) with a LAUNCHER env: today's child env
+    # with PATH stripped of every run-dir entry and VIRTUAL_ENV gone.
+    # What the confined command loses that way it gets back through the
+    # ``-c`` string, as the shell assignment prefix TMPDIR already is:
+    # ``PATH=<venv>/bin:$PATH VIRTUAL_ENV=<venv>`` — the venv reaches
+    # the command, never the launcher. HOME/CLAUDE_CODE_TMPDIR/
+    # GIT_TEMPLATE_DIR (run-dir scratch paths the command needs) and
+    # the seat token stay in the env: env is not an exec-resolution
+    # vector, and the token must NEVER move to argv (visible in ps).
+    # On macOS srt resolves its own helpers (``bash`` via ``which``,
+    # ``env``, the log monitor) through this PATH — stripped of run-dir
+    # entries, a planted ``.venv/bin/bash`` cannot stand in for them;
+    # ``/usr/bin/sandbox-exec`` it invokes by absolute path. On Linux
+    # the same holds for every helper except bwrap/socat/rg, which
+    # build_settings pins absolutely instead (srt resolves those three
+    # through its own which() INSIDE the namespace).
+    launcher_env = dict(child_env)
+    launcher_env.pop("VIRTUAL_ENV", None)
+    launcher_env["PATH"] = _path_without_run_dir(
+        child_env.get("PATH", ""), run_dir
+    )
+    prefix = [f"TMPDIR={shlex.quote(str(tmp))}"]
+    if venv is not None:
+        prefix.append(
+            f"PATH={shlex.quote(str(Path(venv) / 'bin'))}:$PATH"
+        )
+        prefix.append(f"VIRTUAL_ENV={shlex.quote(str(venv))}")
+    command = " ".join(prefix) + " " + shlex.join(cmd)
     # srt runs the command through a shell itself; `-c` takes one command
     # string verbatim ("no escaping applied"), so shlex.join carries our
     # argv across that boundary without quoting accidents. srt becomes a
     # session leader (start_new_session), so one killpg reaches the whole
     # tree — shell, session processes, socat bridges.
     proc = subprocess.Popen(
-        [str(binary), "--settings", str(settings_path), "-c", command],
-        env=child_env,
+        [*launch_argv, "--settings", str(settings_path), "-c", command],
+        env=launcher_env,
         cwd=str(cwd if cwd else run_dir),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

@@ -39,7 +39,12 @@ from factory.prbody import PRBodyError
 from factory.progress import ProgressLogError
 from factory.publish import PublishError, PushRefused
 from factory.replay import ReplayError, replay_lines, resolve_replay_files
-from factory.runs import FACTORY_ROOT_DEFAULT, RUN_ID_RE, RunError
+from factory.runs import (
+    FACTORY_ROOT_DEFAULT,
+    RUN_ID_RE,
+    RunError,
+    project_component,
+)
 from factory.sandbox import SandboxError
 from factory.session import SessionConfigError, seat_token
 from factory.state import TaskQueue, run_lease_held
@@ -387,7 +392,9 @@ def _run_trace(args: argparse.Namespace) -> int:
         # window, then stops. (The lease is per queue: a later run of the
         # same project holding it keeps this follow waiting until that run
         # ends — bounded, never forever.)
-        run_dir = root / "runs" / profile["name"] / args.run_id
+        run_dir = (
+            root / "runs" / project_component(profile["name"]) / args.run_id
+        )
         queue_path = Path(args.queue)
 
         def live() -> bool:

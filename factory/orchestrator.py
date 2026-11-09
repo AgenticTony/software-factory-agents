@@ -101,6 +101,7 @@ from factory.publish import (
     PushRefused,
     RemoteCallTimeout,
     check_pr_text,
+    check_push_content,
     gh_pr_create,
     push_branch,
     remote_call,
@@ -114,6 +115,7 @@ from factory.runs import (
     cleanup_run,
     create_run,
     new_run_id,
+    project_component,
 )
 from factory.sandbox import (
     build_settings,
@@ -408,6 +410,10 @@ def reclaim_runs(queue: TaskQueue, project: str, factory_root: Path) -> list[Pat
         The run dirs removed (empty while a run is live).
     """
     factory_root = Path(factory_root)
+    # F-62 AC-3: a validated slug before any listing or removal — and
+    # the VALIDATED value is what every later join uses (the cleanup
+    # target names the same settings path create_run built).
+    project = project_component(project)
     runs = factory_root / "runs" / project
     sandbox = factory_root / "sandbox"
     removed: list[Path] = []
@@ -1114,6 +1120,19 @@ def run_once(
     pr_state = pr_state or gh_pr_state
 
     queue = TaskQueue(queue_path)
+    # F-62 AC-3: the queue and the profile must name the SAME project —
+    # the queue's project reaches path builders as a namespace
+    # component, and a disagreement means the run would read and write
+    # one project's namespace under another project's contract.
+    # Refused before anything is reclaimed, picked or recorded.
+    if queue.doc.get("project") != profile["name"]:
+        raise RunError(
+            f"the queue at {queue_path} names project "
+            f"{queue.doc.get('project')!r} but the profile at "
+            f"{profile_path} names {profile['name']!r}: a queue and a "
+            "profile that disagree cannot name one project's namespace "
+            "— refusing before anything is reclaimed or recorded"
+        )
     reclaim_runs(queue, profile["name"], factory_root)
     queue.reclaim_abandoned()
     queue.demote_changed_contracts()
@@ -2004,7 +2023,8 @@ def _sweep_stale_prs(
                 finally:
                     cleanup_run(clean)
 
-            reports_dir = (factory_root / "reports" / project
+            reports_dir = (factory_root / "reports"
+                           / project_component(project)
                            / re.sub(r"[^\w.-]", "_", task_id))
             reports_dir.mkdir(parents=True, exist_ok=True)
             report_path = reports_dir / f"{work.run_id}-revalidate.json"
@@ -2175,7 +2195,9 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
             created = frozenset({branch})
             hardened_git(work.root, "checkout", "-q", "-b", branch)
             base_sha = _git_out(work.root, "rev-parse", "--verify", "HEAD^{commit}")
-            reports_dir = ctx.factory_root / "reports" / project / re.sub(r"[^\w.-]", "_", task_id)
+            reports_dir = (ctx.factory_root / "reports"
+                           / project_component(project)
+                           / re.sub(r"[^\w.-]", "_", task_id))
             reports_dir.mkdir(parents=True, exist_ok=True)
 
         def attempt_record(attempt_no, started, outcome, records, report_path, **extra):
@@ -3126,6 +3148,17 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                         # failed, so the secrets travel with it.
                         pr_title = f"{task_id}: {task.get('title', '')}"
                         check_pr_text(pr_title, body, secrets=egress_secrets)
+                        # F-62 AC-2: the PR-text fence covers the PR's
+                        # words; this fence covers the PR's CONTENT —
+                        # every diff line and commit message being
+                        # published, against every secret this run
+                        # holds, in the literal and simple encoded
+                        # forms. Same refusal type as check_pr_text, so
+                        # the same escalation path handles it.
+                        check_push_content(
+                            work.root, base_sha, cast(str, head_sha),
+                            secrets=egress_secrets,
+                        )
                         push_branch(work.root, repo_cfg["remote"], branch,
                                     sha=cast(str, head_sha),
                                     created=created, default_branch=default_branch)

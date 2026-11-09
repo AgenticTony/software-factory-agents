@@ -23,7 +23,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import textwrap
 from pathlib import Path
 
 import pytest
@@ -782,13 +781,10 @@ def test_review_real_srt_reader_stopping_cuts_stdout_mid_line(
     settings = build_settings({}, run.root, model_endpoint="api.z.ai",
                               factory_root=tmp_path)
     write_settings(settings, run.settings_path)
-    shim = tmp_path / "srt-shim"
-    shim.write_text(textwrap.dedent(f"""\
-        #!/bin/sh
-        if [ "$1" = "--version" ]; then echo "{SRT_PIN}"; exit 0; fi
-        exec /bin/sh -c "$4"
-        """))
-    shim.chmod(0o755)
+    from _support.srt import write_srt
+
+    # F-62: node-run stand-in (the launcher exec's [node, cli.js, ...]).
+    shim = write_srt(tmp_path / "srt-shim", version=SRT_PIN, run_c=True)
     # The leader forks a setsid child that writes one huge line slowly,
     # then exits; the child survives the group kill and keeps writing
     # until the drain force-closes the pipes mid-line.

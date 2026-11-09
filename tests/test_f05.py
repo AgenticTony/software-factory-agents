@@ -849,10 +849,12 @@ def test_ensure_srt_accepts_the_pinned_version():
 
 
 def _fake_srt(tmp_path: Path, version: str) -> Path:
-    fake = tmp_path / "fake-srt"
-    fake.write_text(f"#!/bin/sh\necho '{version}'\n")
-    fake.chmod(0o755)
-    return fake
+    """A JS stand-in (F-62: the launcher exec's [node, cli.js, …], so a
+    shell stand-in can no longer run); the real cli.js shebang keeps it
+    faithful to a PATH-resolved launch."""
+    from _support.srt import write_srt
+
+    return write_srt(tmp_path / "fake-srt", version=version)
 
 
 def test_ensure_srt_refuses_a_version_mismatch(tmp_path: Path):
@@ -1329,8 +1331,14 @@ def test_ensure_srt_caches_the_version_check(tmp_path: Path):
     """The pin check costs a Node boot; it must run once per binary state,
     not once per sandboxed command. The counting fake proves invocations."""
     calls = tmp_path / "calls"
+    from _support.srt import STANDIN_SHEBANG
+
     fake = tmp_path / "counting-srt"
-    fake.write_text(f"#!/bin/sh\necho x >> '{calls}'\necho '{SRT_PIN}'\n")
+    fake.write_text(
+        STANDIN_SHEBANG
+        + 'require("fs").appendFileSync(%r, "x\\n");\n' % str(calls)
+        + 'console.log("srt " + %r);\n' % SRT_PIN
+    )
     fake.chmod(0o755)
     ensure_srt(srt_bin_path=fake)
     ensure_srt(srt_bin_path=fake)

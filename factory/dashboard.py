@@ -57,7 +57,7 @@ from pathlib import Path
 from typing import Any
 
 from factory.contract import ContractError, load_profile, load_tasks
-from factory.runs import FACTORY_ROOT_DEFAULT, RUN_ID_RE
+from factory.runs import FACTORY_ROOT_DEFAULT, RUN_ID_RE, project_component
 from factory.state import run_lease_held
 from factory.status import needs_human_tasks, render_status
 from factory.trace import TraceError, read_trace, trace_path
@@ -232,10 +232,21 @@ class Dashboard:
         return load_profile(self.queue_path.parent / "project.yaml")["name"]
 
     def _queue(self) -> dict:
-        """The queue, after schema validation (F-02): invalid state
-        raises :class:`ContractError`, which every page renders as an
-        error page — never partial data."""
-        return load_tasks(self.queue_path)
+        """The queue, after schema validation (F-02) and the profile
+        pair check (F-62 AC-3): a queue whose ``project`` disagrees with
+        the profile this dashboard serves refuses — invalid or
+        mismatched state raises :class:`ContractError`, which every
+        page renders as an error page, never partial data."""
+        queue = load_tasks(self.queue_path)
+        profile_name = self.project()
+        if queue.get("project") != profile_name:
+            raise ContractError(
+                f"the queue at {self.queue_path} names project "
+                f"{queue.get('project')!r} but the profile names "
+                f"{profile_name!r}: a queue and profile that disagree "
+                "cannot name one project's namespace"
+            )
+        return queue
 
     def _contract_error(self, exc: ContractError) -> Response:
         return _error(503, "The factory state is not readable", str(exc))
@@ -258,7 +269,11 @@ class Dashboard:
             for status in _STATUS_ORDER if status in counts
         )
         try:
-            trace_dir = self.factory_root / "trace" / project
+            # F-62 AC-3: a validated slug — the same glob the status
+            # reader uses, never an arbitrary directory list.
+            trace_dir = (
+                self.factory_root / "trace" / project_component(project)
+            )
             runs = sorted(
                 (entry for entry in trace_dir.glob("*.jsonl")
                  if RUN_ID_RE.fullmatch(entry.stem)),
@@ -461,7 +476,10 @@ class Dashboard:
             if not _already_embedded(line, route.after):
                 write(f"data: {line}\n\n".encode())
 
-        run_dir = self.factory_root / "runs" / route.project / route.run_id
+        run_dir = (
+            self.factory_root / "runs"
+            / project_component(route.project) / route.run_id
+        )
 
         def live() -> bool:
             return run_dir.exists() and run_lease_held(self.queue_path)

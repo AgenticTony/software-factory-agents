@@ -28,11 +28,15 @@ fsmonitor): the run's clone was written by an agent.
 
 from __future__ import annotations
 
+import base64
 import os
 import re
+import select
 import shutil
 import subprocess
 import tempfile
+import time
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -116,6 +120,286 @@ def check_pr_text(title: str, body: str, *, secrets: Sequence[str] = ()) -> None
 
 class PushRefused(Exception):
     """The orchestrator refused to push or open a PR for this ref."""
+
+
+def _b64_core(raw: bytes, alignment: int,
+              encoder=base64.b64encode) -> str:
+    """The base64 chars that encode ``raw``'s bits and nothing else,
+    when ``raw`` starts ``alignment`` bytes (0/1/2) into the stream.
+
+    A secret embedded mid-stream is not the base64 of the secret: the
+    chars around its byte range mix in the neighbours' bits. A char is
+    pure (depends only on ``raw``) iff its 6-bit window [6j, 6j+6) lies
+    inside the secret's bit range [8·alignment, 8·(alignment+len)) —
+    so the core starts at char ⌈8·alignment/6⌉ and ends at char
+    ⌊8·(alignment+len)/6⌋. The three cores together cover every
+    alignment a stream can present; each is long enough to match only
+    on the secret (MIN_SECRET_LEN=8 keeps the shortest core ≥ 10
+    chars)."""
+    encoded = encoder(b"\x00" * alignment + raw).decode("ascii")
+    start = -(-8 * alignment // 6)  # ceil
+    end = (8 * (alignment + len(raw))) // 6
+    return encoded[start:end]
+
+
+def _secret_forms(secret: str) -> "list[tuple[str, str]]":
+    """Every ``(label, needle)`` the push-content fence matches.
+
+    The literal and the simple encodings — hex (both cases),
+    URL-percent-encoded, base64 and base64url at all three byte
+    alignments. Shape scanning is inherently bypassable (gzip,
+    reversal, splitting defeat it); the literal plus the trivially
+    computable encodings are the boundary, and the refusal names which
+    form it caught so the owner can judge the neighbourhood."""
+    raw = secret.encode("utf-8")
+    forms = [
+        ("literal", secret),
+        ("hex", raw.hex()),
+        ("hex", raw.hex().upper()),
+        ("url-encoded", urllib.parse.quote(secret, safe="")),
+    ]
+    for encoder, label in (
+        (base64.b64encode, "base64"),
+        (base64.urlsafe_b64encode, "base64url"),
+    ):
+        for alignment in range(3):
+            core = _b64_core(raw, alignment, encoder)
+            if core:
+                forms.append((label, core))
+    return forms
+
+
+# F-62 round 1: the push-content scan reads object bytes in chunks of
+# this size (streamed, never one whole string), carrying an overlap of
+# longest-needle − 1 bytes between chunks so a needle cannot straddle a
+# boundary unseen. Public so the boundary-straddling test can aim at it.
+PUSH_SCAN_CHUNK = 1 << 20  # 1 MiB
+
+
+def check_push_content(
+    repo: Path,
+    base_sha: str,
+    head_sha: str,
+    *,
+    secrets: "Sequence[str]" = (),
+) -> None:
+    """Refuse a push whose OBJECTS carry a session secret (F-62 AC-2)
+    — the fence :func:`check_pr_text` gives the PR TEXT, applied to the
+    PR's main content: everything the push transfers.
+
+    The orchestrator calls this directly after ``check_pr_text`` and
+    before :func:`push_branch``, with the same ``egress_secrets`` tuple
+    (the seat token today). Nothing is pushed: the refusal is the same
+    :class:`PushRefused` the PR-text fence raises, so the existing
+    escalation path (``publish_refused``) handles it unchanged.
+
+    What is scanned — exactly what leaves. ``git push`` transfers every
+    object reachable from ``head`` that the remote lacks: intermediate
+    commits' trees and blobs (round 1: an add-then-delete pair or an
+    orphan branch merged ``-s ours`` publishes objects the NET DIFF of
+    base..head never shows) and every parent of a merge. So the scan is
+    over the object set — ``git rev-list --objects base..head`` — with
+    every object streamed through ONE hardened ``git cat-file
+    --batch``: blobs raw, trees raw (an entry NAME carrying the secret
+    is caught in the tree's bytes), commits raw (message AND
+    author/committer fields). ``cat-file`` serves object bytes; it
+    never applies a textconv or diff driver (a repo ``.gitattributes``
+    or the owner's global diff config cannot change what the scan
+    sees), so diff-side flags are moot by construction.
+
+    Objects are scanned STREAMED, in :data:`PUSH_SCAN_CHUNK` chunks
+    with a longest-needle − 1 byte overlap (a needle cannot straddle a
+    chunk boundary unseen); nothing is buffered whole — a 50 MB publish
+    costs kilobytes, not the diff text times six.
+
+    Secrets shorter than the scrub floor are ignored
+    (:func:`factory.sentinels.is_scrubbable_secret` — the same rule the
+    PR-text fence and the egress seam apply; ``egress_secrets`` is
+    ``(seat_token() or "",)``, and an empty token must match nothing).
+
+    The refusal names the object kind and its path (or the commit SHA)
+    and the encoding — never the secret or the matched bytes: the
+    message travels into escalation notes the owner reads. A path that
+    ITSELF carries a secret form is needle-redacted before naming.
+
+    Fail closed: a failed rev-list/cat-file, a missing object, a stream
+    that ends early, or a scan that exceeds the remote-call timeout is
+    a refusal — an unreadable corpus is never an OK one.
+
+    Args:
+        repo: The clone holding the validated ``head_sha``.
+        base_sha: The merge-base the branch grew from.
+        head_sha: The commit L0/L1/L2 validated.
+        secrets: The run's egress secrets (see
+            :func:`factory.egress.check_secrets` for the shape rules).
+
+    Raises:
+        PushRefused: A secret (in a matched form) appears in an object
+            being published; or the object corpus could not be read
+            (fail closed).
+        TypeError: ``secrets`` is a bare ``str`` or holds a non-str
+            element (:func:`factory.egress.check_secrets`).
+    """
+    secrets = check_secrets(secrets)
+    needles: list[tuple[str, str, bytes]] = [
+        (label, needle, needle.encode("utf-8"))
+        for secret in secrets
+        if is_scrubbable_secret(secret)
+        for label, needle in _secret_forms(secret)
+    ]
+    if not needles:
+        return
+    longest = max(len(encoded) for _label, _needle, encoded in needles)
+
+    def redact_needles(text: str) -> str:
+        """Blank every needle span — the refusal names the file, and a
+        file whose NAME carries the secret must not echo it."""
+        for _label, needle, _encoded in needles:
+            text = text.replace(needle, "[redacted]")
+        return text
+
+    def refuse(where: str, kind: str, label: str) -> "PushRefused":
+        return PushRefused(
+            f"refusing to push: {redact_needles(where)} "
+            f"(a {kind} in the published range "
+            f"{base_sha[:12]}..{head_sha[:12]}) carries a literal "
+            f"session credential in its {label} form (not echoed here) "
+            "— nothing was pushed"
+        )
+
+    repo = Path(repo)
+    listing = remote_call(
+        [
+            "git", *GIT_HARDENING, "-C", str(repo),
+            "rev-list", "--objects", f"{base_sha}..{head_sha}",
+        ],
+        what="secret scan object listing of the published range",
+    )
+    if listing.returncode != 0:
+        raise PushRefused(
+            "cannot list the published objects for the secret scan "
+            f"(git rev-list {base_sha[:12]}..{head_sha[:12]} failed: "
+            f"{listing.stderr.strip()[:300]}) — nothing was pushed"
+        )
+    objects: list[tuple[str, str]] = []
+    for line in listing.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        sha, _, path = line.partition(" ")
+        objects.append((sha, path.strip()))
+    if not objects:
+        return
+
+    deadline = time.monotonic() + NET_TIMEOUT_SEC
+    batch = subprocess.Popen(
+        ["git", *GIT_HARDENING, "-C", str(repo), "cat-file", "--batch"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        env={**os.environ, **GIT_NET_ENV},
+    )
+    assert batch.stdin is not None and batch.stdout is not None
+    try:
+        for sha, path in objects:
+            where = path or sha[:12]
+            try:
+                batch.stdin.write((sha + "\n").encode())
+                batch.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                raise PushRefused(
+                    "cannot scan the published objects for session "
+                    f"secrets (cat-file died: {exc}) — nothing was pushed"
+                ) from exc
+            header = _batch_read_line(batch.stdout, deadline)
+            # A served object answers "<sha> <kind> <size>"; a missing
+            # one answers "<sha> missing" (two tokens — caught by the
+            # length guard, with the kind check naming it for the
+            # reader). Empty/garbage headers fail closed the same way.
+            parts = header.split() if header else []
+            if len(parts) < 3 or parts[1] == b"missing":
+                raise PushRefused(
+                    f"cannot scan the published objects: {sha[:12]} "
+                    "is missing from the local object store — nothing "
+                    "was pushed"
+                )
+            kind = parts[1].decode(errors="replace")
+            try:
+                size = int(parts[2])
+            except ValueError:
+                raise PushRefused(
+                    f"cannot scan the published objects: unreadable "
+                    f"cat-file header for {sha[:12]} — nothing was pushed"
+                ) from None
+            # Stream the object bytes: chunked, with an overlap of
+            # longest-needle − 1 bytes so no needle straddles unseen.
+            carry = b""
+            remaining = size
+            while remaining > 0:
+                want = min(PUSH_SCAN_CHUNK, remaining)
+                data = _batch_read_exactly(batch.stdout, want, deadline)
+                remaining -= want
+                window = carry + data
+                for label, _needle, encoded in needles:
+                    if encoded in window:
+                        raise refuse(where, kind, label)
+                carry = window[-(longest - 1):] if longest > 1 else b""
+            _batch_read_exactly(batch.stdout, 1, deadline)  # trailing \n
+        try:
+            batch.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        returncode = batch.wait(
+            timeout=max(1.0, deadline - time.monotonic()))
+        if returncode != 0:
+            raise PushRefused(
+                "cannot scan the published objects: git cat-file exited "
+                f"{returncode} — nothing was pushed"
+            )
+    finally:
+        if batch.poll() is None:
+            batch.kill()
+            batch.wait()
+
+
+def _batch_read_exactly(stream, count: int, deadline: float) -> bytes:
+    """Read exactly ``count`` bytes from cat-file's stdout, bounded by
+    ``deadline``; EOF or a stall is a PushRefused (fail closed)."""
+    buffer = bytearray()
+    fd = stream.fileno()
+    while len(buffer) < count:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise PushRefused(
+                "cannot scan the published objects: git cat-file "
+                "stalled — nothing was pushed"
+            )
+        ready, _, _ = select.select([fd], [], [], min(left, 5.0))
+        if not ready:
+            continue
+        chunk = os.read(fd, count - len(buffer))
+        if not chunk:
+            raise PushRefused(
+                "cannot scan the published objects: the stream ended "
+                "early — nothing was pushed"
+            )
+        buffer += chunk
+    return bytes(buffer)
+
+
+def _batch_read_line(stream, deadline: float) -> bytes:
+    """One ``\\n``-terminated cat-file header line, bounded by
+    ``deadline``; b'' on EOF (the caller fails closed)."""
+    line = bytearray()
+    while True:
+        byte = _batch_read_exactly(stream, 1, deadline)
+        if byte == b"\n":
+            return bytes(line)
+        line += byte
+        if len(line) > 4096:  # a header is a sha, a kind, a size
+            raise PushRefused(
+                "cannot scan the published objects: unreadable cat-file "
+                "header — nothing was pushed"
+            )
 
 
 class PublishError(Exception):

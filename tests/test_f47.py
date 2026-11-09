@@ -240,14 +240,12 @@ def _passthrough_srt(tmp_path: Path) -> Path:
     srt dies, so a setsid child cannot outlive the kill there; this shim
     exercises the drain's force-close on EVERY platform, through the real
     :func:`run_sandboxed` (pin check included)."""
-    shim = tmp_path / "srt-shim"
-    shim.write_text(textwrap.dedent(f"""\
-        #!/bin/sh
-        if [ "$1" = "--version" ]; then echo "{SRT_PIN}"; exit 0; fi
-        exec /bin/sh -c "$4"
-        """))
-    shim.chmod(0o755)
-    return shim
+    from _support.srt import write_srt
+
+    # F-62: the launcher exec's [node, cli.js, ...] — the stand-in is
+    # JavaScript now, with the real cli.js shebang so a PATH-resolved
+    # launch would exec it the way the real one is exec'd.
+    return write_srt(tmp_path / "srt-shim", version=SRT_PIN, run_c=True)
 
 
 def test_ac_2(tmp_path: Path, monkeypatch):

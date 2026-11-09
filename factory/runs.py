@@ -31,9 +31,71 @@ RUN_ID_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{6}")
 # sandbox settings deny both), so this is the outer layer of the same rule.
 GIT_HARDENING = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
 
+# F-62 AC-3: the project-slug shape. Identical to the profile schema's
+# ``name`` pattern (project.schema.json) — a fullmatch here, because a
+# ``^…$`` pattern alone admits a trailing newline (Python re ``$``);
+# the queue loader adds this same check beside the schema for exactly
+# that reason.
+_PROJECT_SLUG_RE = re.compile(r"[a-z0-9-]+", re.ASCII)
+
 
 class RunError(Exception):
     """A run dir cannot be created or cleaned up as requested."""
+
+
+class ProjectSlugError(RunError):
+    """A project name is not a slug (F-62 AC-3): a queue- or profile-
+    supplied project string that would become a factory-root path
+    component is refused, never sanitised — a ``../x``, an absolute
+    path, ``a/b`` or a Unicode look-alike must never choose where under
+    the factory root (or outside it) the factory writes or reads."""
+
+
+def project_component(name: str) -> str:
+    """Validate ``name`` as a project path component and return it.
+
+    THE one rule every factory-root path builder goes through (F-62
+    AC-3): a component built from a project name is ``[a-z0-9-]+`` and
+    nothing else (ASCII — a Cyrillic look-alike is a different string),
+    checked with :func:`re.fullmatch` so a trailing newline cannot ride
+    a ``^…$`` pattern's end-of-string semantics. Refuses loudly; never
+    sanitises — a silent ``re.sub`` would move the write, not stop it,
+    and the queue that named a bad project is state the owner must see.
+
+    Args:
+        name: The project name (from a validated profile or queue).
+
+    Returns:
+        ``name`` unchanged (it is already the safe component).
+
+    Raises:
+        ProjectSlugError: ``name`` is not a ``[a-z0-9-]+`` slug (or not
+            a string at all).
+    """
+    if not isinstance(name, str) or not _PROJECT_SLUG_RE.fullmatch(name):
+        raise ProjectSlugError(
+            f"{name!r} is not a project slug (^[a-z0-9-]+$, ASCII): a "
+            "project name becomes factory-root path components "
+            "(runs/, sandbox/, trace/, progress/, reports/, import/), so "
+            "anything else could place or read files outside the "
+            "project's namespace — refused, never sanitised"
+        )
+    return name
+
+
+def sandbox_settings_path(
+    factory_root: Path | str, project: str, run_id: str
+) -> Path:
+    """The srt settings file of one run: ``<root>/sandbox/<project>-
+    <run_id>.json`` — the single builder for the sibling every seat
+    uses (create_run, the importer's repair path, the session runner's
+    derivation). The project part is a validated slug (F-62 AC-3): an
+    unvalidated ``f"{project}-…"`` join escapes ``sandbox/`` the moment
+    the project carries a separator."""
+    return (
+        Path(factory_root) / "sandbox"
+        / f"{project_component(project)}-{run_id}.json"
+    )
 
 
 @dataclass(frozen=True)
@@ -75,6 +137,7 @@ def create_run(
             message names the offending step; no partial dir is kept.
     """
     root = Path(factory_root) if factory_root else FACTORY_ROOT_DEFAULT
+    project = project_component(project)
     source = Path(source).resolve()
     if not (source / ".git").exists():
         raise RunError(
@@ -145,7 +208,7 @@ def create_run(
     else:
         _seed_run_excludes(dest, None)
 
-    settings_path = root / "sandbox" / f"{project}-{dest.name}.json"
+    settings_path = sandbox_settings_path(root, project, dest.name)
     return RunDir(project=project, run_id=dest.name, root=dest, settings_path=settings_path)
 
 

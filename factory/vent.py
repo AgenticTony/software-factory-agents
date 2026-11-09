@@ -34,7 +34,8 @@ from typing import TYPE_CHECKING, Any, Sequence
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from factory.egress import check_secrets, scrub_session_text
-from factory.progress import ProgressLog, ProgressLogError, safe_name
+from factory.progress import ProgressLog, ProgressLogError
+from factory.runs import project_component
 from factory.state import now_iso
 
 if TYPE_CHECKING:  # pragma: no cover — import cycle avoidance, typing only
@@ -337,7 +338,9 @@ def weeks_vents(
     appended to ``unreadable`` when the caller passes a list, so the status
     page can say so.
     """
-    root = Path(factory_root) / "progress" / safe_name(project)
+    # F-62 AC-3: the project component is validated, not sanitised —
+    # the vent reader must not become an arbitrary-directory reader.
+    root = Path(factory_root) / "progress" / project_component(project)
     moment = now or datetime.now(timezone.utc)
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)

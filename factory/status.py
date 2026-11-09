@@ -56,6 +56,7 @@ from pathlib import Path
 from typing import Any
 
 from factory.egress import strip_control_sequences
+from factory.runs import project_component
 from factory.vent import VENT_CATEGORIES, weeks_vents
 
 WEEK_DAYS = 7
@@ -339,8 +340,11 @@ def _week_escapees(
     cannot carry one (the forwarder passes ``tool_call`` only), and a
     nested field never matches. A malformed line or an unparsable stamp
     is skipped, and an unreadable trace file is named in the notes —
-    the gap stays visible, like the vents seam's."""
-    directory = Path(factory_root) / "trace" / project
+    the gap stays visible, like the vents seam's. The project is a
+    validated slug (F-62 AC-3): this glob is a read, and an
+    unvalidated component turns it into a cross-project /
+    arbitrary-directory trace read."""
+    directory = Path(factory_root) / "trace" / project_component(project)
     count = 0
     runs: list[str] = []
     unreadable: list[str] = []
