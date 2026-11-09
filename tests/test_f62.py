@@ -531,6 +531,12 @@ def test_linux_settings_pin_bwrap_socat_and_ripgrep(
     monkeypatch.setenv("PATH", f"{toolbin}:{os.environ['PATH']}")
     monkeypatch.setattr(sys, "platform", "linux")
     try:
+        # Re-clear AFTER the setup above: on a real Linux host,
+        # _make_run's own build_settings already resolved the SYSTEM
+        # bwrap/socat/rg into the per-process cache (the designed
+        # behaviour — one resolution per process from a stable PATH);
+        # the pins under test must resolve against the toolbin PATH.
+        sandbox_module._resolved_on_path.cache_clear()
         settings = build_settings({}, run.root, model_endpoint="api.z.ai",
                                   factory_root=root)
         assert settings["bwrapPath"] == str(toolbin / "bwrap")
