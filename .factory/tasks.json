@@ -4756,7 +4756,8 @@
       "depends_on": [
         "F-05",
         "F-06",
-        "F-43"
+        "F-43",
+        "F-63"
       ],
       "risk": [
         "factory_control",
@@ -4943,6 +4944,180 @@
       "links": {},
       "budget": {
         "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-62",
+      "title": "Host-boundary escapes",
+      "source": "BUILD-ORDER.md#f-62--host-boundary-escapes",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-05",
+        "F-43",
+        "F-49"
+      ],
+      "risk": [
+        "factory_control",
+        "privacy"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "The sandbox launcher resolves only from trusted paths. `run_sandboxed` and the pin check (`ensure_srt`/`_verified_srt`) exec srt as `[node, <realpath of srt's cli.js>, ...]`; `node` is resolved once from the orchestrator's own PATH to an absolute path that lies outside every run dir and the factory root, and any other node is refused with the reason named. The pin check runs exactly the argv the launch uses. srt runs with a launcher environment, never the confined child's: the child's PATH and VIRTUAL_ENV reach only the confined command, as a shell assignment prefix the way TMPDIR already does. On Linux, `bwrapPath`/`socatPath` in the srt settings are absolute paths resolved the same way. Tests: a gate command that writes `<run>/.venv/bin/node` (and `bwrap`, `socat`) does not change what the next `run_sandboxed` launches; a node under a run dir is refused; the pin-check argv equals the launch argv.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f62.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Pushed content is scanned for the secrets the orchestrator holds. Before `push_branch`, every added line of `git diff --text <base>..<head>` and every commit message in `<base>..<head>` is scanned for each egress secret, literally and as its base64, hex and URL-encoded forms. A hit refuses the publish exactly like `check_pr_text`: nothing is pushed, the task escalates, and the reason names the file or commit but never echoes the secret. Tests: the token in a new file, in a modified file, in a commit message, and base64-encoded is refused each time; a clean diff pushes; the refusal text contains no secret.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f62.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "Every factory-root path component built from a project name is a validated slug. `tasks.schema.json`'s `project` gets the profile's `^[a-z0-9-]+$` pattern; a queue whose `project` differs from the loaded profile's `name` refuses to load, with both names shown. Every path builder under the factory root goes through one helper that raises on a non-slug component instead of silently sanitising — runs, sandbox settings and their siblings, trace, progress, reports, import, eval, and the status/dashboard readers. Tests: `../x`, an absolute path, `a/b`, the empty string and a Unicode look-alike are refused at queue load and at each builder; the importer's repair path and `factory status` with such a queue create and read nothing outside `<root>/<area>/<slug>`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f62.py::test_ac_3"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-63",
+      "title": "Owner-held approval of project config and contracts",
+      "source": "BUILD-ORDER.md#f-63--owner-held-approval-of-project-config-and-contracts",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-02",
+        "F-22",
+        "F-62"
+      ],
+      "risk": [
+        "factory_control",
+        "privacy"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "Task approvals live in an owner ledger. `factory approve` (single and reconcile) appends to `<factory_root>/approvals/<project>.jsonl`; each entry holds the task id, a SHA-256 over the whole contract (every field except `status`, `acceptance_hash`, `approved_by`, `approved_at`, `attempts`, `attempt_resets`, `links`, and the tick-written completion fields of `owner_steps` (`done_at`, `done_by`, `evidence`)), `approved_by` and `approved_at`. `pick()` and run start return only tasks whose current contract hash matches a ledger entry; a `ready` task without a match is demoted to `draft`, with the reason named. An existing queue is adopted by one interactive owner command that shows each ready task and records it; it has no `--yes` for risk-flagged tasks, matching approve's rule. Tests: a hand-minted `ready` task with a correct `acceptance_hash` is never picked; an edit after approval to `risk`, `gates`, `budget`, `out_of_scope` or `acceptance` demotes the task; an approved task is picked; a ledger line rewritten in place refuses the load; ticking an owner step after approval does not demote.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f63.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "The profile's security-relevant content is owner-approved. Keys covered: `commands.*`, `sentinels`, `network_allowlist`, `docs_allowlist`, `sandbox.*`, `repo.remote`, `repo.default_branch`, `repo.branch_protection`, `paths.protected`, `paths.risk`, `live_checks`, `toolkit`, and, once F-59 lands, its `provider` and `data_owner` blocks. These keys are hashed and must match an owner approval in the same ledger (`factory approve --profile`) before any session or gate runs; a changed profile refuses with the changed keys named. The approval prompt prints those keys, with network entries one per line. Tests cover the refusal for each key group, the approve path, and that unrelated keys don't need re-approval.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f63.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "Egress entries for token-bearing sessions are exact hosts. `network_allowlist`/`docs_allowlist` entries must be bare hostnames: no wildcard, IP literal, port, scheme or path — anything else refuses the profile at load. The srt settings of every session seat (implementer, reviewer, verifier, importer) contain only the model host plus entries the owner approved under AC-2. Tests read the generated settings and cover each refused form.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f63.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "Factory-control files are protected structurally. A schema-level default protected set holds `.factory/**` beside the runner-config globs; it is unioned in both seams that union runner config today — `apply_profile_defaults` and `check_diff_policy` — and a profile can widen protection but never remove it. Test: under a minimal profile with no `.factory` glob, an implementer edit to `.factory/project.yaml` yields `protected_path_touched`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f63.py::test_ac_4"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-64",
+      "title": "Parent-side budget accounting",
+      "source": "BUILD-ORDER.md#f-64--parent-side-budget-accounting",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-38",
+        "F-56"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "Turns are accounted from granted caps. Fan-out funding and attempt accounting use the caps the parent granted to seats already started; a seat whose record arrived on the outer-timeout path counts at its full granted cap. `record.num_turns` is telemetry only. Test: a planted `num_turns: 0` does not raise later seats' caps, and the sum of granted caps never exceeds `budget.max_turns`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f64.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Free quota requeues are bounded. A quota-classified attempt is requeued without counting toward `max_attempts` at most 2 times per task per calendar day (UTC), counted from the task's own attempt records (proposed value; owner decides at spec approval); beyond that it counts as an attempt, and a record's `reason` alone never grants more. Test: repeated planted 429 records reach `attempts_exhausted` within `max_attempts` plus 2 runs.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f64.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "Budgets are visible and bounded at approval. `render_contract` shows `max_turns`, `wall_clock_min` and `max_attempts`; the schema gains maxima — `max_turns` ≤ 200 and `wall_clock_min` ≤ 150 (proposed: the highest values in today's queue, so no existing entry fails to load; owner decides at spec approval). Test: the rendered contract contains the three numbers, over-maximum values fail schema validation, and the factory's own `.factory/tasks.json` still validates.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f64.py::test_ac_3"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "S",
         "max_attempts": 3,
         "max_turns": 200,
         "wall_clock_min": 150
