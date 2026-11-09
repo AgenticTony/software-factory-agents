@@ -28,6 +28,7 @@ import functools
 import hashlib
 import importlib.resources
 import json
+import re
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -97,6 +98,67 @@ def acceptance_hash(acceptance: list) -> str:
     return hashlib.sha256(canonical_json(acceptance).encode("utf-8")).hexdigest()
 
 
+# F-63 AC-1: the whole-contract hash covers every field EXCEPT what the
+# factory itself legitimately writes to a task after approval. This list
+# is pinned by test (tests/test_f63.py::test_contract_hash_exclusion_list):
+# anything else a task carries — including fields a future schema adds —
+# changes the hash.
+CONTRACT_HASH_EXCLUDED_FIELDS = (
+    "status",           # the lifecycle the ledger gates, not the contract
+    "acceptance_hash",  # written at approval, mirrors `acceptance`
+    "approved_by",      # written at approval
+    "approved_at",      # written at approval
+    "attempts",         # append-only run history
+    "attempt_resets",   # append-only budget history
+    "links",            # orchestrator-written PR/branch bookkeeping
+)
+
+# The tick-written completion fields of one owner step (F-63 AC-1):
+# `tick_owner_steps` writes all four together, so all four are outside
+# the hash — ticking an owner step after approval is not a contract
+# change. The step's `text` (and anything else) stays IN the hash.
+OWNER_STEP_HASH_EXCLUDED_FIELDS = ("done", "done_at", "done_by", "evidence")
+
+
+def contract_hash(task: dict) -> str:
+    """Hash a task's whole contract (F-63 AC-1).
+
+    SHA-256 over canonical JSON (sorted keys, fixed separators,
+    ``ensure_ascii=False``) of the task minus exactly
+    :data:`CONTRACT_HASH_EXCLUDED_FIELDS` and each owner step's
+    :data:`OWNER_STEP_HASH_EXCLUDED_FIELDS`. Unlike
+    :func:`acceptance_hash` (acceptance text only), this covers risk,
+    gates, budget, out_of_scope and every other contract field, so an
+    edit to ANY of them invalidates the owner's ledger approval and the
+    task goes back to draft. Acceptance list ORDER is semantic and kept
+    (it is the order criteria are proven in).
+
+    Args:
+        task: The task record.
+
+    Returns:
+        Hex SHA-256 digest.
+    """
+    trimmed = {
+        key: value for key, value in task.items()
+        if key not in CONTRACT_HASH_EXCLUDED_FIELDS
+    }
+    steps = []
+    for step in trimmed.get("owner_steps") or []:
+        if isinstance(step, dict):
+            steps.append({
+                key: value for key, value in step.items()
+                if key not in OWNER_STEP_HASH_EXCLUDED_FIELDS
+            })
+        else:
+            steps.append(step)
+    if steps or "owner_steps" in trimmed:
+        trimmed["owner_steps"] = steps
+    canonical = json.dumps(trimmed, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _field(task: dict, key: str) -> Any:
     """Read a task field only when it is a string.
 
@@ -106,6 +168,63 @@ def _field(task: dict, key: str) -> Any:
     """
     value = task.get(key)
     return value if isinstance(value, str) else None
+
+
+# F-63 R2-1(b): the control classes no PROFILE string may carry, and no
+# task string may carry outside its newline/tab exemptions. Same families
+# as factory.egress's seams (C0, DEL, C1, bidi/isolate); refused at load
+# with the key path named — a value that can rewrite the terminal (or
+# reorder what the owner reads) never reaches an approval prompt.
+_DISALLOWED_CONTROL_RE = re.compile(
+    r"[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]"
+)
+# Task free-text fields where \n and \t are legitimate today (the real
+# queue's attempts[].note is multi-line; tick evidence and text fields
+# may be). Every other control class is refused there too.
+_TASK_FREE_TEXT_KEYS = frozenset({"note", "evidence", "text"})
+
+
+def _iter_string_paths(value: Any, path: str):
+    """Yield ``(path, string)`` for every string in a JSON-shaped value."""
+    if isinstance(value, str):
+        yield path, value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from _iter_string_paths(item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from _iter_string_paths(item, f"{path}[{index}]")
+
+
+def _check_control_strings(
+    value: Any, origin: str, where: str, *, free_text_newline: bool
+) -> None:
+    """Refuse control characters in every string under ``value``.
+
+    Args:
+        value: The JSON-shaped value to walk (a profile, a task).
+        origin: File name for the error message.
+        where: What the walk names in the message (the profile itself,
+            or the task id).
+        free_text_newline: Exempt ``\n``/``\t`` — but no other control
+            class — inside the task free-text fields
+            (:data:`_TASK_FREE_TEXT_KEYS`). Profiles pass False: no
+            profile string may carry any control, newline and tab
+            included.
+    """
+    for path, text in _iter_string_paths(value, where):
+        exempt = free_text_newline and path.rsplit(".", 1)[-1] in _TASK_FREE_TEXT_KEYS
+        for position, char in enumerate(text):
+            if not _DISALLOWED_CONTROL_RE.match(char):
+                continue
+            if exempt and char in ("\n", "\t"):
+                continue
+            raise ContractError(
+                f"{origin}: {where}: {path} carries the control character "
+                f"U+{ord(char):04X} at offset {position} — control "
+                "sequences and bidi controls are refused at load: they "
+                "can rewrite the terminal an approval prompt prints to"
+            )
 
 
 def _check_semantics(tasks: Any, origin: str) -> None:
@@ -137,6 +256,10 @@ def _check_semantics(tasks: Any, origin: str) -> None:
                 )
             seen_ids.add(tid)
         tid = tid if isinstance(tid, str) else "<missing id>"
+        # F-63 R2-1(b): control characters refused in every task string
+        # (newline/tab exempt in the free-text fields only).
+        _check_control_strings(task, origin, f"task {tid}",
+                               free_text_newline=True)
         risk = task.get("risk")
         # bound once so the isinstance guard narrows the .get below
         gates_value = task.get("gates")
@@ -694,6 +817,48 @@ def resolve_test_ref(repo: Path | str, ref: Any) -> str | None:
     return None
 
 
+# F-63 AC-3: an egress allowlist entry is one exact, lowercase ASCII DNS
+# name. Each label is [a-z0-9]([a-z0-9-]{0,61}[a-z0-9])? (RFC 1123 label
+# shape, 63-char ceiling), at least one dot, and the final label is not
+# all-numeric (kills IPv4 literals and integer-IP payloads alike).
+# fullmatch — a ``^…$`` pattern admits a trailing newline (the F-62
+# lesson). Everything else refuses at load with the entry named: a
+# wildcard, scheme, port, path, IP literal, uppercase, non-ASCII, a
+# trailing dot, padding, an empty string.
+_ALLOWLIST_LABEL = r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
+_ALLOWLIST_HOST_RE = re.compile(rf"{_ALLOWLIST_LABEL}(\.{_ALLOWLIST_LABEL})+")
+
+
+def _check_allowlist_hosts(data: dict, origin: str) -> None:
+    """Refuse any network/docs allowlist entry that is not one exact
+    lowercase DNS host (F-63 AC-3).
+
+    The srt allowlist is the egress boundary of sessions that hold the
+    shared provider token, and pinned srt 0.0.79 matches a bare entry
+    EXACTLY (``h === pattern``; only ``*.base`` widens — verified in the
+    pinned source, pinned by test). So the admitted form is precisely
+    the exact-host form; anything broader or stranger is a misconfigured
+    or hostile entry and refuses the profile at load, the entry named.
+    """
+    for key in ("network_allowlist", "docs_allowlist"):
+        entries = data.get(key)
+        if not isinstance(entries, list):
+            continue  # the schema types the field
+        for entry in entries:
+            if not isinstance(entry, str) or (
+                not _ALLOWLIST_HOST_RE.fullmatch(entry)
+                or entry.rsplit(".", 1)[-1].isdigit()
+            ):
+                raise ContractError(
+                    f"{origin}: {key} entry {entry!r} is not one exact "
+                    "lowercase DNS host (labels [a-z0-9-], at least one dot, "
+                    "final label not all-numeric) — no wildcard, scheme, "
+                    "port, path, IP literal or padding is admitted, because "
+                    "the allowlist is the egress boundary of a session that "
+                    "holds the provider token"
+                )
+
+
 def _check_profile_semantics(data: dict, origin: str, *,
                              toolkit_root: Path | str | None = None) -> None:
     """Readable front-end checks on a parsed profile (schema backs them).
@@ -721,11 +886,20 @@ def _check_profile_semantics(data: dict, origin: str, *,
     # builders the queue's project does; the schema's ``^…$`` pattern
     # admits a trailing newline (Python re ``$``), so the fullmatch
     # here is the load-bearing spelling (queue-side: validate_queue).
+    # Runs BEFORE the control-string walk (F-63 R2-1) so a bad name gets
+    # the slug refusal that NAMES the value, not the control-character
+    # one that names the key path — the slug rule subsumes controls.
     if "name" in data:
         try:
             project_component(data["name"])
         except ProjectSlugError as exc:
             raise ContractError(f"{origin}: {exc}") from exc
+    # F-63 AC-3: exact-host egress entries, refused at load (see
+    # _check_allowlist_hosts).
+    _check_allowlist_hosts(data, origin)
+    # F-63 R2-1(b): no control character in ANY profile string — the
+    # profile feeds the approval prompt and the run's own paths.
+    _check_control_strings(data, origin, "profile", free_text_newline=False)
     _check_profile_toolkit(data.get("toolkit"), origin,
                            toolkit_root=toolkit_root)
 
@@ -767,16 +941,51 @@ def runner_config_policy(schema_path: Path | None = None) -> dict:
     return copy.deepcopy(policy)
 
 
+def default_protected_control(schema_path: Path | None = None) -> list:
+    """The schema-level factory-control protection set (F-63 AC-4).
+
+    THE one copy lives in the project schema (``$defs.
+    defaultProtectedControl.const``) beside the runner-config default;
+    this reads it. ``.factory/**`` is the security config itself — the
+    profile, the queue, the approval-adjacent state a client repo or an
+    implementer rewrite could otherwise reshape — and its protection is
+    structural, never each profile's own opt-in (the audit's finding:
+    the config deciding whether the config is protected is
+    self-referential). Unioned into ``paths.protected`` by
+    :func:`apply_profile_defaults` and independently re-unioned by
+    :func:`factory.l0.check_diff_policy`; a profile can only widen.
+
+    Raises:
+        ContractError: If the schema is missing the ``$defs`` entry —
+            the control-protection default is judge state; the factory
+            refuses to guess it.
+    """
+    path = Path(schema_path) if schema_path is not None else (
+        SCHEMA_DIR / "project.schema.json"
+    )
+    try:
+        globs = _schema_document(path)["$defs"]["defaultProtectedControl"]["const"]
+    except (KeyError, TypeError) as exc:
+        raise ContractError(
+            f"schema {path} is missing $defs.defaultProtectedControl.const — "
+            "the factory-control protection default is judge state; "
+            "refusing to guess it"
+        ) from exc
+    return copy.deepcopy(globs)
+
+
 def apply_profile_defaults(profile: dict, schema_path: Path | None = None) -> dict:
-    """Union the schema-level runner-config defaults into a profile.
+    """Union the schema-level defaults into a profile.
 
     The ONE route every profile-shaped mapping takes: ``load_profile``
     after validation, and the in-code synthetic profiles eval and the
     rehearsal fixture build. ``paths.protected`` gains the default
-    protected globs (conftest, pytest.ini) — a profile can only ADD to
-    the default set, never remove from it (F-46 AC-4), so every consumer
-    reading ``paths.protected`` downstream (L0's diff policy, the seats'
-    protected-path hook, the reviewer prompt) sees the same widened set.
+    protected globs — the runner-config set (conftest, pytest.ini,
+    F-46 AC-4) and the factory-control set (``.factory/**``, F-63
+    AC-4) — so a profile can only ADD to either set, never remove from
+    it, and every consumer reading ``paths.protected`` downstream (L0's
+    diff policy, the seats' protected-path hook, the reviewer prompt)
+    sees the same widened set.
 
     Args:
         profile: The profile mapping (validated, when it came from disk).
@@ -785,7 +994,8 @@ def apply_profile_defaults(profile: dict, schema_path: Path | None = None) -> di
     Returns:
         The same mapping, with ``paths.protected`` widened.
     """
-    globs = runner_config_policy(schema_path)["protected_globs"]
+    globs = [*runner_config_policy(schema_path)["protected_globs"],
+             *default_protected_control(schema_path)]
     paths = profile.setdefault("paths", {})
     protected = list(paths.get("protected") or [])
     protected += [glob for glob in globs if glob not in protected]

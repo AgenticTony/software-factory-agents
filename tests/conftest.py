@@ -33,6 +33,28 @@ def _no_ambient_spend(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _pin_factory_root_default(monkeypatch, tmp_path):
+    """F-63: no test may write into the real ~/factory — including the
+    approval ledger.
+
+    ``factory approve``/reconcile (approve.py), the importer session's
+    profile check (importer.py) and the ledger's own default resolution
+    (approvals.py) each hold their own binding of
+    ``FACTORY_ROOT_DEFAULT``; a test that exercises them without an
+    explicit ``--factory-root`` (or its own pin, as
+    test_importer_project_name's ``_pin_default_root`` does) would
+    otherwise append approval entries to the OWNER'S real ledger. The
+    per-test pin below is the floor; a test's own later monkeypatch
+    still wins.
+    """
+    from _support.f63 import pin_factory_root_default
+
+    pin_factory_root_default(
+        monkeypatch, tmp_path / "factory-default-root"
+    )
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """Refuse to run the suite against another checkout's code.
 

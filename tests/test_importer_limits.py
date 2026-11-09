@@ -28,19 +28,32 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _support.f63 import importer_fixture_approve
 
-from factory import importer
+import factory.importer as importer
 from factory.cli import main
 from factory.importer import (
     DEFAULT_MAX_TURNS,
     DEFAULT_TIMEOUT_MIN,
     ImportRefused,
-    run_import,
+)
+from factory.importer import (
+    run_import as _run_import,
 )
 from factory.session import SessionRecord
 
 # ------------------------------------------------------------- fixtures --
 
+
+def run_import(repo, *args, **kwargs):
+    """F-63: the real session path checks the profile against the owner
+    ledger — approve this fixture's profile under the factory root this
+    call uses (the importer's own default when none was passed, so a
+    monkeypatched default is honoured), then delegate to the real one."""
+    root = kwargs.get("factory_root") or importer.FACTORY_ROOT_DEFAULT
+    if kwargs.get("session") is None:  # only the real path checks the ledger
+        importer_fixture_approve(root, repo)
+    return _run_import(repo, *args, **kwargs)
 
 def _profile_yaml() -> str:
     """The smallest profile the project schema accepts (name ``proj``)."""
@@ -175,6 +188,7 @@ def test_cli_flags_reach_the_session_call(tmp_path: Path, monkeypatch):
     repo = _repo(tmp_path)
     captured = _patch_session(monkeypatch, _completed)
     monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    importer_fixture_approve(tmp_path / "froot", repo)  # F-63: real path
     rc = main(["import", "--repo", str(repo),
                "--factory-root", str(tmp_path / "froot"),
                "--max-turns", "9", "--timeout-min", "4.25"])

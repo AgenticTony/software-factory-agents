@@ -658,12 +658,17 @@ class DashboardServer(http.server.ThreadingHTTPServer):
         self.dashboard.port = self.server_address[1]
 
 
-def make_server(factory_root: Path | str = FACTORY_ROOT_DEFAULT,
+def make_server(factory_root: Path | str | None = None,
                 queue: Path | str | None = None,
                 port: int = DEFAULT_PORT) -> DashboardServer:
     """Bind the dashboard server on ``127.0.0.1:<port>`` (port 0 lets the
     OS pick). Serving is the caller's job: ``serve_forever()`` for the
     CLI, a thread for a test."""
+    if factory_root is None:
+        # CALL-time lookup (F-63 R1): a default ARGUMENT binds at import,
+        # beyond the reach of any later patch — the suite's factory-root
+        # pin depends on this resolution happening here.
+        factory_root = FACTORY_ROOT_DEFAULT
     queue_path = (Path(queue) if queue is not None
                   else Path(factory_root) / ".factory" / "tasks.json")
     return DashboardServer(factory_root, queue_path, port)

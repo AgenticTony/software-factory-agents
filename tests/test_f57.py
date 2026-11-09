@@ -45,8 +45,10 @@ from _support.f57 import (
     _prose_repo,
     _wo,
 )
+from _support.f63 import importer_fixture_approve
 from _support.tokens import fake_token
 
+import factory.importer as importer
 from factory.contract import load_tasks
 from factory.importer import (
     FORBIDDEN_FIELDS,
@@ -55,9 +57,11 @@ from factory.importer import (
     build_import_prompt,
     build_proposal_schema,
     read_out_of_scope,
-    run_import,
     scaled_import_budget,
     validate_budget,
+)
+from factory.importer import (
+    run_import as _run_import,
 )
 from factory.session import SessionRecord, build_options
 
@@ -68,6 +72,16 @@ SEAT_TOKEN = fake_token("f57-seat")
 
 # ------------------------------------------------------------- helpers --
 
+
+def run_import(repo, *args, **kwargs):
+    """F-63: the real session path checks the profile against the owner
+    ledger — approve this fixture's profile under the factory root this
+    call uses (the importer's own default when none was passed, so a
+    monkeypatched default is honoured), then delegate to the real one."""
+    root = kwargs.get("factory_root") or importer.FACTORY_ROOT_DEFAULT
+    if kwargs.get("session") is None:  # only the real path checks the ledger
+        importer_fixture_approve(root, repo)
+    return _run_import(repo, *args, **kwargs)
 
 def _patch_real_session(monkeypatch, records) -> ScriptedRunner:
     """The offline real-session seam: run_session_sandboxed + a token,

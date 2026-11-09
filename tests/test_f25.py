@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import yaml
+from _support.f63 import ledger_approve
 from _support.tokens import fake_aws_key, fake_stripe_key
 
 from factory.contract import SCHEMA_DIR, ContractError, acceptance_hash, load_profile
@@ -548,6 +549,9 @@ class Env:
         return TaskQueue(self.queue_path).get(task_id)
 
     def run(self, session_runner, **kwargs):
+        # F-63: record the fixture's owner approvals (profile + frozen
+        # tasks) before the run — the ledger every run consults.
+        ledger_approve(self.root, self.queue_path)
         from factory.mergeorder import Protection
 
         kwargs.setdefault("now", lambda: OFF_PEAK)

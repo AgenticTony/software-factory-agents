@@ -105,6 +105,7 @@ from typing import Any, Callable, NamedTuple, Sequence
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
+from factory.approvals import require_profile_approval
 from factory.contract import (
     SCHEMA_DIR,
     ContractError,
@@ -2594,6 +2595,17 @@ def run_import(
                     f"{profile['name']!r}: a queue and profile that "
                     "disagree cannot name one project's namespace"
                 )
+        # F-63 AC-2: the importer session and its repair seat run under
+        # the profile's security-relevant content — the owner must have
+        # approved it before any session starts. The check hashes THIS
+        # dict; the session below and the repair path both receive it.
+        # (This module's FACTORY_ROOT_DEFAULT on purpose: tests patch it
+        # to redirect every factory-root path this module takes.)
+        require_profile_approval(
+            profile,
+            Path(factory_root) if factory_root else FACTORY_ROOT_DEFAULT,
+            origin=str(repo / ".factory" / "project.yaml"),
+        )
         if max_turns is None or timeout_min is None:
             scaled_turns, scaled_timeout = scaled_import_budget(
                 len(listing.kept)

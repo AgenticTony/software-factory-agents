@@ -31,6 +31,7 @@ from pathlib import Path
 
 import jsonschema
 import pytest
+from _support.f63 import importer_fixture_approve
 
 from factory import contract, importer, state
 from factory.cli import main
@@ -396,6 +397,7 @@ def test_ac_3(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr("factory.importer.run_session_sandboxed", fake_session)
     monkeypatch.setattr("factory.importer.seat_token", lambda: "tok")
+    importer_fixture_approve(tmp_path / "froot", git_repo)  # F-63
     run_import(git_repo, factory_root=tmp_path / "froot")
     # At 200+ listed docs the turn count is ceiling-capped either way
     # (TURN_CEILING=200); the wall clock discriminates: 20 + 200/5 = 60

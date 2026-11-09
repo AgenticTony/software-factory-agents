@@ -41,7 +41,13 @@ from collections import namedtuple
 from collections.abc import Callable
 from pathlib import Path
 
+from factory.approvals import (
+    PROFILE_SECURITY_GROUPS,
+    ApprovalLedger,
+    ApprovalLedgerError,
+)
 from factory.contract import NON_EXECUTABLE_KINDS, ContractError, acceptance_hash
+from factory.egress import escape_approval_text
 from factory.mergeorder import gh_pr_state
 from factory.progress import ProgressLog, ProgressLogError
 from factory.publish import PublishError
@@ -112,30 +118,40 @@ def render_contract(task: dict) -> str:
     budget = task.get("budget") or {}
     risk = task.get("risk") or []
     deps = task.get("depends_on") or []
+
+    def show(value) -> str:
+        # F-63 R2-1: every interpolated value escapes its control
+        # characters — a value that can rewrite the terminal can rewrite
+        # what the owner believes they approved.
+        return escape_approval_text(str(value))
+
     lines = [
-        f"{task.get('id')} — {task.get('title')}",
+        f"{show(task.get('id'))} — {show(task.get('title'))}",
         "  kind: {}   priority: {}   budget: {} (max {} attempts)".format(
-            task.get("kind"),
-            task.get("priority"),
-            budget.get("size", "?"),
-            budget.get("max_attempts", "?"),
+            show(task.get("kind")),
+            show(task.get("priority")),
+            show(budget.get("size", "?")),
+            show(budget.get("max_attempts", "?")),
         ),
-        f"  source: {task.get('source')}",
-        f"  risk: {', '.join(risk) if risk else '(none)'}",
-        f"  depends_on: {', '.join(deps) if deps else '(none)'}",
+        f"  source: {show(task.get('source'))}",
+        f"  risk: {show(', '.join(risk) if risk else '(none)')}",
+        f"  depends_on: {show(', '.join(deps) if deps else '(none)')}",
         "  acceptance (frozen on approval):",
     ]
     for item in task.get("acceptance") or []:
         check = item.get("check", {})
-        lines.append(f"    {item.get('id')}: {item.get('text')}")
+        lines.append(f"    {show(item.get('id'))}: {show(item.get('text'))}")
         if check.get("ref"):
-            lines.append(f"      check: {check.get('type')} {check.get('ref')}")
+            lines.append(
+                f"      check: {show(check.get('type'))} {show(check.get('ref'))}"
+            )
     for step in task.get("owner_steps") or []:
         mark = "x" if step.get("done") else " "
-        lines.append(f"  owner step [{mark}]: {step.get('text')}")
+        lines.append(f"  owner step [{mark}]: {show(step.get('text'))}")
     for slice_ in task.get("slices") or []:
         lines.append(
-            f"  slice {slice_.get('id')} [{slice_.get('status')}]: {slice_.get('text')}"
+            f"  slice {show(slice_.get('id'))} [{show(slice_.get('status'))}]: "
+            f"{show(slice_.get('text'))}"
         )
     return "\n".join(lines)
 
@@ -214,6 +230,7 @@ def approve_task(
     assume_yes: bool = False,
     confirm: Callable[[str], bool] = input_confirm,
     echo: Callable[[str], None] = print,
+    factory_root: Path | None = None,
 ) -> str:
     """Print a draft task's contract, confirm, freeze it, and route it.
 
@@ -221,9 +238,13 @@ def approve_task(
     not a draft, is of a non-executable kind, has no acceptance items
     (AC-1), or is risk-flagged while ``assume_yes`` is set (AC-3). On
     confirmation the contract is frozen (``acceptance_hash``,
-    ``approved_at``, ``approved_by``) and the task moves
-    ``draft -> ready`` or ``draft -> blocked`` per the picker's
-    dependency rule (AC-2) in a single validated save.
+    ``approved_at``, ``approved_by``), the approval is recorded in the
+    owner ledger (F-63 AC-1: the task's whole-contract hash, before the
+    status moves — a ledger entry for a task that never left draft is
+    harmless history, while an approved task with no entry would be
+    demoted straight back), and the task moves ``draft -> ready`` or
+    ``draft -> blocked`` per the picker's dependency rule (AC-2) in a
+    single validated save.
 
     Args:
         queue: The queue to write through (its only writer path).
@@ -233,12 +254,17 @@ def approve_task(
             risk-flagged tasks.
         confirm: Interactive confirmation callable; injected in tests.
         echo: Output callable for the contract; injected in tests.
+        factory_root: Factory root for the approval ledger (default
+            ``~/factory``).
 
     Returns:
         The new status: ``ready`` or ``blocked``.
 
     Raises:
-        ApprovalError: On any refusal, or an unknown task.
+        ApprovalError: On any refusal, or an unknown task — or when the
+            ledger append failed, in which case NOTHING was written to
+            the queue (approve loudly refuses to produce an approved task
+            the ledger doesn't cover).
         ApprovalDeclined: When the human answers no (or the prompt hits
             EOF).
         ContractError: If the resulting queue wouldn't validate.
@@ -255,6 +281,18 @@ def approve_task(
     if not assume_yes and not confirm(f"Approve {task_id}?"):
         raise ApprovalDeclined(f"{task_id}: approval declined")
     _freeze_contract(task, approved_by)
+    ledger = ApprovalLedger.for_project(
+        factory_root or FACTORY_ROOT_DEFAULT,
+        queue.doc.get("project") or "unknown",
+    )
+    try:
+        ledger.record_task_for(task, approved_by=approved_by,
+                               approved_at=task["approved_at"])
+    except ApprovalLedgerError as exc:
+        raise ApprovalError(
+            f"{task_id}: the approval ledger refused the entry and nothing "
+            f"was written to the queue — {exc}"
+        ) from exc
     new_status = (
         "blocked" if unmet_dependencies(task, queue.doc.get("tasks", [])) else "ready"
     )
@@ -681,6 +719,7 @@ def _reconcile_entry(
     approved_by: str,
     confirm: Callable[[str], bool],
     echo: Callable[[str], None],
+    ledger: ApprovalLedger | None = None,
 ) -> ReconcileResult:
     """Reconcile one ledger entry; never raises, failures become results."""
     tid = entry["id"]
@@ -712,17 +751,27 @@ def _reconcile_entry(
             "in dependency order",
         )
     echo(render_contract(task))
-    markers = ", ".join(f"{ac}={m}" for ac, m in sorted(entry["criteria"].items()))
+    markers = ", ".join(
+        f"{escape_approval_text(str(ac))}={escape_approval_text(str(m))}"
+        for ac, m in sorted(entry["criteria"].items())
+    )
     echo(f"Ledger evidence: {markers or '(no criterion markers)'}")
     echo(f"Recorded status to set: {target}")
     if not confirm(f"Approve {tid} and advance it to {target}?"):
         return ReconcileResult(tid, "skipped", "declined")
     try:
-        # One atomic save: freeze the contract, then move through the
-        # whole validated path to the final status. A refusal anywhere
-        # leaves the file untouched — no half-approved task.
+        # One atomic save: record the owner approval, freeze the
+        # contract, then move through the whole validated path to the
+        # final status. A refusal anywhere leaves the file untouched —
+        # no half-approved task. The ledger entry is written BEFORE the
+        # move (the approve_task order): an entry for a task that never
+        # moved is harmless history, an approved task the ledger doesn't
+        # cover would be demoted straight back (F-63).
         _check_approvable(task)
         _freeze_contract(task, approved_by)
+        if ledger is not None:
+            ledger.record_task_for(task, approved_by=approved_by,
+                                   approved_at=task["approved_at"])
         final, path = _reconcile_route(task, queue.doc.get("tasks", []), target)
         queue.transition_path(tid, path)
     except ContractError as exc:
@@ -740,24 +789,25 @@ def reconcile_bootstrap(
     approved_by: str,
     confirm: Callable[[str], bool] = input_confirm,
     echo: Callable[[str], None] = print,
+    factory_root: Path | None = None,
 ) -> list:
     """Approve and advance the tasks named by the bootstrap ledger (AC-4).
 
     For each ledger entry, in file order: print the contract and the
     entry's evidence markers, confirm interactively (reconcile has no
     ``--yes`` — the ledger is plain markdown and this command turns it
-    into ``done`` tasks), then freeze the contract and apply the entry's
-    final status through :meth:`TaskQueue.transition_path` — the whole
-    path validated as legal F-03 transitions, written in one atomic
-    save, never persisting intermediate statuses. A recorded status that
-    asserts the build passed validation (``in_review`` and beyond)
-    requires every acceptance criterion to be marked ``proven``;
-    pending, not met, or unmentioned criteria refuse the entry. A
-    recorded ``done`` with owner steps still open reconciles to
-    ``awaiting_owner``. Entries whose task is no longer draft are
-    skipped, so re-running after a partial reconcile is safe. One
-    entry's failure never stops the others; every outcome is reported in
-    the returned summary.
+    into ``done`` tasks), then freeze the contract, record the approval
+    in the owner ledger (F-63 AC-1) and apply the entry's final status
+    through :meth:`TaskQueue.transition_path` — the whole path validated
+    as legal F-03 transitions, written in one atomic save, never
+    persisting intermediate statuses. A recorded status that asserts the
+    build passed validation (``in_review`` and beyond) requires every
+    acceptance criterion to be marked ``proven``; pending, not met, or
+    unmentioned criteria refuse the entry. A recorded ``done`` with
+    owner steps still open reconciles to ``awaiting_owner``. Entries
+    whose task is no longer draft are skipped, so re-running after a
+    partial reconcile is safe. One entry's failure never stops the
+    others; every outcome is reported in the returned summary.
 
     Args:
         queue: The queue to write through.
@@ -766,6 +816,8 @@ def reconcile_bootstrap(
         confirm: Interactive confirmation callable; injected in tests.
         echo: Output callable for contracts and summaries; injected in
             tests.
+        factory_root: Factory root for the approval ledger (default
+            ``~/factory``).
 
     Returns:
         One :class:`ReconcileResult` per entry, in ledger order; action
@@ -780,7 +832,139 @@ def reconcile_bootstrap(
         raise ApprovalError(
             f"{ledger_path}: cannot read bootstrap ledger: {exc}"
         ) from exc
+    ledger = ApprovalLedger.for_project(
+        factory_root or FACTORY_ROOT_DEFAULT,
+        queue.doc.get("project") or "unknown",
+    )
     return [
-        _reconcile_entry(queue, entry, approved_by, confirm, echo)
+        _reconcile_entry(queue, entry, approved_by, confirm, echo, ledger)
         for entry in parse_bootstrap_ledger(text)
     ]
+
+
+def render_profile_security(profile: dict) -> str:
+    """Render the profile's security-relevant groups for the owner.
+
+    One block per group (the F-63 AC-2 set), network entries one per
+    line; a missing group renders as ``(absent)`` so REMOVAL is as
+    visible as a change.
+    """
+    lines = [f"profile {profile.get('name')} — security-relevant content:"]
+    for group in PROFILE_SECURITY_GROUPS:
+        value: object = profile
+        for key in PROFILE_SECURITY_GROUPS[group]:
+            value = value.get(key) if isinstance(value, dict) else None
+        # The two groups that name WHAT the factory clones or pushes to
+        # render with every non-ASCII character escaped too — a
+        # homoglyph remote reads as its codepoints, not as the real host.
+        homoglyph_sensitive = group in ("repo.path", "repo.remote")
+        if group == "repo.path" and isinstance(value, str):
+            # The approved form: what the run will actually clone.
+            value = str(Path(value).expanduser().resolve())
+        if value is None:
+            lines.append(f"  {group}: (absent)")
+        elif isinstance(value, list):
+            lines.append(f"  {group}:")
+            entries = [
+                f"    - {escape_approval_text(str(entry))}" for entry in value
+            ]
+            lines += entries or ["    (empty)"]
+        elif isinstance(value, str):
+            lines.append(
+                f"  {group}: "
+                f"{escape_approval_text(value, escape_non_ascii=homoglyph_sensitive)}"
+            )
+        else:
+            lines.append(f"  {group}: {escape_approval_text(str(value))}")
+    return "\n".join(lines)
+
+
+def approve_profile(
+    profile: dict,
+    factory_root: Path | str | None = None,
+    *,
+    approved_by: str,
+    confirm: Callable[[str], bool] = input_confirm,
+    echo: Callable[[str], None] = print,
+) -> None:
+    """Show the profile's security-relevant content, confirm, record it.
+
+    F-63 AC-2: the approval prompt prints the covered groups — network
+    entries one per line — and asks interactively. There is no ``--yes``
+    for this command at all: the whole point is that a human read the
+    egress allowlist, the commands, the sandbox knobs. The recorded
+    entry hashes the SAME dict the caller will run with (load once,
+    approve what you loaded).
+
+    Raises:
+        ApprovalError: On a declined prompt or a ledger refusal
+            (nothing recorded).
+        ApprovalDeclined: When the human answers no (or EOF).
+    """
+    echo(render_profile_security(profile))
+    if not confirm(f"Approve this profile's security content for "
+                   f"{profile.get('name')}?"):
+        raise ApprovalDeclined(
+            f"{profile.get('name')}: profile approval declined"
+        )
+    ledger = ApprovalLedger.for_project(factory_root, profile["name"])
+    try:
+        ledger.record_profile_for(profile, approved_by=approved_by)
+    except ApprovalLedgerError as exc:
+        raise ApprovalError(
+            f"{profile.get('name')}: the approval ledger refused the entry "
+            f"and nothing was approved — {exc}"
+        ) from exc
+
+
+def adopt_queue(
+    queue: TaskQueue,
+    factory_root: Path | str | None = None,
+    *,
+    approved_by: str,
+    confirm: Callable[[str], bool] = input_confirm,
+    echo: Callable[[str], None] = print,
+) -> list:
+    """Adopt an existing queue into the owner ledger (F-63 AC-1).
+
+    For every task in an approvable-or-later status whose CURRENT
+    contract hash has no ledger entry — a queue that predates the
+    ledger, or one assembled where it lives today (the client repo) —
+    show the contract and record the approval on confirm. Always
+    interactive (there is no ``--yes`` path here at all, so a
+    risk-flagged task can never be adopted non-interactively — the
+    approve rule). Done tasks are skipped: merged work needs no entry.
+
+    Returns:
+        One :class:`ReconcileResult` per task, action ``adopted``,
+        ``skipped`` or ``failed``.
+    """
+    from factory.contract import contract_hash
+    from factory.state import CONTRACT_FROZEN_STATUSES
+
+    ledger = ApprovalLedger.for_project(
+        factory_root or FACTORY_ROOT_DEFAULT,
+        queue.doc.get("project") or "unknown",
+    )
+    results: list = []
+    for task in queue.doc.get("tasks", []):
+        status = task.get("status")
+        if status not in CONTRACT_FROZEN_STATUSES or status == "done":
+            continue
+        if ledger.has_contract(task.get("id", ""), contract_hash(task)):
+            continue
+        echo(render_contract(task))
+        if not confirm(f"Adopt {task.get('id')} (currently {status}) "
+                       "into the owner ledger?"):
+            results.append(ReconcileResult(task.get("id"), "skipped", "declined"))
+            continue
+        try:
+            ledger.record_task_for(task, approved_by=approved_by)
+        except ApprovalLedgerError as exc:
+            results.append(ReconcileResult(task.get("id"), "failed", str(exc)))
+            continue
+        results.append(
+            ReconcileResult(task.get("id"), "adopted",
+                            f"recorded at status {status}")
+        )
+    return results

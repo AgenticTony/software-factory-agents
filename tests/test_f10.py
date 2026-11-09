@@ -31,6 +31,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import yaml
+from _support.f63 import ledger_approve
 
 from factory import l0 as l0_module
 from factory import l1 as l1_module
@@ -171,6 +172,9 @@ class Env:
         subprocess.run(
             ["git", "clone", "--bare", "-q", str(self.repo), str(self.remote)], check=True
         )
+        # F-63: record the fixture's owner approvals (profile + frozen
+        # tasks) into its factory root — the ledger every run consults.
+        ledger_approve(self.root, self.queue_path)
         self.prs: list[PullRequest] = []
 
     # The open_pr seam: record, never call gh.
@@ -1704,6 +1708,9 @@ def test_rehearsal_run_refuses_when_the_remote_is_unreachable(tmp_path):
     profile = yaml.safe_load(env.profile_path.read_text())
     profile["repo"]["remote"] = str(tmp_path / "does-not-exist.git")
     env.profile_path.write_text(yaml.safe_dump(profile))
+    # F-63: the rewrite changed a covered group — re-approve the profile
+    # so the refusal under test is the fetch, not the ledger.
+    ledger_approve(env.root, env.queue_path, tasks=False)
     seats = Seats()
     with pytest.raises(Exception, match="(?i)fetch"):
         env.run(seats)

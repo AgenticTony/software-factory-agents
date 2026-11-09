@@ -26,6 +26,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
+from _support.f63 import importer_fixture_approve, ledger_approve
 from _support.tokens import fake_jwt, fake_token, fake_zai_key
 
 from factory.contract import acceptance_hash, load_profile
@@ -154,6 +155,8 @@ class _Env:
     def run(self, seats):
         from factory.mergeorder import Protection
 
+        # F-63: record the fixture's owner approvals before the run.
+        ledger_approve(self.root, self.queue_path)
         return run_once(
             self.queue_path, factory_root=self.root, session_runner=seats,
             open_pr=self.open_pr, now=lambda: OFF_PEAK,
@@ -827,6 +830,7 @@ def test_review2(tmp_path, monkeypatch):
     root = tmp_path / "home-factory"
     monkeypatch.setattr("factory.importer.FACTORY_ROOT_DEFAULT", root)
     monkeypatch.setattr("factory.importer.seat_token", lambda: SEAT_TOKEN)
+    importer_fixture_approve(root, repo)  # F-63: the real session's profile
     # A proposal naming the wrong project refuses AFTER the session ran;
     # its title carries both planted secrets (the real-session keep path).
     poisoned = _wo_task(
@@ -1237,6 +1241,7 @@ def test_review11_cli_keep_scrubs_literal(tmp_path, monkeypatch, capsys):
     root = tmp_path / "home-factory"
     monkeypatch.setattr("factory.importer.FACTORY_ROOT_DEFAULT", root)
     monkeypatch.setattr("factory.importer.seat_token", lambda: SEAT_TOKEN)
+    importer_fixture_approve(root, repo)  # F-63: the real session's profile
     # The CLI's keep path uses ITS OWN seat_token import — plant there
     # too, or the test would scrub with the real keychain item.
     monkeypatch.setattr("factory.cli.seat_token", lambda: SEAT_TOKEN)

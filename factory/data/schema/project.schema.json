@@ -41,6 +41,12 @@
       "type": "array",
       "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" }
     },
+    "defaultProtectedControl": {
+      "description": "F-63 AC-4: the factory-control surface is protected by default, structurally — .factory/** is the security config itself (the profile, the queue), and whether it is protected must not be decided by its own content (a client-supplied or implementer-rewritten profile simply omitting the opt-in, the audit's finding). Unioned into paths.protected by the profile loader AND independently re-unioned by L0's diff policy, so a hand-built profile dict cannot narrow it either; a profile can only widen.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "const": [".factory/**"]
+    },
     "toolkitChoice": {
       "type": "object",
       "additionalProperties": false,

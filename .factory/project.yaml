@@ -234,6 +234,15 @@ paths:
     # protected sandbox/publish/runs/trace/contract modules — the same
     # precedent, protected from the day they exist.
     - "tests/test_f62.py"
+    # F-63: the owner-approval contract tests (the task/profile ledger,
+    # exact-host egress entries, structural .factory protection) judge
+    # the protected approvals/contract/state/orchestrator/approve
+    # modules and the ledger schema itself — same precedent.
+    - "tests/test_f63.py"
+    # F-63: the approval ledger module is judge surface (it decides what
+    # the owner approved — the factory/attribution.py and factory/egress.py
+    # precedent: a session must not edit what gates it).
+    - "factory/approvals.py"
     # F-43 review round 1: the seam itself and its vent wiring, the F-42
     # factory/attribution.py precedent — a factory-built PR must not be
     # able to weaken the C-1 fix (scrub_session_text returning its input,

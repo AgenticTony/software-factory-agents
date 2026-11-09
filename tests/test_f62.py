@@ -35,6 +35,7 @@ from pathlib import Path
 
 import pytest
 from _support.f05 import _fixture_repo
+from _support.f63 import ledger_approve
 
 from factory.publish import PushRefused, push_branch
 from factory.runs import create_run
@@ -971,6 +972,10 @@ class _Env:
                         "--format=%(refname)", "refs/heads").split())
 
     def run(self, session_runner, **kwargs):
+
+        # F-63: record the fixture's owner approvals (profile +
+        # frozen tasks) before the run — the ledger every run consults.
+        ledger_approve(self.root, self.queue_path)
         from zoneinfo import ZoneInfo
 
         from factory.mergeorder import Protection

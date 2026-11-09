@@ -87,7 +87,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from factory.attribution import attribution_match
-from factory.contract import runner_config_policy
+from factory.contract import default_protected_control, runner_config_policy
 from factory.egress import strip_control_sequences
 from factory.gates import (
     CommandResult,
@@ -562,7 +562,11 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
     # HERE as well as in load_profile — the protection is structural, so
     # even a hand-built profile dict (a test fixture, a future caller)
     # cannot narrow it. A profile can only widen the set.
-    runner_globs = runner_config_policy()["protected_globs"]
+    # F-63 AC-4: the factory-control set (.factory/**) unions in the
+    # same way, at the same seam — the security config protects itself
+    # whatever the profile (or a hand-built dict) says.
+    runner_globs = [*runner_config_policy()["protected_globs"],
+                    *default_protected_control()]
     protected = (
         declared + sorted(contract_files)
         + [glob for glob in runner_globs if glob not in declared]

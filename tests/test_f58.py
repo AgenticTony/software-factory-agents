@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo
 import pytest
 import yaml
 from _support import wait_until
+from _support.f63 import ledger_approve
 
 from factory.contract import acceptance_hash
 from factory.mergeorder import Protection
@@ -163,6 +164,9 @@ class Env:
         return TaskQueue(self.queue_path).get(task_id)
 
     def run(self, session_runner=None, **kwargs):
+        # F-63: record the fixture's owner approvals (profile + frozen
+        # tasks) before the run — the ledger every run consults.
+        ledger_approve(self.root, self.queue_path)
         kwargs.setdefault("now", lambda: OFF_PEAK)
         kwargs.setdefault("protection", _protection(
             PLAN_LIMIT if self.profile["repo"].get("branch_protection")

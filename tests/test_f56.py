@@ -28,6 +28,7 @@ from pathlib import Path
 import pytest
 from _support.f05 import _child, _fixture_repo
 from _support.f12 import _git_repo
+from _support.f63 import importer_fixture_approve
 from _support.tokens import fake_token
 from claude_agent_sdk import ResultMessage
 
@@ -431,6 +432,7 @@ def test_ac_5(tmp_path: Path, monkeypatch):
 
     repo = _git_repo(tmp_path)
     factory_root = tmp_path / "factory-root"
+    importer_fixture_approve(factory_root, repo)  # F-63
 
     def broken_record(seat, prompt, run_dir, profile, **kwargs):
         # The session ran; the record never became usable (what

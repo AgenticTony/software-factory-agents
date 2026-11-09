@@ -15,6 +15,8 @@ from typing import Any
 
 from factory.approve import (
     ApprovalError,
+    adopt_queue,
+    approve_profile,
     approve_task,
     default_approver,
     reconcile_bootstrap,
@@ -82,12 +84,31 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument(
         "--yes",
         action="store_true",
-        help="non-interactive confirmation (refused for risk-flagged tasks)",
+        help="non-interactive confirmation (refused for risk-flagged tasks, "
+             "and never accepted for --profile or --adopt)",
     )
     approve.add_argument(
         "--reconcile-bootstrap",
         action="store_true",
         help="approve and advance every entry in the bootstrap ledger",
+    )
+    approve.add_argument(
+        "--profile",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help="approve the profile's security-relevant content (F-63): "
+             "commands, sentinels, network/docs allowlists, sandbox, repo, "
+             "paths, live_checks, toolkit. Interactive only. Default path: "
+             "next to --queue",
+    )
+    approve.add_argument(
+        "--adopt",
+        action="store_true",
+        help="adopt an existing queue into the owner approval ledger "
+             "(F-63): show each unledgered task in an approvable-or-later "
+             "status and record it on confirm. Interactive only",
     )
     approve.add_argument(
         "--queue",
@@ -98,6 +119,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--ledger",
         default=".factory/BOOTSTRAP.md",
         help="bootstrap ledger path for --reconcile-bootstrap (default: %(default)s)",
+    )
+    approve.add_argument(
+        "--factory-root",
+        default=None,
+        help="factory root for the approval ledger (default: ~/factory)",
     )
     approve.add_argument(
         "--approved-by", default=None, help="approver name (default: git user.name)"
@@ -312,16 +338,36 @@ def _run_approve(args: argparse.Namespace) -> int:
     """Dispatch the approve subcommand; refusals exit 1, never a traceback."""
     try:
         approver = args.approved_by or default_approver()
+        root = Path(args.factory_root) if args.factory_root else None
+        if args.profile is not None:
+            # F-63 AC-2: interactive only — no --yes exists for this mode.
+            path = args.profile or str(
+                Path(args.queue).parent / "project.yaml"
+            )
+            approve_profile(
+                load_profile(path), root, approved_by=approver
+            )
+            print(f"profile approved: {path}")
+            return 0
         queue = TaskQueue(args.queue)
+        if args.adopt:
+            # F-63 AC-1: interactive only — no --yes exists for this mode.
+            results = adopt_queue(queue, root, approved_by=approver)
+            for result in results:
+                print(f"{result.task_id}: {result.action} — {result.detail}")
+            return 1 if any(r.action == "failed" for r in results) else 0
         if args.reconcile_bootstrap:
             # No --yes here by design (see main): every entry is confirmed
             # interactively.
-            results = reconcile_bootstrap(queue, args.ledger, approved_by=approver)
+            results = reconcile_bootstrap(
+                queue, args.ledger, approved_by=approver, factory_root=root
+            )
             for result in results:
                 print(f"{result.task_id}: {result.action} — {result.detail}")
             return 1 if any(r.action == "failed" for r in results) else 0
         status = approve_task(
-            queue, args.task_id, approved_by=approver, assume_yes=args.yes
+            queue, args.task_id, approved_by=approver, assume_yes=args.yes,
+            factory_root=root,
         )
         print(f"{args.task_id}: approved -> {status}")
         return 0
@@ -708,6 +754,11 @@ def _run_orchestrator(args: argparse.Namespace) -> int:
             # ready (CI red/pending/unknown), visible, never silent.
             for line in result.not_ready_prs:
                 print(f"  not ready: {line}")
+            # F-63 AC-1: tasks the owner ledger does not cover — ready
+            # ones were demoted, the rest were not acted on. Visible,
+            # never silent.
+            for task_id in result.unledgered:
+                print(f"  unledgered (not acted on): {task_id}")
             return _EXIT[result.outcome]
         loop = run_loop(Path(args.queue), profile_path=args.profile, **kwargs)
         for result in loop.results:
@@ -716,6 +767,8 @@ def _run_orchestrator(args: argparse.Namespace) -> int:
                 print(f"    ready: {line}")
             for line in result.not_ready_prs:
                 print(f"    not ready: {line}")
+            for task_id in result.unledgered:
+                print(f"    unledgered (not acted on): {task_id}")
         print(f"factory loop: stopped ({loop.stop_reason}) after {len(loop.results)} run(s)")
         return _EXIT[loop.stop_reason]
     except _RUN_ERRORS as exc:
@@ -743,14 +796,18 @@ def main(argv: list | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "approve":
-        if bool(args.task_id) == bool(args.reconcile_bootstrap):
+        modes = [bool(args.task_id), args.reconcile_bootstrap,
+                 args.profile is not None, args.adopt]
+        if sum(modes) != 1:
             parser.error(
-                "approve takes exactly one of: a task id, or --reconcile-bootstrap"
+                "approve takes exactly one of: a task id, --reconcile-bootstrap, "
+                "--profile [PATH], or --adopt"
             )
-        if args.reconcile_bootstrap and args.yes:
+        if (args.reconcile_bootstrap or args.profile is not None
+                or args.adopt) and args.yes:
             parser.error(
-                "--yes is not accepted with --reconcile-bootstrap: the ledger is "
-                "plain markdown, so reconcile confirms every entry interactively"
+                "--yes is not accepted with --reconcile-bootstrap, --profile "
+                "or --adopt: these modes confirm every entry interactively"
             )
         return _run_approve(args)
     if args.command == "recover":

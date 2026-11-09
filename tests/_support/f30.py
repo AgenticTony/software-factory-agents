@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
+from _support.f63 import ledger_approve
 from factory.contract import acceptance_hash
 from factory.mergeorder import Protection
 from factory.orchestrator import PullRequest, run_once
@@ -144,6 +145,8 @@ class Env:
         return [json.loads(line) for line in lines]
 
     def run(self, session_runner, **kwargs):
+        # F-63: record the fixture's owner approvals before the run.
+        ledger_approve(self.root, self.queue_path)
         kwargs.setdefault("now", lambda: OFF_PEAK)
         kwargs.setdefault("protection", lambda remote, branch: PROTECTED_STRICT)
         kwargs.setdefault("pr_state", lambda url: "open")
