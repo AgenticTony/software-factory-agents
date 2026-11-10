@@ -252,6 +252,10 @@ paths:
     # session/schema modules — same precedent, protected from the day
     # they exist.
     - "tests/test_f65.py"
+    # The reconcile guards: the repo ledger must reconcile cleanly (named
+    # owner-pending entries aside) and every task section must parse —
+    # the judge of the ledger grammar, protected like the contract tests.
+    - "tests/test_reconcile_ledger.py"
     # F-63: the approval ledger module is judge surface (it decides what
     # the owner approved — the factory/attribution.py and factory/egress.py
     # precedent: a session must not edit what gates it).

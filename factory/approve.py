@@ -200,11 +200,18 @@ def input_confirm(question: str) -> bool:
     return answer in ("y", "yes")
 
 
-def _check_approvable(task: dict) -> None:
+def _check_approvable(task: dict, *, require_scope: bool = True) -> None:
     """Refusals that apply to any approval, single or reconcile.
 
     Args:
         task: The task record.
+        require_scope: Demand the F-65 declared file scope. True for
+            every approval of future work (``factory approve``, a
+            reconcile to a runnable status). False only when a
+            reconcile records work that was ALREADY built and validated
+            (``in_review`` and beyond): no session will run it, and a
+            finished task that is ever re-opened still meets the
+            run-time ``scope_missing`` refusal before a session starts.
 
     Raises:
         ApprovalError: When the task is not a draft, is of a
@@ -233,7 +240,7 @@ def _check_approvable(task: dict) -> None:
     # may change — approving a scope-less build/docs contract would
     # approve an unbounded write surface. Non-executable kinds run no
     # session and are exempt.
-    if kind in ELIGIBLE_KINDS and not _scope_paths(task):
+    if require_scope and kind in ELIGIBLE_KINDS and not _scope_paths(task):
         raise ApprovalError(
             f"{task_id}: refusing to approve a {kind} contract with no "
             "declared file scope — add scope.paths (the repo-relative "
@@ -890,7 +897,11 @@ def _reconcile_entry(
         # move (the approve_task order): an entry for a task that never
         # moved is harmless history, an approved task the ledger doesn't
         # cover would be demoted straight back (F-63).
-        _check_approvable(task)
+        # The F-65 scope is a run-time boundary: demanded when this
+        # reconcile makes the task runnable, not when it records work
+        # already built and validated (the proven-criteria targets).
+        _check_approvable(
+            task, require_scope=target not in _PROVEN_REQUIRED_TARGETS)
         _freeze_contract(task, approved_by)
         if ledger is not None:
             ledger.record_task_for(task, approved_by=approved_by,
