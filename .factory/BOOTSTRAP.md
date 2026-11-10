@@ -1073,7 +1073,17 @@ The owner re-ran every round-2/3 repro at `fb66730` — all seven round-3 findin
 
 **Gate:** `ruff check .` clean (no warnings); `PYTHONPATH=. .venv/bin/python -m pytest -q -n auto --deselect tests/test_f06.py::test_ac_3 --deselect tests/test_f06.py::test_ac_4` → **1034 passed** (first run caught 4 f26 review pins observing the pre-F-45 subprocess seam — re-seated as above, then green).
 
-**Status to set at reconcile:** F-45 → `done` (owner, after merge), with the AC-5 amendment and the F-61 proposal recorded above.
+**Reconcile markers (added 2026-11-10; evidence: each contract test green on main 8dedaaa and on the merge PR's CI, merged #101 (cc39047)):**
+
+- **AC-1** proven: `tests/test_f45.py::test_ac_1`
+- **AC-2** proven: `tests/test_f45.py::test_ac_2`
+- **AC-3** proven: `tests/test_f45.py::test_ac_3`
+- **AC-4** proven: `tests/test_f45.py::test_ac_4`
+- **AC-5** proven: `tests/test_f45.py::test_ac_5`
+- **AC-6** proven: `tests/test_f45.py::test_ac_6`
+- **AC-7** proven: `tests/test_f45.py::test_ac_7`
+
+**Status to set at reconcile:** `done` — F-45 → `done` (owner, after merge), with the AC-5 amendment and the F-61 proposal recorded above.
 
 ## F-46 — Gate evasion hardening (L0/L1)
 
@@ -1117,7 +1127,15 @@ The owner re-ran every round-2/3 repro at `fb66730` — all seven round-3 findin
 
 **Gate:** `ruff check .` clean; `PYTHONPATH=. .venv/bin/python -m pytest -q -n auto --deselect tests/test_f06.py::test_ac_3 --deselect tests/test_f06.py::test_ac_4` → first run **5 failed, 1041 passed** (the 5 pins observing the pre-F-46 seams: f10 AC-6/f38 AC-1/f38 AC-5 prompt-hash pins — now loaded through `load_profile`, f12's importer-seat pin — now asserts the defaulted list, f10 AC-11's sandbox probe — re-homed from a diff-shipped conftest into the contract test file's module body with `-s` commands, same assertions); after the re-seats, final run → **1046 passed** (1034 + 12 F-46 tests), none weakened.
 
-**Status to set at reconcile:** F-46 → `done` (owner, after merge), with the AC-4 amendment, the jest-config note for SoloAdventurer onboarding, and the VALIDATOR-SPEC wording proposal recorded above.
+**Reconcile markers (added 2026-11-10; evidence: each contract test green on main 8dedaaa and on the merge PR's CI, merged #104 (fa7a5d5) + #105 (470a5ff)):**
+
+- **AC-1** proven: `tests/test_f46.py::test_ac_1`
+- **AC-2** proven: `tests/test_f46.py::test_ac_2`
+- **AC-3** proven: `tests/test_f46.py::test_ac_3`
+- **AC-4** proven: `tests/test_f46.py::test_ac_4`
+- **AC-5** proven: `tests/test_f46.py::test_ac_5`
+
+**Status to set at reconcile:** `done` — F-46 → `done` (owner, after merge), with the AC-4 amendment, the jest-config note for SoloAdventurer onboarding, and the VALIDATOR-SPEC wording proposal recorded above.
 
 ### F-46 owner review, round 1: three goal-level holes (root forms, pytest's config names, the self-hiding red) — all fixed red-first
 
@@ -1213,7 +1231,14 @@ Found by the reviewer's ubuntu:24.04 container run (real srt + bwrap): 2 failed,
 
 **Gate (final tree, macOS):** `ruff check .` clean; `PYTHONPATH=. .venv/bin/python -m pytest -q -n auto --deselect tests/test_f06.py::test_ac_3 --deselect tests/test_f06.py::test_ac_4` → **1073 passed** (1058 pre-existing + 15 F-47; same count as round 0 — the round-1 fixes changed tests, added none), 12 warnings (pre-existing `re.split` maxsplit deprecation in toolkit.py). Protected re-seats: `tests/test_f22.py::_write_reports` (same strength — f22 AC-5's resolve-time refusal still fires) and `tests/test_f05.py::test_ac_1` (round 1, host invariant — stronger on both platforms); no assertion weakened.
 
-**Status to set at reconcile:** F-47 → `done` (owner, after merge), with the AC-1/AC-2 amendments and the silent-escapee WO proposal recorded above.
+**Reconcile markers (added 2026-11-10; evidence: each contract test green on main 8dedaaa and on the merge PR's CI, merged #107 (b2efa5a)):**
+
+- **AC-1** proven: `tests/test_f47.py::test_ac_1`
+- **AC-2** proven: `tests/test_f47.py::test_ac_2`
+- **AC-3** proven: `tests/test_f47.py::test_ac_3`
+- **AC-4** proven: `tests/test_f47.py::test_ac_4`
+
+**Status to set at reconcile:** `done` — F-47 → `done` (owner, after merge), with the AC-1/AC-2 amendments and the silent-escapee WO proposal recorded above.
 
 ## F-48 — Eval parity and variance
 
@@ -1298,6 +1323,16 @@ The reviewer verified the tree independently (gate 1087 on macOS; production sit
 
 **Gate after round 1 (final tree, macOS):** `ruff check .` clean; `PYTHONPATH=. .venv/bin/python -m pytest -q -n auto --deselect tests/test_f06.py::test_ac_3 --deselect tests/test_f06.py::test_ac_4` → **1087 passed**, 0 failed, exit 0 (same count as round 0 — the round-1 fixes are README and ledger text; the one README-reading test, `test_f16::test_monthly_owner_step_is_documented`, still passes).
 
+**Reconcile markers (added 2026-11-10; evidence: each contract test green on main 8dedaaa and on the merge PR's CI, merged #108 (30a64e5)):**
+
+- **AC-1** proven: `tests/test_f48.py::test_ac_1`
+- **AC-2** proven: `tests/test_f48.py::test_ac_2`
+- **AC-3** proven: `tests/test_f48.py::test_ac_3`
+- **AC-4** proven: `tests/test_f48.py::test_ac_4`
+- **AC-5** pending: owner step, the F-16 seeded eval re-run on the fixed pipeline and the new baseline recorded (manual AC)
+
+**Status to set at reconcile:** `done` — after the owner closes the pending manual criterion above
+
 ## F-49 — Contract and importer hardening
 
 CODE-REVIEW-2026-11-05 M-10, m-3, m-4, m-6, m-7, I-18: nothing enforced that acceptance refs resolve, `format: date-time` was annotation-only, the importer truncated silently, raced its fresh write, lost output on deep JSON, and accepted a proposal with no `project`.
@@ -1380,6 +1415,17 @@ CODE-REVIEW-2026-11-05 M-10, m-3, m-4, m-6, m-7, I-18: nothing enforced that acc
 **Finding 3 (class 1): the planning-doc listing was computed up to three times per import** (inside `build_import_prompt`, again for the budget, again after the session for `plan.truncated_docs`) — a docs change during the session could make the summary name a different capped set than the prompt offered, breaking the module's own one-listing invariant. Fixed: `run_import` computes `PlanningDocs` ONCE before the session and threads the same object to the prompt (`build_import_prompt` gains a `files=` keyword; None computes, for direct callers), the scaled budget and `plan.truncated_docs`. New test `test_review_one_listing_across_prompt_budget_and_summary`: a doc added inside the injected session never reaches the summary — the original dropped five stand, and the late doc is named nowhere.
 
 **Gate after round 1 (final tree, macOS, after the last code edit — an E501 line the first round-1 gate run caught at ruff, fixed):** `ruff check .` clean; `PYTHONPATH=. .venv/bin/python -m pytest -q -n auto --deselect tests/test_f06.py::test_ac_3 --deselect tests/test_f06.py::test_ac_4` → **1104 passed** (1102 + 2 round-1 review tests), 0 failed, 317 s.
+
+**Reconcile markers (added 2026-11-10; evidence: each contract test green on main 8dedaaa and on the merge PR's CI, merged #109 (af7cf2c)):**
+
+- **AC-1** proven: `tests/test_f49.py::test_ac_1`
+- **AC-2** proven: `tests/test_f49.py::test_ac_2`
+- **AC-3** proven: `tests/test_f49.py::test_ac_3`
+- **AC-4** proven: `tests/test_f49.py::test_ac_4`
+- **AC-5** proven: `tests/test_f49.py::test_ac_5`
+- **AC-6** proven: `tests/test_f49.py::test_ac_6`
+
+**Status to set at reconcile:** `done`
 
 ## F-56 — Session record transport
 
@@ -1467,7 +1513,15 @@ Found in the 2026-11-05 jobfinderos import (F-13 step 3, BUILD-ORDER §F-56): th
 
 **Gate (final tree, macOS, frozen after the last code edit — the recovery tree, after the incident above):** `ruff check .` clean; `PYTHONPATH=. .venv/bin/python -m pytest -q -n auto --deselect tests/test_f06.py::test_ac_3 --deselect tests/test_f06.py::test_ac_4` → **1122 passed** (1104 pre-existing + 18 F-56), 0 failed, exit 0, 419 s.
 
-**Status to set at reconcile:** F-56 → `done` (owner, after merge), with the AC-1/AC-2 amendments and the two proposed WOs recorded above.
+**Reconcile markers (added 2026-11-10; evidence: each contract test green on main 8dedaaa and on the merge PR's CI, merged #110 (47705d1)):**
+
+- **AC-1** proven: `tests/test_f56.py::test_ac_1`
+- **AC-2** proven: `tests/test_f56.py::test_ac_2`
+- **AC-3** proven: `tests/test_f56.py::test_ac_3`
+- **AC-4** proven: `tests/test_f56.py::test_ac_4`
+- **AC-5** proven: `tests/test_f56.py::test_ac_5`
+
+**Status to set at reconcile:** `done` — F-56 → `done` (owner, after merge), with the AC-1/AC-2 amendments and the two proposed WOs recorded above.
 
 ### F-56 owner review, round 1: four findings + one classify — all fixed
 
@@ -1659,6 +1713,20 @@ Source findings (CODE-REVIEW-2026-11-05): M-11, m-20, m-21, m-22, m-23, I-1, I-1
 **Round 5 (2026-11-07, reviewer finding — one fix):** round 4's sysconfig-derived site dirs were wrong on Debian/Ubuntu too: posix_prefix's purelib (`/usr/lib/python3.12/site-packages`) does not exist there — Debian installs into **dist-packages** — so the new existence guard reddened the live_network job on any Debian-based host (the reviewer's container: "base site dir /usr/lib/python3.12/site-packages does not exist"; GitHub's setup-python toolcache would likely pass, but the documented Linux contributor setup would not). Fixed: the BASE executable itself (`sys._base_executable`, printed by the job venv's python, then run directly) answers `site.getsitepackages()`; nonexistent entries are FILTERED (Debian lists missing ones); the guards stay loud — ≥1 existing dir AND a non-empty snapshot. Verified shapes: pyenv macOS → …/3.11.9/…/site-packages, 239 dists (the reviewer confirmed the round-4 snapshot count); the reviewer's container → /usr/lib/python3/dist-packages (2 dists) + /usr/local/…/dist-packages (0), missing entries dropped, non-empty. MUTATION: the dir list replaced with a nonexistent path → RED via the ≥1-existing guard ("no base site dir exists … the snapshot cannot prove anything"). Why sysconfig was wrong, recorded here per the round-5 brief: sysconfig describes the SCHEME layout, not what the distro actually created; site.getsitepackages() reports the running interpreter's real search paths.
 **Round-5 gate (final round-5 tree, frozen):** `ruff check .` clean; `pyright --warnings factory` 0/0/0 exit 0; tests/test_f51.py 15/15 parallel. **3.11** (deselects): **1143 passed, 0 failed, 0 skipped, exit 0** (332.94 s). **3.11 no-deselect**: **1143 passed, 2 skipped, exit 0** (364.80 s) — the two live halves only. **3.13**: **1143 passed, 0 failed, 0 skipped, exit 0** (311.23 s). Round-5 mutation (dir list → nonexistent: ≥1-existing guard RED) run and restored; repo clean. The site-dir shape is the BASE interpreter's own `site.getsitepackages()` — real on pyenv (239 dists) and, per the reviewer's verification, on the Debian container (dist-packages entries, missing ones filtered, non-empty).
 
+**Reconcile markers (added 2026-11-10; evidence: each contract test green on main 8dedaaa and on the merge PR's CI, merged #111 (4ce8514)):**
+
+- **AC-1** proven: `tests/test_f51.py::test_ac_1`
+- **AC-2** proven: `tests/test_f51.py::test_ac_2`
+- **AC-3** proven: `tests/test_f51.py::test_ac_3`
+- **AC-4** proven: `tests/test_f51.py::test_ac_4`
+- **AC-5** proven: `tests/test_f51.py::test_ac_5`
+- **AC-6** proven: `tests/test_f51.py::test_ac_6`
+- **AC-7** proven: `tests/test_f51.py::test_ac_7`
+- **AC-8** proven: `tests/test_f51.py::test_ac_8`
+- **AC-9** proven: `tests/test_f51.py::test_ac_9`
+
+**Status to set at reconcile:** `done`
+
 ## F-57 — Importer robustness: per-task tool, repair turn, prose eval
 
 The goal (BUILD-ORDER F-57): importing a real repo whose planning docs are PROSE must reliably end in a valid proposal, cheaply, without ever lowering the bar for what reaches the queue. The 2026-11-05 jobfinderos import broke on every schema shape at once because the only check came after one 47 KB answer; each failure then cost a full re-run; and nothing proved a real model can import prose at all.
@@ -1796,6 +1864,15 @@ The goal (BUILD-ORDER F-57): importing a real repo whose planning docs are PROSE
 
 **Final sweep (2026-11-08, reviewer: CODE CLEAN; two tests missing — tests only, no production change):** T1 (q03) — the TIMEOUT path's read pinned: a planted record with a forged field (result:int; status:dict-carrying-token) at the outer wall clock is treated as ABSENT through the real run_session_sandboxed timeout branch (TimeoutExpired stays the error, never the forged record; the token reaches no message or note) and `_read_record_quietly` itself reads it as None. T2 (q08) — the wall's list-ITEM types pinned at the file boundary: vents/skills/models/propose_facts/proposed_tasks holding a wrong-typed item is the same SessionRecordError naming the field. Mutations: q03 (quietly reader skips the wall) → the T1 tests RED; q08 (item check disabled) → the five T2 legs RED; restored, green. The reviewer's p05 (_record_turns raw) confirmed equivalent — the wall validates num_turns before it runs; belt-and-braces as ledgered. tests/test_f57.py 78/78.
 
+**Reconcile markers (added 2026-11-10; evidence: each contract test green on main 8dedaaa and on the merge PR's CI, merged #112 (fddca65)):**
+
+- **AC-1** proven: `tests/test_f57.py::test_ac_1`
+- **AC-2** proven: `tests/test_f57.py::test_ac_2`
+- **AC-3** proven: `tests/test_f57.py::test_ac_3`
+- **AC-4** pending: owner step, one real (paid) `factory eval --importer` run against the prose fixture (manual AC)
+
+**Status to set at reconcile:** `done` — after the owner closes the pending manual criterion above
+
 ## F-58 — Host preflight, red-CI guard, host-named CI, host table, GitGuardian green
 
 **Owner scope decision (2026-11-08), quoted from the WO brief:** "The production host is the owner's Mac. The factory runs there, for client work too. Ubuntu 26.04 support is DEFERRED. AC-1, AC-2 and AC-7 are NOT built here. AC-3 is amended: per-host job naming on 24.04 only, no 26.04 job." CI stays on Linux (ubuntu-24.04) so the Linux sandbox keeps passing there; the macOS-only skip on `test_nested_suite_skips_instead_of_failing` stays, still visible. AC-G (GitGuardian green without hiding real secrets) is owner-added; its test is named `test_ac_g`.
@@ -1899,6 +1976,18 @@ The goal (BUILD-ORDER F-57): importing a real repo whose planning docs are PROSE
 
 **Round 3 (2026-11-08, caught ON THE REAL PR — neither local tests nor either reviewer saw it): GitHub REJECTED ci.yml; zero jobs ran on 0eb733c.** The run's name was the bare file path (GitHub could not read the workflow); only GitGuardian reported — and it PASSED, so AC-G's proof landed anyway. CAUSE: the AC-3 job ids contained dots (`test-ubuntu-24.04`…); GitHub job ids must match `[A-Za-z_][A-Za-z0-9_-]*`. The YAML parses locally, so every shape test — mine and the reviewer's — passed: the file was checked against OUR rules, never against GitHub's ACCEPTANCE rules. FIX (follow-up commit on the branch, no amend/force-push): ids dot-free (`test-ubuntu-2404`, `live-network-ubuntu-2404`, `typecheck-ubuntu-2404`, `wheel-ubuntu-2404`), each job carrying a display `name:` with the exact host (`test (ubuntu-24.04)` — matrix legs report as `test (ubuntu-24.04) (3.11)`); AC-3 now asserts the DISPLAY name contains the runs-on host; test_f51 re-seated (six refs; f24 was already content-based); README/CLAUDE.md reference the display name. NEW test (would have caught this): test_r3_github_accepts_the_workflow — every job id fully matches `[A-Za-z_][A-Za-z0-9_-]*`, every job has runs-on, steps a non-empty list, each step EXACTLY one of run/uses (the offline-checkable GitHub rules). RED first (the dotted ids failed it); MUTATIONS: a dot back in one id → RED; a display name dropped → AC-3 RED; a step with both run and uses → RED. LESSON (the third of the WO, each costlier than the last): a workflow edit needs a GitHub-ACCEPTANCE check, not only shape tests — the same class as R1-1 (canned shapes vs recorded reality): our validators judge what WE wrote down, and GitHub is the only oracle for its own rules. SCOPE (4) PROPOSAL, not built here: run actionlint in CI (pinned) so every future workflow edit is checked against the real workflow grammar at review time, before a push can kill every job.
 
+**Reconcile markers (added 2026-11-10; merged #113 (0f08664)). NOT reconcilable yet — the contract needs the owner's amendment first:**
+
+- **AC-1** pending: the stored AC text predates the owner's 2026-11-08 rescope (Ubuntu 26.04 deferred to F-61); what was built is proven by tests/test_f58.py, but the contract text must be amended by the owner before reconcile
+- **AC-2** pending: the stored AC text predates the owner's 2026-11-08 rescope (Ubuntu 26.04 deferred to F-61); what was built is proven by tests/test_f58.py, but the contract text must be amended by the owner before reconcile
+- **AC-3** pending: the stored AC text predates the owner's 2026-11-08 rescope (Ubuntu 26.04 deferred to F-61); what was built is proven by tests/test_f58.py, but the contract text must be amended by the owner before reconcile
+- **AC-4** pending: the stored AC text predates the owner's 2026-11-08 rescope (Ubuntu 26.04 deferred to F-61); what was built is proven by tests/test_f58.py, but the contract text must be amended by the owner before reconcile
+- **AC-5** pending: the stored AC text predates the owner's 2026-11-08 rescope (Ubuntu 26.04 deferred to F-61); what was built is proven by tests/test_f58.py, but the contract text must be amended by the owner before reconcile
+- **AC-6** pending: the stored AC text predates the owner's 2026-11-08 rescope (Ubuntu 26.04 deferred to F-61); what was built is proven by tests/test_f58.py, but the contract text must be amended by the owner before reconcile
+- **AC-7** pending: the stored AC text predates the owner's 2026-11-08 rescope (Ubuntu 26.04 deferred to F-61); what was built is proven by tests/test_f58.py, but the contract text must be amended by the owner before reconcile
+
+**Status to set at reconcile:** `done`
+
 ## F-62 — Host-boundary escapes (trusted srt launcher, push-content secret fence, project-slug rule)
 
 **Source:** security audit run-2 (2026-11-09, at 0f08664; evidence owner-held, outside the repo). Three of its four confirmed highs share one shape — a lower-trust file or string reaches a trusted host action: a gate command swaps the binary that launches the sandbox (`factory/sandbox.py:run-sandboxed:srt-launcher-PATH-from-run-writable-venv`), the seat token rides the pushed commit to the client's remote (`factory/publish.py:check_pr_text:push-tree-never-scanned-for-literal-seat-token`), and the queue's `project` string chooses where under the factory root — or outside it — the factory writes and reads (`factory/importer.py:run-import-queue-project-unvalidated-path-joins`).
@@ -1961,7 +2050,13 @@ Textconv probes (why the absorbed mutation is a layer, not a hole): with `--text
 
 **What could NOT be verified here:** real srt on Linux (bwrap/socat/rg pins exercised only through `sys.platform` monkeypatching — no Linux host in this session; CI's ubuntu-24.04 job runs the suite where the branch keys land in real settings); the real-srt test runs on this Mac's seatbelt stack only. The token-split and gzip/reversed limits are inherent to the needle-scan boundary, not untested code paths.
 
-**Status to set at reconcile:** F-62 `done` (3 ACs, `tests/test_f62.py::test_ac_1/2/3`, all green; evidence above), `depends_on` F-05/F-43/F-49 unchanged.
+**Reconcile markers (added 2026-11-10; evidence: each contract test green on main 8dedaaa and on the merge PR's CI, merged #115 (230c797)):**
+
+- **AC-1** proven: `tests/test_f62.py::test_ac_1`
+- **AC-2** proven: `tests/test_f62.py::test_ac_2`
+- **AC-3** proven: `tests/test_f62.py::test_ac_3`
+
+**Status to set at reconcile:** `done` — F-62 `done` (3 ACs, `tests/test_f62.py::test_ac_1/2/3`, all green; evidence above), `depends_on` F-05/F-43/F-49 unchanged.
 
 **Round 1 (2026-11-09, reviewer: NOT clean — 2 holes, both confirmed on this tree by reproduction before fixing):**
 
@@ -2065,7 +2160,14 @@ All nine re-run in the round-1 final sweep (every mutation, not just the new one
 
 **What could NOT be verified here:** the full-pipeline AC-1 leg's Linux-srt half beyond what CI's ubuntu job will run (locally proven on this Mac's seatbelt stack); `factory approve --profile`/`--adopt` at a real TTY (function-level tested with injected confirm/echo); the ledger under a fsync-less filesystem (the mechanism is progress.py's, unchanged).
 
-**Status to set at reconcile:** F-63 `done` (4 ACs, `tests/test_f63.py::test_ac_1/2/3/4`, all green; evidence above), `depends_on` F-02/F-22/F-62 unchanged. Next: F-64 (budget/quota accounting), then F-59.
+**Reconcile markers (added 2026-11-10; evidence: each contract test green on main 8dedaaa and on the merge PR's CI, merged #116 (cd67f45)):**
+
+- **AC-1** proven: `tests/test_f63.py::test_ac_1`
+- **AC-2** proven: `tests/test_f63.py::test_ac_2`
+- **AC-3** proven: `tests/test_f63.py::test_ac_3`
+- **AC-4** proven: `tests/test_f63.py::test_ac_4`
+
+**Status to set at reconcile:** `done` — F-63 `done` (4 ACs, `tests/test_f63.py::test_ac_1/2/3/4`, all green; evidence above), `depends_on` F-02/F-22/F-62 unchanged. Next: F-64 (budget/quota accounting), then F-59.
 
 **Round 1 (2026-11-09, reviewer: two fixes — both confirmed real before fixing):**
 
@@ -2199,7 +2301,13 @@ All nine re-run in the round-1 final sweep (every mutation, not just the new one
 
 **What could NOT be verified here:** no real (paid) session ran against the new caps — every seat is scripted; the caps'/reserve's adequacy for real reviews rests on the trace evidence above (thin samples; revisit after F-13's first JobFinderOS runs). The reserve holds a full-cap review pass at observed per-turn rates (~6.9 min < 8.0) but not an arbitrarily slow one — the wall backstops escalate `budget_exhausted` there rather than starving review silently, which is the amendment's rule for the wall's own exhaustion. Multi-round wall accounting is per-run (pre-existing shape): session_seconds resets each run, so a fix round days later starts a fresh wall budget — unchanged by this WO, noted.
 
-**Status to set at reconcile:** F-64 `done` (3 ACs, `tests/test_f64.py::test_ac_1/2/3`, all green; evidence above), `depends_on` F-38/F-56 unchanged.
+**Reconcile markers (added 2026-11-10; evidence: each contract test green on main 8dedaaa and on the merge PR's CI, merged #117 (f8f5c61) + #118 (17900ed)):**
+
+- **AC-1** proven: `tests/test_f64.py::test_ac_1`
+- **AC-2** proven: `tests/test_f64.py::test_ac_2`
+- **AC-3** proven: `tests/test_f64.py::test_ac_3`
+
+**Status to set at reconcile:** `done` — F-64 `done` (3 ACs, `tests/test_f64.py::test_ac_1/2/3`, all green; evidence above), `depends_on` F-38/F-56 unchanged.
 
 **Round 1 (2026-11-10, reviewer: NOT clean — one goal-level gap, five surviving mutations, one wording; all confirmed red-first before fixing):**
 
@@ -2307,6 +2415,13 @@ All 23 cp-restored from `/tmp/f65-mut-backup` (never `git checkout`), `__pycache
 
 **What could NOT be verified:** no real (paid) implementer session was run — the request_scope tool's in-sandbox plumbing (server attach, allowed_tools grant, toolkit mcp-guard grant) is exercised only by the option-shape/seat-config tests and the parent-side transport by scripted records; the F-51 wheel data path (factory/scoperequest.py ships in the package by construction — it is a factory/ module — but no wheel was built); Linux git behaviour (the NFD-in-tree case) was probed via `precomposeunicode=false` on macOS, not on a Linux host.
 
+**Reconcile markers (added 2026-11-10; evidence: each contract test green on main 8dedaaa and on the merge PR's CI, merged #121 (8dedaaa)):**
+
+- **AC-1** proven: `tests/test_f65.py::test_ac_1`
+- **AC-2** proven: `tests/test_f65.py::test_ac_2`
+- **AC-3** proven: `tests/test_f65.py::test_ac_3`
+- **AC-4** proven: `tests/test_f65.py::test_ac_4`
+
 **Status to set at reconcile:** `done` (AC-1..AC-4 proven by tests/test_f65.py; the consequences above are owner actions at the next approvals, not open work).
 
 ### F-65 round 1 — review findings (2026-11-10)
@@ -2336,3 +2451,9 @@ The reviewer verified R1-1..R1-4 on real code (catch-all spellings all refuse, s
 **Round-2 gates:** ruff clean; pyright 0/0; full suite + marker check recorded below (this section's tail).
 
 **Round-2 gates (final tree):** session.py verified byte-identical to the pre-mutation backup after the Y27 proof; `ruff check .` clean; `pyright --warnings factory` 0/0; `pytest -q -n auto -p no:cacheprovider` (worktree .venv, `__pycache__` purged first) **1334 passed, 2 skipped**; marker check `find ~/factory -newer <marker>` after the suite: EMPTY. Only tests/test_f65.py changed this round — no factory code.
+### F-65 amendment — reconcile records built work without a scope (2026-11-10)
+
+Found by the reconcile dry run that followed F-65's merge: `_check_approvable` (shared by `factory approve` and `factory approve --reconcile-bootstrap`) refused every already-built build task for lacking `scope.paths` — work merged long before F-65 that no session will run again. Class 2 amendment, owner-directed: the scope is a run-time boundary, so it is demanded when an approval makes a task runnable (`factory approve`; a reconcile to `ready`/`approved`/`blocked`) and NOT when a reconcile records work already built and validated (`in_review` and beyond — `_PROVEN_REQUIRED_TARGETS`). A finished task that is ever re-opened still meets F-65's run-time `scope_missing` refusal before any session starts. `factory/approve.py` ★ (`_check_approvable(..., require_scope=)`), `tests/test_reconcile_ledger.py` (new, protected): built work reconciles scope-less to `done`/`in_review`; a reconcile to `ready`/`approved` still refuses; a scoped one passes. Mutations RED: reconcile always/never demanding scope, `factory approve`'s scope check off, the keyword default flipped.
+
+Same PR, the ledger grammar: every entry since F-45 had drifted (status written as "F-45 → `done`" / "F-63 `done`", no per-criterion markers) and F-48/F-49/F-51/F-57/F-58 had no status line at all, so the parser dropped them as prose. Markers and status lines were added (each `proven` marker names the contract test, every one re-run green on main 8dedaaa), with three honest exceptions held by the guard test's `OWNER_PENDING`: F-48 (AC-5 manual baseline re-run), F-57 (AC-4 paid import run), F-58 (contract text predates the 2026-11-08 rescope). The guard (`test_the_repo_ledger_reconciles_cleanly`, `test_every_task_heading_is_a_ledger_entry`) reconciles the real ledger against a copy of the real queue on every suite run, so the next drift fails CI.
+
