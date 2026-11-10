@@ -564,20 +564,42 @@ class _FakeTime:
 
 
 def test_ac_4(tmp_path: Path, monkeypatch):
-    # Turn budget: the delta round leaves 3 turns — not enough for a
-    # two-session fan-out above the floor — so the run escalates
-    # budget_exhausted instead of skipping the final review to publish.
+    # Turn budget (F-64 AMENDED, owner decision 2026-11-09): the review
+    # seats' caps are the parent's fixed constants, so a turn budget the
+    # implementer's record claims to have spent (7 of 10) still runs the
+    # final review at FULL caps — it is never skipped to publish in time
+    # and never squeezed out by the implementer; the PR opens only after
+    # it passed. (The pre-F-64 remainder rule escalated budget_exhausted
+    # here — the exact starvation the amendment removes.)
+    from factory.orchestrator import REVIEWER_TURN_CAP, VERIFIER_TURN_CAP
+
     env = Env(tmp_path / "turns", tasks=[_task(
-        budget={"size": "S", "max_attempts": 3, "max_turns": 10, "wall_clock_min": 10},
+        # max_turns 13 is deliberately NOT the verifier cap (10) or the
+        # reviewer cap (20), so a site regressing to the task budget is
+        # distinguishable from the fixed caps.
+        budget={"size": "S", "max_attempts": 3, "max_turns": 13, "wall_clock_min": 10},
     )])
-    seats = _fix_round({})
+    # The FINAL review carries one minor finding (declared pass), so its
+    # VERIFIER runs too — both verifier passes (round 1's and the final
+    # review's) are pinned at the fixed cap.
+    seats = _fix_round(
+        {"final": _verdict(
+            _finding("late nit: trailing whitespace", severity="minor"),
+            declared="pass")},
+        implementer_turns=7,
+    )
     result = env.run(seats)
-    assert result.outcome == "needs_human", result
-    assert result.escalation == "budget_exhausted"
-    assert env.prs == []  # never skipped to publish
-    assert seats.seats().count("reviewer") == 4  # round 1 + the delta fan-out only
+    assert result.outcome == "pr_opened", result
+    # Round 1 + the delta fan-out + THE FINAL FAN-OUT: all three ran.
+    assert seats.seats().count("reviewer") == 6
+    assert {kw["max_turns"] for kw in seats.kwargs("reviewer")} == {
+        REVIEWER_TURN_CAP
+    }
+    verifier_caps = [kw["max_turns"] for kw in seats.kwargs("verifier")]
+    assert len(verifier_caps) == 2  # round 1's vote + the FINAL vote
+    assert set(verifier_caps) == {VERIFIER_TURN_CAP}
     attempt = env.task()["attempts"][-1]
-    assert "final review" in attempt["note"]
+    assert attempt["final_review"]["verdict"] == "pass"  # it really ran
 
     # Wall clock: the delta fan-out burns the budget; the final review
     # refuses to start rather than being skipped.

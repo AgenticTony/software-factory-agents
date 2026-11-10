@@ -273,6 +273,23 @@ def credential_recovery_eligible(task: dict) -> bool:
 
 ATTEMPTS_RESET_ESCALATIONS = ("attempts_exhausted",)
 
+# F-64 AC-2: how many quota-classified attempts (outcome "aborted",
+# escalation "quota_exhausted") requeue for FREE per task per UTC
+# calendar day — and, since the round-1 amendment, per task LIFETIME
+# (FREE_QUOTA_REQUEUES_TOTAL). A quota error is not the task's fault —
+# but a session that can emit "429" at will must not requeue forever on
+# the owner's shared token: the per-day bound alone still admits a
+# daily-cron task two free sessions a day indefinitely, which is the
+# same "a record's reason grants more", merely rate-limited. A quota
+# abort is free only while BOTH allowances remain; the third and later
+# on the same UTC day count toward max_attempts, and so does every one
+# past the lifetime total (counted since the current attempt-budget
+# floor, so an owner reset restores it). The day is read from the
+# attempt's PARENT-written ``started`` stamp (now_iso()), never a
+# session field. PROPOSED values; the owner decides at spec approval.
+FREE_QUOTA_REQUEUES_PER_DAY = 2
+FREE_QUOTA_REQUEUES_TOTAL = 6
+
 
 def attempts_reset_eligible(task: dict) -> bool:
     """Whether the owner's budget-reset word may move this task.
@@ -306,24 +323,76 @@ def attempt_budget_floor(task: dict, slice_id: str) -> int:
     return floor
 
 
+def _quota_utc_day(attempt: dict) -> str | None:
+    """The UTC calendar day of a quota attempt's PARENT-written
+    ``started`` stamp ("2026-11-09T22:15:33Z" → "2026-11-09"), or None
+    when it is missing or unparseable. F-64 AC-2: the day boundary is
+    UTC midnight, judged from the orchestrator's own stamp — never a
+    session-written field, which a hostile record could shift to keep
+    every abort on a "fresh" day."""
+    started = attempt.get("started")
+    if not isinstance(started, str):
+        return None
+    try:
+        stamp = datetime.fromisoformat(started.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None or stamp.utcoffset() is None:
+        # Naive: no defined UTC day (the schema's date-time format never
+        # admits one through the sanctioned writers) — not provably on
+        # any day, so not provably free. Counts, fail closed.
+        return None
+    return stamp.astimezone(timezone.utc).date().isoformat()
+
+
 def attempt_budget_used(task: dict, slice_id: str) -> int:
     """How many attempts of ``slice_id``'s budget are spent.
 
     The orchestrator's one budget filter: same-slice attempts, not
-    aborted, not session-less sweep escalations (round-5 finding 1), and
-    — after a reset — only those at or after the reset floor. Every
+    session-less sweep escalations (round-5 finding 1), and — after a
+    reset — only those at or after the reset floor. Every
     budget-relative number downstream (the run's attempt numbering, the
     implementer prompt's "attempt N of M", the PR body's attempt line)
     flows from this count.
+
+    Aborted attempts stay free (a peak-window or crashed run is nobody's
+    fault) with TWO bounds (F-64 AC-2, the round-1 amendment adds the
+    second): quota-classified aborts (outcome ``aborted``, escalation
+    ``quota_exhausted``) requeue for free at most
+    :data:`FREE_QUOTA_REQUEUES_PER_DAY` times per UTC calendar day AND
+    at most :data:`FREE_QUOTA_REQUEUES_TOTAL` times since the current
+    attempt-budget floor — a quota abort is free only while BOTH
+    allowances remain. The day is read from each attempt's own
+    PARENT-written ``started`` stamp; the total is the same loop's count
+    of frees (no second counter): because the loop sees only post-floor
+    attempts, an owner reset restores the lifetime allowance with the
+    budget. A quota stamp that is missing, unparseable or offset-less
+    counts (fail closed: an unprovable day is not a free day). Non-quota
+    aborts never consume a quota allowance.
     """
     floor = attempt_budget_floor(task, slice_id)
-    return sum(
-        1 for i, a in enumerate(task.get("attempts") or [])
-        if i >= floor
-        and a.get("slice_id") == slice_id
-        and a.get("outcome") != "aborted"
-        and a.get("escalation") not in RECOVERY_ESCALATIONS
-    )
+    freed_by_day: dict[str, int] = {}
+    freed_total = 0
+    used = 0
+    for i, a in enumerate(task.get("attempts") or []):
+        if i < floor or a.get("slice_id") != slice_id:
+            continue
+        if a.get("escalation") in RECOVERY_ESCALATIONS:
+            continue
+        if a.get("outcome") == "aborted":
+            if a.get("escalation") != "quota_exhausted":
+                continue  # a non-quota abort (peak window, crash): free
+            day = _quota_utc_day(a)
+            if (day is not None
+                    and freed_by_day.get(day, 0) < FREE_QUOTA_REQUEUES_PER_DAY
+                    and freed_total < FREE_QUOTA_REQUEUES_TOTAL):
+                freed_by_day[day] = freed_by_day.get(day, 0) + 1
+                freed_total += 1
+                continue  # both allowances cover it
+            # beyond a day's allowance, past the lifetime total, or an
+            # unprovable day: counts
+        used += 1
+    return used
 
 
 def check_recovery_transition(task: dict, new: str) -> str:

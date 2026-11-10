@@ -239,6 +239,12 @@ paths:
     # the protected approvals/contract/state/orchestrator/approve
     # modules and the ledger schema itself — same precedent.
     - "tests/test_f63.py"
+    # F-64: the parent-side budget-accounting contract tests (fixed
+    # per-seat turn caps, the review wall reserve, bounded free quota
+    # requeues, budget visibility/schema maxima) judge the protected
+    # orchestrator/state/approve/schema modules — same precedent,
+    # protected from the day they exist.
+    - "tests/test_f64.py"
     # F-63: the approval ledger module is judge surface (it decides what
     # the owner approved — the factory/attribution.py and factory/egress.py
     # precedent: a session must not edit what gates it).
