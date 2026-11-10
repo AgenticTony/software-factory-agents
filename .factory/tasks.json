@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-04T22:40:34Z",
+  "updated_at": "2026-11-10T22:52:41Z",
   "tasks": [
     {
       "id": "F-00",
@@ -3599,7 +3599,7 @@
       "source": "BUILD-ORDER.md#f-43--egress-redaction-seam",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-30",
         "F-42"
@@ -3670,7 +3670,10 @@
         "max_attempts": 3,
         "max_turns": 200,
         "wall_clock_min": 150
-      }
+      },
+      "acceptance_hash": "e414c85c970af5136718ac1f2dc3a7461d873c4cfb6c73942c0c6e00e431ed7a",
+      "approved_at": "2026-11-10T22:52:05Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-44",
@@ -3678,7 +3681,7 @@
       "source": "BUILD-ORDER.md#f-44--verdict-integrity",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-38",
         "F-41"
@@ -3732,7 +3735,10 @@
         "max_attempts": 3,
         "max_turns": 200,
         "wall_clock_min": 150
-      }
+      },
+      "acceptance_hash": "3948e4f529dbd7258ba0a1479781bd4ae1d853b049090c4bd64f75f4b7524141",
+      "approved_at": "2026-11-10T22:52:09Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-45",
@@ -3740,7 +3746,7 @@
       "source": "BUILD-ORDER.md#f-45--pre-lease-publish-and-crash-window-robustness",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-10",
         "F-26"
@@ -3818,7 +3824,10 @@
         "max_attempts": 3,
         "max_turns": 200,
         "wall_clock_min": 150
-      }
+      },
+      "acceptance_hash": "110820b7509eaa87293375d182f6b482cce59bcce930b03203a10860bed6e9f4",
+      "approved_at": "2026-11-10T22:52:11Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-46",
@@ -3826,7 +3835,7 @@
       "source": "BUILD-ORDER.md#f-46--gate-evasion-hardening-l0l1",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-08",
         "F-25",
@@ -3889,7 +3898,10 @@
         "max_attempts": 3,
         "max_turns": 200,
         "wall_clock_min": 150
-      }
+      },
+      "acceptance_hash": "bf5284b31087353f160c5c3d892184b38772c75059a75e682671177351dd7a09",
+      "approved_at": "2026-11-10T22:52:13Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-47",
@@ -3897,7 +3909,7 @@
       "source": "BUILD-ORDER.md#f-47--sandbox-read-boundary-and-toolkit-staging",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-05",
         "F-22"
@@ -3952,7 +3964,10 @@
         "max_attempts": 3,
         "max_turns": 100,
         "wall_clock_min": 60
-      }
+      },
+      "acceptance_hash": "fd5af1e00934262ca3e7c7cc61be89ecf5ac568393ffde6691f86be9da433be8",
+      "approved_at": "2026-11-10T22:52:14Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-48",
@@ -4030,7 +4045,7 @@
       "source": "BUILD-ORDER.md#f-49--contract-and-importer-hardening",
       "kind": "build",
       "priority": "P2",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-02",
         "F-12"
@@ -4100,7 +4115,10 @@
         "max_attempts": 3,
         "max_turns": 200,
         "wall_clock_min": 150
-      }
+      },
+      "acceptance_hash": "bc7dbcdc33a5a0c89a72f0ec33d515ca0ac8a1b75ac045701fd2bdf6eef9a71a",
+      "approved_at": "2026-11-10T22:52:16Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-50",
@@ -4192,7 +4210,7 @@
       "source": "BUILD-ORDER.md#f-51--test-suite-and-ci-hygiene",
       "kind": "build",
       "priority": "P2",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-01",
         "F-05"
@@ -4286,7 +4304,10 @@
         "max_attempts": 3,
         "max_turns": 200,
         "wall_clock_min": 150
-      }
+      },
+      "acceptance_hash": "2baf14c2391d52edb69ebc36697f23bc2140ae987ff9b3e045c0d443523466b7",
+      "approved_at": "2026-11-10T22:52:19Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-52",
@@ -4533,7 +4554,7 @@
       "source": "BUILD-ORDER.md#f-56--session-record-transport",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-06",
         "F-30",
@@ -4596,7 +4617,10 @@
         "max_attempts": 3,
         "max_turns": 200,
         "wall_clock_min": 150
-      }
+      },
+      "acceptance_hash": "e282c6e284d6a13e332cc0068b02aba922a08e79501366ab2cdf0b87084b799e",
+      "approved_at": "2026-11-10T22:52:18Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-57",
@@ -4956,7 +4980,7 @@
       "source": "BUILD-ORDER.md#f-62--host-boundary-escapes",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-05",
         "F-43",
@@ -5004,7 +5028,10 @@
         "max_attempts": 3,
         "max_turns": 200,
         "wall_clock_min": 150
-      }
+      },
+      "acceptance_hash": "c0ab34697e7aa14be301f1eb62fac4d73e3a129c0751f28de77b5478fd6d9d9b",
+      "approved_at": "2026-11-10T22:52:21Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-63",
@@ -5012,7 +5039,7 @@
       "source": "BUILD-ORDER.md#f-63--owner-held-approval-of-project-config-and-contracts",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-02",
         "F-22",
@@ -5068,7 +5095,10 @@
         "max_attempts": 3,
         "max_turns": 200,
         "wall_clock_min": 150
-      }
+      },
+      "acceptance_hash": "df04273e1ccf620d879d8df80e52c245dfa2a670be5206d9729818993bf1ffe1",
+      "approved_at": "2026-11-10T22:52:24Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-64",
@@ -5076,7 +5106,7 @@
       "source": "BUILD-ORDER.md#f-64--parent-side-budget-accounting",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-38",
         "F-56"
@@ -5122,7 +5152,10 @@
         "max_attempts": 3,
         "max_turns": 200,
         "wall_clock_min": 150
-      }
+      },
+      "acceptance_hash": "bd823abb842536f2def3fe7acc661b85dfac49ecbca09774d877e5df58172d18",
+      "approved_at": "2026-11-10T22:52:26Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-65",
@@ -5130,7 +5163,7 @@
       "source": "BUILD-ORDER.md#f-65--declared-file-scope",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-07",
         "F-09",
@@ -5186,7 +5219,10 @@
         "max_attempts": 3,
         "max_turns": 200,
         "wall_clock_min": 150
-      }
+      },
+      "acceptance_hash": "bc9795edaab7faf5b79851bd0202cc0123f6782b3a5d3c1353ade1754922c5bc",
+      "approved_at": "2026-11-10T22:52:41Z",
+      "approved_by": "Anthony"
     }
   ]
 }
