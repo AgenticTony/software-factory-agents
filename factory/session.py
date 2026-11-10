@@ -160,7 +160,13 @@ from factory.toolkit import (
     stage_toolkit,
 )
 from factory.trace import STREAM_PREFIX, TraceWriter, scrub_literal, snippet
-from factory.vent import VENT_QUALIFIED_NAME, VENT_TOOL_NAME, VentCollector, vent_server
+from factory.vent import (
+    VENT_QUALIFIED_NAME,
+    VENT_TEXT_CAP,
+    VENT_TOOL_NAME,
+    VentCollector,
+    vent_server,
+)
 
 DEFAULT_BASE_URL = "https://api.z.ai/api/anthropic"
 DEFAULT_TIMEOUT_MS = 600_000
@@ -542,7 +548,11 @@ SEATS: dict[str, SeatConfig] = {
         # build_options from the run's collector. The grant names the tool
         # as the CLI sees it (``mcp__vent__vent``), so it still holds if a
         # seat ever leaves bypassPermissions (review finding 4).
-        allowed_tools=(VENT_QUALIFIED_NAME,),
+        # F-65 AC-3: the implementer additionally carries request_scope
+        # — its only honest channel for "this task needs a file outside
+        # the declared scope". The other seats never get it: a reviewer
+        # or verifier requesting scope has nothing to say.
+        allowed_tools=(VENT_QUALIFIED_NAME, "mcp__request_scope__request_scope"),
         # See the module docstring: the sandbox is the permission system;
         # prompts are bypassed, hooks + srt enforce the policy.
         permission_mode="bypassPermissions",
@@ -1135,6 +1145,13 @@ def _apply_toolkit(options: ClaudeAgentOptions, toolkit: dict) -> None:
 
     if PROPOSE_TOOL_NAME in cast("dict[str, object]", options.mcp_servers or {}):
         granted.add((PROPOSE_TOOL_NAME, PROPOSE_TOOL_NAME))
+    # F-65: the implementer's in-process request_scope server is granted
+    # the same way when a collector attached it (lazy import — the
+    # scoperequest module imports this one).
+    from factory.scoperequest import SCOPE_TOOL_NAME
+
+    if SCOPE_TOOL_NAME in cast("dict[str, object]", options.mcp_servers or {}):
+        granted.add((SCOPE_TOOL_NAME, SCOPE_TOOL_NAME))
     if options.hooks is None:  # SDK default is {}; None never occurs here
         options.hooks = {}
     options.hooks["PreToolUse"].append(mcp_guard_hook(frozenset(granted)))
@@ -1156,6 +1173,7 @@ def build_options(
     toolkit: dict | None = None,
     bypass_denials: BypassDenials | None = None,
     propose_collector: Any = None,
+    scope_collector: Any = None,
 ) -> ClaudeAgentOptions:
     """Build the per-seat ClaudeAgentOptions (WO F-06 options list).
 
@@ -1238,6 +1256,21 @@ def build_options(
         merged[PROPOSE_TOOL_NAME] = propose_server(propose_collector)
         options.mcp_servers = merged
         options.allowed_tools = [*options.allowed_tools, PROPOSE_QUALIFIED_NAME]
+    if scope_collector is not None:
+        # Lazy import: factory.scoperequest imports this module, so the
+        # tool's constructors are reached only at call time (the F-57
+        # propose precedent). Only the SERVER attaches here: the
+        # allowed_tools grant lives in ONE place — the implementer seat
+        # config — exactly like the vent tool (a grant without a server
+        # is inert, so a collector-less build is still correct).
+        from factory.scoperequest import SCOPE_TOOL_NAME, scope_server
+
+        merged: dict[str, Any] = (
+            dict(options.mcp_servers)
+            if isinstance(options.mcp_servers, dict) else {}
+        )
+        merged[SCOPE_TOOL_NAME] = scope_server(scope_collector)
+        options.mcp_servers = merged
     if toolkit is not None:
         _apply_toolkit(options, toolkit)
     if cli_path is not None:
@@ -1285,6 +1318,15 @@ class SessionRecord:
     plays for the vent tool. Empty on every record built before F-57
     and on every session that ran no collector (``from_dict`` defaults
     them; ``_carry`` stamps them only when a collector was given).
+
+    ``scope_requests`` (F-65 AC-3) carries the implementer seat's
+    ``request_scope`` calls — the structured "this task needs a file
+    outside its declared scope" channel. It is attacker-controlled
+    surface like every record field: the parent validates it strictly
+    (:func:`parse_scope_requests` — bounds, per-path shape refusals)
+    and a request can only ESCALATE (``scope_change_needed``), never
+    widen. Empty on every record built before F-65 and on every seat
+    that ran no scope collector (``from_dict`` defaults it).
     """
 
     seat: str
@@ -1312,6 +1354,11 @@ class SessionRecord:
     # made, accepted or refused — zero calls and all-refused calls lead
     # the factory to different places.
     propose_calls: int = 0
+    # F-65 AC-3: the implementer's request_scope calls ({path, reason}),
+    # parent-validated by parse_scope_requests before anything acts on
+    # them — the record is session-written, so the field is bounds-and-
+    # shape checked, never trusted.
+    scope_requests: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1375,7 +1422,7 @@ def record_field_error(record: SessionRecord) -> str | None:
                               "non-negative integer")
     for name, item_type in (("models", str), ("skills", str),
                              ("vents", dict), ("proposed_tasks", dict),
-                             ("propose_facts", dict)):
+                             ("propose_facts", dict), ("scope_requests", dict)):
         value = getattr(record, name)
         if not isinstance(value, list):
             return bad(name, f"a {type(value).__name__}, not a list")
@@ -1398,6 +1445,111 @@ def record_field_error(record: SessionRecord) -> str | None:
                    f"a {type(record.permission_denials).__name__}, not a "
                    "list")
     return None
+
+
+# F-65 AC-3: the parent-side bounds for a session's scope requests. The
+# record is session-written (the attacker's), so the field is validated
+# HERE, strictly — an invalid request is treated as no request, with
+# what was chosen reported, never a crash (a request can only ESCALATE,
+# never widen, so trusting the survivors is safe; the TEXT stays
+# attacker-controlled and every display of it passes
+# :func:`factory.egress.escape_approval_text` — the F-63 spoof class).
+SCOPE_REQUEST_MAX = 20
+SCOPE_REQUEST_PATH_MAX = 1024
+# A reason is a note, not a transcript: capped (seam-scrubbed first) at
+# the vent tool's text cap by clean_request_text.
+
+
+def parse_scope_requests(
+    record: SessionRecord, secrets: "Sequence[str]" = ()
+) -> "tuple[list[dict], list[str]]":
+    """Validate a record's ``scope_requests`` the parent's way.
+
+    Args:
+        record: The session's record (any seat; only the implementer's
+            is ever consulted).
+        secrets: The caller's literal secrets (the run's seat token) —
+            every surviving PATH and REASON, and every refusal line
+            (they echo the path), passes the F-43 egress seam with them
+            HERE. The in-sandbox collector's scrub cannot be trusted to
+            have run: the record file is session-written (R1-2), so the
+            parent scrubs whatever it reads regardless of provenance.
+
+    Returns:
+        ``(valid, refusals)`` — the well-formed ``{path, reason}``
+        entries in call order (each seam-scrubbed, reason capped), and
+        one human-readable refusal line per entry (or the whole list)
+        that was dropped, saying why. A request list that is entirely
+        invalid yields ``([], refusals)``: the round proceeds as if no
+        request was filed (the fix-round machinery owns out-of-scope
+        edits), and the refusals are reported so the owner sees what was
+        ignored.
+    """
+    from factory.contract import scope_pattern_error
+
+    secrets = check_secrets(secrets)
+
+    def scrub(text: str) -> str:
+        return scrub_session_text(text, secrets)
+
+    raw = getattr(record, "scope_requests", None)
+    if not isinstance(raw, list) or not raw:
+        return [], []
+    valid: list[dict] = []
+    refusals: list[str] = []
+    for index, entry in enumerate(raw, start=1):
+        if len(valid) >= SCOPE_REQUEST_MAX:
+            refusals.append(
+                f"scope request {index} dropped: past the "
+                f"{SCOPE_REQUEST_MAX}-request bound"
+            )
+            continue
+        if not isinstance(entry, dict):
+            refusals.append(
+                f"scope request {index} dropped: not an object"
+            )
+            continue
+        path, reason = entry.get("path"), entry.get("reason")
+        if not isinstance(path, str) or not path.strip():
+            refusals.append(
+                f"scope request {index} dropped: no path"
+            )
+            continue
+        problem = scope_pattern_error(path)
+        if problem is not None:
+            refusals.append(
+                f"scope request {index} dropped: path "
+                f"{scrub(path[:80])!r} {problem}"
+            )
+            continue
+        if len(path) > SCOPE_REQUEST_PATH_MAX:
+            refusals.append(
+                f"scope request {index} dropped: path past "
+                f"{SCOPE_REQUEST_PATH_MAX} chars"
+            )
+            continue
+        if not isinstance(reason, str) or not reason.strip():
+            refusals.append(
+                f"scope request {index} dropped: no reason"
+            )
+            continue
+        valid.append({
+            "path": scrub(path),
+            "reason": clean_request_text(reason, secrets),
+        })
+    return valid, refusals
+
+
+def clean_request_text(text: str, secrets: "Sequence[str]" = ()) -> str:
+    """One request reason through the F-43 egress seam, then capped —
+    the vent-tool rule (redact before cap, so a cap never cuts a
+    credential in half). Terminal control sequences strip here; the
+    ESCAPE for approval-time display happens separately, at render."""
+    text = scrub_session_text(text, secrets)
+    if len(text) > VENT_TEXT_CAP:
+        marker = " …[request truncated]"
+        text = text[: VENT_TEXT_CAP - len(marker)] + marker
+    return text
 
 
 def _primary_model(model_usage: dict[str, Any] | None) -> str | None:
@@ -1645,6 +1797,7 @@ async def run_session(
     trace_sink: Callable[[dict[str, Any]], None] | None = None,
     toolkit: dict | None = None,
     propose_collector: Any = None,
+    scope_collector: Any = None,
 ) -> SessionRecord:
     """Run one seat's session and return what it recorded.
 
@@ -1694,6 +1847,12 @@ async def run_session(
             record out (``proposed_tasks`` / ``propose_facts``) on every
             exit path. ``Any``-typed for the same cycle reason as in
             :func:`build_options`.
+        scope_collector: F-65 — the implementer's request_scope
+            collector. When None and the seat is the implementer, a
+            fresh one is built here (the tool attaches for that seat
+            alone); its requests ride the record out as
+            ``scope_requests`` on every exit path. ``Any``-typed for
+            the same cycle reason.
 
     Returns:
         The record: ``completed`` / ``failed`` (with reason) / ``aborted``
@@ -1711,6 +1870,15 @@ async def run_session(
         # it crosses the boundary (the flush scrubs again outside).
         vent_collector = VentCollector(
             run_id=run_id or "", task_id=task_id or "", seat=seat,
+            secrets=(token,) if token else (),
+        )
+    if scope_collector is None and seat == "implementer":
+        # F-65 AC-3: the implementer's request_scope tool, attached by
+        # seat (no spec plumbing needed — the seat names itself). Lazy
+        # import: factory.scoperequest imports this module.
+        from factory.scoperequest import ScopeCollector as _ScopeCollector
+
+        scope_collector = _ScopeCollector(
             secrets=(token,) if token else (),
         )
     # F-42 AC-5: the denial state shared by the bypass hook (which counts
@@ -1732,6 +1900,7 @@ async def run_session(
         toolkit=toolkit,
         bypass_denials=bypass_denials,
         propose_collector=propose_collector,
+        scope_collector=scope_collector,
     )
 
     def _carry(record: SessionRecord) -> SessionRecord:
@@ -1761,6 +1930,11 @@ async def run_session(
             record.proposed_tasks = propose_collector.tasks()
             record.propose_facts = propose_collector.facts()
             record.propose_calls = propose_collector.calls
+        # ...and the scope requests (F-65 AC-3): whatever the outcome,
+        # the request_scope calls the implementer made ride out — the
+        # parent validates and escalates; nothing here widens anything.
+        if scope_collector is not None:
+            record.scope_requests = list(scope_collector.requests)
         return record
 
     result_message: ResultMessage | None = None

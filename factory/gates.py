@@ -8,6 +8,7 @@ drifting between layer modules. The layer modules (``factory.l0``,
 """
 
 import fnmatch
+import functools
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -121,6 +122,67 @@ class GateReport:
 def matches(path: str, patterns) -> bool:
     """True when the posix relpath matches any glob (fnmatch, case-sensitive)."""
     return any(fnmatch.fnmatchcase(path, pat) for pat in patterns)
+
+
+def scope_matches(path: str, patterns) -> bool:
+    """True when ``path`` matches any DECLARED-SCOPE glob (F-65).
+
+    Scope semantics — deliberately stricter than :func:`matches`:
+
+    * ``*`` and ``?`` never cross ``/``: a scope is a list of places,
+      and ``src/*.py`` must not reach ``src/deep/x.py``;
+    * ``**`` as a whole segment matches zero or more whole directories;
+    * matching is case-sensitive on the exact path string git reports —
+      a case variant or Unicode-normalisation look-alike of an in-scope
+      path is OUT of scope.
+
+    :func:`matches` (protected/risk paths) keeps fnmatch semantics on
+    purpose: there ``*`` crossing ``/`` is the broader, fail-safe
+    reading — a protected or risk glob should over-match, while a scope
+    glob is an allowlist and must under-match. Character classes
+    (``[...]``) are NOT supported here; the load-time refusals
+    (:func:`factory.contract.scope_pattern_error`) reject them so a
+    declared scope never silently means something else.
+
+    Args:
+        path: The repo-relative posix path git reported (exact bytes,
+            already through ``core.quotePath`` decoding).
+        patterns: The scope globs (task ``scope.paths`` or profile
+            ``paths.generated``).
+
+    Returns:
+        Whether any pattern matches the whole path.
+    """
+    segments = path.split("/")
+    return any(
+        _scope_glob_match(tuple(pat.split("/")), tuple(segments))
+        for pat in patterns
+    )
+
+
+@functools.lru_cache(maxsize=4096)
+def _scope_glob_match(pat_segs: tuple, path_segs: tuple) -> bool:
+    """Segment-wise glob match: ``**`` eats zero or more path segments,
+    every other segment matches within itself (``*``/``?`` never see a
+    ``/`` because the comparison is per-segment). Memoised on the
+    (pattern, path) segment tuples: a pattern stacking ``**`` segments
+    would otherwise revisit the same suffix pairs exponentially (the
+    regex-CPU finding's cousin — patterns are owner-approved, but the
+    bound costs nothing). The cache is BOUNDED: a long-lived `factory
+    loop` or dashboard process matches unbounded distinct paths, and an
+    unbounded memo would grow with them."""
+    if not pat_segs:
+        return not path_segs
+    head, rest = pat_segs[0], pat_segs[1:]
+    if head == "**":
+        # zero or more directories: try consuming 0..len(path) segments
+        return any(
+            _scope_glob_match(rest, path_segs[i:])
+            for i in range(len(path_segs) + 1)
+        )
+    if not path_segs or not fnmatch.fnmatchcase(path_segs[0], head):
+        return False
+    return _scope_glob_match(rest, path_segs[1:])
 
 
 def is_test_file(path: str) -> bool:

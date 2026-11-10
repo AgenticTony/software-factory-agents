@@ -97,6 +97,7 @@ from factory.gates import (
     GateReport,
     contract_test_files,
     diff_file_changes,
+    scope_matches,
 )
 from factory.gates import git as _git
 from factory.gates import is_test_file as _is_test_file
@@ -524,12 +525,35 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
 
     FAIL classes (findings): protected path touched (added, modified or
     deleted — adding one of the task's own contract test files is allowed),
-    test file deleted. Escalation classes (no FAIL by themselves):
-    undeclared risk path touched (flag added; forces a human merge),
-    dependency manifest changed. The skip-marker, assertion, credential
-    and lint-suppression sentinels (F-25) scan in
+    test file deleted, and — F-65 — a change outside the task's declared
+    file scope. Escalation classes (no FAIL by themselves): undeclared
+    risk path touched (flag added; forces a human merge), dependency
+    manifest changed. The skip-marker, assertion, credential and
+    lint-suppression sentinels (F-25) scan in
     :func:`factory.sentinels.builtin_sentinel_findings`, not here — one
     home for the standing set.
+
+    F-65 scope boundary, stated: this gates WHICH FILES change, not
+    what changes inside them. Unrelated edits inside an in-scope file
+    stay L2's to catch against ``out_of_scope`` — an L0 pass is never
+    read as "scope verified". Every change class is judged (added,
+    modified, deleted, type-change, mode-only — git reports each as a
+    path with a status — a submodule pointer bump, both sides of a
+    rename, the destination of a copy) on the exact path string git
+    reports, through the scope matcher
+    (:func:`factory.gates.scope_matches`): a case variant or
+    Unicode-normalisation look-alike of an in-scope path is out of
+    scope, and a symlink is judged by its own path, never its target.
+    The allowed set is exactly: the task's ``scope.paths``, the
+    profile's ``paths.generated`` (AC-4) and the task's contract test
+    files (written red-first by the implementer) — nothing else is
+    implicit. A task that declares no scope is not judged here at all:
+    requiring the scope is the approval and run refusals' job
+    (``scope_missing``), and the replay corpus / pre-F-65 revalidations
+    call this policy with scope-less tasks. Scope never overrides
+    protection: a protected path inside the scope still fails exactly
+    as today, and a path both protected and out of scope gets both
+    findings.
 
     A modified ``pyproject.toml`` is diff-aware when refs are supplied:
     the escalation fires only if the dependency surface —
@@ -545,7 +569,8 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
     Args:
         profile: The loaded ``project.yaml`` mapping.
         changes: ``FileChange`` list from ``diff_file_changes``.
-        task: The task record (its ``risk`` and acceptance test refs).
+        task: The task record (its ``risk``, ``scope`` and acceptance
+            test refs).
         matched_flags: The diff's matched risk flags, when the caller
             already computed them (:func:`factory.sentinels.matched_risk_flags`
             — computed once per L0 run and passed through); ``None``
@@ -572,6 +597,15 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
         + [glob for glob in runner_globs if glob not in declared]
     )
     manifests = profile.get("dependency_manifests") or []
+    # F-65 AC-2: the declared file scope. Present only when the task
+    # declares one — see the docstring's boundary note. Generated globs
+    # (AC-4) and the contract test files join the allowed set; nothing
+    # else does.
+    scope_paths = list(
+        (task.get("scope") or {}).get("paths") or []
+    ) if isinstance(task.get("scope") or {}, dict) else []
+    allowed_globs = scope_paths + list(paths.get("generated") or [])
+    scope_declared = bool(scope_paths)
 
     findings: list[Finding] = []
     escalations: set[str] = set()
@@ -586,6 +620,25 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
 
     for change in changes:
         for path, verb in events(change):
+            # F-65 AC-2: outside the declared scope is a FAIL finding
+            # (not an escalation — the fix round can revert it, and the
+            # SAME path two rounds running escalates
+            # scope_change_needed one layer up, in the orchestrator).
+            # Scope never overrides protection: both findings fire when
+            # both apply.
+            if scope_declared and path not in contract_files \
+                    and not scope_matches(path, allowed_globs):
+                findings.append(
+                    Finding(
+                        "out_of_scope",
+                        f"out of scope: {verb} {path} — not in the "
+                        f"declared scope ({', '.join(scope_paths)}); "
+                        "revert it, or request the wider scope "
+                        "(request_scope tool) so the owner can widen the "
+                        "contract",
+                        file=path,
+                    )
+                )
             # The gate runner's venv (factory/orchestrator._create_gate_venv)
             # is factory infrastructure inside the clone: a tracked path
             # under .venv/ means an implementer `git add -f`-ed planted

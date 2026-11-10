@@ -112,6 +112,7 @@ def _task(task_id: str = "T-1", *, risk=(), ref: str = REF, **overrides) -> dict
         "approved_at": "2026-10-18T10:00:00Z",
         "approved_by": "owner",
         "budget": {"size": "S", "max_attempts": 3, "max_turns": 20, "wall_clock_min": 30},
+        "scope": {"paths": ["impl.py", "tests/test_feature.py"]},
         "attempts": [],
     }
     task.update(overrides)
@@ -715,7 +716,8 @@ def test_ac_8(tmp_path: Path):
 
 def test_ac_8_collection_red_reason(tmp_path: Path):
     """A brand-new module makes the red run a collection error: shown as such."""
-    env = Env(tmp_path)
+    env = Env(tmp_path, tasks=[_task(
+        scope={"paths": ["feature.py", "tests/test_feature.py"]})])
     test = "from feature import answer\n\n\ndef test_ac_1():\n    assert answer() == 42\n"
 
     def implementer(prompt, run_dir, kwargs):

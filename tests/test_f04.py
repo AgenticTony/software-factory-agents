@@ -56,6 +56,9 @@ def _task(**overrides):
         "gates": {"spec_approval": True, "merge": "human", "deploy": "human"},
         "acceptance": copy.deepcopy(ACCEPTANCE),
         "budget": {"size": "S", "max_attempts": 3, "max_turns": 80, "wall_clock_min": 60},
+        # F-65: approval requires a declared file scope; the fixture's
+        # contract names tests/x.py (its test ref).
+        "scope": {"paths": ["impl.py", "tests/x.py"]},
     }
     base.update(overrides)
     return base

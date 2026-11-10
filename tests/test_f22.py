@@ -748,6 +748,7 @@ def test_ac_8(tmp_path: Path, monkeypatch):
         "approved_at": "2026-10-18T10:00:00Z", "approved_by": "owner",
         "budget": {"size": "S", "max_attempts": 3, "max_turns": 20,
                    "wall_clock_min": 30},
+        "scope": {"paths": ["impl.py", "tests/test_feature.py"]},
         "attempts": [],
     }
     profile = dict(PROFILE_EXTRA_BASE)

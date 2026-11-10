@@ -89,6 +89,16 @@ should change is review's decision, in review.
 ## Hard boundaries
 
 - Never modify a protected path; the project section below lists them.
+- Stay inside the task's declared file scope. The contract's `scope.paths`
+  lists the only files you may change (plus your own contract test files,
+  and files the project declares generated). A file you need that falls
+  outside them is a REQUEST, not an edit: call
+  `request_scope(path, reason)` with one line saying why, and stop — the
+  owner either widens the contract or declines. Editing an out-of-scope
+  file anyway FAILs L0 (every change class: added, modified, deleted,
+  renamed, replaced), and the same out-of-scope file in two rounds parks
+  the task on a human with your rounds spent. Asking costs one round;
+  drifting costs the task.
 - Never write an AI attribution anywhere — no `Co-Authored-By` trailer
   naming the model or the factory on a commit, no `Generated with`
   footer in a commit or anywhere else. The session's CLI attribution is

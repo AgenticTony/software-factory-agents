@@ -273,6 +273,30 @@ def credential_recovery_eligible(task: dict) -> bool:
 
 ATTEMPTS_RESET_ESCALATIONS = ("attempts_exhausted",)
 
+# F-65 AC-3: the declared-scope escalations. Both park a task with no
+# GitHub signal at all (nothing was pushed; the task never reached a
+# PR), so like credential_added the only honest exit is the owner's:
+# widen (or drop) the scope, re-approve the new contract into the F-63
+# ledger, and take the re-queue through
+# :meth:`TaskQueue.recover_scope` — the dedicated state-layer writer
+# `factory recover` drives with an interactive y/N and the ledger check
+# (a widened scope that is not re-approved does not move).
+SCOPE_RECOVERY_ESCALATIONS = ("scope_change_needed", "scope_missing")
+
+
+def scope_recovery_eligible(task: dict) -> bool:
+    """Whether the owner's scope re-queue word may move this task.
+
+    True only for a ``needs_human`` task whose last attempt escalated
+    ``scope_change_needed``/``scope_missing`` (F-65). The ledger half of
+    the gate — the CURRENT contract hash must be owner-approved — lives
+    in :meth:`TaskQueue.recover_scope`, which demands the ledger.
+    """
+    attempts = task.get("attempts") or []
+    return (task.get("status") == "needs_human"
+            and bool(attempts)
+            and attempts[-1].get("escalation") in SCOPE_RECOVERY_ESCALATIONS)
+
 # F-64 AC-2: how many quota-classified attempts (outcome "aborted",
 # escalation "quota_exhausted") requeue for FREE per task per UTC
 # calendar day — and, since the round-1 amendment, per task LIFETIME
@@ -351,7 +375,10 @@ def attempt_budget_used(task: dict, slice_id: str) -> int:
     """How many attempts of ``slice_id``'s budget are spent.
 
     The orchestrator's one budget filter: same-slice attempts, not
-    session-less sweep escalations (round-5 finding 1), and — after a
+    session-less sweep escalations (round-5 finding 1), not
+    ``scope_missing`` refusals (F-65: the pre-seat refusal spent no
+    session — a queue-wide fail-closed period must not burn every
+    task's budget before the owner adds scopes), and — after a
     reset — only those at or after the reset floor. Every
     budget-relative number downstream (the run's attempt numbering, the
     implementer prompt's "attempt N of M", the PR body's attempt line)
@@ -381,6 +408,8 @@ def attempt_budget_used(task: dict, slice_id: str) -> int:
             continue
         if a.get("escalation") in RECOVERY_ESCALATIONS:
             continue
+        if a.get("escalation") == "scope_missing":
+            continue  # F-65: session-less pre-seat refusal, no budget
         if a.get("outcome") == "aborted":
             if a.get("escalation") != "quota_exhausted":
                 continue  # a non-quota abort (peak window, crash): free
@@ -1090,6 +1119,81 @@ class TaskQueue:
             "slice_id": slice_id,
             "prior_attempts": len(task.get("attempts") or []),
         })
+        self.save()
+        return new_status
+
+    def recover_scope(self, task_id: str, *, ledger, evidence: str,
+                      done_by: str | None = None) -> str:
+        """Re-queue a scope-escalated task after the owner re-approves
+        its (possibly widened) contract: the one writer of that edge
+        (F-65 AC-3 — the minimal path this WO had to build; the spec
+        said "the existing approval path", but the contract audit never
+        demoted a ``needs_human`` task whose scope changed, and
+        ``approve`` refuses non-draft tasks, so nothing moved it).
+
+        Two gates, both HERE (the credential/attempts precedent: the
+        command cannot be the only gate): the task must be parked on
+        ``scope_change_needed``/``scope_missing``
+        (:func:`scope_recovery_eligible`), and its CURRENT whole-contract
+        hash must be owner-approved in the F-63 ledger — the widened
+        scope IS the contract change, so a hash with no ledger entry
+        means the owner has not re-approved it yet, and the task does
+        not move. Routing matches every recovery writer: ``blocked``
+        when a dependency is open, else ``ready``; attempts are never
+        reset (the pre-F-65 ``scope_missing`` refusals spent no budget
+        anyway — :func:`attempt_budget_used` skips them).
+
+        Args:
+            task_id: Task parked on a scope escalation.
+            ledger: The :class:`~factory.approvals.ApprovalLedger` the
+                re-approval was recorded into (required, never None:
+                without the ledger there is no proof of re-approval).
+            evidence: What the owner checked; must not be blank.
+            done_by: Who confirmed; recorded by the command's log entry.
+
+        Returns:
+            The new status: ``ready`` or ``blocked``.
+
+        Raises:
+            StateError: Unknown task, blank evidence, or a missing
+                ledger.
+            TransitionError: The task isn't parked on a scope
+                escalation, or its current contract hash has no owner
+                approval on record.
+        """
+        if not (evidence or "").strip():
+            raise StateError(f"{task_id}: scope recovery requires evidence")
+        if ledger is None:
+            raise StateError(
+                f"{task_id}: scope recovery requires the approval ledger — "
+                "the re-approved contract hash is the gate"
+            )
+        task = self.get(task_id)
+        if not scope_recovery_eligible(task):
+            raise TransitionError(
+                f"{task_id}: scope recovery needs a needs_human task whose "
+                "last attempt escalated scope_change_needed or scope_missing"
+            )
+        chash = contract_hash(task)
+        if not ledger.has_contract(task_id, chash):
+            raise TransitionError(
+                f"{task_id}: the current contract (hash {chash[:12]}) has no "
+                "owner approval in the ledger — widen the scope in the "
+                "queue, record the re-approval (`factory adopt` shows the "
+                "contract and records the new hash; `factory approve` "
+                "refuses non-draft tasks), then recover; a widened scope "
+                "the owner has not re-approved does not move"
+            )
+        new_status = (
+            "blocked" if unmet_dependencies(task, self.doc.get("tasks", []))
+            else "ready"
+        )
+        reason = RECOVERY_TRANSITIONS.get((_status_of(task), new_status))
+        assert reason is not None  # needs_human → ready/blocked is in the table
+        _check_kind_rules(task, _status_of(task), new_status)
+        _check_slice_rules(task, new_status)
+        _check_owner_step_rules(task, new_status)
+        task["status"] = new_status
         self.save()
         return new_status
 

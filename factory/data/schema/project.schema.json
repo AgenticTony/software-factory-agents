@@ -99,6 +99,7 @@
           "additionalProperties": { "type": "array", "items": { "type": "string" } }
         },
         "protected": { "type": "array", "items": { "type": "string" } },
+        "generated": { "type": "array", "items": { "type": "string", "minLength": 1 }, "description": "F-65 AC-4: repo-relative globs (scope-matcher semantics) of generated files (lockfiles, snapshots, codegen output) in scope for EVERY task of this project. Owner-approved profile content (security group paths.generated under F-63); widening without re-approval refuses the run. Obeys the declared-scope refusals at load — a catch-all or climbing pattern refuses." },
         "setup_outputs": { "type": "array", "items": { "type": "string" }, "description": "Repo-relative directories the setup command creates (a venv, node_modules). L1 keeps them through its between-phase git clean, so the red and green runs have the installed tools; everything else untracked is still removed." }
       }
     },

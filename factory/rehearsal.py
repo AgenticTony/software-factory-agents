@@ -343,6 +343,10 @@ def _task() -> dict:
         "approved_at": "2026-10-19T10:00:00Z",
         "approved_by": "owner",
         "budget": {"size": "S", "max_attempts": 2, "max_turns": 20, "wall_clock_min": 30},
+        # F-65: the rehearsal's implementer writes exactly these two
+        # files (its scripted seat at build_rehearsal_fixture) — the
+        # honest declared scope, no wider.
+        "scope": {"paths": ["impl.py", "tests/test_feature.py"]},
         "attempts": [],
     }
 

@@ -80,6 +80,11 @@ PROFILE_SECURITY_GROUPS: dict[str, tuple[str, ...]] = {
     "repo.branch_protection": ("repo", "branch_protection"),
     "paths.protected": ("paths", "protected"),
     "paths.risk": ("paths", "risk"),
+    # F-65 AC-4: the generated-file list widens every task's effective
+    # scope (an L0 allowance), so it is owner-approved content like the
+    # protected list — through the same F-63 group mechanism, not its
+    # own.
+    "paths.generated": ("paths", "generated"),
     "live_checks": ("live_checks",),
     "toolkit": ("toolkit",),
 }
