@@ -1123,7 +1123,8 @@
         "F-45",
         "F-46",
         "F-47",
-        "F-56"
+        "F-56",
+        "F-65"
       ],
       "risk": [
         "cross_repo"
@@ -5118,6 +5119,70 @@
       "links": {},
       "budget": {
         "size": "S",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-65",
+      "title": "Declared file scope",
+      "source": "BUILD-ORDER.md#f-65--declared-file-scope",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-07",
+        "F-09",
+        "F-12",
+        "F-63"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "Contracts declare their file scope. The task schema gains `scope.paths`: a non-empty list of repo-relative globs, inside `contract_hash`, so the F-63 approval ledger covers it and any widening needs re-approval. Scope globs use their own matcher: `*` and `?` never cross `/`, `**` matches across directories, matching is case-sensitive on the exact git path. Protected and risk paths keep today's matcher unchanged (its `*` crosses `/`, so it stays the broader, fail-safe one). A pattern that is absolute, contains `..`, is empty, or matches every path (`**`, `**/*`, `*/**` and equivalents) refuses to load, naming the task and the pattern. `render_contract` shows the paths. `scope` stays optional in the schema so existing entries load, but approval refuses a `build` task without it, and the importer proposes `scope.paths` for every task it drafts. Test: each refused shape refuses with the pattern named; the hash changes when a path changes; approval refuses a scope-less `build` task; the factory's own `.factory/tasks.json` still validates.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f65.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "L0 fails changes outside the declared scope. Every changed path, whether added, modified, deleted, mode-only, a submodule pointer, or either side of a rename or copy, must match `scope.paths`, a profile `paths.generated` glob (AC-4), or one of the task's own contract test files; anything else is an L0 FAIL finding that names the path and the scope. Scope never overrides protection: a protected path inside the scope still fails exactly as today. Paths are judged on the exact git path bytes: a case variant, a Unicode-normalisation look-alike, or a symlink whose own path is out of scope fails even when its target or folded form is in scope. Test: one planted diff per change class, plus each bypass shape, and an all-in-scope diff that passes.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f65.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "The implementer works inside its scope and asks instead of drifting. The implementer prompt lists `scope.paths` and says that a needed file outside it is a stop-and-report, not an edit. An out-of-scope finding reaches the fix round as \"revert it, or report that the task needs a wider scope\"; the same out-of-scope path flagged in two rounds of one attempt escalates `scope_change_needed` (needs_human), naming the paths, instead of spending more rounds. `scope_change_needed` joins the escalation enum; the owner widens the scope and re-approves, and the re-approval returns the task to `ready` through the existing approval path. Nothing inside a run can widen it. Test: a scripted implementer that keeps touching an out-of-scope file reaches `scope_change_needed` within 2 rounds with the path named; one that reverts in round 2 opens a PR.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f65.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "Generated files are allowed explicitly, never implicitly. A project profile may declare `paths.generated` globs (lockfiles, snapshots, codegen output) that are in scope for every task of that project; they are owner-approved profile content under F-63 (security group) and obey AC-1's refused shapes. No other implicit allowance exists. Test: a lockfile change passes only when declared; a catch-all `paths.generated` refuses to load; widening `paths.generated` without re-approval refuses the run.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f65.py::test_ac_4"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
         "max_attempts": 3,
         "max_turns": 200,
         "wall_clock_min": 150
