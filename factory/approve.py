@@ -127,11 +127,18 @@ def render_contract(task: dict) -> str:
 
     lines = [
         f"{show(task.get('id'))} — {show(task.get('title'))}",
-        "  kind: {}   priority: {}   budget: {} (max {} attempts)".format(
+        # F-64 AC-3: the whole budget beside the size — max_attempts,
+        # max_turns and wall_clock_min are what the run will spend, so
+        # the approval decision sees all three (through the same
+        # escaping as every other interpolated value).
+        "  kind: {}   priority: {}   budget: {} (max {} attempts, "
+        "{} turns, {} min wall clock)".format(
             show(task.get("kind")),
             show(task.get("priority")),
             show(budget.get("size", "?")),
             show(budget.get("max_attempts", "?")),
+            show(budget.get("max_turns", "?")),
+            show(budget.get("wall_clock_min", "?")),
         ),
         f"  source: {show(task.get('source'))}",
         f"  risk: {show(', '.join(risk) if risk else '(none)')}",

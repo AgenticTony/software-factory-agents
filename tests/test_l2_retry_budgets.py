@@ -1,4 +1,5 @@
-"""The reviewer retry's budgets and abort paths (PR #90 rounds 3-4).
+"""The reviewer retry's budgets and abort paths (PR #90 rounds 3-4, as
+amended by F-64).
 
 Round 3: the retry re-ran a seat unconditionally — it could exceed the
 fan-out's own turn invariant, spend a stale pre-fan-out wall-clock
@@ -7,13 +8,18 @@ invalid_verdict_json FAIL, and leave failure notes for seats its retry
 had already rescued.
 
 Round 4: a quota'd re-run stops the fan-out's remaining re-runs (the
-attempt is aborting — more re-runs only burn tokens); a re-run reserves
-the verifier's turn floor (a flaky reviewer must never escalate a task
-that would otherwise fail a normal round); every still-invalid seat gets
-ONE note naming the original failure, whether a re-run happened or was
-refused (and by which budget), and the re-run's outcome; the trace event
-carries seat:"reviewer" plus a 1-based seat_no; and the orchestrator's
-two collection blocks are one shared closure.
+attempt is aborting — more re-runs only burn tokens); every
+still-invalid seat gets ONE note naming the original failure, whether a
+re-run happened or was refused (and by which budget), and the re-run's
+outcome; the trace event carries seat:"reviewer" plus a 1-based seat_no;
+and the orchestrator's two collection blocks are one shared closure.
+
+F-64 (owner decision 2026-11-09, option D) superseded the turn half of
+the round-4 fit: a re-run runs at the FIXED parent-granted
+REVIEWER_TURN_CAP — no session record funds or drains it, and only the
+wall clock (recomputed per re-run from parent-measured time) can refuse
+one. The verifier it used to reserve a floor for has its own fixed cap,
+so it can no longer be starved.
 
 Unit half: the budget-fit policy and the helper's refusal semantics.
 Integration half: the orchestrator's wiring, driven through the F-23
@@ -40,47 +46,41 @@ def _session(result, seat="reviewer", status="completed", turns=1):
     )
 
 
-# --- 1/2. the budget-fit policy: turns and wall clock --------------------
+# --- 1/2. the budget-fit policy: fixed turns, recomputed wall clock ------
 
 
-def test_retry_budget_caps_at_share_and_remaining_and_floors():
+def test_retry_budget_grants_the_fixed_reviewer_cap():
+    """F-64 AC-1: the re-run's turns are the parent's constant — no
+    record funds or drains them (the old remainder arithmetic read the
+    session-writable num_turns, so the fit no longer takes records at
+    all); only the wall clock is recomputed."""
+    from factory.orchestrator import REVIEWER_TURN_CAP
+
     budget = {"max_turns": 40, "wall_clock_min": 10.0}
-    records = [SessionRecord(seat="implementer", status="completed",
-                             num_turns=30)]
-    # min(share 8, remaining 10) turns; the wall clock left after spend.
-    assert _retry_budget(budget, records, 5.0 * 60, 8) == (8, 5.0, None)
+    # The take-nothing baseline, the window after a 5-minute spend, and
+    # a fresh window: the turn grant never moves.
+    assert _retry_budget(budget, 0.0) == (REVIEWER_TURN_CAP, 10.0, None)
+    assert _retry_budget(budget, 5.0 * 60) == (REVIEWER_TURN_CAP, 5.0, None)
+    # Even a budget whose max_turns is BELOW the cap: the cap is the
+    # grant (fixed per-seat accounting), never the task's remainder.
+    small = {"max_turns": 4, "wall_clock_min": 10.0}
+    assert _retry_budget(small, 0.0) == (REVIEWER_TURN_CAP, 10.0, None)
 
 
-def test_retry_budget_reserves_the_verifiers_turn_floor():
-    """Round 4 finding 2: a re-run may only take turns that leave the
-    verifier's floor for the pass after it — min(share, remaining -
-    floor), refused below the floor. Both numbers are the existing
-    _REVIEW_TURN_FLOOR; nothing new is invented."""
-    budget = {"max_turns": 40, "wall_clock_min": 10.0}
-    records = [SessionRecord(seat="implementer", status="completed",
-                             num_turns=36)]
-    # remaining 4: min(share 8, 4 - 2 reserved) = 2, exactly the floor
-    assert _retry_budget(budget, records, 0.0, 8) == (2, 10.0, None)
-    # remaining 3: min(8, 3 - 2) = 1, below the floor — the verifier's
-    # floor wins; the refusal names its refuser (round 5: the fit and
-    # the name come from ONE function).
-    records.append(SessionRecord(seat="reviewer", status="completed",
-                                 num_turns=1))
-    assert _retry_budget(budget, records, 0.0, 8) == (
-        None, None, "turn budget")
-    # … and the share still caps: remaining 20, share 5 → 5.
-    records.clear()
-    records.append(SessionRecord(seat="implementer", status="completed",
-                                 num_turns=20))
-    assert _retry_budget(budget, records, 0.0, 5) == (5, 10.0, None)
+def test_retry_budget_never_refuses_on_turns():
+    """Round 4's finding ("a re-run must not starve the verifier") holds
+    ABSOLUTELY since F-64: the verifier has its own fixed cap, so a
+    re-run reserves nothing and is never refused on turns — only the
+    wall clock refuses (named, per round 5's one-function rule)."""
+    budget = {"max_turns": 4, "wall_clock_min": 10.0}
+    assert _retry_budget(budget, 0.0).refusal is None
 
 
 def test_retry_budget_refused_without_wall_clock():
     budget = {"max_turns": 40, "wall_clock_min": 10.0}
-    records = []
-    assert _retry_budget(budget, records, 10.0 * 60, 8) == (
+    assert _retry_budget(budget, 10.0 * 60) == (
         None, None, "wall-clock budget")
-    assert _retry_budget(budget, records, 10.5 * 60, 8) == (
+    assert _retry_budget(budget, 10.5 * 60) == (
         None, None, "wall-clock budget")
 
 
@@ -91,17 +91,15 @@ def test_three_invalid_seats_spend_at_most_the_window():
     the granted windows can never sum past the budget."""
     budget = {"max_turns": 100, "wall_clock_min": 10.0}
     granted: list[float] = []
-    spent = {"seconds": 9.5 * 60, "records": []}
+    spent = {"seconds": 9.5 * 60}
 
     def rerun(seat_no, session, parse_error):
-        fit = _retry_budget(budget, spent["records"], spent["seconds"], 10)
+        fit = _retry_budget(budget, spent["seconds"])
         if fit.refusal is not None:
             return None
         granted.append(fit.wall)
         # the retry consumes its whole granted window (worst case)
         spent["seconds"] += fit.wall * 60.0
-        spent["records"].append(SessionRecord(
-            seat="reviewer", status="completed", num_turns=1))
         return _session(GARBAGE)
 
     reports, retries = parse_reviews_with_retry([_session(GARBAGE)] * 3,
@@ -204,10 +202,17 @@ def _current_round(seats) -> int:
     return sum(1 for s, *_ in seats.calls if s == "implementer")
 
 
-# --- 1 (wiring). a turn-refused retry: no third seat, fail closed ---------
+# --- 1 (wiring). a "spent" turn budget never blocks a re-run ---------------
 
 
-def test_turn_refused_retry_never_runs_a_third_seat(tmp_path):
+def test_turn_spent_budget_still_runs_one_rerun_per_seat(tmp_path):
+    """F-64 AC-1: a turn budget the records claim to have drained (the
+    implementer's 3 plus two 8-turn seats of 20) no longer refuses a
+    re-run — every invalid seat still gets its ONE retry at the fixed
+    REVIEWER_TURN_CAP; the round stays fail-closed (every attempt's
+    review void) and the task runs out of attempts, never of retries."""
+    from factory.orchestrator import REVIEWER_TURN_CAP
+
     env = Env(tmp_path)
     seats = Scripted(impls=Scripted.MOVING,
                      reviews=("not verdict json at all",))
@@ -217,33 +222,31 @@ def test_turn_refused_retry_never_runs_a_third_seat(tmp_path):
         record = base_call(seat, prompt, run_dir, profile, **kwargs)
         if seat == "reviewer":
             # The default budget is 20 turns; the implementer's 3 plus
-            # two 8-turn seats drain 19 — one turn remains, below the
-            # review floor, so no retry can fit.
+            # two 8-turn seats claim 19 of them — telemetry only.
             record.num_turns = 8
         return record
 
     result = env.run(runner)
-    # Every attempt's review is void (invalid union, retry refused — the
-    # turn budget resets per attempt but is 19/20 spent by each fan-out)
-    # so the task runs out of attempts — and NO attempt's fan-out ever
-    # got a third seat: 3 attempts x 2 seats, never a re-run.
     assert result.escalation == "attempts_exhausted"
-    reviewer_calls = [
-        c for c in seats.calls if c[0] == "reviewer"
-    ]
-    assert len(reviewer_calls) == 6
+    reviewer_calls = [c for c in seats.calls if c[0] == "reviewer"]
+    # 3 attempts x (2-seat fan-out + one re-run per seat): every invalid
+    # seat was retried every attempt, at the fixed cap throughout.
+    assert len(reviewer_calls) == 3 * 4
+    assert {c[3]["max_turns"] for c in reviewer_calls} == {REVIEWER_TURN_CAP}
 
 
-# --- round 4 / finding 2: a re-run never starves the verifier -------------
+# --- round 4 / finding 2 (as amended by F-64): the verifier cannot be starved
 
 
 def test_a_retry_never_starves_the_verifier(tmp_path):
-    """The fan-out leaves 3 turns: an unreserved re-run would take them
-    (min(share, 3) on the round-3 code), its rescue would hand the union
-    findings, and the verifier fit check would then escalate
-    budget_exhausted -> needs_human. The re-run must reserve the
-    verifier's floor instead: refused, the round fails as a NORMAL
-    invalid-verdict round and the next attempt ships the PR."""
+    """Round 4's finding holds absolutely since F-64: the re-run runs at
+    the FIXED REVIEWER_TURN_CAP (never a remainder), and the verifier at
+    its own fixed cap — a flaky reviewer can never escalate
+    (budget_exhausted -> needs_human) a task that would otherwise fail a
+    normal round. The round-1 seats die, their re-runs rescue them, the
+    PR ships."""
+    from factory.orchestrator import REVIEWER_TURN_CAP, VERIFIER_TURN_CAP
+
     env = Env(tmp_path)
     seats = Scripted(impls=Scripted.MOVING,
                      reviews=(_verdict(_finding()), _verdict(), _verdict()))
@@ -255,7 +258,7 @@ def test_a_retry_never_starves_the_verifier(tmp_path):
                 seen = sum(1 for s, *_ in seats.calls if s == "reviewer")
             if seen < 2:
                 # The seats die, 7 turns each; with the implementer's 3
-                # that drains 17 of the 20-turn budget — 3 remain.
+                # that claims 17 of the 20-turn budget — telemetry only.
                 with seats.lock:
                     seats.calls.append((seat, prompt, Path(run_dir), kwargs))
                     seats.round_reviews += 1
@@ -270,6 +273,10 @@ def test_a_retry_never_starves_the_verifier(tmp_path):
     result = env.run(runner)
     assert result.outcome == "pr_opened"  # NOT needs_human/budget_exhausted
     assert result.escalation is None
+    assert {c[3]["max_turns"] for c in seats.calls
+            if c[0] == "reviewer"} == {REVIEWER_TURN_CAP}
+    assert {c[3]["max_turns"] for c in seats.calls
+            if c[0] == "verifier"} == {VERIFIER_TURN_CAP}
 
 
 # --- 6. the session-ended note: only for seats the retry did not rescue ---

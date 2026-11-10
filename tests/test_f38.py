@@ -402,15 +402,19 @@ def test_ac_5(tmp_path: Path, monkeypatch):
     assert versions["verifier"] == prompt_hash(assemble_verifier_prompt(loaded))
     assert versions["verifier"] != versions["reviewer-1"]
 
-    # The fan-out is inside the attempt's turn budget (review round
-    # finding 3): the reviewers share the remainder after the implementer
-    # ((20-3)//2 = 8 each), the verifier gets what they actually spent
-    # left over (20-3-2-2 = 13) — the caps can never sum past max_turns —
-    # and the attempt's recorded turns are the sum over ALL sessions.
-    assert {kw["max_turns"] for kw in seats.kwargs("reviewer")} == {(20 - 3) // 2}
-    assert seats.kwargs("verifier")[0]["max_turns"] == 20 - 3 - 2 - 2
+    # F-64 AC-1 superseded F-38 finding 3's remainder sharing (owner
+    # decision 2026-11-09, option D): every seat runs at its FIXED
+    # parent-granted cap — reviewers at REVIEWER_TURN_CAP, the verifier
+    # at VERIFIER_TURN_CAP — whatever the implementer's record claimed
+    # (3 turns here). The attempt's recorded turns stay the sum over ALL
+    # sessions, session-REPORTED telemetry only.
+    from factory.orchestrator import REVIEWER_TURN_CAP, VERIFIER_TURN_CAP
+
+    assert {kw["max_turns"] for kw in seats.kwargs("reviewer")} == {
+        REVIEWER_TURN_CAP
+    }
+    assert seats.kwargs("verifier")[0]["max_turns"] == VERIFIER_TURN_CAP
     assert attempt["turns"] == 3 + 2 + 2 + 1  # impl + reviewer x2 + verifier
-    assert attempt["turns"] <= 20
 
     # And inside the wall-clock budget: the verifier inherits the remaining
     # time after the reviewers, and never starts once it is spent.
@@ -1037,55 +1041,58 @@ def test_review2_unanimous_blocking_still_fails_the_round(tmp_path: Path):
     ), f"the refused drop is not in the ledger: {drops}"
 
 
-def test_review3_turn_budget_is_aggregate(tmp_path: Path):
-    """Finding 3: the fan-out shares the REMAINDER of the attempt's turn
-    budget (implementer included), each session capped at its share, the
-    verifier at what is left — so a round can never spend more than the
-    task's max_turns across its sessions."""
+def test_review3_turn_caps_are_fixed_not_remainder(tmp_path: Path):
+    """F-38 finding 3 as AMENDED by F-64 (owner decision 2026-11-09,
+    option D): the seats' turn caps are the parent's FIXED constants.
+    The stub echoes half its cap as turns: implementer 3, reviewers at
+    REVIEWER_TURN_CAP (spending 10 each), verifier at VERIFIER_TURN_CAP
+    (spending 5) — and a budget the implementer's record claims to have
+    spent (19, or 15 with the reviewers claiming their full caps) still
+    runs the whole fan-out at full caps: review is the quality guarantee,
+    never squeezed out, and no record funds or drains a seat."""
+    from factory.orchestrator import REVIEWER_TURN_CAP, VERIFIER_TURN_CAP
+
     env = Env(tmp_path)
-    # The stub echoes half its cap as turns: implementer 3, each reviewer
-    # capped at the shared remainder (20-3)//2 = 8 and spending 4, the
-    # verifier capped at what is left (20 - 3 - 4 - 4 = 9) and spending 4.
     seats = Fanout(
         reviews=_verdict(_finding("rename helper", severity="minor"), declared="pass"),
     )
     seats.echo_turn_cap = True
     result = env.run(seats)
     assert result.outcome == "pr_opened", result
-    reviewer_caps = {kw["max_turns"] for kw in seats.kwargs("reviewer")}
-    assert reviewer_caps == {(20 - 3) // 2}  # the shared remainder, per session
-    verifier_cap = seats.kwargs("verifier")[0]["max_turns"]
-    assert verifier_cap == 20 - 3 - 2 * 4  # what the reviewers actually spent
+    assert {kw["max_turns"] for kw in seats.kwargs("reviewer")} == {
+        REVIEWER_TURN_CAP
+    }
+    assert seats.kwargs("verifier")[0]["max_turns"] == VERIFIER_TURN_CAP
     attempt = env.task()["attempts"][-1]
-    assert attempt["turns"] == 3 + 4 + 4 + 4  # impl + reviewers + verifier echoes
-    assert attempt["turns"] <= 20
+    assert attempt["turns"] == 3 + 2 * (REVIEWER_TURN_CAP // 2) + (
+        VERIFIER_TURN_CAP // 2)  # impl + reviewer echoes + verifier echo
 
-    # Refusal: the implementer spends 19 of the 20 turns — the share for
-    # two reviewers is 0, below the floor, so the fan-out never starts.
+    # The pre-F-64 refusal cases are gone: an implementer that "spent" 19
+    # of the 20 turns, and reviewers claiming their full caps, still get
+    # the complete fan-out at full caps — no turn-budget escalation.
     env2 = Env(tmp_path / "spent", tasks=[_one_round_task()])
     seats2 = Fanout(
         reviews=_verdict(declared="pass"),
         implementer_turns=19,
     )
     result2 = env2.run(seats2)
-    assert result2.outcome == "needs_human", result2
-    assert result2.escalation == "budget_exhausted"
-    assert "reviewer" not in seats2.seats() and "verifier" not in seats2.seats()
+    assert result2.outcome == "pr_opened", result2
+    assert seats2.seats().count("reviewer") == 2
+    assert {kw["max_turns"] for kw in seats2.kwargs("reviewer")} == {
+        REVIEWER_TURN_CAP
+    }
 
-    # Refusal before the verifier: the reviewers spend down to a remainder
-    # below the floor — the verifier never starts.
     env3 = Env(tmp_path / "verifier-floor", tasks=[_one_round_task()])
     seats3 = Fanout(
         reviews=_verdict(_finding("rename helper", severity="minor"),
                          declared="pass"),
         implementer_turns=15,
     )
-    seats3.echo_turn_cap = False  # reviewers burn their FULL caps
+    seats3.echo_turn_cap = False  # reviewers claim their FULL caps
     result3 = env3.run(seats3)
-    assert result3.outcome == "needs_human", result3
-    assert result3.escalation == "budget_exhausted"
-    assert "verifier" not in seats3.seats()
-    assert "verifier" in env3.task()["attempts"][-1]["note"]
+    assert result3.outcome == "pr_opened", result3
+    assert seats3.seats().count("verifier") == 1
+    assert seats3.kwargs("verifier")[0]["max_turns"] == VERIFIER_TURN_CAP
 
 
 def test_review4_round_one_fail_voted_out_passes(tmp_path: Path):

@@ -303,7 +303,16 @@ class TraceWriter:
     def session_end(self, record: Any, seat: str) -> None:
         """One session's spend and outcome (AC-1's session_end row), plus
         the session's sandbox-bypass denial count (F-42 AC-5: the summary
-        next to the marked ``tool_call`` events, never instead of them)."""
+        next to the marked ``tool_call`` events, never instead of them).
+
+        ``turns`` is TELEMETRY, session-reported (F-64 AC-1): only a
+        non-bool int >= 0 renders; anything else a forged record carries
+        renders as None ("turns unknown"), never raw — the same rule the
+        importer's ``_record_turns`` set. Turn budgets never read it.
+        """
+        turns = getattr(record, "num_turns", None)
+        if isinstance(turns, bool) or not isinstance(turns, int) or turns < 0:
+            turns = None
         self.append({
             "type": "session_end",
             "seat": seat,
@@ -311,7 +320,7 @@ class TraceWriter:
             "reason": getattr(record, "reason", None),
             "tokens": getattr(record, "tokens", None),
             "cost_usd": getattr(record, "total_cost_usd", None),
-            "turns": getattr(record, "num_turns", None),
+            "turns": turns,
             "model": getattr(record, "model", None),
             "duration_ms": getattr(record, "duration_ms", None),
             "sandbox_bypass_denials": getattr(record, "sandbox_bypass_denials", 0) or 0,

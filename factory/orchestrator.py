@@ -181,10 +181,50 @@ _PR_BODY_LIMIT = 65_000
 _REVIEW_OUTPUT_TAIL = 6000
 _REVIEW_DIFF_CAP = 200_000
 # F-38 review finding 3: the smallest per-session turn cap a review seat
-# may start with. Below it the fan-out / verifier refuses to start and the
-# round escalates budget_exhausted — a review that cannot take a tool turn
-# and answer is not a review.
+# may meaningfully start with — a review that cannot take a tool turn and
+# answer is not a review. Since F-64 it is the floor the two caps below
+# must sit at or above (a cap below it would reinstate, as a constant,
+# exactly the starvation F-38 refused); the runtime refusals it used to
+# drive are gone — see the caps.
 _REVIEW_TURN_FLOOR = 2
+
+# F-64 AC-1 (owner decision 2026-11-09, option D): FIXED per-seat turn
+# caps the parent grants. No cap depends on any session's record — the
+# record file is session-writable, so a forged num_turns must fund or
+# drain nothing. Every reviewer seat (round review, final review, and
+# each re-run) gets REVIEWER_TURN_CAP; the verifier VERIFIER_TURN_CAP;
+# the implementer budget.max_turns, unchanged. Review is the factory's
+# quality guarantee: a seat is never refused or shrunk on turns because
+# of what the implementer used or claimed — the pre-F-64 remainder
+# sharing (max_turns - _turns_spent) let a long implementer run starve
+# review into budget_exhausted, and a forged record move the number.
+# PROPOSED values, sized from the owner's traces (~/factory/trace/**,
+# session_end events, 2026-11-09): reviewer n=8 median 10 / max 15
+# turns; verifier n=1: 5 turns. 20/10 give headroom over the observed
+# maxima; the samples are thin — revisit after F-13's first runs.
+REVIEWER_TURN_CAP = 20
+VERIFIER_TURN_CAP = 10
+
+# F-64 AC-1: the wall-clock minutes reserved for the review/verify fan-out.
+# The implementer's timeout is wall_clock_min minus this reserve, so a
+# session can never spend the review window, whatever its record claims —
+# wall clock is measured by the parent (time.monotonic), never from a
+# record. PROPOSED value, sized from the same traces: the observed
+# review pass max is reviewer 4.4 min + verifier 1.0 min ≈ 5.4, but a
+# reviewer spending its FULL cap at the observed ~18 s/turn (15 turns in
+# 4.4 min) needs ≈ 5.9 min, plus the verifier ≈ 6.9 → 8.0; re-runs and
+# later review events draw on what remains beyond it (the wall-backstop
+# refusals below stay for the pathological tail).
+REVIEW_WALL_RESERVE_MIN = 8.0
+# The minimal implementer window a wall budget must hold beside the
+# reserve: a run that cannot grant the implementer one minute refuses at
+# attempt start rather than starting a seat it cannot review.
+_MIN_IMPLEMENTER_WALL_MIN = 1.0
+
+assert REVIEWER_TURN_CAP >= _REVIEW_TURN_FLOOR, (
+    "a reviewer cap below the turn floor is not a review (F-38 finding 3)")
+assert VERIFIER_TURN_CAP >= _REVIEW_TURN_FLOOR, (
+    "a verifier cap below the turn floor is not a vote (F-38 finding 3)")
 
 _IDENTITY = ("-c", "user.name=Software Factory", "-c", "user.email=factory@localhost",
              "-c", "commit.gpgsign=false")
@@ -528,17 +568,17 @@ def _tokens(record: SessionRecord | None, key: str) -> int:
     return int(value) if isinstance(value, (int, float)) else 0
 
 
-def _turns_spent(records: list) -> int:
-    """Turns the attempt's sessions have actually spent so far (F-38
-    review finding 3): the implementer included — the fan-out shares the
-    REMAINDER of the task's turn budget, so every session's spend must be
-    counted before the next one is capped."""
-    total = 0
-    for record in records:
-        turns = getattr(record, "num_turns", None) if record else None
-        if isinstance(turns, (int, float)) and not isinstance(turns, bool):
-            total += int(turns)
-    return total
+def _session_turns(record) -> int:
+    """One record's turn count as TELEMETRY (F-64 AC-1): only a non-bool
+    int >= 0 counts; anything else a forged record carries renders as
+    nothing (never raw) — the importer's ``_record_turns`` rule, applied
+    to the attempt record's turn sum. Turn BUDGETS never read this: caps
+    are the parent's constants (REVIEWER_TURN_CAP & co), so a session's
+    claimed count can neither fund nor drain a seat."""
+    turns = getattr(record, "num_turns", None) if record else None
+    if isinstance(turns, bool) or not isinstance(turns, int) or turns < 0:
+        return 0
+    return turns
 
 
 class RetryFit(NamedTuple):
@@ -553,37 +593,23 @@ class RetryFit(NamedTuple):
     refusal: str | None = None
 
 
-def _retry_budget(
-    budget: dict, records: list, session_seconds: float, reviewer_share: int
-) -> RetryFit:
+def _retry_budget(budget: dict, session_seconds: float) -> RetryFit:
     """The turns and wall-clock minutes ONE reviewer re-run may have, or
     the refusal that denies it (PR #90 rounds 3-5: ONE source of truth
     for the fit and the refusal's name — the two can never drift).
 
-    The fan-out's own invariant is that its sessions' summed turns never
-    exceed ``budget["max_turns"]``; a re-run joins that invariant, so it
-    is capped at ``min(its per-seat share, what actually remains)`` and
-    refused below :data:`_REVIEW_TURN_FLOOR` — the same floor at which
-    the fan-out itself refuses to start. Since round 4 the re-run also
-    RESERVES the verifier's floor: it may only take turns that leave at
-    least :data:`_REVIEW_TURN_FLOOR` for the verifier pass after it, so
-    a flaky reviewer can never escalate (budget_exhausted ->
-    needs_human) a task that would otherwise have failed a normal
-    round. The wall clock is recomputed from ``session_seconds`` per
-    re-run (re-runs are sequential; reusing the pre-fan-out window would
-    let N invalid seats spend N windows) and must be positive, the same
-    fit the review path itself requires — the existing verifier fit
-    check has no positive wall floor (only ``<= 0``), so none is
-    reserved here.
+    Since F-64 the turns are the FIXED parent-granted reviewer cap
+    (:data:`REVIEWER_TURN_CAP`): no session record funds or drains a
+    seat, and a re-run is never refused on turns — the same fixed-cap
+    rule the fan-out itself runs under. Only the wall clock can refuse
+    one, and it is recomputed from the parent-measured
+    ``session_seconds`` per re-run (re-runs are sequential; reusing the
+    pre-fan-out window would let N invalid seats spend N windows).
     """
-    remaining_turns = budget["max_turns"] - _turns_spent(records)
-    turns = min(reviewer_share, remaining_turns - _REVIEW_TURN_FLOOR)
     remaining_wall = budget["wall_clock_min"] - session_seconds / 60.0
     if remaining_wall <= 0:
         return RetryFit(None, None, "wall-clock budget")
-    if turns < _REVIEW_TURN_FLOOR:
-        return RetryFit(None, None, "turn budget")
-    return RetryFit(turns, remaining_wall)
+    return RetryFit(REVIEWER_TURN_CAP, remaining_wall)
 
 
 def _compact(report: dict | None, tail: int) -> dict | None:
@@ -2174,6 +2200,45 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
     used = attempt_budget_used(task, slice_id)
     versions = prompt_versions(profile, reviewers=ctx.config.reviewers)
     log = ProgressLog.for_task(ctx.factory_root, project, task_id)
+    # F-64 AC-1: a wall budget too small to hold the review reserve plus
+    # a minimal implementer window refuses at attempt start, BEFORE any
+    # seat starts — a run that could only fund its implementer by
+    # squeezing review out of the budget never begins (the numbers are
+    # named so the refusal reads as a budgeting decision, not a crash).
+    if (budget["wall_clock_min"]
+            < REVIEW_WALL_RESERVE_MIN + _MIN_IMPLEMENTER_WALL_MIN):
+        note = (
+            f"wall_clock_min {budget['wall_clock_min']} cannot hold the "
+            f"{REVIEW_WALL_RESERVE_MIN:g}-min review reserve plus a "
+            f"minimal {_MIN_IMPLEMENTER_WALL_MIN:g}-min implementer "
+            "window — refusing before any seat starts; raise the budget "
+            "or slice the task"
+        )
+        attempt = {
+            "run_id": new_run_id(),
+            "slice_id": slice_id,
+            "started": now_iso(),
+            "ended": now_iso(),
+            "outcome": "escalated",
+            "rounds": 0,
+            "turns": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "prompt_versions": dict(versions),
+            "skills": [],  # no session ran: nothing was loaded
+            "escalation": "budget_exhausted",
+            "note": note,
+        }
+        queue.append_attempt(task_id, attempt)
+        _progress_best_effort(
+            log,
+            {"run_id": attempt["run_id"], "outcome": "escalated",
+             "escalation": "budget_exhausted",
+             "findings": [f"1. {note}"]},
+            task_id,
+        )
+        queue.transition(task_id, "needs_human")
+        return RunResult("needs_human", task_id, escalation="budget_exhausted")
     protected = list((profile.get("paths") or {}).get("protected") or [])
     implementer_system = assemble_implementer_prompt(profile)
     reviewer_system = assemble_reviewer_prompt(profile)
@@ -2248,7 +2313,11 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                 "ended": now_iso(),
                 "outcome": outcome,
                 "rounds": attempt_no,
-                "turns": sum((r.num_turns or 0) for r in records if r),
+                # F-64 AC-1: session-REPORTED telemetry, validated the
+                # importer's way (_session_turns: a forged non-int,
+                # negative or bool count renders as nothing, never raw) —
+                # never budget arithmetic; caps are the parent's.
+                "turns": sum(_session_turns(r) for r in records),
                 "input_tokens": sum(_tokens(r, "input_tokens") for r in records),
                 "output_tokens": sum(_tokens(r, "output_tokens") for r in records),
                 "prompt_versions": dict(versions),
@@ -2284,11 +2353,11 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
             drives it and decides whether the retry's verdict is used; a
             still-invalid retry keeps the fail-closed union FAIL.
 
-            Budget-fitted (round 3): the re-run is capped at what the
-            attempt's turn and wall-clock budgets actually have left
-            (:func:`_retry_budget`, the verifier's turn floor reserved
-            since round 4) and REFUSED — ``None``, counted as no retry —
-            when neither can fit one; the refusal's budget is named in
+            Budget-fitted (round 3; F-64 fixed-cap): the re-run runs at
+            the parent-granted :data:`REVIEWER_TURN_CAP` and is REFUSED
+            — ``None``, counted as no retry — only when the wall clock
+            (:func:`_retry_budget`, recomputed from parent-measured
+            time) cannot fit one; the refusal's budget is named in
             ``outcomes`` for the seat's note. A re-run that dies on
             quota is not a refusal: its record lands in
             ``retry_records`` (and the caller aborts the attempt exactly
@@ -2301,8 +2370,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
             seat number and the original failure (the attempt record is
             schema-locked, so the trace is the retry's ledger)."""
             nonlocal session_seconds
-            fit = _retry_budget(
-                budget, records, session_seconds, reviewer_share)
+            fit = _retry_budget(budget, session_seconds)
             if fit.refusal is not None:
                 outcomes[seat_no] = {"refused": fit.refusal}
                 return None
@@ -2450,10 +2518,27 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                 finish(attempt, "needs_human", ["1. attempt budget already spent"])
                 return RunResult("needs_human", task_id, escalation="attempts_exhausted")
             remaining_min = budget["wall_clock_min"] - session_seconds / 60.0
-            if remaining_min <= 0:
-                attempt = attempt_record(attempt_no, started, "escalated", [], None,
-                                         escalation="budget_exhausted")
-                finish(attempt, "needs_human", ["1. wall-clock budget spent"])
+            # F-64 AC-1: the implementer's window is what remains BEYOND
+            # the review reserve. Wall clock is the unforgeable total
+            # bound, measured here by the parent — never from a record —
+            # and a round whose review the remaining wall cannot fund
+            # must not run its implementer: review is never squeezed out
+            # (the same rule F-41 AC-4 gives the final review).
+            impl_window = remaining_min - REVIEW_WALL_RESERVE_MIN
+            if impl_window <= 0:
+                attempt = attempt_record(
+                    attempt_no, started, "escalated", [], None,
+                    escalation="budget_exhausted",
+                    note=(f"wall-clock budget spent before the implementer "
+                          f"round: {remaining_min:.1f} of "
+                          f"{budget['wall_clock_min']} min remain, of which "
+                          f"the {REVIEW_WALL_RESERVE_MIN:g}-min review "
+                          "reserve is untouchable"),
+                )
+                finish(attempt, "needs_human", [
+                    "1. wall-clock budget spent: only the review reserve "
+                    "remains",
+                ])
                 return RunResult("needs_human", task_id, escalation="budget_exhausted")
             if in_peak_window(ctx.now(), ctx.config.peak_window):
                 queue.transition(task_id, "ready")
@@ -2493,7 +2578,10 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                     impl = ctx.session_runner(
                         "implementer", prompt, work.root, profile,
                         factory_root=ctx.factory_root, max_turns=budget["max_turns"],
-                        timeout_min=remaining_min, protected=protected,
+                        # F-64: the implementer may spend the budget MINUS
+                        # the review reserve — the fan-out runs inside the
+                        # reserve this window leaves.
+                        timeout_min=impl_window, protected=protected,
                         system_prompt=implementer_system, srt_bin_path=ctx.srt_bin_path,
                         run_id=work.run_id, task_id=task_id,
                         trace_sink=trace.append,  # F-30: live tool_call events
@@ -2630,57 +2718,22 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                 review_prompt = _review_prompt(
                                     task, diff, reports["L0"], reports["L1"],
                                     delta=delta, carried=raised)
-                                # F-38 review finding 3: the fan-out shares the
-                                # REMAINDER of the attempt's turn budget —
-                                # each reviewer session capped at
-                                # remaining // N, so the sessions' summed
-                                # turns can never exceed max_turns. A share
-                                # below the floor refuses to start (a review
-                                # that cannot take a tool turn and answer is
-                                # not a review), escalating exactly like the
-                                # wall-clock path.
-                                remaining_turns = (
-                                    budget["max_turns"] - _turns_spent(records)
-                                )
-                                reviewer_share = (
-                                    remaining_turns // ctx.config.reviewers
-                                )
-                                if reviewer_share < _REVIEW_TURN_FLOOR:
-                                    path = _store(reports_dir, work.run_id,
-                                                  attempt_no, reports)
-                                    attempt = attempt_record(
-                                        attempt_no, started, "escalated", records,
-                                        path, escalation="budget_exhausted",
-                                        note=(f"turn budget spent before the review "
-                                              f"fan-out: {remaining_turns} of "
-                                              f"{budget['max_turns']} turns left, "
-                                              f"{reviewer_share} per reviewer session"),
-                                    )
-                                    finish(attempt, "needs_human", [
-                                        f"1. turn budget spent before the review "
-                                        f"fan-out ({remaining_turns} turns left for "
-                                        f"{ctx.config.reviewers} reviewer sessions)",
-                                    ])
-                                    return RunResult(
-                                        "needs_human", task_id,
-                                        escalation="budget_exhausted",
-                                        reports=reports,
-                                    )
-                                # F-38: N reviewer sessions over the same diff,
-                                # each a fresh context, in parallel — one
-                                # integrity guard spanning every one of them
-                                # (one baseline before, one workspace check
-                                # after all finish; a mutation by any session
-                                # fails the whole fan-out), each session with
-                                # its own settings and scratch, and all inside
-                                # the attempt's turn and wall-clock budgets.
+                                # F-64 AC-1: every reviewer seat runs at the
+                                # FIXED parent-granted cap — never a
+                                # remainder, never a number a session record
+                                # funds. The fan-out cannot be refused on
+                                # turns: review is the quality guarantee,
+                                # whatever the implementer used or claimed.
+                                # (F-38 review finding 3's remainder sharing
+                                # is superseded by this; the wall-clock
+                                # backstop above stays the total bound.)
                                 reviews = run_sessions_parallel(
                                     [("reviewer", review_prompt)]
                                     * ctx.config.reviewers,
                                     clean.root, profile,
                                     runner=ctx.session_runner,
                                     factory_root=ctx.factory_root,
-                                    max_turns=reviewer_share,
+                                    max_turns=REVIEWER_TURN_CAP,
                                     timeout_min=remaining_review,
                                     protected=protected,
                                     system_prompt=reviewer_system,
@@ -2721,26 +2774,24 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                         budget["wall_clock_min"]
                                         - session_seconds / 60.0
                                     )
-                                    verifier_turns = (
-                                        budget["max_turns"] - _turns_spent(records)
-                                    )
-                                    if remaining_verifier <= 0 or (
-                                        verifier_turns < _REVIEW_TURN_FLOOR
-                                    ):
-                                        spent = (
-                                            "wall-clock" if remaining_verifier <= 0
-                                            else "turn"
-                                        )
+                                    # F-64 AC-1: the verifier runs at its
+                                    # FIXED parent-granted cap — never
+                                    # refused on turns, only by the wall
+                                    # clock (the parent-measured total
+                                    # bound, a backstop the reserved
+                                    # implementer window keeps unloaded).
+                                    verifier_turns = VERIFIER_TURN_CAP
+                                    if remaining_verifier <= 0:
                                         path = _store(reports_dir, work.run_id,
                                                       attempt_no, reports)
                                         attempt = attempt_record(
                                             attempt_no, started, "escalated", records,
                                             path, escalation="budget_exhausted",
-                                            note=f"{spent} budget spent before "
+                                            note="wall-clock budget spent before "
                                                  "the verifier pass",
                                         )
                                         finish(attempt, "needs_human", [
-                                            f"1. {spent} budget spent before "
+                                            "1. wall-clock budget spent before "
                                             "the verifier pass",
                                         ])
                                         return RunResult(
@@ -2922,34 +2973,12 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                 # shape, in fresh contexts, at the end.
                                 final_prompt = _review_prompt(
                                     task, diff, reports["L0"], reports["L1"])
-                                remaining_turns = (
-                                    budget["max_turns"] - _turns_spent(records)
-                                )
-                                reviewer_share = (
-                                    remaining_turns // ctx.config.reviewers
-                                )
-                                if reviewer_share < _REVIEW_TURN_FLOOR:
-                                    path = _store(reports_dir, work.run_id,
-                                                  attempt_no, reports)
-                                    attempt = attempt_record(
-                                        attempt_no, started, "escalated", records,
-                                        path, escalation="budget_exhausted",
-                                        note=(f"turn budget spent before the final "
-                                              f"review fan-out: {remaining_turns} "
-                                              f"of {budget['max_turns']} turns left, "
-                                              f"{reviewer_share} per reviewer session"),
-                                    )
-                                    finish(attempt, "needs_human", [
-                                        f"1. turn budget spent before the final "
-                                        f"review fan-out ({remaining_turns} turns "
-                                        f"left for {ctx.config.reviewers} reviewer "
-                                        f"sessions)",
-                                    ])
-                                    return RunResult(
-                                        "needs_human", task_id,
-                                        escalation="budget_exhausted",
-                                        reports=reports,
-                                    )
+                                # F-64 AC-1: the final review's seats run at
+                                # the SAME fixed caps as the round review's —
+                                # guaranteed, never remainder-funded (F-41
+                                # AC-4's "never skip the final review" now
+                                # holds on turns absolutely; the wall clock
+                                # backstop above stays).
                                 t0 = time.monotonic()
                                 final_reviews = run_sessions_parallel(
                                     [("reviewer", final_prompt)]
@@ -2957,7 +2986,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                     clean.root, profile,
                                     runner=ctx.session_runner,
                                     factory_root=ctx.factory_root,
-                                    max_turns=reviewer_share,
+                                    max_turns=REVIEWER_TURN_CAP,
                                     timeout_min=remaining_final,
                                     protected=protected,
                                     system_prompt=reviewer_system,
@@ -2990,26 +3019,21 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                         budget["wall_clock_min"]
                                         - session_seconds / 60.0
                                     )
-                                    verifier_turns = (
-                                        budget["max_turns"] - _turns_spent(records)
-                                    )
-                                    if remaining_verifier <= 0 or (
-                                        verifier_turns < _REVIEW_TURN_FLOOR
-                                    ):
-                                        spent = (
-                                            "wall-clock" if remaining_verifier <= 0
-                                            else "turn"
-                                        )
+                                    # F-64 AC-1: the final verifier, like
+                                    # every review seat, at its fixed cap —
+                                    # wall clock is the only refusal.
+                                    verifier_turns = VERIFIER_TURN_CAP
+                                    if remaining_verifier <= 0:
                                         path = _store(reports_dir, work.run_id,
                                                       attempt_no, reports)
                                         attempt = attempt_record(
                                             attempt_no, started, "escalated", records,
                                             path, escalation="budget_exhausted",
-                                            note=f"{spent} budget spent before the "
+                                            note="wall-clock budget spent before the "
                                                  "final review's verifier pass",
                                         )
                                         finish(attempt, "needs_human", [
-                                            f"1. {spent} budget spent before the "
+                                            "1. wall-clock budget spent before the "
                                             "final review's verifier pass",
                                         ])
                                         return RunResult(
