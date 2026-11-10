@@ -53,12 +53,14 @@ from factory.progress import ProgressLog, ProgressLogError
 from factory.publish import PublishError
 from factory.runs import FACTORY_ROOT_DEFAULT
 from factory.state import (
+    ELIGIBLE_KINDS,
     TaskQueue,
     attempts_reset_eligible,
     credential_recovery_eligible,
     now_iso,
     open_owner_steps,
     recovery_task_eligible,
+    scope_recovery_eligible,
     unmet_dependencies,
 )
 
@@ -143,6 +145,11 @@ def render_contract(task: dict) -> str:
         f"  source: {show(task.get('source'))}",
         f"  risk: {show(', '.join(risk) if risk else '(none)')}",
         f"  depends_on: {show(', '.join(deps) if deps else '(none)')}",
+        # F-65 AC-1: the file scope is half of what the owner is
+        # approving — L0 fails anything outside these globs, and widening
+        # them later is a new contract needing re-approval.
+        f"  scope (files this contract may change): "
+        f"{show(', '.join(_scope_paths(task)) if _scope_paths(task) else '(none declared)')}",
         "  acceptance (frozen on approval):",
     ]
     for item in task.get("acceptance") or []:
@@ -201,7 +208,9 @@ def _check_approvable(task: dict) -> None:
 
     Raises:
         ApprovalError: When the task is not a draft, is of a
-            non-executable kind, or has no acceptance items (AC-1).
+            non-executable kind, has no acceptance items (AC-1), or —
+            F-65 — is of a kind the picker runs but declares no file
+            scope.
     """
     task_id = task.get("id")
     kind = task.get("kind")
@@ -220,6 +229,24 @@ def _check_approvable(task: dict) -> None:
             f"{task_id}: refusing to approve a contract with no acceptance "
             "items — there is nothing to hold the work to"
         )
+    # F-65 AC-1: a task a session will build must declare the files it
+    # may change — approving a scope-less build/docs contract would
+    # approve an unbounded write surface. Non-executable kinds run no
+    # session and are exempt.
+    if kind in ELIGIBLE_KINDS and not _scope_paths(task):
+        raise ApprovalError(
+            f"{task_id}: refusing to approve a {kind} contract with no "
+            "declared file scope — add scope.paths (the repo-relative "
+            "globs this task may change); the run refuses scope-less "
+            "tasks (F-65)"
+        )
+
+
+def _scope_paths(task: dict) -> list:
+    """The task's declared scope globs (empty when none declared)."""
+    scope = task.get("scope")
+    paths = scope.get("paths") if isinstance(scope, dict) else None
+    return list(paths) if isinstance(paths, list) and paths else []
 
 
 def _freeze_contract(task: dict, approved_by: str) -> None:
@@ -402,6 +429,12 @@ def recover_task(
         return _recover_attempts_task(
             queue, task_id, task, evidence=evidence, reset_attempts=reset_attempts,
             assume_yes=assume_yes, done_by=done_by, factory_root=factory_root,
+            confirm=confirm, echo=echo,
+        )
+    if scope_recovery_eligible(task):
+        return _recover_scope_task(
+            queue, task_id, task, evidence=evidence, assume_yes=assume_yes,
+            done_by=done_by, factory_root=factory_root,
             confirm=confirm, echo=echo,
         )
     if not recovery_task_eligible(task):
@@ -601,6 +634,89 @@ def _recover_attempts_task(
             "note": f"attempts_exhausted re-queued ({new_status}) with a "
                     f"fresh budget by {who}; {marker.get('prior_attempts')} "
                     f"attempt(s) kept on file: {evidence.strip()}",
+        })
+    except ProgressLogError as exc:
+        raise ApprovalError(
+            f"{task_id}: moved to {new_status}, but the progress log could "
+            f"not be written — the confirmation is NOT durably recorded: {exc}"
+        ) from exc
+    assert entry.get("outcome") == "recovered"
+    return new_status
+
+
+def _recover_scope_task(
+    queue: TaskQueue,
+    task_id: str,
+    task: dict,
+    *,
+    evidence: str | None,
+    assume_yes: bool,
+    done_by: str | None,
+    factory_root: Path | None,
+    confirm: Callable[[str], bool],
+    echo: Callable[[str], None],
+) -> str:
+    """The F-65 scope re-queue: evidence + interactive y/N + the ledger
+    check, through the state layer's dedicated edge
+    (:meth:`TaskQueue.recover_scope`), with the confirmation persisted
+    to the task's progress log like the credential exit. The gate that
+    distinguishes it: the task's CURRENT contract hash (the widened
+    scope included) must already be owner-approved in the F-63 ledger —
+    recover moves nothing the owner has not re-approved (class-2
+    amendment: the spec said "the existing approval path", but no
+    existing path moved a needs_human scope escalation back to ready)."""
+    if evidence is None or not evidence.strip():
+        raise ApprovalError(
+            f"{task_id}: scope recovery requires --evidence — what you "
+            "checked before re-queueing (e.g. 'the session's reason was "
+            "sound; widened to cover tests/util.py')"
+        )
+    if assume_yes:
+        raise ApprovalError(
+            f"{task_id}: scope recovery is interactive only — --yes is not "
+            "accepted; widening a contract is a human decision, not a "
+            "default"
+        )
+    attempts = task.get("attempts") or []
+    scope_now = ", ".join(_scope_paths(task)) or "(none declared)"
+    echo(
+        f"{task_id}: {task.get('title')}\n"
+        f"  escalation: {attempts[-1].get('escalation')} "
+        "(nothing was pushed; the request or refusal is in the attempt "
+        "note)\n"
+        f"  scope now declared: {scope_now}\n"
+        f"  evidence: {evidence.strip()}\n"
+        "  recover re-queues the task under the CURRENT contract — widen "
+        "its scope in the queue and record the re-approval first "
+        "(`factory adopt` shows the contract and records the new hash; "
+        "`factory approve` refuses non-draft tasks); a scope the ledger "
+        "does not cover does not move. Attempts are NOT reset."
+    )
+    if not confirm(f"Re-queue {task_id} under its re-approved scope?"):
+        raise ApprovalDeclined(f"{task_id}: scope recovery declined")
+    who = done_by or default_approver()
+    root = factory_root or FACTORY_ROOT_DEFAULT
+    ledger = ApprovalLedger.for_project(
+        root, queue.doc.get("project") or "unknown"
+    )
+    new_status = queue.recover_scope(
+        task_id, ledger=ledger, evidence=evidence.strip(), done_by=who
+    )
+    # The audit trail: the state has moved, so a log failure is loud —
+    # same posture as the credential and attempts exits.
+    try:
+        entry = ProgressLog.for_task(
+            root,
+            queue.doc.get("project") or "unknown",
+            task_id,
+        ).append({
+            "outcome": "recovered",
+            "escalation": attempts[-1].get("escalation"),
+            "evidence": evidence.strip(),
+            "done_by": who,
+            "recovered_at": now_iso(),
+            "note": f"scope escalation re-queued ({new_status}) by {who} "
+                    f"under the re-approved contract: {evidence.strip()}",
         })
     except ProgressLogError as exc:
         raise ApprovalError(

@@ -113,6 +113,7 @@ from factory.contract import (
     iter_schema_violations,
     load_profile,
     load_tasks,
+    scope_pattern_error,
     validate_queue,
 )
 from factory.egress import check_secrets, scrub_session_text, scrub_session_value
@@ -160,6 +161,7 @@ SPEC_FIELDS = (
     "depends_on",
     "risk",
     "gates",
+    "scope",
     "acceptance",
     "budget",
     "owner_steps",
@@ -833,6 +835,13 @@ def build_import_prompt(
         "- Never set status, acceptance_hash, approved_at, approved_by,",
         "  attempts, links or out_of_scope. Every task is imported as draft;",
         "  approval is the owner's act (factory approve).",
+        "- scope.paths names the files each task may change (F-65):",
+        "  repo-relative globs, `*` never crossing `/`, `**` spanning",
+        "  directories. Propose one for EVERY task. Refused: an absolute",
+        "  or `..` path, an empty pattern, `[` character classes, and any",
+        "  pattern that matches everything (`**`, `*`, `**/*`, `*/**`).",
+        "  Name the real surface (the module, its tests, the docs the",
+        "  task owns) — the owner edits or approves it with the contract.",
         '- When a proposed task resembles an out-of-scope record, add',
         '  "out_of_scope_match": "<the record\'s path>" to that task. Never',
         "  drop, reword or omit a task because it matches — the owner",
@@ -926,6 +935,22 @@ def _task_violations(
             f"{name}: out_of_scope_match {match!r} names no record under "
             f"{OUT_OF_SCOPE_DIR}/ (known records: {known})"
         )
+    # F-65: every declared scope pattern obeys the load-time refusals
+    # HERE too (the shared validator), so a proposal never lands a
+    # catch-all or absolute scope the queue would refuse to load.
+    scope_paths = (
+        (task.get("scope") or {}).get("paths")
+        if isinstance(task.get("scope"), dict) else None
+    )
+    if isinstance(scope_paths, list):
+        for pattern in scope_paths:
+            reason = scope_pattern_error(pattern)
+            if reason is not None:
+                lines.append(
+                    f"{name}: scope pattern {pattern!r} {reason} — scope "
+                    "paths are repo-relative globs naming the files the "
+                    "task may change (F-65)"
+                )
     # The staged proposal schema over a one-task document: every shape
     # violation is about this task (the project key is filled in).
     lines.extend(iter_schema_violations(
@@ -1270,8 +1295,9 @@ def _new_task(proposed: dict) -> dict:
 # non-draft task changes what the owner approved (F-03's X→draft reason).
 # acceptance rides the recomputed hash; risk and gates ride the schema's
 # risk⇒human-merge rule — a proposal that relaxes either must never keep
-# the task's approval (F-57 review round 1, F4).
-CONTRACT_FIELDS = ("acceptance", "risk", "gates")
+# the task's approval (F-57 review round 1, F4). scope rides the F-63
+# whole-contract hash (F-65): a widened file scope is a new contract.
+CONTRACT_FIELDS = ("acceptance", "risk", "gates", "scope")
 
 
 def _merge_task(

@@ -170,6 +170,94 @@ def _field(task: dict, key: str) -> Any:
     return value if isinstance(value, str) else None
 
 
+# F-65: the segments a scope pattern may not contain, and the classes
+# refused outright. Decisions, documented (BUILD-ORDER §F-65 glob
+# tricks): ``[...]`` character classes are NOT supported by the scope
+# matcher (gates.scope_matches) — a bracket in a pattern would silently
+# mean its fnmatch sense to some readers and a literal to others, so it
+# refuses; a project with bracket-named paths covers them with ``*``.
+# An empty segment (``src//x``, a trailing ``/``) and a ``.`` segment
+# (``./src/**``) never match a real git path — they narrow a scope to
+# nothing while reading like a real scope, so they refuse too.
+_SCOPE_FORBIDDEN_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\\\[\]]")
+# F-65 R1-1: a segment made only of wildcards (`*` and `?`, any mix).
+# `?*` matches every non-empty name exactly as `*` does, so a pattern
+# whose every segment is wildcard-only (`?*/**`, `**/?*`, `*?`) matches
+# every path — the structural catch-all, however spelled.
+_WILDONLY_RE = re.compile(r"[*?]+")
+
+
+def scope_pattern_error(pattern: Any) -> str | None:
+    """Why ``pattern`` cannot be a declared-scope glob (F-65), or None.
+
+    ONE validator for every scope-shaped pattern a load can see: a
+    task's ``scope.paths`` (task semantics), the profile's
+    ``paths.generated`` (profile semantics), the importer's proposals
+    (per-task violations) and the parent-side validation of a session's
+    scope request. The refusals:
+
+    * not a string, or empty;
+    * a NUL/control character, a backslash, or a ``[``/`]`` (character
+      classes are unsupported — see :func:`factory.gates.scope_matches`);
+    * absolute, or any ``..`` segment (a scope cannot climb) — and no
+      ``.``/empty segment (``src//x``, ``src/``, ``./src/**``): those
+      match no real git path while reading like a scope;
+    * structurally catch-all: no segment carries a literal character —
+      every segment is made only of ``*`` and ``?`` (``**``, ``*``,
+      ``**/*``, ``*/**``, ``?*/**``, ``**/?*``, ``*?`` and equivalents
+      — ``?*`` matches every non-empty name exactly as ``*`` does). A
+      scope that matches every path is no scope; the rule is
+      structural (no literal anywhere), not a spelling deny-list.
+
+    Args:
+        pattern: The candidate glob (any type — non-strings refuse).
+
+    Returns:
+        The refusal reason naming what is wrong, or None when the
+        pattern is a well-formed scope glob.
+    """
+    if not isinstance(pattern, str) or not pattern:
+        return "is empty (or not a string)"
+    bad = _SCOPE_FORBIDDEN_CHARS.search(pattern)
+    if bad is not None:
+        return (
+            f"carries {bad.group()!r} — control characters, backslashes and "
+            "[...] character classes are refused (write the glob without them)"
+        )
+    if pattern.startswith("/"):
+        return "is absolute — scope paths are repo-relative"
+    segments = pattern.split("/")
+    for seg in segments:
+        if seg == "..":
+            return "has a .. segment — a scope cannot climb out of the repo"
+        if seg in ("", "."):
+            return (
+                f"has an empty or . segment ({pattern!r}) — it matches no "
+                "real git path; write the clean relative glob"
+            )
+    if all(_WILDONLY_RE.fullmatch(seg) for seg in segments):
+        return "matches every path — a declared scope must name places"
+    return None
+
+
+def _check_task_scope(task: dict, origin: str, tid: str) -> None:
+    """Refuse a malformed declared scope, naming the task and pattern."""
+    scope = task.get("scope")
+    if scope is None:
+        return  # absent is legal (the schema keeps it optional); the
+        # approval and run refusals demand it for ELIGIBLE_KINDS
+    paths = scope.get("paths") if isinstance(scope, dict) else None
+    if not isinstance(paths, list):  # shape is the schema's to describe
+        return
+    for pattern in paths:
+        reason = scope_pattern_error(pattern)
+        if reason is not None:
+            raise ContractError(
+                f"{origin}: task {tid} declares scope pattern {pattern!r} "
+                f"that {reason} (F-65)"
+            )
+
+
 # F-63 R2-1(b): the control classes no PROFILE string may carry, and no
 # task string may carry outside its newline/tab exemptions. Same families
 # as factory.egress's seams (C0, DEL, C1, bidi/isolate); refused at load
@@ -260,6 +348,9 @@ def _check_semantics(tasks: Any, origin: str) -> None:
         # (newline/tab exempt in the free-text fields only).
         _check_control_strings(task, origin, f"task {tid}",
                                free_text_newline=True)
+        # F-65 AC-1: every declared scope pattern is a well-formed
+        # repo-relative glob (a malformed scope refuses the load).
+        _check_task_scope(task, origin, tid)
         risk = task.get("risk")
         # bound once so the isinstance guard narrows the .get below
         gates_value = task.get("gates")
@@ -882,6 +973,18 @@ def _check_profile_semantics(data: dict, origin: str, *,
                 f"paths.risk.{flag} globs or drop the sentinels key "
                 "(a skipped-forever sentinel reads as checked when it can't be)"
             )
+    # F-65 AC-4: generated-path globs obey the declared-scope rules —
+    # a catch-all or climbing pattern would widen every task's scope
+    # implicitly, so it refuses at load, the pattern named.
+    generated = (data.get("paths") or {}).get("generated")
+    if isinstance(generated, list):
+        for pattern in generated:
+            reason = scope_pattern_error(pattern)
+            if reason is not None:
+                raise ContractError(
+                    f"{origin}: paths.generated pattern {pattern!r} {reason} "
+                    "(F-65)"
+                )
     # F-62 AC-3: the profile's name feeds the same factory-root path
     # builders the queue's project does; the schema's ``^…$`` pattern
     # admits a trailing newline (Python re ``$``), so the fullmatch

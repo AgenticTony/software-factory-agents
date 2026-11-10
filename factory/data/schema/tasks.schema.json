@@ -20,7 +20,7 @@
       "enum": ["auth", "payments", "rls", "migration", "safety", "privacy", "new_dependency", "deploy", "cross_repo", "external_service", "factory_control"]
     },
     "escalation": {
-      "enum": ["attempts_exhausted", "budget_exhausted", "risk_path_touched", "new_dependency", "protected_path_touched", "contract_ambiguous", "quota_exhausted", "live_check_failed", "cross_repo", "pr_create_failed", "orchestrator_error", "publish_refused", "review_not_converging", "sentinel_failed", "credential_added", "stale_base", "pr_closed"]
+      "enum": ["attempts_exhausted", "budget_exhausted", "risk_path_touched", "new_dependency", "protected_path_touched", "contract_ambiguous", "quota_exhausted", "live_check_failed", "cross_repo", "pr_create_failed", "orchestrator_error", "publish_refused", "review_not_converging", "sentinel_failed", "credential_added", "stale_base", "pr_closed", "scope_missing", "scope_change_needed"]
     },
     "attempt_reset": {
       "type": "object",
@@ -167,6 +167,15 @@
         "priority": { "enum": ["P1", "P2", "P3"] },
         "status": { "$ref": "#/$defs/status" },
         "depends_on": { "type": "array", "items": { "type": "string", "description": "Task id, or repo:id for cross-repo" } },
+        "scope": {
+          "type": "object",
+          "required": ["paths"],
+          "additionalProperties": false,
+          "description": "F-65: the files this contract may change — repo-relative globs on the scope matcher (gates.scope_matches: * and ? never cross /, ** spans directories, case-sensitive on the exact git path). Inside contract_hash, so widening needs re-approval. Optional so pre-F-65 entries load, but every ELIGIBLE_KINDS task (build, docs) must declare it: approval refuses without it and the run escalates scope_missing. Malformed patterns (absolute, .., empty, catch-all, character classes) refuse at load (contract._check_task_scope).",
+          "properties": {
+            "paths": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } }
+          }
+        },
         "out_of_scope": { "type": "array", "items": { "type": "string" }, "description": "Things this task must not change or add. Written at approval; gives the L2 spec axis something concrete to check scope creep against. Not part of acceptance_hash." },
         "risk": { "type": "array", "items": { "$ref": "#/$defs/risk_flag" }, "uniqueItems": true },
         "gates": {

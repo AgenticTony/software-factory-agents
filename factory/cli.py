@@ -134,18 +134,22 @@ def build_parser() -> argparse.ArgumentParser:
     recover.add_argument(
         "task_id",
         help="task id to recover (stale_base/pr_closed, "
-             "credential_added with --evidence, or attempts_exhausted "
-             "with --evidence and --reset-attempts)")
+             "credential_added with --evidence, attempts_exhausted "
+             "with --evidence and --reset-attempts, or a scope_missing/"
+             "scope_change_needed escalation with --evidence after the "
+             "widened contract is re-approved)")
     recover.add_argument(
         "--yes", action="store_true",
         help="non-interactive confirmation (never allowed for "
-             "credential_added or attempts_exhausted)",
+             "credential_added, attempts_exhausted or a scope escalation)",
     )
     recover.add_argument(
         "--evidence", default=None,
-        help="required for credential_added/attempts_exhausted: what you "
-             "checked (e.g. 'test fixture, not a real credential' or "
-             "'all attempts died to the sandbox bind bug, fixed in PR #NN')",
+        help="required for credential_added/attempts_exhausted/scope "
+             "escalations: what you checked (e.g. 'test fixture, not a "
+             "real credential', 'all attempts died to the sandbox bind "
+             "bug, fixed in PR #NN', or 'widened to cover the fixture "
+             "the session's reason named')",
     )
     recover.add_argument(
         "--reset-attempts", action="store_true",

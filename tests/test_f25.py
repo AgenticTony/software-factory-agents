@@ -475,6 +475,7 @@ def _e2e_task(task_id: str = "T-1", *, risk=()) -> dict:
         "approved_at": "2026-10-20T10:00:00Z",
         "approved_by": "owner",
         "budget": {"size": "S", "max_attempts": 3, "max_turns": 20, "wall_clock_min": 30},
+        "scope": {"paths": ["impl.py", "tests/test_feature.py"]},
         "attempts": [],
     }
 

@@ -245,6 +245,13 @@ paths:
     # orchestrator/state/approve/schema modules — same precedent,
     # protected from the day they exist.
     - "tests/test_f64.py"
+    # F-65: the declared-file-scope contract tests (scope patterns in
+    # the schema/semantics/hash, the L0 out_of_scope gate, the
+    # request_scope transport and escalation, the generated-file
+    # profile group) judge the protected gates/l0/state/approve/
+    # session/schema modules — same precedent, protected from the day
+    # they exist.
+    - "tests/test_f65.py"
     # F-63: the approval ledger module is judge surface (it decides what
     # the owner approved — the factory/attribution.py and factory/egress.py
     # precedent: a session must not edit what gates it).

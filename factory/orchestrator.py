@@ -74,7 +74,7 @@ from typing import Any, Callable, NamedTuple, Sequence, cast
 from factory.approvals import ApprovalLedger, require_profile_approval
 from factory.config import CONFIG_FILE, FactoryConfig, in_peak_window, load_config
 from factory.contract import contract_hash, load_profile
-from factory.egress import scrub_session_text, scrub_session_value
+from factory.egress import escape_approval_text, scrub_session_text, scrub_session_value
 from factory.gates import CommandResult, diff_name_status, git_rc
 from factory.gates import git as hardened_git
 from factory.l0 import run_l0
@@ -128,12 +128,14 @@ from factory.sandbox import (
 from factory.session import (
     DEFAULT_BASE_URL,
     SessionRecord,
+    parse_scope_requests,
     probe_session_interpreter,
     run_session_sandboxed,
     run_sessions_parallel,
     seat_token,
 )
 from factory.state import (
+    ELIGIBLE_KINDS,
     RunInProgressError,
     TaskQueue,
     attempt_budget_used,
@@ -762,6 +764,7 @@ def _implementer_prompt(task: dict, slice_: dict | None, branch: str, history: s
     contract = {
         "acceptance": task.get("acceptance", []),
         "out_of_scope": task.get("out_of_scope", []),
+        "scope": task.get("scope"),
     }
     parts = [
         f"# Task {task['id']}: {task.get('title', '')}",
@@ -788,6 +791,16 @@ def _implementer_prompt(task: dict, slice_: dict | None, branch: str, history: s
         f"- You are on branch `{branch}` in this directory. Commit as you go if you "
         "like; the orchestrator commits whatever the working tree holds when you stop.",
         "- Never push, never run `gh`, never touch protected paths.",
+        # F-65: the declared file scope is part of the contract the
+        # owner approved — a file outside it is a REQUEST, never an edit.
+        "- You may change ONLY the files `scope.paths` above names (plus this "
+        "task's own contract test files, and files the project declares "
+        "generated). L0 FAILs any other changed file — added, modified, "
+        "deleted, renamed or replaced — and the same out-of-scope file in "
+        "two rounds parks the task on a human. A file you need that is "
+        "outside the scope is a REQUEST, not an edit: call "
+        "`request_scope(path, reason)` and stop; the owner widens the "
+        "contract or declines.",
         "",
         f"This is attempt {attempt} of {max_attempts}.",
     ]
@@ -2241,6 +2254,50 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
         )
         queue.transition(task_id, "needs_human")
         return RunResult("needs_human", task_id, escalation="budget_exhausted")
+    # F-65 AC-1: a task a session would build must declare its file
+    # scope BEFORE any seat starts — approval already refuses one, so a
+    # scope-less task here is pre-F-65 state (or a hand-minted queue):
+    # fail closed with the session-less scope_missing escalation,
+    # whether or not the ledger holds the old contract's hash (an
+    # approval from before F-65 approved no scope). The refusal is
+    # budget-free (state.attempt_budget_used skips scope_missing).
+    scope_paths = list(
+        ((task.get("scope") or {}).get("paths") or [])
+        if isinstance(task.get("scope") or {}, dict) else []
+    )
+    if task.get("kind") in ELIGIBLE_KINDS and not scope_paths:
+        note = (
+            f"{task_id} declares no file scope — add scope.paths (the "
+            "repo-relative globs this task may change) and approve the "
+            "contract, or (a parked task) record the re-approval with "
+            "`factory adopt` and `factory recover --evidence` "
+            "(F-65 scope_missing)"
+        )
+        attempt = {
+            "run_id": new_run_id(),
+            "slice_id": slice_id,
+            "started": now_iso(),
+            "ended": now_iso(),
+            "outcome": "escalated",
+            "rounds": 0,
+            "turns": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "prompt_versions": dict(versions),
+            "skills": [],  # no session ran: nothing was loaded
+            "escalation": "scope_missing",
+            "note": note,
+        }
+        queue.append_attempt(task_id, attempt)
+        _progress_best_effort(
+            log,
+            {"run_id": attempt["run_id"], "outcome": "escalated",
+             "escalation": "scope_missing",
+             "findings": [f"1. {note}"]},
+            task_id,
+        )
+        queue.transition(task_id, "needs_human")
+        return RunResult("needs_human", task_id, escalation="scope_missing")
     protected = list((profile.get("paths") or {}).get("protected") or [])
     implementer_system = assemble_implementer_prompt(profile)
     reviewer_system = assemble_reviewer_prompt(profile)
@@ -2274,6 +2331,13 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
     # over the full diff, not another delta pass.
     final_repeats_left = ctx.config.final_review_repeats
     final_pending = False
+    # F-65 AC-3: out-of-scope paths this run's own L0 findings have
+    # flagged, counted from the PARENT's findings — never a session
+    # field. The same path twice means the implementer will not revert
+    # it: escalate scope_change_needed instead of spending the budget
+    # on a third round (before review_not_converging, which needs a
+    # review verdict L0-blocked rounds never produce).
+    scope_repeats: dict[str, int] = {}
     round_no = 0
     # F-45 AC-4 (m-13): whether this round's finish() already recorded its
     # attempt. The error path below must never append a second attempt for
@@ -2604,6 +2668,56 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                         finish(attempt, "ready", [f"1. quota: {impl.reason}"])
                         return RunResult("quota_exhausted", task_id, escalation="quota_exhausted")
 
+                    # F-65 AC-3: a valid scope request escalates AT ONCE
+                    # — no round is spent reverting anything, no review
+                    # runs. The record is session-written, so the
+                    # requests are parent-validated (bounds + shape);
+                    # the SURVIVORS are safe to trust because a request
+                    # can only ESCALATE, never widen — but every path
+                    # and reason is attacker TEXT, so the note renders
+                    # each through escape_approval_text (the F-63
+                    # spoof class) BEFORE it lands in the attempt note
+                    # (the queue would refuse control bytes at its next
+                    # load otherwise). A request list that validates to
+                    # nothing is reported to the next round instead.
+                    scope_requests, request_refusals = parse_scope_requests(
+                        impl, egress_secrets)
+                    if scope_requests:
+                        shown = "; ".join(
+                            f"{escape_approval_text(req['path'])} "
+                            f"({escape_approval_text(req['reason'])})"
+                            for req in scope_requests
+                        )
+                        refusal_note = (
+                            " — dropped as invalid: " + "; ".join(
+                                escape_approval_text(r) for r in request_refusals
+                            )
+                        ) if request_refusals else ""
+                        note = (
+                            "the implementer requested a wider scope: "
+                            f"{shown}{refusal_note} — widen scope.paths in "
+                            "the queue, record the re-approval "
+                            "(`factory adopt`), then `factory recover "
+                            "--evidence` (a request never widens anything "
+                            "by itself)"
+                        )
+                        path = _store(reports_dir, work.run_id, attempt_no, reports)
+                        attempt = attempt_record(
+                            attempt_no, started, "escalated", records, path,
+                            escalation="scope_change_needed", note=note,
+                        )
+                        finish(attempt, "needs_human", [
+                            "1. [scope] implementer requested a wider scope: "
+                            + shown,
+                        ])
+                        return RunResult("needs_human", task_id,
+                                         escalation="scope_change_needed",
+                                         reports=reports)
+                    for refusal in request_refusals:
+                        extra_findings.append(
+                            f"[scope request ignored] {escape_approval_text(refusal)}"
+                        )
+
                     if impl.status != "completed":
                         extra_findings.append(
                             f"[session {impl.status}] the implementer session ended: {impl.reason}"
@@ -2628,6 +2742,13 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                                         runner=runner, timeout_sec=ctx.gate_timeout_sec)
                             reports["L0"] = l0.to_dict()
                             trace.gate_checks(reports["L0"])  # F-30 AC-3
+                            # F-65 AC-3: this round's out-of-scope paths,
+                            # counted from the parent's own findings.
+                            for finding in l0.findings:
+                                if finding.id == "out_of_scope" and finding.file:
+                                    scope_repeats[finding.file] = (
+                                        scope_repeats.get(finding.file, 0) + 1
+                                    )
                         if l0.escalations:
                             escalation = next(e for e in _L0_ESCALATION_ORDER
                                               if e in l0.escalations)
@@ -3254,6 +3375,48 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                         queue.transition(task_id, "in_review")
                     trace.run_end("published")  # after phase_end: the last line
                     return RunResult("pr_opened", task_id, pr=url, reports=reports)
+
+                # F-65 AC-3: the SAME out-of-scope path flagged in two
+                # rounds of this run — the implementer had a fix round
+                # carrying "revert it, or request the wider scope" and
+                # kept the file anyway. Escalate now, before any more
+                # rounds (and before review_not_converging, which a
+                # L0-blocked round can never reach): the move is the
+                # owner's — widen the contract or drop the task.
+                repeated = sorted(
+                    path_ for path_, count in scope_repeats.items() if count >= 2
+                )
+                if repeated:
+                    # The path is a git path the implementer NAMED — it
+                    # goes into the durable attempt note, so it passes
+                    # the F-43 seam with this run's secrets before the
+                    # display escape (R1-2's class: a drift file named
+                    # after the seat token must not land raw in the
+                    # queue).
+                    shown = ", ".join(
+                        escape_approval_text(
+                            scrub_session_text(path_, egress_secrets))
+                        for path_ in repeated
+                    )
+                    note = (
+                        "the same out-of-scope path(s) in two rounds of "
+                        f"this run: {shown} — the implementer will not "
+                        "revert them; widen scope.paths in the queue, "
+                        "record the re-approval (`factory adopt`), then "
+                        "`factory recover --evidence`, or drop the task "
+                        "(the fix round told it to revert or request)"
+                    )
+                    attempt = attempt_record(
+                        attempt_no, started, "escalated", records, path,
+                        escalation="scope_change_needed", note=note,
+                        sentinels=list(l0.sentinel_results) if l0 is not None else None,
+                        review_drops=_review_drops(l2),
+                        final_review=final_field,
+                    )
+                    finish(attempt, "needs_human", findings, finding_keys=round_keys)
+                    return RunResult("needs_human", task_id,
+                                     escalation="scope_change_needed",
+                                     reports=reports)
 
                 # F-23 no-progress stop: apply_convergence decided, where
                 # the prior set was in hand, that this FAIL gives the next
