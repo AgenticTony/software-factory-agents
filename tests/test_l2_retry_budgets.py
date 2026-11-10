@@ -473,9 +473,9 @@ class _StepClock:
 def test_the_real_session_seconds_refuses_later_re_runs(
         tmp_path, monkeypatch):
     """Round 1 seats and their re-runs each "take" four minutes of the
-    10-minute window, capped by the wall each was granted. The grants
-    must shrink with the REAL accounting — 10 for the fan-out, 6 for
-    the first re-run, 2 for the second — which only holds if
+    30-minute window, capped by the wall each was granted. The grants
+    must shrink with the REAL accounting — 30 for the fan-out, 26 for
+    the first re-run, 22 for the second — which only holds if
     session_seconds grows inside the re-run, not after the loop."""
     env = Env(tmp_path)
     clock = _StepClock()
@@ -496,7 +496,7 @@ def test_the_real_session_seconds_refuses_later_re_runs(
         c[3]["timeout_min"] for c in seats.calls if c[0] == "reviewer"
     ]
     # fan-out (2 seats), then the two re-runs — attempt 1's sequence.
-    assert timeouts[:4] == [10.0, 10.0, 6.0, 2.0]
+    assert timeouts[:4] == [30.0, 30.0, 26.0, 22.0]
 
 
 def _trace_events(env) -> list[dict]:

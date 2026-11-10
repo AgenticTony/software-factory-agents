@@ -949,7 +949,7 @@ class _Env:
             "acceptance_hash": acceptance_hash(acceptance),
             "approved_at": "2026-11-09T10:00:00Z", "approved_by": "owner",
             "budget": {"size": "S", "max_attempts": 3, "max_turns": 20,
-                       "wall_clock_min": 10},
+                       "wall_clock_min": 30},
             "attempts": [], "links": {},
         }
         self.queue_path.write_text(

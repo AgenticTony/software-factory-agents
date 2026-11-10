@@ -85,7 +85,7 @@ def _task(task_id: str = "T-1", *, risk=(), ref: str = REF, **overrides) -> dict
         "acceptance_hash": acceptance_hash(acceptance),
         "approved_at": "2026-11-15T10:00:00Z",
         "approved_by": "owner",
-        "budget": {"size": "S", "max_attempts": 3, "max_turns": 20, "wall_clock_min": 10},
+        "budget": {"size": "S", "max_attempts": 3, "max_turns": 20, "wall_clock_min": 30},
         "attempts": [],
     }
     task.update(overrides)
@@ -403,14 +403,14 @@ def test_contract_hash_exclusion_list(tmp_path: Path):
 
     # canonicalisation: key order is irrelevant; NFC/NFD and 1 vs 1.0 are
     # distinct bytes and stay distinct hashes
-    reordered = _task(budget={"wall_clock_min": 10, "max_turns": 20,
+    reordered = _task(budget={"wall_clock_min": 30, "max_turns": 20,
                              "max_attempts": 3, "size": "S"})
     assert contract_hash(reordered) == same
     nfc = _task(title="café")
     nfd = _task(title="café")
     assert contract_hash(nfc) != contract_hash(nfd)
     assert contract_hash(_task(budget={"size": "S", "max_attempts": 3,
-                                       "max_turns": 20, "wall_clock_min": 10.0})) != same
+                                       "max_turns": 20, "wall_clock_min": 30.0})) != same
     # acceptance list order is semantic: swapping items changes the hash
     two = [{"id": "AC-1", "text": "one"}, {"id": "AC-2", "text": "two"}]
     assert contract_hash({"acceptance": two}) != contract_hash(

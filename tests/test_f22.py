@@ -747,7 +747,7 @@ def test_ac_8(tmp_path: Path, monkeypatch):
         "acceptance": acceptance, "acceptance_hash": acceptance_hash(acceptance),
         "approved_at": "2026-10-18T10:00:00Z", "approved_by": "owner",
         "budget": {"size": "S", "max_attempts": 3, "max_turns": 20,
-                   "wall_clock_min": 10},
+                   "wall_clock_min": 30},
         "attempts": [],
     }
     profile = dict(PROFILE_EXTRA_BASE)

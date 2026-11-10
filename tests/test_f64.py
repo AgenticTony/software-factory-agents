@@ -268,22 +268,26 @@ def test_ac_1(tmp_path: Path, monkeypatch):
     seats = Fanout(reviews=_pass_with_a_finding())
     base = seats.__call__
 
+    impl_window = 45 - REVIEW_WALL_RESERVE_MIN
+
     def arming_runner(seat, prompt, run_dir, profile, **kwargs):
         if seat == "implementer":
-            clock.arm(40 * 60.0)  # 40 min: one minute PAST its 39-min window
+            # one minute PAST its window: the reserve minus one remains
+            clock.arm((impl_window + 1) * 60.0)
         return base(seat, prompt, run_dir, profile, **kwargs)
 
     result = env.run(arming_runner)
     assert result.outcome == "pr_opened", result
     assert seats.kwargs("implementer")[0]["timeout_min"] == pytest.approx(
-        45 - REVIEW_WALL_RESERVE_MIN
+        impl_window
     )
     assert {kw["max_turns"] for kw in seats.kwargs("reviewer")} == {
         REVIEWER_TURN_CAP
     }
     assert seats.kwargs("verifier")[0]["max_turns"] == VERIFIER_TURN_CAP
     reviewer_timeouts = [kw["timeout_min"] for kw in seats.kwargs("reviewer")]
-    assert all(0 < t <= 5 for t in reviewer_timeouts)  # the 5-min reserve
+    # review runs in what the overrunning implementer left: reserve - 1
+    assert all(0 < t <= REVIEW_WALL_RESERVE_MIN - 1 for t in reviewer_timeouts)
 
     # A wall_clock_min too small to hold the reserve plus a minimal
     # implementer window refuses at attempt start, before any seat starts.
@@ -321,8 +325,8 @@ def test_ac_1(tmp_path: Path, monkeypatch):
             state["n"] += 1
             n = state["n"]
         if n <= 2:  # round 1's fan-out: FAIL, and its sessions "take"
-            # 38 of the 45 minutes — 7 remain, under the reserve.
-            late_clock.arm(38 * 60.0)
+            # all but (reserve - 1) of the 45 minutes — under the reserve.
+            late_clock.arm((45 - (REVIEW_WALL_RESERVE_MIN - 1)) * 60.0)
             return fail_round1
         return _pass_with_a_finding()  # round 2's fan-out (never reached)
 
@@ -337,7 +341,7 @@ def test_ac_1(tmp_path: Path, monkeypatch):
     assert "review reserve" in attempt["note"]
 
 
-# --- AC-2: free quota requeues are bounded (2 per task per UTC day) ----------
+# --- AC-2: free quota requeues are bounded (per UTC day and lifetime) -------
 
 
 def _quota_runner(seats: Fanout) -> "callable":
@@ -375,9 +379,13 @@ def _quota_attempt(started: str, slice_id: str = "T-1") -> dict:
 
 
 def test_ac_2(tmp_path: Path, monkeypatch):
-    # Repeated planted 429s on ONE UTC day: the first 2 requeue for free,
-    # every later one counts — the task reaches attempts_exhausted within
-    # max_attempts + 2 runs.
+    # Repeated planted 429s on ONE UTC day: the first PER_DAY requeue for
+    # free, every later one counts — the task reaches attempts_exhausted
+    # within max_attempts + PER_DAY runs.
+    from factory.state import FREE_QUOTA_REQUEUES_PER_DAY as per_day
+    from factory.state import FREE_QUOTA_REQUEUES_TOTAL
+
+    assert FREE_QUOTA_REQUEUES_TOTAL >= per_day  # one day never exceeds it
     env = Env(tmp_path / "same-day")
     seats = Fanout(reviews=_pass_with_a_finding())
     runner = _quota_runner(seats)
@@ -390,15 +398,16 @@ def test_ac_2(tmp_path: Path, monkeypatch):
     assert results[-1].escalation == "attempts_exhausted", [
         r.outcome for r in results
     ]
-    # The 2 free requeues spend no attempt number: the counting quota
-    # aborts run as attempts 1, 2, 3 — max_attempts + 2 session runs in
-    # total, then the next tick refuses before any seat starts.
-    assert runner.implementer_runs["implementer"] == 3 + 2
-    assert len(seats.prompts("implementer")) == 3 + 2
-    assert len(results) == 3 + 2 + 1  # ... plus the refusal tick
+    # The free requeues spend no attempt number: the counting quota
+    # aborts run as attempts 1, 2, 3 — max_attempts + per_day session
+    # runs in total, then the next tick refuses before any seat starts.
+    assert runner.implementer_runs["implementer"] == 3 + per_day
+    assert len(seats.prompts("implementer")) == 3 + per_day
+    assert len(results) == 3 + per_day + 1  # ... plus the refusal tick
     quota_attempts = [a for a in env.task()["attempts"]
                       if a.get("escalation") == "quota_exhausted"]
-    assert len(quota_attempts) == 5  # every one recorded, none re-run away
+    # every one recorded, none re-run away
+    assert len(quota_attempts) == 3 + per_day
     assert env.task()["status"] == "needs_human"
 
     # The counting is the ONE filter's: attempt_budget_used on the live
@@ -426,11 +435,11 @@ def test_ac_2(tmp_path: Path, monkeypatch):
     day1 = "2026-11-09T23:59:59Z"
     day2 = "2026-11-10T00:00:00Z"
     task = {
-        "attempts": [
-            _quota_attempt(day1), _quota_attempt(day1),  # day 1: both free
-            _quota_attempt(day1),                        # day 1: counts
-            _quota_attempt(day2), _quota_attempt(day2),  # day 2: both free
-        ]
+        "attempts": (
+            [_quota_attempt(day1)] * per_day    # day 1: all free
+            + [_quota_attempt(day1)]            # day 1: counts
+            + [_quota_attempt(day2)] * per_day  # day 2: all free
+        )
     }
     assert attempt_budget_used(task, "T-1") == 1
     task["attempts"].append(_quota_attempt(day2))  # day 2: counts
@@ -438,32 +447,33 @@ def test_ac_2(tmp_path: Path, monkeypatch):
 
     # A NON-quota abort (the peak-window shape) is unaffected: free, and
     # it never consumes a day's quota allowance.
-    task["attempts"] = [
-        _quota_attempt(day1), _quota_attempt(day1),
-        {**_quota_attempt(day1), "escalation": None, "note": None},
-        _quota_attempt(day1),  # counts: day 1's allowance is spent
-    ]
+    task["attempts"] = (
+        [_quota_attempt(day1)] * per_day
+        + [{**_quota_attempt(day1), "escalation": None, "note": None}]
+        + [_quota_attempt(day1)]  # counts: day 1's allowance is spent
+    )
     assert attempt_budget_used(task, "T-1") == 1
 
-    # The LIFETIME ceiling (round 1, R1-1): 2 free a day is still
+    # The LIFETIME ceiling (round 1, R1-1): a per-day allowance alone is
     # unbounded across days — a daily loop claiming 429 every run would
-    # requeue free forever. 2 quota aborts a day over 4 days: the first
-    # FREE_QUOTA_REQUEUES_TOTAL (6) are free, the 7th and 8th count.
-    from factory.state import FREE_QUOTA_REQUEUES_TOTAL
-
-    four_days = [f"2026-11-{d:02d}T10:00:00Z" for d in range(1, 5)]
+    # requeue free forever. per_day quota aborts a day over enough days
+    # to pass the total: the first FREE_QUOTA_REQUEUES_TOTAL are free,
+    # every later one counts.
+    n_days = FREE_QUOTA_REQUEUES_TOTAL // per_day + 2
+    days = [f"2026-11-{d:02d}T10:00:00Z" for d in range(1, n_days + 1)]
     task = {"attempts": [
-        _quota_attempt(day) for day in four_days for _ in range(2)
+        _quota_attempt(day) for day in days for _ in range(per_day)
     ]}
-    # 8 attempts, FREE_QUOTA_REQUEUES_TOTAL of them free: the rest count.
+    assert len(task["attempts"]) > FREE_QUOTA_REQUEUES_TOTAL
+    # FREE_QUOTA_REQUEUES_TOTAL of them free: the rest count.
     assert attempt_budget_used(task, "T-1") == (
         len(task["attempts"]) - FREE_QUOTA_REQUEUES_TOTAL
     )
     # An owner reset restores the LIFETIME allowance with the budget
     # (the count starts at the reset floor, like every other attempt).
     task["attempt_resets"] = [{
-        "at": four_days[-1], "evidence": "owner granted more", "done_by": "o",
-        "slice_id": "T-1", "prior_attempts": 8,
+        "at": days[-1], "evidence": "owner granted more", "done_by": "o",
+        "slice_id": "T-1", "prior_attempts": len(task["attempts"]),
     }]
     assert attempt_budget_used(task, "T-1") == 0
 
@@ -471,8 +481,7 @@ def test_ac_2(tmp_path: Path, monkeypatch):
     # NAIVE, missing or garbage counts — fail closed. An unprovable day
     # is never a free day, and a naive stamp is never read as local time
     # (which would let a hand-shifted stamp mint fresh days).
-    task = {"attempts": [
-        _quota_attempt(day1), _quota_attempt(day1),   # the day's 2 frees
+    task = {"attempts": [_quota_attempt(day1)] * per_day + [  # the frees
         _quota_attempt("2026-11-15"),                 # naive: counts
         _quota_attempt(None),                         # missing: counts
         _quota_attempt("not a timestamp"),            # garbage: counts
@@ -484,7 +493,9 @@ def test_ac_2(tmp_path: Path, monkeypatch):
     env2 = Env(tmp_path / "midnight")
     seats2 = Fanout(reviews=_pass_with_a_finding())
     runner2 = _quota_runner(seats2)
-    clock = {"now": datetime(2026, 11, 9, 23, 59, 10, tzinfo=timezone.utc)}
+    # Start so day 1's per_day ticks (30 s apart) all land before midnight.
+    midnight = datetime(2026, 11, 10, tzinfo=timezone.utc)
+    clock = {"now": midnight - timedelta(seconds=30 * per_day - 10)}
 
     def fake_now_iso():
         return clock["now"].isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -495,22 +506,24 @@ def test_ac_2(tmp_path: Path, monkeypatch):
         clock["now"] += timedelta(seconds=seconds)
         return env2.run(runner2)
 
-    # Day 1: two free requeues (23:59:10, 23:59:40)...
+    # Day 1: per_day free requeues, the last 20 s before midnight...
     assert tick(0).outcome == "quota_exhausted"
-    assert tick(30).outcome == "quota_exhausted"
-    # ... midnight crosses; day 2 opens a fresh allowance: 00:00:10 and
-    # 00:00:40 are free again, and the 00:01:10 / 00:01:40 aborts count.
-    assert tick(30).outcome == "quota_exhausted"
-    assert tick(30).outcome == "quota_exhausted"
-    assert tick(30).outcome == "quota_exhausted"
-    assert tick(30).outcome == "quota_exhausted"
+    for _ in range(per_day - 1):
+        assert tick(30).outcome == "quota_exhausted"
+    assert clock["now"] < midnight
+    # ... midnight crosses; day 2 opens a fresh allowance: per_day more
+    # are free again, and the two aborts after them count.
+    for _ in range(per_day + 2):
+        assert tick(30).outcome == "quota_exhausted"
+    assert clock["now"].date() == midnight.date()
     task2 = TaskQueue(env2.queue_path).get("T-1")
     assert attempt_budget_used(task2, "T-1") == 2
     # The run numbering every downstream number flows from: the free
     # requeues (both days) were all "attempt 1 of 3"; only the counting
     # aborts move it.
     impl_prompts = seats2.prompts("implementer")
-    assert len(impl_prompts) == 6  # six quota runs across the two days
+    # every quota run across the two days
+    assert len(impl_prompts) == 2 * per_day + 2
     assert "This is attempt 1 of 3." in impl_prompts[0]
     assert "This is attempt 1 of 3." in impl_prompts[-2]
     assert "This is attempt 2 of 3." in impl_prompts[-1]
@@ -595,3 +608,27 @@ def test_trace_turns_render_unknown_for_forged_counts(tmp_path: Path):
         "reviewer",
     )
     assert [e["turns"] for e in events] == [None, None, None, None, 7]
+
+
+def test_owner_confirmed_budget_values():
+    # The F-64 policy numbers the owner confirmed on 2026-11-10. The
+    # behavioural tests above derive from the constants, so this pin is
+    # what makes a change to any of them a visible, reviewed edit — an
+    # implementer quietly loosening a quota or a review floor fails here.
+    from factory.orchestrator import (
+        _MIN_IMPLEMENTER_WALL_MIN,
+        REVIEW_WALL_RESERVE_MIN,
+        REVIEWER_TURN_CAP,
+        VERIFIER_TURN_CAP,
+    )
+    from factory.state import (
+        FREE_QUOTA_REQUEUES_PER_DAY,
+        FREE_QUOTA_REQUEUES_TOTAL,
+    )
+
+    assert REVIEWER_TURN_CAP == 20
+    assert VERIFIER_TURN_CAP == 10
+    assert REVIEW_WALL_RESERVE_MIN == 15.0
+    assert _MIN_IMPLEMENTER_WALL_MIN == 1.0
+    assert FREE_QUOTA_REQUEUES_PER_DAY == 3
+    assert FREE_QUOTA_REQUEUES_TOTAL == 9

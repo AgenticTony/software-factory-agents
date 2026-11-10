@@ -99,7 +99,7 @@ def _task(task_id: str = "T-1", **overrides) -> dict:
         "acceptance_hash": acceptance_hash(acceptance),
         "approved_at": "2026-10-18T10:00:00Z",
         "approved_by": "owner",
-        "budget": {"size": "S", "max_attempts": 3, "max_turns": 20, "wall_clock_min": 10},
+        "budget": {"size": "S", "max_attempts": 3, "max_turns": 20, "wall_clock_min": 30},
         "attempts": [],
     }
     task.update(overrides)
@@ -577,7 +577,7 @@ def test_ac_4(tmp_path: Path, monkeypatch):
         # max_turns 13 is deliberately NOT the verifier cap (10) or the
         # reviewer cap (20), so a site regressing to the task budget is
         # distinguishable from the fixed caps.
-        budget={"size": "S", "max_attempts": 3, "max_turns": 13, "wall_clock_min": 10},
+        budget={"size": "S", "max_attempts": 3, "max_turns": 13, "wall_clock_min": 30},
     )])
     # The FINAL review carries one minor finding (declared pass), so its
     # VERIFIER runs too — both verifier passes (round 1's and the final
@@ -739,7 +739,7 @@ def test_ac_6(tmp_path: Path):
     # Through the orchestrator: a round that declares pass with a
     # surviving major never opens a PR.
     env = Env(tmp_path / "orchestrator", tasks=[_task(
-        budget={"size": "S", "max_attempts": 1, "max_turns": 20, "wall_clock_min": 10},
+        budget={"size": "S", "max_attempts": 1, "max_turns": 20, "wall_clock_min": 30},
     )])
     seats = Seats(scripts={
         "round1": _verdict(_finding("empty state lies", severity="major"),

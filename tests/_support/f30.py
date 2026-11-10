@@ -72,7 +72,7 @@ def _task(task_id: str = "T-1", *, risk=(), ref: str = REF, **overrides) -> dict
         "acceptance_hash": acceptance_hash(acceptance),
         "approved_at": "2026-10-18T10:00:00Z",
         "approved_by": "owner",
-        "budget": {"size": "S", "max_attempts": 3, "max_turns": 20, "wall_clock_min": 10},
+        "budget": {"size": "S", "max_attempts": 3, "max_turns": 20, "wall_clock_min": 30},
         "attempts": [],
     }
     task.update(overrides)
