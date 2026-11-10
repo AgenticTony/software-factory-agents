@@ -279,16 +279,18 @@ ATTEMPTS_RESET_ESCALATIONS = ("attempts_exhausted",)
 # (FREE_QUOTA_REQUEUES_TOTAL). A quota error is not the task's fault —
 # but a session that can emit "429" at will must not requeue forever on
 # the owner's shared token: the per-day bound alone still admits a
-# daily-cron task two free sessions a day indefinitely, which is the
+# daily-cron task its free sessions every day indefinitely, which is the
 # same "a record's reason grants more", merely rate-limited. A quota
-# abort is free only while BOTH allowances remain; the third and later
-# on the same UTC day count toward max_attempts, and so does every one
+# abort is free only while BOTH allowances remain; every one past the
+# day's allowance counts toward max_attempts, and so does every one
 # past the lifetime total (counted since the current attempt-budget
 # floor, so an owner reset restores it). The day is read from the
 # attempt's PARENT-written ``started`` stamp (now_iso()), never a
-# session field. PROPOSED values; the owner decides at spec approval.
-FREE_QUOTA_REQUEUES_PER_DAY = 2
-FREE_QUOTA_REQUEUES_TOTAL = 6
+# session field. Owner-confirmed 2026-11-10: 3 a day (a GLM quota window
+# is ~5 h, so a genuine task rarely hits more) and 9 in total (three
+# full days) — past either, a quota abort spends a normal attempt.
+FREE_QUOTA_REQUEUES_PER_DAY = 3
+FREE_QUOTA_REQUEUES_TOTAL = 9
 
 
 def attempts_reset_eligible(task: dict) -> bool:

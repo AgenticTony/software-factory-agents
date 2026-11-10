@@ -198,7 +198,7 @@ _REVIEW_TURN_FLOOR = 2
 # of what the implementer used or claimed — the pre-F-64 remainder
 # sharing (max_turns - _turns_spent) let a long implementer run starve
 # review into budget_exhausted, and a forged record move the number.
-# PROPOSED values, sized from the owner's traces (~/factory/trace/**,
+# Owner-confirmed 2026-11-10, sized from the owner's traces (~/factory/trace/**,
 # session_end events, 2026-11-09): reviewer n=8 median 10 / max 15
 # turns; verifier n=1: 5 turns. 20/10 give headroom over the observed
 # maxima; the samples are thin — revisit after F-13's first runs.
@@ -209,13 +209,15 @@ VERIFIER_TURN_CAP = 10
 # The implementer's timeout is wall_clock_min minus this reserve, so a
 # session can never spend the review window, whatever its record claims —
 # wall clock is measured by the parent (time.monotonic), never from a
-# record. PROPOSED value, sized from the same traces: the observed
-# review pass max is reviewer 4.4 min + verifier 1.0 min ≈ 5.4, but a
-# reviewer spending its FULL cap at the observed ~18 s/turn (15 turns in
-# 4.4 min) needs ≈ 5.9 min, plus the verifier ≈ 6.9 → 8.0; re-runs and
-# later review events draw on what remains beyond it (the wall-backstop
+# record. It is a FLOOR, not a ceiling: review gets the reserve plus
+# every minute the implementer left unused. Owner-confirmed 2026-11-10
+# at 15.0: the observed review-pass max is reviewer 4.4 min + verifier
+# 1.0 ≈ 5.4, and a reviewer spending its FULL cap at the observed
+# ~18 s/turn plus the verifier ≈ 6.9 — 15 leaves headroom for large
+# diffs (slower turns) at ~5% of a 150-min budget. Re-runs and later
+# review events draw on what remains beyond it (the wall-backstop
 # refusals below stay for the pathological tail).
-REVIEW_WALL_RESERVE_MIN = 8.0
+REVIEW_WALL_RESERVE_MIN = 15.0
 # The minimal implementer window a wall budget must hold beside the
 # reserve: a run that cannot grant the implementer one minute refuses at
 # attempt start rather than starting a seat it cannot review.

@@ -422,7 +422,7 @@ def test_ac_5(tmp_path: Path, monkeypatch):
         seat: [kw["timeout_min"] for kw in seats.kwargs(seat)]
         for seat in ("reviewer", "verifier")
     }
-    assert all(0 < t <= 10 for t in timeouts["reviewer"])
+    assert all(0 < t <= 30 for t in timeouts["reviewer"])
     assert timeouts["verifier"][0] <= min(timeouts["reviewer"])
 
     env2 = Env(tmp_path / "spent")

@@ -365,7 +365,7 @@ def _body_task() -> dict:
         "title": "Make answer() return 42",
         "source": "docs/T-1.md",
         "risk": [],
-        "budget": {"size": "S", "max_attempts": 3, "max_turns": 20, "wall_clock_min": 10},
+        "budget": {"size": "S", "max_attempts": 3, "max_turns": 20, "wall_clock_min": 30},
         "acceptance": [
             {"id": "AC-1", "text": "answer() returns 42",
              "check": {"type": "test", "ref": REF}}
@@ -474,7 +474,7 @@ def _e2e_task(task_id: str = "T-1", *, risk=()) -> dict:
         "acceptance_hash": acceptance_hash(acceptance),
         "approved_at": "2026-10-20T10:00:00Z",
         "approved_by": "owner",
-        "budget": {"size": "S", "max_attempts": 3, "max_turns": 20, "wall_clock_min": 10},
+        "budget": {"size": "S", "max_attempts": 3, "max_turns": 20, "wall_clock_min": 30},
         "attempts": [],
     }
 

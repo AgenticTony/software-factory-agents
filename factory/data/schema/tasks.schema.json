@@ -208,8 +208,8 @@
           "properties": {
             "size": { "enum": ["S", "M"], "description": "L is not allowed: slice it" },
             "max_attempts": { "type": "integer", "minimum": 1, "maximum": 3 },
-            "max_turns": { "type": "integer", "minimum": 1, "maximum": 200, "description": "PROPOSED maximum (F-64 AC-3): the highest value in today's queues (200, this repo); the owner confirms at spec approval." },
-            "wall_clock_min": { "type": "integer", "minimum": 1, "maximum": 150, "description": "PROPOSED maximum (F-64 AC-3): the highest value in today's queues (150, this repo); the owner confirms at spec approval." }
+            "max_turns": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Maximum (F-64 AC-3, owner-confirmed 2026-11-10): the highest value in today's queues (200, this repo). Work that needs more is too big: slice it." },
+            "wall_clock_min": { "type": "integer", "minimum": 1, "maximum": 150, "description": "Maximum (F-64 AC-3, owner-confirmed 2026-11-10): the highest value in today's queues (150, this repo). Work that needs more is too big: slice it." }
           }
         },
         "attempts": { "type": "array", "items": { "$ref": "#/$defs/attempt" } },

@@ -97,7 +97,7 @@ def _task(task_id: str = "T-1", *, ref: str = REF, **overrides) -> dict:
         "acceptance_hash": acceptance_hash(acceptance),
         "approved_at": "2026-10-18T10:00:00Z",
         "approved_by": "owner",
-        "budget": {"size": "S", "max_attempts": 3, "max_turns": 20, "wall_clock_min": 10},
+        "budget": {"size": "S", "max_attempts": 3, "max_turns": 20, "wall_clock_min": 30},
         "attempts": [],
     }
     task.update(overrides)
@@ -1286,7 +1286,7 @@ def test_review33_sweep_escalations_do_not_burn_the_budget(tmp_path: Path):
     must still leave the fix round attempt 2, not attempt 3."""
     env = Env(tmp_path, tasks=[_task(
         "T-1", budget={"size": "S", "max_attempts": 2, "max_turns": 20,
-                       "wall_clock_min": 10})])
+                       "wall_clock_min": 30})])
     assert env.run(Seats()).outcome == "pr_opened"        # attempt 1 (pass)
     env.advance_remote_main("def answer():\n    return 99\n",
                             message="conflicting remote change")
@@ -1657,7 +1657,7 @@ def test_attempts_reset_restores_budget_and_keeps_history(tmp_path: Path):
 
     env = Env(tmp_path, tasks=[_task(
         "T-1", budget={"size": "S", "max_attempts": 2, "max_turns": 20,
-                       "wall_clock_min": 10})])
+                       "wall_clock_min": 30})])
     assert env.run(_FailingSeats()).outcome == "needs_human"
     task = env.task("T-1")
     assert task["attempts"][-1]["escalation"] == "attempts_exhausted"
