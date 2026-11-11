@@ -1617,7 +1617,8 @@
       "depends_on": [
         "F-13",
         "F-14",
-        "F-15"
+        "F-15",
+        "F-66"
       ],
       "risk": [
         "cross_repo"
@@ -5223,6 +5224,71 @@
       "acceptance_hash": "bc9795edaab7faf5b79851bd0202cc0123f6782b3a5d3c1353ade1754922c5bc",
       "approved_at": "2026-11-10T22:52:41Z",
       "approved_by": "Anthony"
+    },
+    {
+      "id": "F-66",
+      "title": "Contract epochs and project-queue migration",
+      "source": "BUILD-ORDER.md#f-66--contract-epochs-and-project-queue-migration",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-12",
+        "F-59",
+        "F-63",
+        "F-64",
+        "F-65"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "Rule changes are declared as contract epochs, and CI enforces the declaration. The epoch register is `factory/data/schema/epochs.json`, protected and schema-validated. It lists each epoch: number, date, the WO, the surfaces it tightens (`queue`, `profile`, or both), what changed in one line, and its migration. A migration is either a named automatic rewrite (AC-4) or an owner action, with the exact command. The current epoch is the register's highest number. It is stamped as the queue's top-level `version` on every factory write. Epoch 1 is today's baseline. Epochs 2–4 are registered retroactively for F-64, F-65 and F-59. A test fingerprints both schema files and the profile/queue semantic-check functions (`_check_semantics`, the provider and allowlist checks) against the register's latest entry. Any change to them without a new register entry fails CI with the instruction to add one. An entry that tightens nothing (a refactor, a loosening) records that and does not raise the epoch. Test: editing either schema file, or a fingerprinted function, without a register entry fails. The same edit with an entry passes. The factory's own queue carries the current epoch.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f66.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "`factory doctor` checks every onboarded project, read-only, before anything breaks mid-run. The F-63 approval ledger records the repo path with each profile approval. Doctor checks every repo in the ledger, plus any `--repo` given. For each repo it loads the profile and queue through the real loaders, collecting ALL violations instead of stopping at the first (an all-errors mode of `validate_queue`/`load_profile`). It reports: schema and semantic violations, each with its epoch and migration; tasks of a runnable kind that approval would refuse (`scope_missing`, over-cap budgets); a profile whose approved group hashes no longer match its file; the queue's recorded epoch against the current one. It starts no session, writes nothing, and exits non-zero on any finding. `factory run`, `loop` and `import` run the same checks for their own repo first, and refuse with doctor's full report instead of one bare schema error. Test: a planted pre-F-64 queue, a scope-less queue and a profile with a banned allowlist host are each reported with the epoch and the exact fix. A clean repo exits 0. Nothing under the factory root or the repo changes.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f66.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "A stale project names its way forward. Every refusal caused by a rule newer than the file says which epoch the file predates, what changed, and the command that fixes it (the register's migration). It never ends as only `schema violation at tasks/31/...`. Test: the F-13 pilot's two refusals (the over-cap queue, the `docs.z.ai` profile) each print the epoch, the WO and the fix command.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f66.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "A draft-only stale queue is re-proposed, never patched. If the existing queue fails validation but still parses as JSON, and every task in it is `draft`, `factory import` proposes a full replacement under the current rules. The owner reviews it exactly as a first import: the whole diff against the old file, every line. Any task past `draft` (approved, in flight, done or escalated), or a file that does not parse, refuses the re-proposal, naming those tasks and the epoch they predate. Those need the owner's per-task action. Owner-confirmed automatic rewrites named in the register are the only edits a migration may make without a session, and only ones that cannot change a task's meaning (for example, re-stamping `version` on a queue that already validates under the current rules). None of them may touch an approved task's hashed contract fields. Test: a draft-only queue with over-cap budgets re-imports through a scripted importer into a valid current-epoch queue, and the review shows the full diff. The same queue with one approved task refuses, naming it. An approved task's `contract_hash` is never changed by any migration.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f66.py::test_ac_4"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
     }
   ]
 }
