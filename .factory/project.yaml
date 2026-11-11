@@ -275,6 +275,11 @@ paths:
     # forcing a human review.
     - "factory/egress.py"
     - "factory/vent.py"
+    # F-67: the importer-v0-gates contract tests (gate normalisation, the
+    # import session records, possibly-shipped flags, dropped-criteria
+    # accounting) judge the protected importer/approve/session/status/
+    # schema modules — same precedent, protected from the day they exist.
+    - "tests/test_f67.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 

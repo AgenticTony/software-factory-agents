@@ -102,8 +102,13 @@ def _quota_record() -> SessionRecord:
 
 
 def _saved(root: Path) -> list[Path]:
+    # F-67: the import dir also holds *.record.json session records —
+    # these assertions count the kept PROPOSAL outputs only.
     directory = root / "import"
-    return sorted(directory.iterdir()) if directory.is_dir() else []
+    return sorted(
+        path for path in (directory.iterdir() if directory.is_dir() else [])
+        if not path.name.endswith(".record.json")
+    )
 
 
 def _collector(**kwargs) -> "object":
@@ -951,9 +956,12 @@ def test_ac_4_refused_then_repaired_reports_valid(tmp_path, monkeypatch):
     report = out["report"]
     assert report["schema_valid"] is True
     # S2: first-pass success and a repaired import never read the same
+    # (F-67: the repair facts also name the kept original's path)
     assert report["repair"] == {"ran": True, "outcome": "repaired",
                                 "turns": 11,
-                                "output": report["repair"]["output"]}
+                                "output": report["repair"]["output"],
+                                "original_saved":
+                                    report["repair"]["original_saved"]}
     assert "repaired (outcome repaired, 11 turns)" in (
         out["rendered_path"].read_text())
 
@@ -1273,10 +1281,14 @@ def test_f4_contract_change_on_live_task_demotes_both_paths(tmp_path):
     result_a = _outcome(repo_a, via_set=False)
     task = load_tasks(result_a.queue_path)["tasks"][0]
     assert task["status"] == "draft"
-    # history kept (re-approval overwrites), the relaxation carried
+    # history kept (re-approval overwrites), the risk relaxation carried
     assert task["acceptance_hash"] == "a" * 64
     assert task["approved_by"] == "owner" and task["approved_at"]
-    assert task["gates"]["merge"] == "auto" and task["risk"] == []
+    # F-67: the proposed merge relaxation never lands — v0 gates are
+    # human, the override is listed, and the demote rides the risk
+    # change (the contract field that actually changed).
+    assert task["gates"]["merge"] == "human" and task["risk"] == []
+    assert "PROSE-1: gates.merge" in result_a.summary
     assert "-> draft (the approved contract changed" in result_a.summary
     assert "history" in result_a.summary
 
@@ -1479,6 +1491,13 @@ def test_r2_1_each_contract_field_alone_demotes(tmp_path, field, override):
     task.update(status="ready", acceptance_hash="a" * 64,
                 approved_at="2026-11-07T09:00:00Z", approved_by="owner",
                 risk=["payments"])
+    if field == "gates":
+        # F-67: the importer can no longer WRITE a non-human gate, so
+        # the gates leg's stored task carries one the pre-F-67 way —
+        # planted in the queue by hand (schema-legal; approve refuses
+        # it). The proposal's own (normalised, human) gates then differ
+        # from the stored value: a LEGAL gates-only contract change.
+        task["gates"]["deploy"] = "auto"
     queue.save()
     result = run_import(
         repo, session=lambda p: _proposal(_wo("PROSE-1", **override)),
@@ -1682,12 +1701,15 @@ def test_n12_dep_on_a_queue_only_id_is_accepted(tmp_path):
     repo = _prose_repo(tmp_path)
     run_import(repo, session=lambda p: _proposal(_wo("PROSE-1")),
                confirm=lambda s: True)
-    # PROSE-1 stays in the queue; the new proposal does not mention it
-    # but depends on it.
+    # PROSE-1 stays in the queue; the new proposal does not re-propose
+    # it but ACCOUNTS for it (F-67 predecessors, its criterion carried
+    # by from) and depends on it — the dep still resolves against the
+    # merged, queue-only id.
+    replacement = _wo("PROSE-2", depends_on=["PROSE-1"],
+                      predecessors=["PROSE-1"])
+    replacement["acceptance"][0]["from"] = "PROSE-1/AC-1"
     result = run_import(
-        repo, session=lambda p: _proposal(
-            _wo("PROSE-2", depends_on=["PROSE-1"])
-        ),
+        repo, session=lambda p: _proposal(replacement),
         confirm=lambda s: True,
     )
     tasks = {t["id"]: t for t in load_tasks(result.queue_path)["tasks"]}
@@ -1768,14 +1790,22 @@ def test_s5_own_project_prefix_is_local(tmp_path):
     repo2 = _prose_repo(tmp_path / "b")
     run_import(repo2, session=lambda p: _proposal(_wo("PROSE-1")),
                confirm=lambda s: True)
-    result2 = run_import(repo2, session=lambda p: _proposal(
-        _wo("PROSE-2", depends_on=["prose-demo:PROSE-1"])
-    ), confirm=lambda s: True)
+    replacement = _wo("PROSE-2", depends_on=["prose-demo:PROSE-1"],
+                      predecessors=["PROSE-1"])
+    replacement["acceptance"][0]["from"] = "PROSE-1/AC-1"
+    result2 = run_import(repo2, session=lambda p: _proposal(replacement),
+                         confirm=lambda s: True)
     assert result2.applied
+    ghost = _wo("PROSE-3", depends_on=["prose-demo:GHOST"],
+                predecessors=["PROSE-1", "PROSE-2"])
+    ghost["acceptance"][0]["from"] = "PROSE-1/AC-1"
+    ghost["acceptance"].append({
+        "id": "AC-2", "text": "carries PROSE-2's criterion",
+        "check": {"type": "manual", "expect": "review"},
+        "from": "PROSE-2/AC-1",
+    })
     with pytest.raises(ImportRefused, match="depends_on names"):
-        run_import(repo2, session=lambda p: _proposal(
-            _wo("PROSE-3", depends_on=["prose-demo:GHOST"])
-        ))
+        run_import(repo2, session=lambda p: _proposal(ghost))
 
 
 def test_s6_two_evals_two_report_files(tmp_path, monkeypatch):

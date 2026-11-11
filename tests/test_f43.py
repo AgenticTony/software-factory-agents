@@ -551,6 +551,17 @@ _EGRESS_MODULES = {
             # allow set) and the accepted set was seam-scrubbed in the
             # sandbox at accept time, so both paths are guarded.
             "_session_proposal",
+            # F-67 re-seats, same scrub-before-plan rule as plan_import:
+            # the possibly-shipped validator and the criteria accounting
+            # run INSIDE plan_import over the already-scrubbed proposal;
+            # the toplevel carry is pre-scrub in-memory (parse_proposal's
+            # class — it only lifts the two whitelisted lists); the abort
+            # wrapper composes the seam with the allowed _abort_refusal;
+            # the render-side escaper never writes (F-63's approval-text
+            # rule, applied to the summary's session-derived strings).
+            "_validate_possibly_shipped", "_account_reference",
+            "_carry_proposal_toplevel", "_abort_exc",
+            "escape_approval_text", "show",
         },
     },
     "factory/session.py": {

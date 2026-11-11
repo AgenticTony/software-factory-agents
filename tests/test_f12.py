@@ -288,17 +288,46 @@ def test_ac_3_changed_doc_updates_spec_keeps_state(tmp_path: Path):
 
 def test_task_absent_from_proposal_is_kept_and_listed(tmp_path: Path):
     """A task the proposal does not mention is carried untouched — and
-    listed, so a silently dropped WO is visible, never quiet."""
+    listed, so a silently dropped WO is visible, never quiet. F-67: the
+    absence must be ACCOUNTED for (a drop with a doc line), or the
+    import refuses."""
     repo = _repo(tmp_path)
 
     def session(prompt: str) -> str:
         return _proposal(_wo("WO-1"), _wo("WO-2"))
 
     run_import(repo, session=session, confirm=lambda summary: True)
+    # Without the accounting, the second import refuses (F-67 AC-4).
+    with pytest.raises(ImportRefused) as excinfo:
+        run_import(
+            repo,
+            session=lambda prompt: _proposal(_wo("WO-1")),
+            confirm=lambda summary: True,
+        )
+    assert "WO-2" in str(excinfo.value)
+    # With WO-2's absence accounted (dropped against a real doc line —
+    # its own planning section, which says the page shipped), it is
+    # carried and listed exactly as before.
+    plan_doc = repo / "docs" / "PLAN.md"
+    plan_doc.write_text(
+        plan_doc.read_text()
+        + "\n## WO-2: [x] done — the billing page shipped already.\n"
+    )
+    drop = {
+        "ref_task": "WO-2",
+        "doc": "docs/PLAN.md",
+        "line": len(plan_doc.read_text().splitlines()),
+        "reason": "the doc marks the billing page shipped",
+    }
     result = run_import(
         repo,
-        session=lambda prompt: _proposal(_wo("WO-1")),
+        session=lambda prompt: json.dumps({
+            "project": "proj", "tasks": [_wo("WO-1")],
+            "dropped_criteria": [drop],
+        }),
         confirm=lambda summary: True,
+        # F-67/R2-1: every drop needs the owner's per-drop acceptance
+        confirm_drop=lambda _drop: True,
     )
     by_id = {change.task_id: change.kind for change in result.plan.changes}
     assert by_id == {"WO-1": "unchanged", "WO-2": "missing"}
@@ -889,7 +918,11 @@ def test_cli_stale_plan_refuses_exit_1(tmp_path: Path, monkeypatch, capsys):
 @pytest.mark.parametrize("omitted", ["depends_on", "risk", "gates"])
 def test_omitted_spec_field_keeps_the_existing_value(tmp_path: Path, omitted):
     """#61 finding 4: a proposal that leaves out depends_on, risk or
-    gates keeps the stored value — a default is not a proposal."""
+    gates keeps the stored value — a default is not a proposal. F-67: a
+    non-human stored gate can no longer arrive via an import (the parent
+    normalises everything it writes), so the gates leg plants it in the
+    queue by hand — exactly the pre-F-67/hand-edited queue the approve
+    gate check covers."""
     repo = _repo(tmp_path)
     stored = {
         "depends_on": ["WO-1"],
@@ -898,10 +931,20 @@ def test_omitted_spec_field_keeps_the_existing_value(tmp_path: Path, omitted):
     }
     first = run_import(
         repo,
-        session=lambda p: _proposal(_wo("WO-1"), _wo("WO-2", **stored)),
+        session=lambda p: _proposal(
+            _wo("WO-1"),
+            _wo("WO-2", depends_on=stored["depends_on"],
+                risk=stored["risk"])),
         confirm=lambda s: True,
     )
-    bare = _wo("WO-2", **stored)
+    if omitted == "gates":
+        # Plant the pre-F-67 shape by hand (schema-legal; approve would
+        # refuse it — that is F-67's other half, not this test's).
+        queue = TaskQueue(first.queue_path)
+        queue.get("WO-2")["gates"]["deploy"] = "auto"
+        queue.save()
+    bare = _wo("WO-2", depends_on=stored["depends_on"],
+               risk=stored["risk"])
     del bare[omitted]
     second = run_import(repo, session=lambda p: _proposal(_wo("WO-1"), bare),
                         confirm=lambda s: True)

@@ -339,7 +339,9 @@ def test_write_failure_at_apply_keeps_the_output(tmp_path: Path,
     home = _pin_default_root(monkeypatch, tmp_path)
     _real_session(monkeypatch, _proposal(_wo()))
 
-    def broken_apply(plan, queue_path, *, confirm):
+    def broken_apply(plan, queue_path, *, confirm, **_kwargs):
+        # F-67: apply_import grew confirm_drop — the fake keeps accepting
+        # whatever the caller passes.
         raise OSError("disk on fire")
 
     monkeypatch.setattr("factory.importer.apply_import", broken_apply)
