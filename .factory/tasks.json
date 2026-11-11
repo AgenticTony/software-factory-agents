@@ -1618,7 +1618,8 @@
         "F-13",
         "F-14",
         "F-15",
-        "F-66"
+        "F-66",
+        "F-69"
       ],
       "risk": [
         "cross_repo"
@@ -5341,6 +5342,201 @@
           "check": {
             "type": "test",
             "ref": "tests/test_f67.py::test_ac_4"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-68",
+      "title": "Lifecycle dashboard",
+      "source": "BUILD-ORDER.md#f-68--lifecycle-dashboard",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-11",
+        "F-30",
+        "F-31",
+        "F-59",
+        "F-67"
+      ],
+      "risk": [
+        "privacy"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "The home page lists every project the factory knows (each repo recorded in the F-63 approval ledger, plus the factory itself), one card each: name, current lifecycle stage (onboarding, import review, queue, running, PR, idle), tasks by status, open factory PRs, the escalations waiting on the owner, and tokens and estimated cost this week (F-59 provider rows, including F-67's import sessions). Above the cards, one \"needs you\" strip lists every pending owner act across projects (an approval, an import to read, an escalation, a PR to merge) linking to where it is decided. A project whose profile or queue fails to load shows the failure on its card, never crashes the page. Test: a fixture factory root with three projects (one healthy, one with a stale queue, one onboarding) renders three cards with the right stage and counts, the stale one showing its load error, and the strip listing each pending act once.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f68.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "A project page is a kanban of that project's tasks: columns Onboard, Draft, Approved, Running, PR, Merged (escalated tasks show in place, flagged), with a header of the project's lifecycle checklist and its cost and first-pass numbers. Each task card shows id, size, risk flags, the current round's L0–L4 verdict chips, its PR link and CI state when it has one, and tokens and minutes for its latest attempt. A running task updates live from F-31's existing event stream; no second live transport. Test: a fixture queue with one task per column renders each in its column with its chips; a scripted run's trace events move a card from Running to PR without a reload.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f68.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "Clicking a task opens a drawer with its whole history: the contract as `render_contract` shows it, each attempt and round with its verdicts and findings, the trace for that run, the PR, and cost. Every step opens with a one-line plain summary, the raw detail below it. Every text shown that came from a session (findings, notes, summaries, PR bodies) goes through `escape_approval_text`. Test: a fixture task with two attempts and a failed L2 round renders both with summaries first; a finding carrying ESC/CSI/bidi bytes renders escaped.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f68.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "Still read-only and still local: every new route is GET, Host-checked (F-31 AC-2), builds no filesystem path from URL input, and serves only from the factory root and the recorded repos. A test sweeps every route against a fixture root and asserts no file under it or under any recorded repo changed (mtime and hash), and that a `..`, absolute or symlinked project path is refused.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f68.py::test_ac_4"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-69",
+      "title": "Guided project onboarding",
+      "source": "BUILD-ORDER.md#f-69--guided-project-onboarding",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-31",
+        "F-59",
+        "F-63",
+        "F-66",
+        "F-67",
+        "F-68"
+      ],
+      "risk": [
+        "factory_control",
+        "privacy",
+        "external_service"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "Start and confirm are the only writes, and only the owner's click makes either happen. The dashboard gains exactly two POST routes: `POST /onboard/start` (starts an onboarding session for a named new project) and `POST /onboard/confirm` (carries out one proposed write). Both enforce F-34 AC-2's per-launch token, exact `Host` and matching `Origin`; a confirm carries a one-time nonce bound to the proposal's kind and the hash of its exact content, and a reused nonce or changed content gets 409 and writes nothing. The confirm card is built by the server from the onboarding state file, never from agent text (F-35 AC-2). No agent tool, route or token reaches `/onboard/confirm`. Test: one test per refusal (token, Host, Origin, reused nonce, changed content); a scripted session that tries every tool leaves everything outside its own state file byte-identical; one end-to-end start and confirm from a page served as `localhost`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f69.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "The interview asks every gate question before anything is written, and records each answer in `<factory_root>/onboarding/<project>/state.json` (0600 in 0700): whose project it is (`data_owner`); the model provider and region, refusing a choice F-59 would refuse at load (a client with Z.ai); for a client, whether a DPA or written consent is on file; whether a repo exists (GitHub remote, local folder only, or nothing), and if nothing, the stack and the GitHub account (F-70); setup, lint, typecheck and test commands; where the plan lives and whether the planning docs are current with what has shipped; protected and risk paths; the deploy target (deploy gate always human in v0); docs and network allowlists; default budgets within the F-64 caps; an optional monthly cost cap. Answers the repo already holds (commands from its CI files, dependencies, existing protected paths, default branch) are detected and shown for the owner to confirm, never assumed. Test: a scripted interview over a fixture repo detects its CI commands and asks only the rest; a client + Z.ai answer is refused with the F-59 reason; nothing is written before the last answer.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f69.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "Each answer is carried out as a proposed write the owner confirms: the adapter (`.factory/project.yaml`), the data-processing record (`.factory/data-processing.md`), a branch and PR in the project repo carrying both, and the keychain item check (presence only, never the value). Every proposed adapter passes `load_profile` and `factory doctor` (F-66) before its card is shown; a failing one is fixed in the session, never shown. Nothing is pushed to the default branch. Test: a scripted onboarding produces exactly these proposals; a confirmed adapter loads clean; a declined one writes nothing; an adapter that `factory doctor` flags is never offered.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f69.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "Onboarding runs every check the F-13 pilot hit and shows each result on the project's checklist (F-68): the provider credential is present; `gh` can push to the repo; the default branch has the protection and required checks the factory admits (F-26); the local checkout is clean; open PRs that touch the same files as onboarding's own PR are listed; the readiness run passes every profile command unattended in the real sandbox on a clean clone; `factory doctor` is clean. A failing check names the exact fix and blocks the next step; nothing is silently skipped. Test: one fixture per failing check shows its named fix and blocks; an all-passing fixture reaches the next step.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f69.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "Onboarding ends at ready for the first run: it runs the import (F-67, a session the owner confirms starting), shows the import review (possibly shipped, dropped criteria, gate overrides, the diff) for the owner to accept, then proposes the best first task with its acceptance refs and `scope.paths` already checked for approvability (exact test refs, tight scope, no catch-all) and the reasons it was chosen. The owner's three acts (`factory approve --profile`, accepting the import, approving the first task) are shown as the exact command or confirm card, never taken. Test: a scripted onboarding over a fixture repo with a planning doc reaches \"ready for first run\" with the three owner acts pending and nothing approved; the proposed first task passes `_check_approvable`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f69.py::test_ac_5"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-70",
+      "title": "Greenfield project scaffold",
+      "source": "BUILD-ORDER.md#f-70--greenfield-project-scaffold",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-69"
+      ],
+      "risk": [
+        "external_service",
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "Stack templates ship in the factory package, vetted and versioned. The first is the owner's default stack: a FastAPI backend with PostgreSQL/Supabase access, pytest with one passing test, ruff, a GitHub Actions CI workflow running lint and tests, a README and a `docs/` folder for the plan. Each template declares the adapter commands it implies. Test: rendering the template into a temp dir and running its declared setup, lint and test commands passes, offline except for package installs.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f70.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Creating the repo is a confirmed write (F-69 AC-1): onboarding proposes the repo name, the owner's chosen GitHub account, private visibility and the default branch, and only the confirm creates the GitHub repo, makes the first commit of the rendered skeleton, pushes it, and sets branch protection with the template's CI as a required check. A local folder that already exists is used as the working copy only when it is empty or holds no git repo; otherwise onboarding stops and names the clash. Test: with the GitHub CLI stubbed, a confirm issues exactly those calls in order; a decline issues none; a non-empty folder with a repo stops with the clash named.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f70.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "A scaffolded project then goes through F-69's checks unchanged: the generated adapter loads and passes `factory doctor`, the readiness run passes on a clean clone, and its CI is green on the first commit. Test: a scaffold into a temp repo with a stubbed remote passes `load_profile`, `factory doctor` and the readiness run.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f70.py::test_ac_3"
           }
         }
       ],
