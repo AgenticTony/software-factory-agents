@@ -5334,6 +5334,14 @@
             "type": "test",
             "ref": "tests/test_f67.py::test_ac_3"
           }
+        },
+        {
+          "id": "AC-4",
+          "text": "Criteria the docs still carry are never silently dropped. The reference is the repo's existing `.factory/tasks.json`, read as plain JSON even when it fails the current schema, so an import into a fresh queue file (`--queue`) is checked too. Every reference task and every one of its acceptance criteria must be accounted for: mapped to a proposed task and criterion (the proposal states each new task's predecessors), or listed in `dropped_criteria` (a whole task, or one criterion) with the doc line that removes, completes or supersedes it. The parent checks the accounting is complete and that each cited doc line exists in a kept planning doc; an unaccounted task or criterion refuses the proposal, naming it. The review output shows `dropped_criteria` before the diff. A dropped criterion whose source text is still present in the kept planning docs is flagged `still in docs` and blocks applying the proposal until the owner accepts the drop at review. Found on JobFinderOS: the WO-19 rule \"never fetch or output URLs that appear inside the posting body\" (still in `WO-19-honest-gates.md`) and five other doc-carried items vanished from the proposal with no trace. Test: a scripted import into a fresh `--queue` file over a schema-invalid reference queue still runs the check; one that leaves a reference criterion unaccounted refuses, naming it; one that drops a criterion still present in the docs refuses to apply until accepted, naming the criterion and its doc line; a drop backed by a doc line that marks the work done is listed and applies; a criterion mapped across a task split (one task into two) is not reported as dropped.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f67.py::test_ac_4"
+          }
         }
       ],
       "attempts": [],
