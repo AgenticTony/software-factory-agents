@@ -569,8 +569,34 @@ def _run_import(args: argparse.Namespace) -> int:
         if answer.strip().lower() != "y":
             print("factory import: nothing written.")
             return 0
+        # F-67 AC-4 + R2-1: EVERY drop gets its own named prompt —
+        # never one blanket yes, and never a bypass.
+        accepted_drops: set[str] = set()
+        for drop in result.plan.dropped:
+            try:
+                drop_answer = input(
+                    f"Accept dropping {drop.label} (cited {drop.doc}:"
+                    f"{drop.line})? [y/N] "
+                )
+            except EOFError:
+                print(
+                    "factory import: no answer on stdin — nothing written.",
+                    file=sys.stderr,
+                )
+                return 1
+            if drop_answer.strip().lower() == "y":
+                accepted_drops.add(drop.label)
+            else:
+                print(
+                    "factory import: drop declined — nothing written "
+                    "(re-propose the criterion or edit the proposal)."
+                )
+                return 0
         try:
-            apply_import(result.plan, result.queue_path, confirm=lambda: True)
+            apply_import(
+                result.plan, result.queue_path, confirm=lambda: True,
+                confirm_drop=lambda drop: drop.label in accepted_drops,
+            )
         except (ImportRefused, OSError) as exc:
             # The real session's output is keepable; a --proposal review
             # already holds its file and keeps nothing (round 2: keying

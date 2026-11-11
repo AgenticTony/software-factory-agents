@@ -200,6 +200,33 @@ def input_confirm(question: str) -> bool:
     return answer in ("y", "yes")
 
 
+def check_v0_gates(task: dict) -> None:
+    """Refuse a contract whose merge/deploy gate is not ``human`` (F-67
+    AC-1).
+
+    TASK-CONTRACT §gates: in v0 everything is ``human``. The importer
+    normalises what it writes, but a hand-edited queue — or one written
+    before F-67 — can still carry an auto gate, and approving it would
+    let a run merge or deploy on its own. ``spec_approval`` is NEVER
+    judged here: an owner-only task's ``spec_approval: false`` is the
+    landed queues' own shape (the pilot's carries it on 24 of 32 tasks).
+
+    Raises:
+        ApprovalError: ``gates.merge`` or ``gates.deploy`` is not the
+            string ``"human"`` — naming the task and the field.
+    """
+    gates = task.get("gates")
+    values = gates if isinstance(gates, dict) else {}
+    for field in ("merge", "deploy"):
+        if values.get(field) != "human":
+            raise ApprovalError(
+                f"{task.get('id')}: refusing to approve a contract whose "
+                f"gates.{field} is {values.get(field)!r} — in v0 every "
+                "gate is human (the owner merges and deploys; F-67); fix "
+                "the queue before approving"
+            )
+
+
 def _check_approvable(task: dict, *, require_scope: bool = True) -> None:
     """Refusals that apply to any approval, single or reconcile.
 
@@ -215,9 +242,10 @@ def _check_approvable(task: dict, *, require_scope: bool = True) -> None:
 
     Raises:
         ApprovalError: When the task is not a draft, is of a
-            non-executable kind, has no acceptance items (AC-1), or —
-            F-65 — is of a kind the picker runs but declares no file
-            scope.
+            non-executable kind, has no acceptance items (AC-1), carries
+            a non-human merge/deploy gate (:func:`check_v0_gates`,
+            F-67), or — F-65 — is of a kind the picker runs but declares
+            no file scope.
     """
     task_id = task.get("id")
     kind = task.get("kind")
@@ -236,6 +264,9 @@ def _check_approvable(task: dict, *, require_scope: bool = True) -> None:
             f"{task_id}: refusing to approve a contract with no acceptance "
             "items — there is nothing to hold the work to"
         )
+    # F-67 AC-1: v0 gates are human wherever the queue came from — a
+    # hand-edited or pre-F-67 queue cannot carry an auto gate into a run.
+    check_v0_gates(task)
     # F-65 AC-1: a task a session will build must declare the files it
     # may change — approving a scope-less build/docs contract would
     # approve an unbounded write surface. Non-executable kinds run no

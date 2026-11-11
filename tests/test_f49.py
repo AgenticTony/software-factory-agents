@@ -140,8 +140,13 @@ def _proposal(*tasks: dict, project: str = "proj") -> str:
 
 
 def _saved_files(factory_root: Path) -> list[Path]:
+    # F-67: the import dir also holds *.record.json session records —
+    # these assertions count the kept PROPOSAL outputs only.
     directory = factory_root / "import"
-    return sorted(directory.iterdir()) if directory.is_dir() else []
+    return sorted(
+        path for path in (directory.iterdir() if directory.is_dir() else [])
+        if not path.name.endswith(".record.json")
+    )
 
 
 # ----------------------------------------------------------------- AC-1 --

@@ -204,10 +204,13 @@ def test_prompt_states_required_keys_of_every_object_shape(tmp_path: Path):
 
 
 def test_prompt_carries_the_hard_rules(tmp_path: Path):
-    """The three rules the refused import tripped over: merge is human,
-    size tops out at M (split, never L), priority is P1–P3 only."""
+    """The rules the refused import tripped over: v0 gates (merge and
+    deploy human, spec_approval true on eligible kinds — F-67 states
+    all three), size tops out at M (split, never L), priority is P1–P3
+    only."""
     prompt = build_import_prompt(tmp_path, "docs", [], project="proj")
-    assert 'gates.merge is always "human"' in prompt
+    assert 'merge is always "human" and deploy is always "human"' in prompt
+    assert "spec_approval is always true for build and docs tasks" in prompt
     assert "too big for size M" in prompt
     assert "P1–P3" in prompt
 
@@ -253,8 +256,11 @@ def _three_violation_proposal() -> dict:
         "tasks": [
             _wo("WO-A", priority="P0"),
             _wo("WO-B", risk="spills across modules"),
-            _wo("WO-C", gates={"spec_approval": True, "merge": True,
-                               "deploy": "auto"}),
+            # F-67: a WRONG-VALUED gate is normalised to the v0 value and
+            # listed as an override — the shape violation that survives
+            # is an extra key in gates (additionalProperties).
+            _wo("WO-C", gates={"spec_approval": True, "merge": "human",
+                               "deploy": "human", "extra": 1}),
         ],
     }
 
@@ -268,8 +274,7 @@ def test_refusal_lists_every_violation(tmp_path: Path):
     assert "tasks/0/priority" in message and "P0" in message
     assert "tasks/1/risk" in message
     assert "'spills across modules' is not of type 'array'" in message
-    assert "tasks/2/gates/merge" in message
-    assert "True is not one of" in message
+    assert "tasks/2/gates" in message and "extra" in message
 
 
 def test_refusal_is_capped_with_a_more_count(tmp_path: Path):
@@ -294,7 +299,7 @@ def test_proposal_review_path_lists_every_violation(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "tasks/0/priority" in err and "P0" in err
     assert "tasks/1/risk" in err
-    assert "tasks/2/gates/merge" in err
+    assert "tasks/2/gates" in err and "extra" in err
 
 
 def test_semantics_only_refusal_keeps_its_message(tmp_path: Path):
@@ -443,13 +448,20 @@ def test_proposal_schema_derives_from_the_queue_schema():
     queue = _load_tasks_schema()
     staged = build_proposal_schema(queue)
     assert staged["required"] == ["project", "tasks"]  # version gone
-    assert set(staged["properties"]) == {"project", "tasks"}
+    assert set(staged["properties"]) == {
+        "project", "tasks",
+        # F-67's proposal-only top-level fields
+        "possibly_shipped", "dropped_criteria",
+    }
     task = staged["$defs"]["task"]
     assert "status" not in task["required"]
     for banned in ("status", *FORBIDDEN_FIELDS):
         assert banned not in task["properties"], banned
-    for field in ("id", *SPEC_FIELDS, "out_of_scope_match"):
+    for field in ("id", *SPEC_FIELDS, "out_of_scope_match",
+                  "predecessors"):  # F-67's proposal-only task field
         assert field in task["properties"], field
+    # F-67: the acceptance item gains the proposal-only `from`
+    assert "from" in staged["$defs"]["acceptance_item"]["properties"]
     # the shapes are the queue's own, not a hand-copy: enums identical
     for field in ("kind", "priority"):
         assert (task["properties"][field]["enum"]
@@ -488,8 +500,12 @@ def test_staged_check_agrees_with_plan_import(tmp_path: Path):
         "invented check type": {"acceptance": [{
             "id": "AC-1", "text": "t",
             "check": {"type": "grep", "ref": "app"}}]},
-        "boolean merge gate": {"gates": {"spec_approval": True,
-                                         "merge": True, "deploy": "human"}},
+        # F-67: a WRONG-VALUED gate is normalised (test_f67), not a
+        # shape refusal — the surviving gates shape error is an extra
+        # key, caught by both checks.
+        "extra key in gates": {"gates": {"spec_approval": True,
+                                         "merge": "human", "deploy": "human",
+                                         "extra": 1}},
         "risk as a string": {"risk": "spills across modules"},
         "owner_steps as strings": {"owner_steps": ["confirm with Paddle"]},
         "slices as strings": {"slices": ["phase one"]},

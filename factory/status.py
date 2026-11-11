@@ -600,15 +600,97 @@ def _estimate_cost(rates: "dict[str, float] | None",
     return f"${total:.2f}"
 
 
-def _render_providers(queue: dict,
-                      config: "FactoryConfig | None") -> "list[str]":
+def _import_session_rows(
+    factory_root: "Path | str | None", project: str,
+) -> "tuple[list[dict], list[str]]":
+    """The import session records under ``<factory-root>/import/`` (F-67
+    AC-2), filtered to this project: one row per record (the sessions
+    the importer and its repairs ran). Malformed files degrade to a
+    note — status is read-only and never crashes on them."""
+    if factory_root is None:
+        return [], []
+    directory = Path(factory_root) / "import"
+    if not directory.is_dir():
+        return [], []
+    rows: list[dict] = []
+    notes: list[str] = []
+    for path in sorted(directory.glob("*.record.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            notes.append(f"{path.name}: unreadable import record, skipped")
+            continue
+        if not isinstance(data, dict) or data.get("project") != project:
+            continue
+        rows.append(data)
+    return rows, notes
+
+
+def _render_import_sessions(
+    factory_root: "Path | str | None", project: str,
+    config: "FactoryConfig | None",
+) -> "list[str]":
+    """The F-67 AC-2 import-session table under the Providers section:
+    kind, model, usage and an estimated cost under the same price rule
+    as the attempts above — one row per recorded session, unknown counts
+    rendered unknown, never a partial sum and never 0."""
+    rows, notes = _import_session_rows(factory_root, project)
+    lines: list[str] = []
+    if not rows and not notes:
+        return lines
+    lines += ["", "Import sessions (import/ records):", ""]
+    if not rows:
+        lines.append("- none recorded")
+    else:
+        lines.append("| session | provider | model | in | cache read | "
+                     "cache write | out | est. cost |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        prices = (config.prices if config is not None else {}) or {}
+        for row in rows:
+            provider = row.get("provider")
+            provider = provider if isinstance(provider, dict) else {}
+            kind = str(provider.get("kind") or "unknown")
+            model = str(row.get("model") or "unknown")
+            usage = row.get("usage")
+            usage = usage if isinstance(usage, dict) else {}
+            cells = {
+                name: [usage.get(name)] for name in _USAGE_FIELDS
+            }
+
+            def cell(name: str, _cells=cells) -> str:
+                value = _column(_cells.get(name))
+                return _fmt_millions(value)
+
+            rates = prices.get(kind, {}).get(model)
+            lines.append(
+                f"| {row.get('run_id', '?')} ({row.get('outcome', '?')}) "
+                f"| {kind} | {model} "
+                f"| {cell('input')} | {cell('cache_read')} "
+                f"| {cell('cache_write')} | {cell('output')} "
+                f"| {_estimate_cost(rates, cells)} |")
+    lines.append("Import sessions are the importer seat's own records; "
+                 "unknown counts stay unknown, never 0.")
+    lines.extend(f"- {note}" for note in notes)
+    return lines
+
+
+def _render_providers(
+    queue: dict,
+    config: "FactoryConfig | None",
+    *,
+    factory_root: "Path | str | None" = None,
+    project: str = "",
+) -> "list[str]":
     """The F-59 AC-4 provider section: per kind+model token totals and
     an estimated cost from the owner-maintained price table. A missing
-    price is n/a; an invalid usage count is unknown — neither is 0."""
+    price is n/a; an invalid usage count is unknown — neither is 0.
+    F-67 appends the import sessions' own rows (one per recorded
+    importer/repair session)."""
     rows = _provider_rows(queue)
     lines = ["## Providers", ""]
     if not rows:
         lines.append("- no provider records yet (no attempts recorded)")
+        lines.extend(_render_import_sessions(factory_root, project, config))
         return lines
     lines.append("| provider | model | in | cache read | cache write | out | est. cost |")
     lines.append("|---|---|---|---|---|---|---|")
@@ -629,6 +711,7 @@ def _render_providers(queue: dict,
     lines.append("")
     lines.append("Estimates from the owner-maintained price table "
                  "(config.yaml `prices`); a missing price shows n/a.")
+    lines.extend(_render_import_sessions(factory_root, project, config))
     return lines
 
 
@@ -807,7 +890,8 @@ def render_status(
         except ConfigError as exc:
             notes.append(f"factory config unreadable, no cost estimates: {exc}")
             config = None
-    lines += [""] + _render_providers(queue, config)
+    lines += [""] + _render_providers(
+        queue, config, factory_root=factory_root, project=project)
     if notes:
         lines += ["", "## Notes", ""]
         lines += [f"- {note}" for note in notes]

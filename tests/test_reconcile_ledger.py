@@ -118,7 +118,54 @@ OWNER_PENDING = {
             "deferred to F-61); the owner amends the contract first",
     "F-59": "AC-7 is manual: one real (paid) bedrock session on the "
             "rehearsal fixture (BOOTSTRAP §F-59 runbook)",
+    "F-67": "its own ACs are proven, but reconcile walks the dep chain: "
+            "F-57 AC-4 and F-59 AC-7 (the owner's paid runs) land first",
 }
+
+
+def _owner_held(detail: str) -> bool:
+    """Is this reconcile failure the OWNER's to resolve (R1-2)?
+
+    Two classes: the entry's own pending criterion, or a dependency
+    wait where EVERY unmet dependency it names is itself owner-pending
+    (the chain is the owner's — F-67 waits on F-57/F-59's paid runs). A
+    dependency wait on anything NOT in OWNER_PENDING is a real ordering
+    failure in the ledger, not an owner step, and must stay a failure
+    the guard reports.
+    """
+    if "pending" in detail:
+        return True
+    if "dependency not met" not in detail:
+        return False
+    named = detail.split("dependency not met (", 1)[1].split(")", 1)[0]
+    deps = [dep.strip() for dep in named.split(",") if dep.strip()]
+    return bool(deps) and all(dep in OWNER_PENDING for dep in deps)
+
+
+def test_owner_held_failure_is_narrow():
+    # R1-2: the guard's owner-held class is exact — a dependency wait on
+    # a task that is NOT owner-pending is a ledger ordering failure.
+    assert _owner_held("a criterion marked pending (or not proven) …")
+    assert _owner_held(
+        "dependency not met (F-57, F-59); reconcile entries in "
+        "dependency order")
+    assert not _owner_held(
+        "dependency not met (F-04); reconcile entries in dependency order")
+    assert not _owner_held("dependency not met (); reconcile entries …")
+    assert not _owner_held("some other failure entirely")
+
+
+def test_dependency_wait_on_a_built_task_still_fails(tmp_path: Path):
+    # The negative, live: an entry whose unmet dependency is NOT
+    # owner-pending must fail reconciliation and the guard's class.
+    results, task = _reconcile(
+        tmp_path,
+        LEDGER.format(status="ready"),
+        _task(depends_on=["T-DEP"]),
+    )
+    assert [r.action for r in results] == ["failed"], results
+    assert not _owner_held(results[0].detail), results[0].detail
+    assert "T-DEP" in results[0].detail
 
 
 def test_the_repo_ledger_reconciles_cleanly(tmp_path: Path):
@@ -140,7 +187,7 @@ def test_the_repo_ledger_reconciles_cleanly(tmp_path: Path):
     unexpected = {tid: d for tid, d in failed.items() if tid not in OWNER_PENDING}
     assert not unexpected, unexpected
     for tid, detail in failed.items():
-        assert "pending" in detail, (tid, detail)
+        assert _owner_held(detail), (tid, detail)
     # A listed id that now reconciles (or is past draft) must leave the
     # list: the exception never outlives its reason.
     stale = sorted(set(OWNER_PENDING) - set(failed))

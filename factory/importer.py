@@ -85,6 +85,36 @@ F-49 hardening, from the 2026-11-05 review (m-4, m-6, m-7, I-18):
   same shapes the session self-checks — so a proposal without a
   non-empty ``project`` key, an extra key, or a handed ``status`` is
   refused before planning.
+
+F-67 — the four gaps the F-13 pilot's fresh import exposed (each
+defeated parent-side; the session only ever proposes):
+
+* **v0 gates are forced, never trusted** (:func:`_normalise_gates`):
+  every task the importer writes — new and merged — lands
+  ``merge``/``deploy`` ``human`` and ``spec_approval`` true on
+  :data:`factory.state.ELIGIBLE_KINDS` kinds, whatever the proposal
+  said; every override is listed in the summary before the diff, and
+  :func:`factory.approve.check_v0_gates` refuses a non-human gate
+  wherever the queue came from;
+* **every import session is on record**
+  (:func:`_write_session_record`): the importer session AND each repair
+  session write a provider-stamped (the PARENT's resolution), scrubbed,
+  0600 record under ``<factory-root>/import/`` on every exit path —
+  accepted, refused, aborted — and ``factory status`` renders them;
+* **possibly shipped work is flagged, never decided**
+  (:func:`_validate_possibly_shipped`): the proposal's
+  ``possibly_shipped`` list is validated (every entry names a proposed
+  task; evidence is repo-relative), rendered FIRST in the summary, and
+  changes nothing — the owner decides;
+* **criteria the docs still carry are never silently dropped**
+  (:func:`_account_reference`): the repo's own ``.factory/tasks.json``,
+  read as PLAIN JSON (it may predate the current schema), is accounted
+  against — every reference task and criterion mapped
+  (``predecessors`` + a criterion's ``from``), re-proposed, or dropped
+  against a real line of a kept planning doc; a drop whose criterion
+  text the docs still carry blocks :func:`apply_import` until the owner
+  accepts it, per drop. The proposal-only fields never reach the queue.
+
 """
 
 from __future__ import annotations
@@ -100,6 +130,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from dataclasses import replace as dataclasses_replace
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Sequence
 
@@ -116,7 +147,12 @@ from factory.contract import (
     scope_pattern_error,
     validate_queue,
 )
-from factory.egress import check_secrets, scrub_session_text, scrub_session_value
+from factory.egress import (
+    check_secrets,
+    escape_approval_text,
+    scrub_session_text,
+    scrub_session_value,
+)
 from factory.provider import (
     ProviderError,
     keychain_service,
@@ -143,6 +179,7 @@ from factory.session import (
     run_session_sandboxed,
 )
 from factory.state import (
+    ELIGIBLE_KINDS,
     RunInProgressError,
     TaskQueue,
     _atomic_write_json,
@@ -241,16 +278,52 @@ REPAIR_BUDGET_FRACTION = 4
 REPAIR_TURN_FLOOR = 8
 REPAIR_TIMEOUT_FLOOR = 5.0
 
+# ----------------------------------------------------- F-67: gates/records --
+
+# The possibly-shipped and dropped-criteria bounds (both lists are
+# session-written: bounded at the schema AND re-checked parent-side,
+# where the count is judged against the proposal's own task count).
+MAX_SHIPPED_ENTRIES = 200
+MAX_DROPPED_ENTRIES = 1000
+MAX_PREDECESSORS = 50
+# The Rewritten-criteria section's render cap (R1-1) — the count is
+# stated, never hidden.
+MAX_SHOWN_REWRITTEN = 20
+# The import session-record files' suffix under <factory-root>/import/
+# (beside the kept refused outputs, same permissions and naming rule).
+RECORD_SUFFIX = ".record.json"
+# The reference queue (the repo's own .factory/tasks.json) is read as
+# PLAIN JSON — it may predate the current schema (the F-13 pilot's
+# landed queue fails F-64's budget bounds 22 times over) — but it is
+# still bounded: a huge or deeply nested file refuses the import
+# cleanly, and the read never writes a byte back.
+MAX_REFERENCE_BYTES = 20 * 1024 * 1024
+MAX_DOC_TEXT_BYTES = 10 * 1024 * 1024
+# A drop is "backed" when its cited doc line carries one of these
+# markers — the repo's own records mark finished work this way (work-
+# order status lines, executed stamps, checkbox ticks). Narrow and
+# documented: the flag's false-negative risks are stated in
+# _account_reference's docstring.
+_DONE_MARKER = re.compile(
+    r"\[[xX ]\]|✓|✔|✅|\[[Dd]one\]|\b[Dd]one\b|\b[Ss]hipped\b"
+    r"|\b[Ss]uperseded\b|\b[Ee]xecuted\b|\b[Cc]ompleted\b|\b[Ll]anded\b"
+)
+
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 
 class ImportRefused(ContractError):
     """The import was refused. The message is written for humans.
 
+    ``saved_path`` (F-67): the kept output's file name when this
+    refusal rode out through :func:`keep_refused_import_output` — the
+    session-record write names it without re-parsing the message.
 
     Subclasses :class:`~factory.contract.ContractError` so every caller
     that already refuses on invalid contract state refuses on a broken
     import too."""
+
+    saved_path: str | None = None
 
 
 # --------------------------------------------------------------- proposal --
@@ -453,12 +526,72 @@ def build_proposal_schema(schema: dict) -> dict:
         # that ever sees the proposal's own project value.
         "project": {**proposal["properties"]["project"], "minLength": 1},
         "tasks": proposal["properties"]["tasks"],
+        # F-67 AC-3: work that may already be shipped, flagged for the
+        # owner — never decided. Bounded like every session-written list.
+        "possibly_shipped": {
+            "type": "array",
+            "maxItems": MAX_SHIPPED_ENTRIES,
+            "items": {
+                "type": "object",
+                "required": ["task_id", "evidence", "reason"],
+                "additionalProperties": False,
+                "properties": {
+                    "task_id": {"type": "string", "minLength": 1,
+                                "maxLength": 200},
+                    "evidence": {"type": "string", "minLength": 1,
+                                 "maxLength": 400},
+                    "reason": {"type": "string", "minLength": 1,
+                               "maxLength": 500},
+                },
+            },
+        },
+        # F-67 AC-4: the criteria accounting's explicit-drops list, every
+        # entry backed by a line of a kept planning doc.
+        "dropped_criteria": {
+            "type": "array",
+            "maxItems": MAX_DROPPED_ENTRIES,
+            "items": {
+                "type": "object",
+                "required": ["ref_task", "doc", "line", "reason"],
+                "additionalProperties": False,
+                "properties": {
+                    "ref_task": {"type": "string", "minLength": 1,
+                                 "maxLength": 200},
+                    "ref_ac": {"type": "string",
+                               "pattern": "^AC-[0-9]+$"},
+                    "doc": {"type": "string", "minLength": 1,
+                            "maxLength": 400},
+                    "line": {"type": "integer", "minimum": 1},
+                    "reason": {"type": "string", "minLength": 1,
+                               "maxLength": 500},
+                },
+            },
+        },
     }
     task = proposal["$defs"]["task"]
-    keep = {"id", *SPEC_FIELDS, "out_of_scope_match"}
+    keep = {"id", *SPEC_FIELDS, "out_of_scope_match", "predecessors"}
     task["properties"] = {
         name: prop for name, prop in task["properties"].items() if name in keep
     }
+    # F-67 AC-4: the reference ids a proposed task replaces (a merge or
+    # a split names several; several tasks may share one). Proposal-only:
+    # consumed by the accounting, stripped before the queue write.
+    task["properties"]["predecessors"] = {
+        "type": "array",
+        "maxItems": MAX_PREDECESSORS,
+        "items": {"type": "string", "minLength": 1, "maxLength": 200},
+    }
+    # F-67 AC-4: per-criterion provenance — "<ref task id>/<ref AC id>"
+    # naming the reference criterion this one carries (a split maps each
+    # reference criterion into exactly one part). Proposal-only, like
+    # predecessors: stripped before the queue write.
+    acceptance = proposal["$defs"].get("acceptance_item")
+    if isinstance(acceptance, dict):
+        acceptance.setdefault("properties", {})["from"] = {
+            "type": "string",
+            "pattern": "^[^/\\s]+/AC-[0-9]+$",
+            "maxLength": 300,
+        }
     task["properties"]["out_of_scope_match"] = {
         "type": "string",
         "description": (
@@ -827,8 +960,12 @@ def build_import_prompt(
         contract,
         *_schema_contract_lines(_load_tasks_schema()),
         *naming_rule,
-        '- gates.merge is always "human" — the owner merges; the importer',
-        "  never proposes an auto merge.",
+        "- gates in v0 are the safest value, whatever you propose (the",
+        "  parent forces them and lists every override to the owner):",
+        '- merge is always "human" and deploy is always "human" — the',
+        "  owner merges and deploys; never propose an auto gate.",
+        "- spec_approval is always true for build and docs tasks; other",
+        "  kinds (owner_only, decision, research) keep what you propose.",
         "- budget.size tops out at M: a task too big for size M is split",
         "  into slices or proposed as separate tasks, never sized above",
         "  the enum.",
@@ -841,6 +978,29 @@ def build_import_prompt(
         "- Never set status, acceptance_hash, approved_at, approved_by,",
         "  attempts, links or out_of_scope. Every task is imported as draft;",
         "  approval is the owner's act (factory approve).",
+        "- Possibly shipped work (F-67): for each build or docs task you",
+        "  propose, check the committed HEAD you are reading for the",
+        "  task's named deliverables — named files, functions, migrations,",
+        "  or a status line in the repo's own records (a work-order",
+        "  doc's status, CLAUDE.md). Report every match in the top-level",
+        '  "possibly_shipped" list, one {task_id, evidence (a path:line',
+        "  or a commit sha, repo-relative), reason (one line)} object per",
+        "  match. The owner decides — nothing changes a task because you",
+        "  flagged it; a task you then omit from the proposal makes its",
+        "  entry refuse.",
+        "- Criteria accounting (F-67), against the repo's existing",
+        "  .factory/tasks.json when one exists: every reference task and",
+        "  every one of its acceptance criteria must be accounted for, or",
+        "  the proposal is REFUSED. Account for each by (a) naming the",
+        '  reference ids a new task replaces in its "predecessors" list',
+        "  (a split or a merge names them; several tasks may share one),",
+        '  (b) giving each carried criterion a "from": "<ref task id>/',
+        '  <ref AC id>" beside its text, or (c) listing the drop in the',
+        '  top-level "dropped_criteria" as {ref_task, ref_ac (omit for a',
+        "  whole task), doc, line, reason} — where doc:line is a line of",
+        "  a planning doc you were shown that removes, completes or",
+        "  supersedes it. A drop whose criterion text the docs still",
+        "  carry blocks the apply until the owner accepts it by name.",
         "- scope.paths names the files each task may change (F-65):",
         "  repo-relative globs, `*` never crossing `/`, `**` spanning",
         "  directories. Propose one for EVERY task. Refused: an absolute",
@@ -1202,6 +1362,80 @@ class OutOfScopeMatch:
     record: str
 
 
+@dataclass(frozen=True)
+class GateOverride:
+    """One gate the parent forced (F-67 AC-1): what the proposal said,
+    what the queue held, and the v0 value that landed (always
+    ``human``/``True``). Rendered in the summary before the diff — a
+    relaxation is never silently dropped."""
+
+    task_id: str
+    field: str
+    proposed: Any
+    stored: Any
+    new_task: bool
+
+
+@dataclass(frozen=True)
+class ShippedFlag:
+    """Possibly-shipped work (F-67 AC-3): flagged for the owner, never
+    decided. ``evidence_found`` is None when the evidence is not a
+    repo-relative path (a commit sha) and was not checked; False when a
+    path-shaped evidence names no file in the repo."""
+
+    task_id: str
+    evidence: str
+    reason: str
+    evidence_found: bool | None
+
+
+@dataclass(frozen=True)
+class DropEntry:
+    """One explicitly dropped reference task or criterion (F-67 AC-4),
+    backed by a doc line.
+
+    R2-1: EVERY drop needs the owner's per-drop acceptance — there is
+    deliberately no exemption (a done-marked line about one criterion
+    cited to drop another walked the R1 exemption; the session chooses
+    which line to cite, so no cited line can decide). The evidence the
+    owner decides with is carried as ADVISORY labels: ``cited_done``
+    (the cited line carries a done-marker), ``own_source`` (the cited
+    doc is the reference task's own ``source`` doc) and
+    ``still_in_docs`` (the exact-text label) — none of them bypass
+    anything."""
+
+    ref_task: str
+    ref_ac: str | None
+    doc: str
+    line: int
+    reason: str
+    still_in_docs: bool
+    cited_done: bool = False
+    own_source: bool = False
+
+    @property
+    def label(self) -> str:
+        return self.ref_task if self.ref_ac is None \
+            else f"{self.ref_task}/{self.ref_ac}"
+
+
+@dataclass(frozen=True)
+class RewrittenCriterion:
+    """One reference criterion whose mapped proposed criterion changed
+    its TEXT or weakened its CHECK (R1-1/R2-2: the accounting proves
+    claims; the review must also SHOW what each claim did to the
+    criterion's meaning and enforcement). Includes the same-id carry
+    (same task id + same AC id). Not blocking — visible, escaped, in
+    the summary's Rewritten section with what changed named."""
+
+    ref_key: str
+    ref_text: str
+    new_text: str
+    ref_check: "dict | None" = None
+    new_check: "dict | None" = None
+    changed: tuple = ()
+
+
 @dataclass
 class ImportPlan:
     """What the import proposes: the merged document, the per-task
@@ -1221,15 +1455,41 @@ class ImportPlan:
     # a capped view. Set by run_import (which sees the repo); a directly
     # built plan has none.
     truncated_docs: list[str] = field(default_factory=list)
+    # F-67 AC-1: every gate the parent forced (rendered before the
+    # diff — a relaxation is never silently dropped).
+    gate_overrides: list[GateOverride] = field(default_factory=list)
+    # F-67 AC-3: possibly-shipped work, flagged for the owner (rendered
+    # FIRST — before the overrides and the diff).
+    shipped: list[ShippedFlag] = field(default_factory=list)
+    # F-67 AC-4 + R2-1: the explicit drops. Every drop needs the
+    # owner's per-drop acceptance at apply; the advisory labels
+    # (done-marker, own source doc, exact text still carried) ride
+    # along for the decision, never as a bypass.
+    dropped: list[DropEntry] = field(default_factory=list)
+    # R1-1: mappings that changed a criterion's text — shown in the
+    # summary's Rewritten section, never blocking.
+    rewritten: list[RewrittenCriterion] = field(default_factory=list)
+    # F-67 AC-4: the accounting's note when there was no reference
+    # queue to account against (rendered beside the drops).
+    reference_note: str = ""
 
 
-def _task_from_proposal(raw: Any, index: int, record_paths: set[str]) -> tuple[dict, str | None]:
+def _task_from_proposal(
+    raw: Any, index: int, record_paths: set[str],
+) -> "tuple[dict, str | None, list[str], list[tuple[str, str, dict | None]]]":
     """Build one proposed task from a raw proposal entry.
 
     Returns the task (``id``, ``status: draft`` and exactly the spec
     fields the entry carries — no defaults: a default here would read as
-    a proposal to an existing task's merge; see :func:`_new_task`) and
-    the out-of-scope record it claims to resemble, if any.
+    a proposal to an existing task's merge; see :func:`_new_task`), the
+    out-of-scope record it claims to resemble (if any), its
+    ``predecessors`` (F-67 AC-4: the reference ids it replaces) and its
+    acceptance criteria's ``from`` mappings as ``("<ref task>/<ref AC>",
+    <the criterion's proposed text>, <its check>)`` triples (R1-1/R2-2:
+    the text and the check ride along so a mapping that rewrites a
+    criterion or weakens its check can be shown). The two
+    accounting fields are proposal-only — extracted here and never
+    copied into the task, so they cannot reach tasks.json.
 
     Raises:
         ImportRefused: The entry is not an object, carries a forbidden
@@ -1275,7 +1535,38 @@ def _task_from_proposal(raw: Any, index: int, record_paths: set[str]) -> tuple[d
     for spec_field in SPEC_FIELDS:
         if spec_field in raw:
             task[spec_field] = raw[spec_field]
-    return task, match
+    # F-67 AC-4: the accounting metadata rides beside the task, never
+    # in it — a "from" left inside an acceptance item would land in the
+    # owner's queue (the queue schema's items carry exactly id/text/
+    # check).
+    predecessors_raw = raw.get("predecessors")
+    predecessors = (
+        [str(dep) for dep in predecessors_raw]
+        if isinstance(predecessors_raw, list) else []
+    )
+    froms: "list[tuple[str, str, dict | None]]" = []
+    acceptance = task.get("acceptance")
+    if isinstance(acceptance, list):
+        cleaned: list[Any] = []
+        for item in acceptance:
+            if isinstance(item, dict) and "from" in item:
+                from_ref = item["from"]
+                ac_text = item.get("text")
+                ac_check = item.get("check")
+                if isinstance(from_ref, str):
+                    froms.append((
+                        from_ref,
+                        ac_text if isinstance(ac_text, str) else "",
+                        ac_check if isinstance(ac_check, dict) else None,
+                    ))
+                cleaned.append(
+                    {key: value for key, value in item.items()
+                     if key != "from"}
+                )
+            else:
+                cleaned.append(item)
+        task["acceptance"] = cleaned
+    return task, match, predecessors, froms
 
 
 def _new_task(proposed: dict) -> dict:
@@ -1349,6 +1640,55 @@ def _merge_task(
     return merged, changed, demoted, flagged
 
 
+def _normalise_gates(
+    task: dict, stored: dict | None,
+) -> list[GateOverride]:
+    """Force v0 gates on one proposed task (F-67 AC-1), in place.
+
+    The ONE normalisation step the parent applies to EVERY task the
+    importer writes — new and merged, whatever the proposal says
+    (``"auto"``, ``"Human"``, a boolean, a missing key): ``merge`` and
+    ``deploy`` become ``"human"``, and ``spec_approval`` becomes ``True``
+    for kinds the picker runs (:data:`factory.state.ELIGIBLE_KINDS`).
+    Other kinds keep what the proposal says (the pilot's owner-only
+    tasks carry ``spec_approval: false`` by design). Every change is
+    recorded as a :class:`GateOverride` — a relaxation is never silently
+    dropped; the summary lists them before the diff.
+
+    A proposal whose ``gates`` is not an object is left alone: the
+    proposal-schema check refuses it right after, with the shape named.
+    A merged task whose proposal OMITS ``gates`` is left alone too: the
+    stored gates survive (F-12 AC-3), and a stored auto gate is caught
+    where it matters — :func:`factory.approve.check_v0_gates` refuses it
+    at approval.
+    """
+    gates = task.get("gates")
+    if not isinstance(gates, dict):
+        return []
+    task_id = task.get("id", "?")
+    stored_gates = (
+        stored.get("gates") if isinstance(stored, dict) else None
+    )
+    stored_gates = stored_gates if isinstance(stored_gates, dict) else {}
+    overrides: list[GateOverride] = []
+
+    def _force(field: str, v0_value: Any) -> None:
+        if gates.get(field) != v0_value:
+            overrides.append(GateOverride(
+                task_id=task_id, field=f"gates.{field}",
+                proposed=gates.get(field),
+                stored=stored_gates.get(field),
+                new_task=stored is None,
+            ))
+            gates[field] = v0_value
+
+    _force("merge", "human")
+    _force("deploy", "human")
+    if task.get("kind") in ELIGIBLE_KINDS:
+        _force("spec_approval", True)
+    return overrides
+
+
 def _format_violations(head: str, lines: list[str]) -> str:
     """One refusal from a violation list: the count, every line capped
     at :data:`MAX_SHOWN_VIOLATIONS` with a ``+N more`` tail."""
@@ -1389,11 +1729,20 @@ def plan_import(
     records: list[dict],
     *,
     project: str,
+    reference: dict | None = None,
+    doc_texts: dict[str, str] | None = None,
+    repo: Path | None = None,
 ) -> ImportPlan:
     """Build the import plan: merged document, per-task changes,
     out-of-scope matches and the full diff. Validates the merged
     document against the schema — an invalid proposal is refused before
     anything is shown or written (AC-1).
+
+    F-67 adds three parent-side stages, in order after the per-task
+    rules: the v0 gate normalisation (every task the importer writes,
+    new and merged — :func:`_normalise_gates`), the possibly-shipped
+    validation (:func:`_validate_possibly_shipped`) and the criteria
+    accounting (:func:`_account_reference`).
 
     Args:
         existing_doc: The queue as it is on disk, or None for a fresh
@@ -1402,13 +1751,25 @@ def plan_import(
         records: The out-of-scope register (see :func:`read_out_of_scope`).
         project: The queue's project name — from the existing queue, or
             the profile for a fresh one.
+        reference: The reference queue for the criteria accounting
+            (:func:`read_reference_queue`'s plain-JSON read). None (the
+            default, for direct callers) skips the accounting —
+            :func:`run_import` always passes the real one.
+        doc_texts: The kept planning docs' texts (see
+            :func:`read_kept_doc_texts`), for the doc-line checks. None
+            with a reference means no doc can back a drop.
+        repo: The project repo, for possibly-shipped evidence existence
+            checks. None skips the check (the flag renders
+            ``evidence not found`` for path-shaped evidence).
 
     Raises:
         ImportRefused: The proposal names another project, omits or
             misspells the ``project`` key (F-49 AC-6 — the proposal
             schema requires it), duplicates an id, carries forbidden
             fields or statuses, names an unknown out-of-scope record —
-            or the merged document would not validate (AC-1).
+            or the merged document would not validate (AC-1); or (F-67)
+            a malformed/unknown ``possibly_shipped`` entry, or a
+            reference task/criterion the proposal leaves unaccounted.
     """
     proposed_project = proposal.get("project")
     if proposed_project is not None and proposed_project != project:
@@ -1417,11 +1778,18 @@ def plan_import(
             f"is {project!r}"
         )
     record_paths = {record["path"] for record in records}
+    existing_tasks = existing_doc.get("tasks", []) if existing_doc else []
+    by_id = {task.get("id"): task for task in existing_tasks}
     proposed_tasks: list[dict] = []
     matches: list[OutOfScopeMatch] = []
+    predecessors: dict[str, list[str]] = {}
+    froms: set[str] = set()
+    from_triples: list[tuple[str, str, "dict | None"]] = []
+    gate_overrides: list[GateOverride] = []
     seen: set[str] = set()
     for index, raw in enumerate(proposal.get("tasks", [])):
-        task, match = _task_from_proposal(raw, index, record_paths)
+        task, match, task_predecessors, task_froms = _task_from_proposal(
+            raw, index, record_paths)
         if task["id"] in seen:
             raise ImportRefused(
                 f"task {task['id']} appears twice in the proposal; task ids "
@@ -1429,6 +1797,15 @@ def plan_import(
                 "ambiguous"
             )
         seen.add(task["id"])
+        # F-67 AC-1: the ONE normalisation step, applied to every task
+        # the importer writes — new and merged — before the schema check
+        # judges the normalised gates and the merge builds the diff.
+        gate_overrides.extend(
+            _normalise_gates(task, by_id.get(task["id"])))
+        # F-67 AC-4: the accounting metadata, collected beside the tasks.
+        predecessors[task["id"]] = task_predecessors
+        froms.update(ref for ref, _text, _check in task_froms)
+        from_triples.extend(task_froms)
         proposed_tasks.append(task)
         if match:
             matches.append(OutOfScopeMatch(task_id=task["id"], record=match))
@@ -1459,6 +1836,29 @@ def plan_import(
             "(the same shape check the session runs on its own output)",
             violations,
         ))
+
+    # F-67 AC-3: possibly-shipped flags — validated against the proposal
+    # itself (every entry names a proposed task) and the repo (path-
+    # shaped evidence), before anything merges.
+    shipped = _validate_possibly_shipped(proposal, seen, repo)
+    # F-67 AC-4: the criteria accounting over the reference queue.
+    dropped, reference_note = _account_reference(
+        proposed_ids=seen,
+        proposed_ac_ids={
+            task["id"]: {
+                item.get("id") for item in task.get("acceptance") or []
+                if isinstance(item, dict)
+            }
+            for task in proposed_tasks
+        },
+        predecessors=predecessors,
+        froms=froms,
+        reference=reference,
+        dropped_raw=proposal.get("dropped_criteria"),
+        doc_texts=doc_texts,
+    )
+    # R1-1: show what every mapping did to the criterion's meaning.
+    rewritten = _rewritten_criteria(from_triples, proposed_tasks, reference)
 
     existing_tasks = existing_doc.get("tasks", []) if existing_doc else []
     by_id = {task.get("id"): task for task in existing_tasks}
@@ -1579,7 +1979,21 @@ def plan_import(
         matches=matches,
         diff=diff,
         base_doc=copy.deepcopy(existing_doc),
+        gate_overrides=gate_overrides,
+        shipped=shipped,
+        dropped=dropped,
+        rewritten=rewritten,
+        reference_note=reference_note,
     )
+
+
+def _check_repr(check: "dict | None") -> str:
+    """One check as a compact renderable string (type + ref/expect)."""
+    if not isinstance(check, dict):
+        return "(none)"
+    kind = str(check.get("type", "?"))
+    detail = check.get("ref") or check.get("expect") or ""
+    return f"{kind} {detail}".strip()
 
 
 def _doc_text(doc: dict) -> str:
@@ -1593,9 +2007,23 @@ def _doc_text(doc: dict) -> str:
 def render_summary(plan: ImportPlan) -> str:
     """The import summary: per-task changes, the out-of-scope matches
     (each with its record's path, for you to confirm — AC-4), and the
-    full diff."""
+    full diff.
+
+    F-67 adds four review sections, always rendered, in the order the
+    owner must read them: possibly shipped (FIRST), the dropped
+    criteria (R1-1: the acceptance mark decides the apply gate; the
+    still-in-docs label is advisory), the rewritten criteria (R1-1:
+    every mapping that changed a criterion's text, the same-id carry
+    included), and the forced gate overrides — all before the diff.
+    Every session-derived string in them is escaped
+    (:func:`factory.egress.escape_approval_text`): the evidence and
+    reasons are attacker-controlled text.
+    """
     def ids(kind: str) -> list[str]:
         return [c.task_id for c in plan.changes if c.kind == kind]
+
+    def show(value: Any) -> str:
+        return escape_approval_text(str(value))
 
     new, unchanged, changed, missing = (
         ids("new"),
@@ -1634,6 +2062,88 @@ def render_summary(plan: ImportPlan) -> str:
     lines.append(
         "- every proposed task is draft; approval stays yours (factory approve)"
     )
+    # F-67 AC-3: possibly shipped — FIRST, before the overrides and the
+    # diff. Flagged, never decided: the owner drops, re-scopes or
+    # approves each one; nothing here changes a task.
+    lines += ["", "## Possibly shipped", ""]
+    if not plan.shipped:
+        lines.append("- none flagged")
+    for flag in plan.shipped:
+        suffix = ""
+        if flag.evidence_found is False:
+            suffix = " [evidence not found]"
+        lines.append(
+            f"- {show(flag.task_id)}: {show(flag.evidence)} — "
+            f"{show(flag.reason)}{suffix} (flagged for you, never decided; "
+            "still draft)"
+        )
+    # F-67 AC-4: the dropped criteria, after possibly_shipped, with the
+    # still-in-docs ones marked — those block the apply until you accept
+    # each drop, by name.
+    lines += ["", "## Dropped criteria", ""]
+    if plan.reference_note:
+        lines.append(f"- ({plan.reference_note})")
+    if not plan.dropped:
+        lines.append("- none dropped" if not plan.reference_note else "- none")
+    else:
+        lines.append(
+            "- every drop below applies only on your explicit per-drop "
+            "acceptance"
+        )
+    for drop in plan.dropped:
+        marks = []
+        if drop.cited_done:
+            marks.append("cited line marks done")
+        if drop.own_source:
+            marks.append("cited doc is the task's own source")
+        if drop.still_in_docs:
+            marks.append("still in docs")
+        mark = f" [{'; '.join(marks)}]" if marks else ""
+        lines.append(
+            f"- {show(drop.label)}: dropped — {show(drop.reason)} "
+            f"(doc {show(drop.doc)}:{drop.line}){mark}"
+        )
+    # R1-1: every mapping that changed a criterion's text — visible,
+    # escaped, capped; the count is stated so nothing hides behind the
+    # cap (the rest is the proposal's from fields against the
+    # reference queue).
+    lines += ["", "## Rewritten criteria", ""]
+    if not plan.rewritten:
+        lines.append(
+            "- none (every mapped criterion carries its reference text)"
+        )
+    for item in plan.rewritten[:MAX_SHOWN_REWRITTEN]:
+        what = "+".join(item.changed) if item.changed else "text"
+        parts = []
+        if "text" in item.changed:
+            parts.append(
+                f"text: {show(item.ref_text)} -> {show(item.new_text)}")
+        if "check" in item.changed:
+            parts.append(
+                f"check: {show(_check_repr(item.ref_check))} -> "
+                f"{show(_check_repr(item.new_check))}")
+        lines.append(f"- {show(item.ref_key)} [{what}]: " + "; ".join(parts))
+    if len(plan.rewritten) > MAX_SHOWN_REWRITTEN:
+        lines.append(
+            f"- (+{len(plan.rewritten) - MAX_SHOWN_REWRITTEN} more "
+            "rewritten — compare the reference queue's acceptance texts "
+            "with the proposal's from-mapped criteria to see every one)"
+        )
+    # F-67 AC-1: the forced gate overrides, before the diff — a
+    # relaxation is never silently dropped.
+    lines += ["", "## Gate overrides", ""]
+    if not plan.gate_overrides:
+        lines.append("- none (v0 forces human gates; nothing was changed)")
+    for override in plan.gate_overrides:
+        origin = "new task" if override.new_task else "existing task"
+        forced = (True if override.field == "gates.spec_approval"
+                  else "human")
+        stored = (f", stored {override.stored!r}"
+                  if override.stored is not None else "")
+        lines.append(
+            f"- {show(override.task_id)}: {override.field} proposed "
+            f"{override.proposed!r} -> forced {forced!r} ({origin}{stored})"
+        )
     if plan.truncated_docs:
         # F-49 AC-3 (m-4): the proposal was built from a capped view —
         # the owner confirming it must know which docs the session never
@@ -1667,6 +2177,468 @@ def render_summary(plan: ImportPlan) -> str:
     return "\n".join(lines)
 
 
+# ------------------------------------------------- F-67: reference reading --
+
+
+def read_reference_queue(repo: Path | str) -> dict | None:
+    """The repo's existing ``.factory/tasks.json``, read as PLAIN JSON.
+
+    The reference the criteria accounting checks against — even when the
+    file fails the current schema (the F-13 pilot's landed queue
+    predates F-64's bounds), and even when ``--queue`` points somewhere
+    else: an import into a fresh queue file is checked against the
+    queue the repo already carries. A missing file reads as None (the
+    check has nothing to account for); a file that is not JSON, nests
+    too deeply, or is larger than :data:`MAX_REFERENCE_BYTES` REFUSES
+    the import — fail-closed, never a silent skip, never a crash, and
+    the read never writes a byte back.
+
+    Raises:
+        ImportRefused: The reference file exists but cannot be read as
+            a bounded plain-JSON queue (not JSON, wrong shape, too
+            large, nested too deeply).
+    """
+    path = Path(repo) / ".factory" / "tasks.json"
+    if not path.is_file():
+        return None
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise ImportRefused(
+            f"{path}: the reference queue cannot be read ({exc}) — the "
+            "criteria accounting (F-67) refuses to run blind"
+        ) from exc
+    if size > MAX_REFERENCE_BYTES:
+        raise ImportRefused(
+            f"{path}: the reference queue is {size} bytes; the criteria "
+            f"accounting reads at most {MAX_REFERENCE_BYTES} — a queue "
+            "that size is not a queue this import can account against"
+        )
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ImportRefused(
+            f"{path}: the reference queue cannot be read ({exc})"
+        ) from exc
+    try:
+        doc = json.loads(text)
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+        raise ImportRefused(
+            f"{path}: the reference queue is not valid JSON ({exc}) — the "
+            "criteria accounting (F-67) refuses to run blind"
+        ) from exc
+    depth = _max_nesting(doc)
+    if depth > MAX_PROPOSAL_DEPTH:
+        raise ImportRefused(
+            f"{path}: the reference queue nests {depth} levels deep; the "
+            f"accounting reads at most {MAX_PROPOSAL_DEPTH}"
+        )
+    if not isinstance(doc, dict) or not isinstance(doc.get("tasks"), list):
+        raise ImportRefused(
+            f"{path}: the reference queue has no 'tasks' list — the "
+            "criteria accounting (F-67) refuses to run blind"
+        )
+    return doc
+
+
+def read_kept_doc_texts(
+    repo: Path | str, kept: "Sequence[str]",
+) -> dict[str, str]:
+    """The kept planning docs' texts, bounded per file — the accounting's
+    doc-line existence checks and still-in-docs search run over these.
+
+    Docs the listing cap dropped are absent by design: a drop citing
+    one refuses (the session was never shown it). A doc that cannot be
+    read refuses the import, never skips — a missing text would make
+    the doc-line check vacuous.
+    """
+    repo = Path(repo)
+    texts: dict[str, str] = {}
+    for name in kept:
+        path = repo / name
+        try:
+            with path.open("rb") as handle:
+                raw = handle.read(MAX_DOC_TEXT_BYTES + 1)
+        except OSError as exc:
+            raise ImportRefused(
+                f"{name}: a kept planning doc cannot be read ({exc}) — "
+                "the criteria accounting (F-67) refuses to run blind"
+            ) from exc
+        try:
+            texts[name] = raw[:MAX_DOC_TEXT_BYTES].decode(
+                "utf-8", errors="replace"
+            )
+        except (UnicodeDecodeError, ValueError) as exc:  # pragma: no cover
+            raise ImportRefused(
+                f"{name}: a kept planning doc cannot be decoded ({exc})"
+            ) from exc
+    return texts
+
+
+def _norm_text(value: str) -> str:
+    """The still-in-docs matcher's normalisation: whitespace collapsed,
+    case folded — doc wrapping and casing must not hide a carried
+    criterion. (The input is the OWNER's reference/doc text, never
+    session text — named to say so.)"""
+    return " ".join(value.split()).casefold()
+
+
+def _line_text(doc_text: str, line: int) -> str:
+    lines = doc_text.splitlines()
+    return lines[line - 1] if 1 <= line <= len(lines) else ""
+
+
+# ------------------------------------------------- F-67: the accounting --
+
+
+def _validate_possibly_shipped(
+    proposal: dict, task_ids: "set[str]", repo: Path | None,
+) -> list[ShippedFlag]:
+    """Validate the proposal's ``possibly_shipped`` list (F-67 AC-3).
+
+    Every entry must name a task the proposal carries, with non-empty
+    repo-relative evidence and a one-line reason; the count may not
+    exceed the proposal's own task count. Evidence that escapes the
+    repo (``..``, an absolute path) refuses; a path-shaped evidence that
+    names no file in the repo is FLAGGED ``evidence not found`` — the
+    owner judges it, the parent does not refuse it.
+
+    Raises:
+        ImportRefused: A malformed entry, an unknown task id, an
+            escaping evidence path, or a count past the proposal's own
+            task count.
+    """
+    raw = proposal.get("possibly_shipped")
+    if raw is None:
+        return []
+    tasks = proposal.get("tasks") or []
+    if len(raw) > len(tasks):
+        raise ImportRefused(
+            f"possibly_shipped lists {len(raw)} entries for a proposal of "
+            f"{len(tasks)} task(s) — every entry must name a task the "
+            "proposal carries"
+        )
+    flags: list[ShippedFlag] = []
+    for index, entry in enumerate(raw, start=1):
+        if not isinstance(entry, dict) or set(entry) - {
+            "task_id", "evidence", "reason",
+        } or not {"task_id", "evidence", "reason"} <= set(entry):
+            raise ImportRefused(
+                f"possibly_shipped entry #{index} is malformed — each "
+                "entry is an object with exactly task_id, evidence and "
+                "reason"
+            )
+        task_id, evidence, reason = (
+            entry["task_id"], entry["evidence"], entry["reason"])
+        if task_id not in task_ids:
+            known = ", ".join(sorted(task_ids)[:10]) or "none"
+            raise ImportRefused(
+                f"possibly_shipped entry #{index} names task {task_id!r}, "
+                f"which the proposal does not carry (proposed: {known})"
+            )
+        if (not isinstance(evidence, str) or not evidence.strip()
+                or not isinstance(reason, str) or not reason.strip()):
+            raise ImportRefused(
+                f"possibly_shipped entry #{index} (task {task_id}) carries "
+                "an empty evidence or reason — name where the work lives "
+                "and why it looks shipped"
+            )
+        if evidence.startswith("/") or ".." in evidence or "\x00" in evidence:
+            raise ImportRefused(
+                f"possibly_shipped entry #{index} (task {task_id}): "
+                f"evidence {evidence[:80]!r} escapes the repository — "
+                "evidence is repo-relative (a path, a path:line, or a "
+                "commit sha)"
+            )
+        found: bool | None = None
+        if repo is not None and not any(ch.isspace() for ch in evidence):
+            candidate = repo / evidence.split(":", 1)[0]
+            found = candidate.exists()
+        flags.append(ShippedFlag(
+            task_id=task_id, evidence=evidence, reason=reason,
+            evidence_found=found,
+        ))
+    return flags
+
+
+def _account_reference(
+    proposed_ids: "set[str]",
+    proposed_ac_ids: "dict[str, set]",
+    predecessors: "dict[str, list[str]]",
+    froms: "set[str]",
+    reference: dict | None,
+    dropped_raw: Any,
+    doc_texts: dict[str, str] | None,
+) -> "tuple[list[DropEntry], str]":
+    """The deterministic criteria accounting (F-67 AC-4).
+
+    Every reference task must be accounted — proposed under its own id,
+    named in some proposed task's ``predecessors``, or dropped whole
+    with a doc line — and every one of its acceptance criteria must be
+    mapped (a proposed criterion's ``from``, or the same-id carry: a
+    reference task re-proposed under its own id keeps a criterion when
+    the proposed task carries the same AC id) or dropped with a doc
+    line. Anything unaccounted refuses the proposal, naming the
+    reference task and AC. The accounting never trusts the session's
+    word for completeness: it is computed over the reference itself.
+
+    Each drop's cited ``doc:line`` must exist in a KEPT planning doc
+    (the ``doc_texts`` map — docs the listing cap dropped are not in
+    it, so a drop citing one refuses). ``still_in_docs`` is then decided
+    mechanically: the reference criterion's text, normalised
+    (:func:`_norm_text`), found in any kept doc — EXCEPT when the
+    drop's own cited line carries a done-marker (:data:`_DONE_MARKER`)
+    and quotes the criterion (the doc itself says the work shipped).
+    Flagged drops block :func:`apply_import` until the owner accepts
+    each one.
+
+    Failure modes, stated (the rule is exact-text, whole-doc):
+    a paraphrased criterion still carried by the docs is NOT flagged
+    (false negative — the drop still renders, so the owner sees it);
+    a done-marked quote of the criterion exempts the drop even if
+    another unmarked copy exists elsewhere (rare; the exemption needs
+    both the marker and the criterion text on the cited line); a
+    criterion whose text survives only past the per-doc read cap is
+    missed (docs that large do not exist in practice).
+
+    Raises:
+        ImportRefused: A drop names an unknown reference task or AC, a
+            doc outside the kept set, a line past the doc's end, or a
+            reference task/criterion is unaccounted.
+    """
+    if reference is None:
+        return [], (
+            "no reference queue exists under .factory/ — there was nothing "
+            "to account for"
+        )
+    doc_texts = doc_texts or {}
+    ref_tasks: dict[str, dict] = {}
+    for entry in reference.get("tasks") or []:
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str):
+            ref_tasks[entry["id"]] = entry
+
+    # A from naming something the reference does not carry is a broken
+    # mapping — refused by name, never silently unmatched (a bogus from
+    # would otherwise leave the real criterion unaccounted behind it).
+    for from_ref in sorted(froms):
+        ref_id, _, ac_id = from_ref.partition("/")
+        if ref_id not in ref_tasks \
+                or ac_id not in _ref_ac_ids(ref_tasks[ref_id]):
+            raise ImportRefused(
+                f"a proposed criterion's from names {from_ref!r}, which "
+                "the reference queue does not carry — a from maps a real "
+                "reference task and criterion"
+            )
+
+    # Validate the drops against the reference and the kept docs first.
+    drops: list[DropEntry] = []
+    for index, entry in enumerate(dropped_raw or [], start=1):
+        if not isinstance(entry, dict):
+            raise ImportRefused(
+                f"dropped_criteria entry #{index} is not an object"
+            )
+        ref_task = entry.get("ref_task")
+        if ref_task not in ref_tasks:
+            raise ImportRefused(
+                f"dropped_criteria entry #{index} names reference task "
+                f"{ref_task!r}, which the reference queue does not carry"
+            )
+        ref_ac = entry.get("ref_ac")
+        ref_acs = _ref_ac_ids(ref_tasks[ref_task])
+        if ref_ac is not None and ref_ac not in ref_acs:
+            raise ImportRefused(
+                f"dropped_criteria entry #{index} names {ref_task}/"
+                f"{ref_ac}, which the reference task does not carry"
+            )
+        doc, line, reason = (
+            entry.get("doc"), entry.get("line"), entry.get("reason"))
+        if doc not in doc_texts:
+            raise ImportRefused(
+                f"dropped_criteria entry #{index} ({ref_task}) cites doc "
+                f"{doc!r}, which is not a kept planning doc of this "
+                "import (docs the listing cap dropped cannot back a drop)"
+            )
+        line_count = len(doc_texts[doc].splitlines())
+        if not isinstance(line, int) or isinstance(line, bool) \
+                or not 1 <= line <= line_count:
+            raise ImportRefused(
+                f"dropped_criteria entry #{index} ({ref_task}) cites "
+                f"{doc}:{line!r}, but the doc has {line_count} line(s) — "
+                "a drop must cite a line that exists"
+            )
+        drops.append(DropEntry(
+            ref_task=ref_task, ref_ac=ref_ac, doc=doc, line=line,
+            reason=reason if isinstance(reason, str) else "",
+            still_in_docs=False,
+        ))
+
+    # The mapping sets: criterion keys are "<ref task>/<ref AC id>".
+    mapped = set(froms)
+    dropped_keys = {f"{d.ref_task}/{d.ref_ac}" for d in drops if d.ref_ac}
+    whole_dropped = {d.ref_task for d in drops if d.ref_ac is None}
+    unaccounted: list[str] = []
+    for ref_id, ref_task in ref_tasks.items():
+        if not (
+            ref_id in proposed_ids
+            or ref_id in whole_dropped
+            or any(ref_id in deps for deps in predecessors.values())
+        ):
+            unaccounted.append(f"{ref_id} (the whole task)")
+            continue
+        if ref_id in whole_dropped:
+            continue  # a whole-task drop carries every criterion
+        for ac_id in _ref_ac_ids(ref_task):
+            key = f"{ref_id}/{ac_id}"
+            if key in mapped or key in dropped_keys:
+                continue
+            if ref_id in proposed_ids and ac_id in proposed_ac_ids.get(
+                    ref_id, set()):
+                continue  # the same-id carry: the criterion survives
+            unaccounted.append(key)
+    if unaccounted:
+        raise ImportRefused(
+            "the proposal leaves reference criteria unaccounted — every "
+            "reference task and criterion must be mapped (predecessors "
+            "plus a criterion's from), re-proposed under its own id, or "
+            "listed in dropped_criteria with a doc line: "
+            + "; ".join(unaccounted[:MAX_SHOWN_VIOLATIONS])
+        )
+
+    # R2-1: no exemption — the advisory labels the owner decides with
+    # are computed here, and the apply gate asks for every drop.
+    docs_norm = {
+        name: _norm_text(doc_text)
+        for name, doc_text in doc_texts.items()
+    }
+    flagged: list[DropEntry] = []
+    for drop in drops:
+        ref_task = ref_tasks[drop.ref_task]
+        cited_line = _line_text(doc_texts[drop.doc], drop.line)
+        own_source_doc = str(ref_task.get("source", "")).partition("#")[0]
+        criteria = _ref_ac_texts(ref_task, drop.ref_ac)
+        carried = any(
+            _norm_text(criterion) in doc_norm
+            for criterion in criteria
+            for doc_norm in docs_norm.values()
+        )
+        flagged.append(dataclasses_replace(
+            drop,
+            still_in_docs=carried,
+            cited_done=bool(_DONE_MARKER.search(cited_line)),
+            own_source=drop.doc == own_source_doc,
+        ))
+    return flagged, ""
+
+
+def _check_changed(ref_check: "dict | None",
+                   new_check: "dict | None") -> bool:
+    """Did the mapping change the criterion's enforcement (R2-2)? The
+    check TYPE, or — for test checks, the only kind that enforces
+    anything mechanical — its REF. Manual-to-manual rewording of the
+    expectation is a review note, not a lost enforcement."""
+    ref_type = (ref_check or {}).get("type")
+    new_type = (new_check or {}).get("type")
+    if ref_type != new_type:
+        return True
+    if ref_type == "test":
+        return (ref_check or {}).get("ref") != (new_check or {}).get("ref")
+    return False
+
+
+def _rewritten_criteria(
+    from_triples: "list[tuple[str, str, dict | None]]",
+    proposed_tasks: list[dict],
+    reference: dict | None,
+) -> list[RewrittenCriterion]:
+    """Every mapping that changes a criterion's TEXT or CHECK
+    (R1-1/R2-2).
+
+    The accounting proves each reference criterion is claimed; this
+    shows the owner what each claim did to its MEANING and its
+    ENFORCEMENT: every mapped pair — an explicit ``from``, or the
+    same-id carry (same task id + same AC id) — whose proposed text,
+    normalised (:func:`_norm_text`), differs from the reference text,
+    or whose check changed (:func:`_check_changed`: the type, or a
+    test check's ref — a test-backed criterion turned manual keeps its
+    words and loses its enforcement). Not blocking; rendered escaped
+    in the summary's Rewritten section with what changed named, capped,
+    with the count stated.
+    """
+    if reference is None:
+        return []
+    ref_texts: dict[str, str] = {}
+    ref_checks: dict[str, "dict | None"] = {}
+    ref_ids: set = set()
+    for entry in reference.get("tasks") or []:
+        if not isinstance(entry, dict):
+            continue
+        ref_id = entry.get("id")
+        ref_ids.add(ref_id)
+        for item in entry.get("acceptance") or []:
+            if not isinstance(item, dict):
+                continue
+            key = f"{ref_id}/{item.get('id')}"
+            if isinstance(item.get("text"), str):
+                ref_texts[key] = item["text"]
+            check = item.get("check")
+            ref_checks[key] = check if isinstance(check, dict) else None
+    triples = list(from_triples)
+    for task in proposed_tasks:
+        if task.get("id") not in ref_ids:
+            continue
+        for item in task.get("acceptance") or []:
+            if not isinstance(item, dict) or item.get("id") is None:
+                continue
+            text = item.get("text")
+            check = item.get("check")
+            triples.append((
+                f"{task['id']}/{item.get('id')}",
+                text if isinstance(text, str) else "",
+                check if isinstance(check, dict) else None,
+            ))
+    seen: set[tuple[str, str, str]] = set()
+    rewritten: list[RewrittenCriterion] = []
+    for ref_key, new_text, new_check in triples:
+        ref_text = ref_texts.get(ref_key)
+        if ref_text is None:
+            continue
+        text_changed = _norm_text(ref_text) != _norm_text(new_text)
+        check_changed = _check_changed(
+            ref_checks.get(ref_key), new_check)
+        if not text_changed and not check_changed:
+            continue
+        marker = (ref_key, _norm_text(new_text), str(new_check))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        rewritten.append(RewrittenCriterion(
+            ref_key=ref_key, ref_text=ref_text, new_text=new_text,
+            ref_check=ref_checks.get(ref_key), new_check=new_check,
+            changed=("text", "check") if text_changed and check_changed
+            else ("text",) if text_changed else ("check",),
+        ))
+    return rewritten
+
+
+def _ref_ac_ids(ref_task: dict) -> "set":
+    """The reference task's acceptance ids (garbage entries skipped)."""
+    return {
+        item.get("id") for item in ref_task.get("acceptance") or []
+        if isinstance(item, dict)
+    }
+
+
+def _ref_ac_texts(ref_task: dict, ref_ac: str | None) -> "list[str]":
+    """The reference criterion texts a drop covers: one AC's, or every
+    AC's for a whole-task drop (empty texts skipped)."""
+    return [
+        item["text"] for item in ref_task.get("acceptance") or []
+        if isinstance(item, dict)
+        and isinstance(item.get("text"), str) and item["text"].strip()
+        and (ref_ac is None or item.get("id") == ref_ac)
+    ]
+
+
 # -------------------------------------------------------------------- write --
 
 
@@ -1675,6 +2647,7 @@ def apply_import(
     queue_path: Path | str,
     *,
     confirm: Callable[[], bool],
+    confirm_drop: "Callable[[DropEntry], bool] | None" = None,
 ) -> bool:
     """Write the plan's merged document — only on an explicit confirm.
 
@@ -1691,21 +2664,39 @@ def apply_import(
     approval, a status move, a queue created by another writer — refuses
     the write rather than being overwritten with the stale plan.
 
+    F-67 AC-4 + R1-1 + R2-1: EVERY dropped criterion blocks the write
+    until the owner explicitly accepts THAT drop — per drop, by name,
+    with no exemption (the cited line's done-marker and the task's own
+    source doc are advisory evidence in the summary, never a bypass).
+    A declined or unanswered drop (no ``confirm_drop`` callable) refuses
+    the write; there is deliberately no blanket acceptance.
+
     Args:
         plan: The plan to apply.
         queue_path: The queue file.
         confirm: Called before anything is written; False writes nothing.
+        confirm_drop: Called once per dropped criterion with the entry
+            itself; any False refuses the write.
 
     Returns:
         True if the queue was written, False if the confirm declined.
 
     Raises:
-        ImportRefused: The queue changed since the plan was built.
+        ImportRefused: The queue changed since the plan was built, or a
+            drop was not accepted.
         OSError: The write itself failed (the previous contents, if any,
             are intact).
     """
     if not confirm():
         return False
+    for drop in plan.dropped:
+        if confirm_drop is None or not confirm_drop(drop):
+            raise ImportRefused(
+                f"the proposal drops {drop.label} (cited {drop.doc}:"
+                f"{drop.line}) — every drop applies only on your "
+                "explicit per-drop acceptance (re-propose the criterion "
+                "instead, if it should survive)"
+            )
     path = Path(queue_path)
     stale = ImportRefused(
         f"{path}: the queue changed since this import was planned (an "
@@ -1818,6 +2809,103 @@ def _save_refused_output(
     return path
 
 
+def _validated_usage(usage: Any) -> "dict[str, Any] | None":
+    """The F-64 telemetry rule over a record's usage block: each of the
+    four counts is a non-bool int >= 0 or None (unknown) — anything else
+    a forged record carries renders unknown downstream, never raw and
+    never 0. None when there is no usable block at all."""
+    if not isinstance(usage, dict):
+        return None
+
+    def count(name: str) -> Any:
+        value = usage.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) \
+                or value < 0:
+            return None
+        return value
+
+    block = {name: count(name)
+             for name in ("input", "cache_read", "cache_write", "output")}
+    return block if any(v is not None for v in block.values()) else None
+
+
+def _write_session_record(
+    *,
+    factory_root: Path | str | None,
+    project: str,
+    profile: dict | None,
+    run_id: str | None,
+    record: "SessionRecord | None",
+    kind: str,
+    outcome: str,
+    proposal_file: str | None,
+    secrets: "Sequence[str]",
+) -> Path | None:
+    """Write one import session's record (F-67 AC-2) under
+    ``<factory-root>/import/`` as ``<project>-<run id>.record.json`` —
+    the refused-output writer's naming, mode 0600 and create-only open.
+
+    The provider is the PARENT's resolution
+    (:func:`factory.provider.resolve_provider` over the profile,
+    role ``importer``) — never the session-written ``record.provider``
+    (the F-59 R2-1 rule: the record file is session-writable, so its
+    provider claim is evidence of nothing). The model is what the
+    session reported, or the string ``unknown`` — never a bare null.
+    Usage passes the F-64 rule (:func:`_validated_usage`); turns pass
+    :func:`_record_turns`. The whole payload passes the egress seam
+    (:func:`scrub_session_value` with the run's secrets) before the
+    write: a credential echoed anywhere in the session's reported fields
+    must not reach the record. ``run_id`` None means no session existed
+    (nothing was spent) — nothing is written.
+
+    Returns:
+        The written path, or None when nothing was written (no run id,
+        or the write failed — a failed record never masks the outcome
+        it records).
+    """
+    if not run_id:
+        return None
+    provider: dict[str, Any]
+    try:
+        provider = resolve_provider(
+            profile or {}, "importer").provider_record()
+    except ProviderError:
+        provider = {"kind": "unknown"}
+    model = getattr(record, "model", None) if record is not None else None
+    payload = {
+        "kind": kind,
+        "project": project,
+        "run_id": run_id,
+        "provider": provider,
+        # the session-reported model (never null), or "unknown"
+        "model": model if isinstance(model, str) and model else "unknown",
+        "usage": _validated_usage(
+            getattr(record, "usage", None) if record is not None else None),
+        "turns": _record_turns(record) if record is not None else None,
+        "outcome": outcome,
+        "proposal_file": proposal_file,
+        "written_at": now_iso(),
+    }
+    payload = scrub_session_value(payload, secrets)
+    root = Path(factory_root) if factory_root is not None \
+        else FACTORY_ROOT_DEFAULT
+    directory = root / "import"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        safe = project_component(project)
+        path = directory / f"{safe}-{run_id}{RECORD_SUFFIX}"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2, ensure_ascii=False)
+                         + "\n")
+        return path
+    except OSError:
+        # The record is telemetry, never a gate: a failed write must not
+        # mask the outcome it records (the refusal or summary still
+        # reaches the owner).
+        return None
+
+
 def _import_fix_command(
     saved: Path, repo: Path, queue_path: Path, docs_dir: str
 ) -> str:
@@ -1881,9 +2969,14 @@ def keep_refused_import_output(
         return exc
     command = _import_fix_command(saved, repo, queue_path, docs_dir)
     if isinstance(exc, ImportRefused):
-        return ImportRefused(
+        refusal = ImportRefused(
             f"{exc}; saved to {saved}; fix it and review with {command}"
         )
+        # F-67 AC-2: the kept file's name rides the exception out — the
+        # caller's session-record write names it without re-parsing the
+        # message.
+        refusal.saved_path = saved.name
+        return refusal
     exc.add_note(f"raw importer output saved to {saved}; "
                  f"re-review with {command}")
     return exc
@@ -1906,8 +2999,10 @@ def _abort_refusal(
     head: str, *, run: RunDir, project: str, factory_root: Path,
     repo: Path, queue_path: Path, docs_dir: str,
     secrets: "Sequence[str]" = (),
-) -> str:
-    """The refusal message for a session that did not complete.
+) -> "tuple[str, str | None]":
+    """The refusal message for a session that did not complete, with the
+    saved proposal file's name (F-67 AC-2 rides it onto the session
+    record; None when nothing was kept).
 
     Before ``cleanup_run`` sweeps the scratch, the proposal the session
     had written so far — if any — is copied out through the one writer
@@ -1925,16 +3020,16 @@ def _abort_refusal(
     try:
         text = proposal.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return f"{head}; no proposal was written before the abort"
+        return f"{head}; no proposal was written before the abort", None
     except (OSError, ValueError) as exc:
-        return f"{head}; (its last proposal could not be read: {exc})"
+        return f"{head}; (its last proposal could not be read: {exc})", None
     try:
         saved = _save_refused_output(text, project, factory_root, secrets=secrets)
     except OSError as exc:
-        return f"{head}; (its last proposal could not be saved: {exc})"
+        return f"{head}; (its last proposal could not be saved: {exc})", None
     command = _import_fix_command(saved, repo, queue_path, docs_dir)
-    return f"{head}; its last proposal was saved to {saved}; " \
-           f"review it with {command}"
+    return (f"{head}; its last proposal was saved to {saved}; "
+            f"review it with {command}", saved.name)
 
 
 # --------------------------------------------------- F-57: the ONE repair --
@@ -2002,8 +3097,13 @@ def build_repair_prompt(*, project: str, violations: str) -> str:
     ]
     lines.extend(_schema_contract_lines(_load_tasks_schema()))
     lines += [
-        "- gates.merge is always \"human\" — the owner merges; the importer",
-        "  never proposes an auto merge.",
+        "- gates in v0 are the safest value, whatever you propose (the",
+        "  parent forces them and lists every override to the owner):",
+        "- merge is always \"human\" and deploy is always \"human\" — the",
+        "  owner merges and deploys; never propose an auto gate.",
+        "- spec_approval is always true for build and docs tasks; other",
+        "  kinds (owner_only, decision, research) keep what the proposal",
+        "  says.",
         "- budget.size tops out at M: a task too big for size M is split",
         "  into slices or proposed as separate tasks, never sized above",
         "  the enum.",
@@ -2013,6 +3113,10 @@ def build_repair_prompt(*, project: str, violations: str) -> str:
         "- Never set status, acceptance_hash, approved_at, approved_by,",
         "  attempts, links or out_of_scope. Every task is imported as",
         "  draft; approval is the owner's act (factory approve).",
+        "- Carry the proposal's possibly_shipped and dropped_criteria",
+        "  lists, and each task's predecessors and acceptance \"from\"",
+        "  fields, through unchanged: they are the owner's accounting,",
+        "  not violations — dropping them re-refuses the proposal.",
         "",
         "Before you answer, check your own output (the interpreter named",
         "below is the pinned one your sandbox already runs, and jsonschema",
@@ -2095,6 +3199,8 @@ def _repair_refused_proposal(
     import_turns: int,
     import_timeout: float,
     secrets: "Sequence[str]",
+    reference: dict | None = None,
+    doc_texts: dict[str, str] | None = None,
 ) -> "tuple[ImportPlan | None, dict, ImportRefused | None]":
     """Run the ONE repair session for a refused real-session proposal
     (F-57 AC-2). Returns ``(plan, facts, final_refusal)`` — exactly one
@@ -2137,6 +3243,18 @@ def _repair_refused_proposal(
         return None, {}, None
     run_id = new_run_id()
     writer = TraceWriter(root, project, run_id, "-")
+
+    def _write_repair_record(
+        outcome: str, record: "SessionRecord | None" = None,
+    ) -> None:
+        """The repair session's own record (F-67 AC-2) — written on
+        every exit where a repair session attempt existed."""
+        _write_session_record(
+            factory_root=factory_root, project=project, profile=profile,
+            run_id=run_id, record=record, kind="import_repair",
+            outcome=outcome, proposal_file=original.name, secrets=secrets,
+        )
+
     writer.append({
         "type": "import_repair", "outcome": "started",
         "original_saved": str(original),
@@ -2158,7 +3276,8 @@ def _repair_refused_proposal(
         return None, _repair_not_started(original), None
     final: ImportRefused | None = None
     plan: ImportPlan | None = None
-    facts: dict = {}
+    # original_saved rides every path (F-67 AC-2's record names it).
+    facts: dict = {"original_saved": str(original)}
     run: RunDir | None = None
     with lease_stack:
         # The workspace is created AND swept inside the lease: reclaim
@@ -2214,6 +3333,7 @@ def _repair_refused_proposal(
                 "type": "import_repair", "outcome": "record_lost",
                 "detail": str(session_exc)[:200],
             })
+            _write_repair_record("record_lost")
             return None, _repair_not_started(original), None
         except (SessionConfigError, SandboxError, RunError) as session_exc:
             # The repair session could not START (no token, no bundled
@@ -2228,6 +3348,7 @@ def _repair_refused_proposal(
             # The repair session hung past its teardown grace: something
             # ran and died — say so, naming the kept original.
             writer.append({"type": "import_repair", "outcome": "failed"})
+            _write_repair_record("failed")
             final = ImportRefused(
                 f"{exc}; the repair session timed out after "
                 f"{session_exc.timeout:.0f}s; the original output is "
@@ -2245,6 +3366,7 @@ def _repair_refused_proposal(
                 writer.append({
                     "type": "import_repair", "outcome": "record_unusable",
                 })
+                _write_repair_record("record_unusable", record)
                 final = ImportRefused(
                     f"{exc}; the repair session ran but its record is "
                     f"unusable (record field {field_error}); the original "
@@ -2257,6 +3379,7 @@ def _repair_refused_proposal(
                     "type": "import_repair", "outcome": "quota_stopped",
                     "turns": turns,
                 })
+                _write_repair_record("quota_stopped", record)
                 kept = ""
                 partial_text = record.result or ""
                 if partial_text.strip():
@@ -2282,6 +3405,7 @@ def _repair_refused_proposal(
                     "type": "import_repair", "outcome": "failed",
                     "turns": turns,
                 })
+                _write_repair_record("failed", record)
                 final = ImportRefused(
                     f"{exc}; one repair session was attempted and ended "
                     + scrub_session_text(
@@ -2294,18 +3418,21 @@ def _repair_refused_proposal(
                 text = record.result or ""
                 try:
                     # EXACTLY the chain the original proposal faced —
-                    # the same parse, the same scrub, the same plan.
+                    # the same parse, the same scrub, the same plan
+                    # (F-67: the same criteria accounting too).
                     proposal = scrub_session_value(
                         parse_proposal(text), secrets
                     )
                     plan = plan_import(
-                        existing_doc, proposal, records, project=project
+                        existing_doc, proposal, records, project=project,
+                        reference=reference, doc_texts=doc_texts, repo=repo,
                     )
                 except ImportRefused as second:
                     writer.append({
                         "type": "import_repair", "outcome": "still_refused",
                         "turns": turns,
                     })
+                    _write_repair_record("refused", record)
                     try:
                         repair_saved = _save_refused_output(
                             text, project, factory_root, secrets=secrets
@@ -2335,11 +3462,13 @@ def _repair_refused_proposal(
                         "type": "import_repair", "outcome": "repaired",
                         "turns": turns,
                     })
+                    _write_repair_record("repaired", record)
                     facts = {
                         "ran": True, "outcome": "repaired",
                         "turns": turns,
                         # the judged document, for the caller's keep path
                         "output": text,
+                        "original_saved": str(original),
                     }
         finally:
             if run is not None:
@@ -2400,6 +3529,39 @@ def _accepted_set_proposal(accepted: Any, project: str) -> dict:
     return proposal
 
 
+def _carry_proposal_toplevel(proposal: dict, text: str) -> dict:
+    """Carry the F-67 top-level proposal fields off a parsing text
+    answer onto the accepted-set proposal (the propose_task path's only
+    channel for them: the collector is per-task, so ``possibly_shipped``
+    and ``dropped_criteria`` travel in the final text answer).
+
+    Only the two whitelisted fields ride; ``tasks``/``project`` never
+    (the accepted set owns those). A text answer that is not a JSON
+    object — the expected one-line confirmation — carries nothing. The
+    values are the session's: the plan-side schema and the parent's
+    validation judge them exactly as a text-answer proposal's would be.
+    """
+    if not text.strip():
+        return proposal
+    stripped = text.strip()
+    match = _FENCE.search(stripped)
+    if match:
+        stripped = match.group(1).strip()
+    if len(stripped) > PROPOSE_TASK_MAX_CHARS:
+        return proposal
+    try:
+        answer = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError, RecursionError):
+        return proposal
+    if not isinstance(answer, dict):
+        return proposal
+    for name in ("possibly_shipped", "dropped_criteria"):
+        value = answer.get(name)
+        if isinstance(value, list):
+            proposal[name] = value
+    return proposal
+
+
 def _session_proposal(
     accepted: Any, text: str, project: str, *, calls: int = 0,
 ) -> "tuple[dict, str]":
@@ -2431,7 +3593,8 @@ def _session_proposal(
             f"the session made {calls} propose_task call(s), none "
             "accepted; the text answer is the proposal"
         )
-    proposal = _accepted_set_proposal(accepted, project)
+    proposal = _carry_proposal_toplevel(
+        _accepted_set_proposal(accepted, project), text)
     tasks = proposal["tasks"]
     if not text.strip():
         return proposal, (
@@ -2497,6 +3660,7 @@ def run_import(
     docs_dir: str = DEFAULT_DOCS_DIR,
     session: Callable[[str], str] | None = None,
     confirm: Callable[[str], bool] | None = None,
+    confirm_drop: "Callable[[DropEntry], bool] | None" = None,
     factory_root: Path | str | None = None,
     keep_refused: bool = False,
     max_turns: int | None = None,
@@ -2530,6 +3694,11 @@ def run_import(
         session: Injected importer session (``prompt -> text``); default
             :func:`sdk_import_session` (sandboxed, in a disposable clone).
         confirm: ``summary -> bool``; asked before the one and only write.
+        confirm_drop: Called once per drop that needs acceptance (R1-1:
+            every drop unless backed by a done-marked line in the
+            reference task's own source doc)
+            (F-67 AC-4) at apply time; any False refuses the write.
+            Passed straight to :func:`apply_import`.
         factory_root: Factory root for the default session's run dir,
             sandbox settings, and refused-output copies (default
             ``~/factory``).
@@ -2599,7 +3768,46 @@ def run_import(
     listing = _list_planning_docs(repo, docs_dir)
     prompt = build_import_prompt(repo, docs_dir, records, project=project,
                                  files=listing)
+    # F-67 AC-4: the reference queue (the repo's own, as PLAIN JSON — it
+    # may predate the current schema) and the kept docs' texts, computed
+    # once and threaded into BOTH plan_import calls (the proposal's and
+    # the repair's): an import into a fresh --queue is checked against
+    # the queue the repo already carries, and the doc-line checks judge
+    # the same docs the prompt listed.
+    reference = read_reference_queue(repo)
+    doc_texts = read_kept_doc_texts(repo, listing.kept)
     keep = session is None or keep_refused
+    # F-67 AC-2: the main session's once-per-run record channel. The
+    # write happens on every exit path (accepted, refused, aborted), for
+    # the real session only — an injected stub re-runs free and keeps
+    # nothing, records included.
+    main_session: dict[str, Any] = {}
+
+    def _run_sink(run_id: str, record: "SessionRecord | None",
+                  proposal_saved: str | None) -> None:
+        main_session["run_id"] = run_id
+        main_session["record"] = record
+        if proposal_saved is not None:
+            main_session.setdefault("proposal_saved", proposal_saved)
+
+    record_written: list[bool] = []
+
+    def _write_main_record(outcome: str, proposal_file: str | None = None) -> None:
+        """Write the main import session's record, once per run."""
+        if not keep or record_written or "run_id" not in main_session:
+            return
+        record_written.append(True)
+        record = main_session.get("record")
+        if record is None and sink_records:
+            record = sink_records[-1]
+        _write_session_record(
+            factory_root=factory_root, project=project, profile=profile,
+            run_id=main_session["run_id"], record=record, kind="import",
+            outcome=outcome,
+            proposal_file=proposal_file
+            or main_session.get("proposal_saved"),
+            secrets=egress_secrets,
+        )
 
     def _keep(exc: BaseException, payload: str) -> BaseException:
         """Today's keep-refused wrapper: an ImportRefused comes back with
@@ -2619,6 +3827,11 @@ def run_import(
     raw_calls: Any = 0
     effective_turns = max_turns or DEFAULT_MAX_TURNS
     effective_timeout = timeout_min or DEFAULT_TIMEOUT_MIN
+    sink_records: list[SessionRecord] = []
+
+    def _sink(record: SessionRecord) -> None:
+        sink_records.append(record)
+
     if session is not None:
         text = session(prompt)
     else:
@@ -2662,27 +3875,30 @@ def run_import(
         effective_timeout = (
             timeout_min if timeout_min is not None else scaled_timeout
         )
-        sink_records: list[SessionRecord] = []
-
-        def _sink(record: SessionRecord) -> None:
-            sink_records.append(record)
-
-        text = sdk_import_session(
-            prompt, repo, profile=profile, queue_path=queue_path,
-            factory_root=factory_root,
-            max_turns=effective_turns, timeout_min=effective_timeout,
-            docs_dir=docs_dir,
-            # F-57 AC-1: the real session gets the per-task tool, built
-            # from the same staged schema, the same register and the
-            # queue's own project name; the accepted set rides the
-            # record back out of the sandbox.
-            propose={
-                "project": project,
-                "schema": build_proposal_schema(_load_tasks_schema()),
-                "record_paths": [record["path"] for record in records],
-            },
-            record_sink=_sink,
-        )
+        try:
+            text = sdk_import_session(
+                prompt, repo, profile=profile, queue_path=queue_path,
+                factory_root=factory_root,
+                max_turns=effective_turns, timeout_min=effective_timeout,
+                docs_dir=docs_dir,
+                # F-57 AC-1: the real session gets the per-task tool, built
+                # from the same staged schema, the same register and the
+                # queue's own project name; the accepted set rides the
+                # record back out of the sandbox.
+                propose={
+                    "project": project,
+                    "schema": build_proposal_schema(_load_tasks_schema()),
+                    "record_paths": [record["path"] for record in records],
+                },
+                record_sink=_sink,
+                run_sink=_run_sink,
+            )
+        except ImportRefused:
+            # The session aborted (wall clock, turn cap, an unusable
+            # record): it still ran, so it is still on record (F-67
+            # AC-2) — write what the run sink captured, then re-raise.
+            _write_main_record("aborted")
+            raise
         if sink_records:
             # F1 (review round 1): the record file is session-writable,
             # so its fields are UNTRUSTED — taken raw here; the parse
@@ -2741,7 +3957,8 @@ def run_import(
                     json.dumps(proposal, indent=2, ensure_ascii=False) + "\n"
                 )
             plan = plan_import(existing_doc, proposal, records,
-                               project=project)
+                               project=project, reference=reference,
+                               doc_texts=doc_texts, repo=repo)
         except ImportRefused as exc:
             refused = exc
         if refused is not None:
@@ -2762,6 +3979,17 @@ def run_import(
                 import_turns=effective_turns,
                 import_timeout=effective_timeout,
                 secrets=egress_secrets,
+                reference=reference, doc_texts=doc_texts,
+            )
+            # The main session's proposal was refused: its record says
+            # so (F-67 AC-2), naming the kept original the repair works
+            # from — written whatever the repair did with it.
+            _write_main_record(
+                "refused",
+                proposal_file=(
+                    Path(str(repair.get("original_saved"))).name
+                    if repair.get("original_saved") else None
+                ),
             )
             if plan is None:
                 if final is None:
@@ -2807,10 +4035,16 @@ def run_import(
             )
         if precedence_note:
             summary += f"\n({precedence_note})\n"
+        # The main session's record (F-67 AC-2): written once the plan
+        # exists — before the confirm, so a declined apply still leaves
+        # the session's cost on record. proposal_file stays None here:
+        # an accepted proposal became the plan, not a kept file.
+        _write_main_record("accepted")
         applied = False
         if confirm is not None:
             applied = apply_import(
-                plan, queue_path, confirm=lambda: bool(confirm(summary))
+                plan, queue_path, confirm=lambda: bool(confirm(summary)),
+                confirm_drop=confirm_drop,
             )
     except (ImportRefused, OSError) as exc:
         if exc is repair_final:
@@ -2844,6 +4078,7 @@ def sdk_import_session(
     docs_dir: str = DEFAULT_DOCS_DIR,
     propose: dict | None = None,
     record_sink: "Callable[[SessionRecord], None] | None" = None,
+    run_sink: 'Callable[[str, "SessionRecord | None", "str | None"], None] | None' = None,
 ) -> str:
     """The default importer session: the reviewer seat, sandboxed.
 
@@ -2943,6 +4178,35 @@ def sdk_import_session(
         TaskQueue(queue_path)
         if queue_path is not None and Path(queue_path).is_file() else None
     )
+    # F-67 AC-2: the once-per-run channel the session record write rides
+    # on — fired on EVERY exit where a session attempt existed (the
+    # run_session_sandboxed call was made: completed, aborted, failed,
+    # record lost, timeout), with the record in hand when there is one
+    # and the salvage's proposal file name when there is not. The
+    # could-not-start refusals (before the session call) fire nothing:
+    # nothing was spent, no session existed.
+    run_fired: list[bool] = []
+
+    def _fire(record: "SessionRecord | None",
+              proposal_saved: str | None = None) -> None:
+        if run_sink is not None and not run_fired:
+            run_fired.append(True)
+            run_sink(run.run_id, record, proposal_saved)
+
+    def _abort_exc(head: str) -> "tuple[ImportRefused, str | None]":
+        message, salvaged = _abort_refusal(
+            head, run=run, project=profile["name"], factory_root=root,
+            repo=repo, queue_path=Path(queue_path), docs_dir=docs_dir,
+            secrets=(token,),
+        )
+        return ImportRefused(message), salvaged
+
+    def _saved_record_or_none() -> "SessionRecord | None":
+        """The record file's contents, best effort (the file may hold a
+        record even when the runner died before returning one)."""
+        from factory.session import _read_record_quietly, record_path_for
+
+        return _read_record_quietly(record_path_for(run.settings_path))
     # F2 (review round 1): a busy queue here is an ImportRefused (the
     # CLI's caught class), naming the holder — the same conversion the
     # repair applies to its own lease. Pre-existing behaviour for the
@@ -2992,32 +4256,29 @@ def sdk_import_session(
             # scratch. The error text is already seam-scrubbed by the
             # record-failure helper; it is scrubbed again here because it
             # is session text in a message the terminal prints.
-            raise ImportRefused(_abort_refusal(
-                scrub_session_text(
-                    f"the importer session's record was unusable: {exc}",
-                    (token,),
-                ),
-                run=run, project=profile["name"], factory_root=root,
-                repo=repo, queue_path=Path(queue_path), docs_dir=docs_dir,
-                secrets=(token,),
-            )) from exc
+            refusal, salvaged = _abort_exc(scrub_session_text(
+                f"the importer session's record was unusable: {exc}",
+                (token,),
+            ))
+            _fire(_saved_record_or_none(), salvaged)
+            raise refusal from exc
         except (SessionConfigError, SandboxError, RunError) as exc:
             # Runner setup errors: no bundled CLI / token (SessionConfigError),
             # srt missing or not at the pin (SandboxError, from ensure_srt
             # before anything spawns), a run-dir fault (RunError). Each is
             # a refusal (exit 1 at the CLI), never a traceback. The session
-            # never started, so there is no scratch proposal to salvage.
+            # never started, so there is no scratch proposal to salvage and
+            # no session record (F-67: nothing was spent).
             raise ImportRefused(f"the importer session could not run: {exc}") from exc
         except subprocess.TimeoutExpired as exc:
             # The outer wall clock (the runner hung past its teardown
             # grace): salvage before cleanup, exactly like an aborted
             # record — the scratch is still on disk here.
-            raise ImportRefused(_abort_refusal(
-                f"the importer session timed out after {exc.timeout:.0f}s",
-                run=run, project=profile["name"], factory_root=root,
-                repo=repo, queue_path=Path(queue_path), docs_dir=docs_dir,
-                secrets=(token,),
-            )) from exc
+            refusal, salvaged = _abort_exc(
+                f"the importer session timed out after {exc.timeout:.0f}s"
+            )
+            _fire(_saved_record_or_none(), salvaged)
+            raise refusal from exc
         else:
             # R3-1 (review round 3): the runner-returned record is
             # validated at the file boundary (_read_record) — this is the
@@ -3028,15 +4289,12 @@ def sdk_import_session(
 
             field_error = record_field_error(record)
             if field_error is not None:
-                raise ImportRefused(_abort_refusal(
-                    scrub_session_text(
-                        "the importer session's record is unusable "
-                        f"(record field {field_error})", (token,),
-                    ),
-                    run=run, project=profile["name"], factory_root=root,
-                    repo=repo, queue_path=Path(queue_path), docs_dir=docs_dir,
-                    secrets=(token,),
+                refusal, salvaged = _abort_exc(scrub_session_text(
+                    "the importer session's record is unusable "
+                    f"(record field {field_error})", (token,),
                 ))
+                _fire(record, salvaged)
+                raise refusal
             if record.status != "completed":
                 # The salvage (inside the raise's argument) runs BEFORE
                 # the finally's cleanup_run sweeps the scratch: any other
@@ -3044,15 +4302,13 @@ def sdk_import_session(
                 # third lost jobfinderos session exposed. record.reason is
                 # session text in a message the terminal prints — seam it
                 # with the token this session itself held.
-                raise ImportRefused(_abort_refusal(
-                    scrub_session_text(
-                        f"the importer session ended {record.status}: "
-                        f"{record.reason}", (token,)
-                    ),
-                    run=run, project=profile["name"], factory_root=root,
-                    repo=repo, queue_path=Path(queue_path), docs_dir=docs_dir,
-                    secrets=(token,),
+                refusal, salvaged = _abort_exc(scrub_session_text(
+                    f"the importer session ended {record.status}: "
+                    f"{record.reason}", (token,)
                 ))
+                _fire(record, salvaged)
+                raise refusal
+            _fire(record)
         finally:
             cleanup_run(run)
     if record_sink is not None:
