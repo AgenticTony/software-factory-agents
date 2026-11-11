@@ -5548,6 +5548,135 @@
         "max_turns": 200,
         "wall_clock_min": 150
       }
+    },
+    {
+      "id": "F-71",
+      "title": "Pre-spend contract checks and dependency policy",
+      "source": "BUILD-ORDER.md#f-71--pre-spend-contract-checks-and-dependency-policy",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [],
+      "risk": [
+        "factory_control",
+        "new_dependency",
+        "external_service"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "Risk flags cover the scope. At approval, and on every task the importer writes, the factory computes the risk flags the contract's `scope.paths` can reach. It takes every tracked file on the default branch that matches a scope glob, plus each literal scope path, and runs them through the profile's `paths.risk` matcher (the same matcher L0 uses). The importer adds any missing flag to the task's `risk` and lists each addition at review. Approval refuses a contract whose `risk` does not cover the computed flags, naming each flag and the scope path that reaches it. Test: a contract scoping a profile risk path without its flag is refused at approval with the flag and path named. The importer adds the flag and lists it. A contract that declares the flag approves. A scope glob that reaches a risk file only through `**` is caught too.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f71.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Check refs are runnable before approval. Approval refuses a `test` check whose `ref` is not `<repo-relative path>::<test name>` (one or more `::` segments), and a `command` check whose command is empty. It warns, without refusing, on a ref whose file sits under the profile's `paths.protected` while the scope cannot touch that file. The warning names the criterion: it can go green only through a protected change (the wo19 calibration-pin case). The owner must confirm the warning at the y/N prompt. `--yes` is refused for a task carrying the warning. The importer prompt requires exact refs and states the convention for new test files (`tests/test_<task>.py::test_ac_N`). Test: a prose ref refuses with the criterion named. An exact ref approves. A ref into a protected file outside scope shows the warning, and `--yes` is refused for it. The factory's own queue still approves.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f71.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "Budgets have a floor the owner sets once. The profile gains an optional `budget_floor` (`max_turns`, default 60; `wall_clock_min`, default 30), owner-approved profile content under F-63. It stays inside F-64's caps, and a floor above a cap refuses to load. Approval refuses a runnable task below the floor, naming the field, and the importer clamps a proposal up to the floor and lists the change. Test: a 30-turn task refuses at approval under the default floor. The importer clamps a 30-turn proposal to 60 and lists it. A floor of 300 refuses to load.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f71.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "Declared dependencies pass without a human. The task schema gains an optional `dependencies` list, inside `contract_hash`: each entry has `ecosystem` (`pypi` or `npm`) and `name`. When a diff changes a `dependency_manifests` file, L0 parses what was added: direct requirements from `requirements*.txt`, `pyproject.toml` dependency tables and `package.json` dependency maps, and every new pin in `requirements*.lock` and `package-lock.json`. Every added direct package must be declared in the contract. A changed version of an already-pinned package counts as added. Every added package, direct or transitive, must pass the registry checks VALIDATOR-SPEC L0 deferred: it exists in its registry, its first release is at least 30 days old, and its name is not within edit distance 1 of a package on the top-package list shipped in the factory package (and is not that package). The checks run parent-side, outside the sandbox, against the public registry's JSON API, and their results are recorded in the L0 report. A declared direct package that passes every check no longer escalates `new_dependency`. An undeclared package, a failed check, an unreadable registry, or a manifest L0 cannot parse escalates as today (fail closed). Approval shows the declared dependencies, and `--yes` is refused for a contract that declares any. Test: with the registry stubbed, a declared, aged package with an unrelated name passes L0 with no escalation. Each of these escalates: undeclared, too new, a near-miss name, registry down, an unparseable lockfile. A transitive pin that fails a check escalates even though its parent is declared.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f71.py::test_ac_4"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-72",
+      "title": "Escalations keep the work, retry first, and never stop the batch",
+      "source": "BUILD-ORDER.md#f-72--escalations-keep-the-work-retry-first-and-never-stop-the-batch",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [],
+      "risk": [
+        "factory_control",
+        "external_service"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "Guarded changes retry before they escalate. A `protected_path_touched` or `sentinel_failed` result becomes an L0 FAIL finding for the next fix round of the same attempt. The finding names the path or the sentinel output and the instruction (\"revert this; it is outside what this contract may change\"). Only the same class on the same path or sentinel in 2 consecutive rounds escalates, with its reason, and the escalation note says the contract or the project rule is the likely problem. F-65's handling of out-of-scope changes is unchanged: an explicit scope request still escalates at once, because it means the contract is too narrow. `credential_added` keeps its immediate escalation and is never retried. Test: a scripted implementer that touches a protected file in round 1 and reverts in round 2 reaches a PR. One that touches it in both rounds escalates `protected_path_touched` within 2 rounds. A failing sentinel follows the same pattern. A credential still escalates in round 1.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f72.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "An arbiter settles a non-converging review before the owner. Where `review_not_converging` fires today, the parent first starts an arbiter session. It runs in a seat of its own under a fixed parent-side turn cap (F-64), and gets the contract, the diff and only the repeated findings, never the implementer's or reviewer's argument. For each finding it rules: `valid` (one more fix round must resolve it), `invalid` (dropped from this attempt's review), or `contract` (the contract itself is wrong). It rules through a structured tool, in the same way as the reviewer's verdict. A `contract` ruling, a second non-convergence after an arbiter ruling, or an arbiter session that fails escalates `review_not_converging` with the rulings attached. Test: scripted rulings of all-`invalid` lead to a PR. A `valid` ruling leads to one more round. A `contract` ruling escalates with the ruling shown. A failed arbiter session escalates.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f72.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "An escalation after a session keeps the work as a draft PR. When a run escalates after a session produced commits, the parent pushes the run branch and opens a draft PR through the existing push fence and PR-body gates. The body names the escalation, links the stored L0–L2 reports, and carries the factory's escalation label. `links.pr` records it. The task is `needs_human` as today, and the clone is cleaned only after the push succeeds. `credential_added` never pushes; its branch is discarded as today. A failed push or PR create leaves the reports on disk and records `pr_create_failed` with the reason. An escalation draft PR never counts as a ready factory PR: the sweep does not re-validate it, and `factory run` never reports it `ready`. Test: a scripted `new_dependency` escalation opens one draft PR with the reason and links, and the task links it. A `credential_added` escalation pushes nothing. A stubbed push failure records `pr_create_failed` and keeps the reports.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f72.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "The owner answers an escalation in one command. `factory recover <task-id> --accept --evidence \"<what you checked>\"` is interactive y/N with no `--yes`, and it is accepted for `new_dependency` and `risk_path_touched` escalations that hold an escalation draft PR. It records the acceptance (task, escalation, PR head SHA, evidence, who, when) in the approval ledger. It then re-runs L0 on that exact head with that escalation class waived for that SHA only, and continues the round through L1 and review. A pass marks the PR ready for review and the task `in_review`. Any new commit on the branch voids the waiver. `factory recover <task-id> --reject` closes the draft PR and returns the task to `draft` (a new `needs_human → draft` edge in the transition table), so the contract can be changed and re-approved. The other escalation reasons keep their current exits. Test: an accepted `new_dependency` on an unchanged head reaches `in_review` with the ledger entry written. The same accept after a new commit refuses. An accept for a `protected_path_touched` escalation refuses with the supported reasons named. A reject closes the PR and drafts the task.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f72.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "The loop parks an escalation and carries on. `factory loop` no longer stops on `needs_human`. It parks the task and picks the next eligible one, and it still stops on an empty queue, quota, the peak window, or an orchestrator error. An escalation draft PR does not hold the repo's writer slot. At the end, the loop prints one line per task parked during the run: id, reason, and the draft PR. Test: a scripted queue of three tasks where the first escalates runs the second and third, then prints the parked one. An orchestrator error still stops the loop.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f72.py::test_ac_5"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
     }
   ]
 }
