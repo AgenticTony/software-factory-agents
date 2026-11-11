@@ -116,6 +116,8 @@ OWNER_PENDING = {
     "F-57": "AC-4 is manual: one real (paid) `factory eval --importer` run",
     "F-58": "the stored AC text predates the 2026-11-08 rescope (26.04 "
             "deferred to F-61); the owner amends the contract first",
+    "F-59": "AC-7 is manual: one real (paid) bedrock session on the "
+            "rehearsal fixture (BOOTSTRAP §F-59 runbook)",
 }
 
 

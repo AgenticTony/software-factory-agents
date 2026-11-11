@@ -260,6 +260,14 @@ paths:
     # the owner approved — the factory/attribution.py and factory/egress.py
     # precedent: a session must not edit what gates it).
     - "factory/approvals.py"
+    # F-59: the ONE resolver is the same class (it decides whose provider
+    # token reaches which endpoint — every seat's provider, credential
+    # and egress host resolves through it), and the per-project-provider
+    # contract tests judge it and the protected session/sandbox/
+    # orchestrator/importer wiring — same precedent, protected from the
+    # day they exist.
+    - "factory/provider.py"
+    - "tests/test_f59.py"
     # F-43 review round 1: the seam itself and its vent wiring, the F-42
     # factory/attribution.py precedent — a factory-built PR must not be
     # able to weaken the C-1 fix (scrub_session_text returning its input,
@@ -287,7 +295,6 @@ docs_allowlist:
   - docs.python.org
   - docs.pytest.org
   - json-schema.org
-  - docs.z.ai
 
 # F-11 review round (2026-10-26): the L2 reviewer ran the smell baseline
 # only — this repo's own conventions (conventional commits with the WO

@@ -84,6 +84,52 @@
         "turns": { "type": "integer", "minimum": 0 },
         "input_tokens": { "type": "integer", "minimum": 0 },
         "output_tokens": { "type": "integer", "minimum": 0 },
+        "provider": {
+          "type": "object",
+          "description": "F-59: the attempt's provider record — kind, model (when the profile names one; absent for a self project with no provider block, whose seats run the CLI default), region or endpoint host, from the PARENT's resolver (never the session's claim, never a credential). Absent on every attempt recorded before F-59.",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": { "enum": ["zai", "anthropic", "bedrock", "vertex", "anthropic_compatible"] },
+            "model": { "type": "string" },
+            "region": { "type": "string" },
+            "endpoint_host": { "type": "string" }
+          }
+        },
+        "provider_usage": {
+          "type": "array",
+          "description": "F-59/R1-5: the per-(kind, model) usage breakdown over this attempt's records, each attributed to its own parent-stamped provider (records without one attribute to the attempt's primary provider). Telemetry only; drives no decision.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "model", "usage"],
+            "properties": {
+              "kind": { "enum": ["zai", "anthropic", "bedrock", "vertex", "anthropic_compatible"] },
+              "model": { "type": "string" },
+              "usage": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "input": { "type": ["integer", "null"], "minimum": 0 },
+                  "cache_read": { "type": ["integer", "null"], "minimum": 0 },
+                  "cache_write": { "type": ["integer", "null"], "minimum": 0 },
+                  "output": { "type": ["integer", "null"], "minimum": 0 }
+                }
+              }
+            }
+          }
+        },
+        "token_usage": {
+          "type": "object",
+          "description": "F-59: session-REPORTED token usage (input, cache read, cache write, output), summed per attempt and validated — non-negative ints only; a forged or unparsable count is null (unknown), never 0. Telemetry like turns since F-64: it drives no decision.",
+          "additionalProperties": false,
+          "properties": {
+            "input": { "type": ["integer", "null"], "minimum": 0 },
+            "cache_read": { "type": ["integer", "null"], "minimum": 0 },
+            "cache_write": { "type": ["integer", "null"], "minimum": 0 },
+            "output": { "type": ["integer", "null"], "minimum": 0 }
+          }
+        },
         "sandbox_bypass_denials": { "type": "integer", "minimum": 0, "description": "F-42: Bash calls this attempt's sessions made with dangerouslyDisableSandbox, denied by the PreToolUse hook — summed off the session records; factory status totals them for the week." },
         "pr": { "type": "string" },
         "validator_report": { "type": "string", "description": "Path to the stored validator report" },

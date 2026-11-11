@@ -513,6 +513,9 @@ def test_fanout_guard_covers_every_reviewer_session(tmp_path, monkeypatch):
     ANY reviewer session fails every record of the fan-out (no verdict from
     a fan-out that touched the workspace is trusted), restores the
     workspace, and tears the scratch down."""
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     import factory.session as session_module
 
     repo, profile = _sandbox_repo(tmp_path)
@@ -537,7 +540,7 @@ def test_fanout_guard_covers_every_reviewer_session(tmp_path, monkeypatch):
         [("reviewer", "one"), ("reviewer", "two")],
         repo, profile,
         factory_root=tmp_path, settings_path=tmp_path / "base.json",
-        max_turns=5, timeout_min=1, token="t", cli_path=Path("/bin/echo"),
+        max_turns=5, timeout_min=1, cli_path=Path("/bin/echo"),
     )
     assert calls["n"] == 2
     assert all(r.status == "failed" for r in records)
@@ -777,6 +780,9 @@ def test_review1_fanout_scratch_is_per_session(tmp_path, monkeypatch):
     lists only that session's scratch (never run_dir/.home — a shared
     writable dir would be a covert channel — and never the other
     session's)."""
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     import factory.session as session_module
     from factory.sandbox import sandbox_env
 
@@ -806,7 +812,7 @@ def test_review1_fanout_scratch_is_per_session(tmp_path, monkeypatch):
         [("reviewer", "one"), ("reviewer", "two")],
         repo, profile,
         factory_root=tmp_path / "repo-root", settings_path=tmp_path / "base.json",
-        max_turns=5, timeout_min=1, token="t", cli_path=Path("/bin/echo"),
+        max_turns=5, timeout_min=1, cli_path=Path("/bin/echo"),
     )
     assert len(captured) == 2
     scratches = [scratch for scratch, _ in captured]
@@ -1171,6 +1177,9 @@ def test_review6_fanout_sessions_carry_the_toolkit(tmp_path, monkeypatch):
     with the spec the fan-out's own staging produced (the f22 ac_7
     pattern); the plumbing half captures specs/settings per session from
     a monkeypatched sandbox."""
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     from _support.f22 import _toolkit_with
 
     import factory.session as session_module
@@ -1215,7 +1224,7 @@ def test_review6_fanout_sessions_carry_the_toolkit(tmp_path, monkeypatch):
         [("reviewer", "one"), ("reviewer", "two")],
         repo, profile,
         factory_root=tmp_path / "repo-root", settings_path=tmp_path / "base.json",
-        max_turns=5, timeout_min=1, token="t", cli_path=Path("/bin/echo"),
+        max_turns=5, timeout_min=1, cli_path=Path("/bin/echo"),
         toolkit=resolved,
     )
     assert len(specs_seen) == 2
@@ -1274,6 +1283,9 @@ def test_review7_toolkit_dirs_torn_down_even_on_exception(tmp_path, monkeypatch)
     """F-22 × F-38 (b): each session's -toolkit dir (with its settings,
     runner and scratch) is gone after the fan-out — on the happy path AND
     when a session raises mid-fan-out."""
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     from _support.f22 import _toolkit_with
 
     import factory.session as session_module
@@ -1306,7 +1318,7 @@ def test_review7_toolkit_dirs_torn_down_even_on_exception(tmp_path, monkeypatch)
                 [("reviewer", "one"), ("reviewer", "two")],
                 repo, profile,
                 factory_root=tmp_path, settings_path=base,
-                max_turns=5, timeout_min=1, token="t",
+                max_turns=5, timeout_min=1,
                 cli_path=Path("/bin/echo"), toolkit=resolved,
             )
         except RuntimeError:

@@ -64,9 +64,17 @@ def _entry_stub(monkeypatch, captured: dict, *, stdout="", stderr="",
 
     ``write_record=False`` is the failed entry (nothing written); or pass
     ``on_run(spec, record_path)`` to perturb the flow (plant something
-    else at the path)."""
+    else at the path).
+
+    R1-2: the constructor takes no raw credential any more, so the stub
+    also plants the zai keychain item every affected test's session
+    resolves (the per-test fake_token shapes patch over it themselves)."""
 
     from factory import session as session_mod
+
+    monkeypatch.setattr(
+        "factory.provider._keychain_token",
+        lambda service: "tok" if service == "factory-zai" else None)
 
     def fake_run_sandboxed(cmd, run_dir, settings_path, **kwargs):
         captured["cmd"] = list(cmd)
@@ -85,6 +93,9 @@ def _entry_stub(monkeypatch, captured: dict, *, stdout="", stderr="",
             ))
         return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
 
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "tok"
+                        if service == "factory-zai" else None)
     monkeypatch.setattr(session_mod, "run_sandboxed", fake_run_sandboxed)
 
 
@@ -114,7 +125,9 @@ def _run_stream(message: ResultMessage):
         yield message
 
     return asyncio.run(run_session(
-        "reviewer", "do it", REPO, 5, 10, query_fn=query, token="tok"))
+        "reviewer", "do it", REPO, 5, 10,
+        query_fn=query, base_url="https://api.z.ai/api/anthropic",
+        token="tok"))
 
 
 # --------------------------------------------------- AC-1: file transport --
@@ -145,7 +158,7 @@ def test_ac_1(tmp_path: Path, monkeypatch):
                 on_run=on_run)
     record = session_mod.run_session_sandboxed(
         "implementer", "p", run.root, {},
-        factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
+        factory_root=tmp_path, max_turns=1, timeout_min=1,
     )
     assert record.status == "completed"
     assert record.result == "x" * (2 << 20), "the full 2 MB record did not arrive"
@@ -168,7 +181,7 @@ def test_ac_1(tmp_path: Path, monkeypatch):
     _entry_stub(monkeypatch, {}, on_run=fanout_run)
     records = session_mod.run_sessions_parallel(
         [("reviewer", "r1"), ("verifier", "v1")], run.root, {},
-        factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
+        factory_root=tmp_path, max_turns=1, timeout_min=1,
     )
     assert [r.status for r in records] == ["completed", "completed"]
     assert len(seen) == 2 and seen[0] != seen[1], seen
@@ -191,10 +204,8 @@ def test_ac_1(tmp_path: Path, monkeypatch):
     with pytest.raises(SessionConfigError, match="cannot be opened"):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
-            factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
+            factory_root=tmp_path, max_turns=1, timeout_min=1,
         )
-
-
 def test_ac_1_real_srt_record_dir_persists_on_the_host(tmp_path: Path):
     """The record path must be a carve-out that persists on the host: on
     Linux, srt mounts a tmpfs over the read-denied factory root, so a
@@ -251,11 +262,17 @@ def test_ac_2(tmp_path: Path, monkeypatch):
     token = fake_token("f56-record", prefix="tok-secret-")
     _entry_stub(monkeypatch, {}, returncode=1, write_record=False,
                 stderr=f"boom: the command failed with {token}\n")
+    # After the stub's generic credential, THIS test's token is the one
+    # the session must scrub with (the seam order matters: last patch
+    # wins).
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: token
+                        if service == "factory-zai" else None)
     with pytest.raises(SessionConfigError) as excinfo:
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
-            factory_root=tmp_path, max_turns=1, timeout_min=1, token=token,
-        )
+            factory_root=tmp_path, max_turns=1, timeout_min=1,
+    )
     message = str(excinfo.value)
     assert "exit 1" in message, message
     assert "boom: the command failed" in message, message
@@ -277,8 +294,8 @@ def test_ac_2(tmp_path: Path, monkeypatch):
     with pytest.raises(SessionConfigError) as excinfo:
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
-            factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
-        )
+            factory_root=tmp_path, max_turns=1, timeout_min=1,
+    )
     assert "SIGKILL" in str(excinfo.value), str(excinfo.value)
 
     # 3. The record-failure type: every branch raises it (the importer's
@@ -290,12 +307,10 @@ def test_ac_2(tmp_path: Path, monkeypatch):
     with pytest.raises(SessionRecordError):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
-            factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
-        )
-
-
+            factory_root=tmp_path, max_turns=1, timeout_min=1,
 # --------------------------------------------- AC-3: permission_denials bound --
 
+        )
 def test_ac_3():
     """permission_denials is bounded where the record is built: each
     tool_input capped at the documented size, the list capped at the
@@ -370,8 +385,8 @@ def test_ac_4(tmp_path: Path, monkeypatch):
     with pytest.raises(SessionConfigError) as excinfo:
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
-            factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
-        )
+            factory_root=tmp_path, max_turns=1, timeout_min=1,
+    )
     message = str(excinfo.value)
     assert "srt reported killing the command" in message, message
 
@@ -381,15 +396,13 @@ def test_ac_4(tmp_path: Path, monkeypatch):
     with pytest.raises(SessionConfigError) as excinfo:
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
-            factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
-        )
+            factory_root=tmp_path, max_turns=1, timeout_min=1,
+    )
     assert "killed by a signal" in str(excinfo.value), str(excinfo.value)
 
     # 3. The factory's spawn passes no --control-fd (pinned on the real
     # argv run_sandboxed builds): the dead-channel path is configured out.
     assert "--control-fd" not in captured["cmd"], captured["cmd"]
-
-
 def test_ac_4_real_srt_large_line_survives_a_live_reader(tmp_path: Path):
     """The size/boundary probe under real srt: one large single line —
     at exactly the observed 81,920 bytes and at 2 MB — crosses the pipe
@@ -449,7 +462,9 @@ def test_ac_5(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr("factory.importer.run_session_sandboxed",
                         broken_record)
-    monkeypatch.setattr("factory.importer.seat_token", lambda: "tok")
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "tok"
+                        if service == "factory-zai" else None)
     with pytest.raises(ImportRefused) as excinfo:
         run_import(repo, factory_root=factory_root)
     message = str(excinfo.value)
@@ -499,15 +514,16 @@ def test_review_timeout_after_record_written_uses_it(tmp_path, monkeypatch):
         exc.force_closed_pipes = ()
         raise exc
 
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "tok"
+                        if service == "factory-zai" else None)
     monkeypatch.setattr(session_mod, "run_sandboxed", fake)
     record = session_mod.run_session_sandboxed(
         "implementer", "p", run.root, {},
-        factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
+        factory_root=tmp_path, max_turns=1, timeout_min=1,
     )
     assert record.status == "completed"
     assert record.result == "done before the hang"
-
-
 def test_review_timeout_without_record_keeps_diagnostics(
         tmp_path, monkeypatch):
     """The timeout path with no record: the TimeoutExpired still carries
@@ -527,19 +543,20 @@ def test_review_timeout_without_record_keeps_diagnostics(
         exc.force_closed_pipes = ("stdout",)
         raise exc
 
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "tok"
+                        if service == "factory-zai" else None)
     monkeypatch.setattr(session_mod, "run_sandboxed", fake)
     with pytest.raises(sp.TimeoutExpired) as excinfo:
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
-            factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
+            factory_root=tmp_path, max_turns=1, timeout_min=1,
             trace_sink=events.append,
         )
     notes = getattr(excinfo.value, "__notes__", [])
     assert notes and "hung in teardown" in notes[-1], notes
     assert notes and str(tmp_path / "sessions") in notes[-1], notes
     assert [e["type"] for e in events] == ["sandbox_escapee"]
-
-
 def test_review_fake_stdout_record_line_is_ignored(tmp_path, monkeypatch):
     """A record-looking line the session prints on stdout is ignored:
     stdout carries only factory-trace lines, and the record comes from
@@ -563,11 +580,9 @@ def test_review_fake_stdout_record_line_is_ignored(tmp_path, monkeypatch):
         on_run=on_run)
     record = session_mod.run_session_sandboxed(
         "implementer", "p", run.root, {},
-        factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
+        factory_root=tmp_path, max_turns=1, timeout_min=1,
     )
     assert record.result == "the real one"
-
-
 def test_review_settings_carve_out_the_record_dir(tmp_path, monkeypatch):
     """The settings _run_prepared builds carry the record dir in BOTH
     allowWrite and allowRead (the carve-out that persists on Linux), and
@@ -597,15 +612,13 @@ def test_review_settings_carve_out_the_record_dir(tmp_path, monkeypatch):
     with pytest.raises(SessionConfigError):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
-            factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
+            factory_root=tmp_path, max_turns=1, timeout_min=1,
         )
     settings = captured["settings"]
     record_dir = _record_file(run.settings_path).parent
     assert str(record_dir) in settings["filesystem"]["allowWrite"]
     assert str(record_dir.resolve()) in settings["filesystem"]["allowRead"]
     assert not stale.exists(), "the stale record was not wiped before the run"
-
-
 def test_review_entry_writes_the_record_file_atomically(
         tmp_path, monkeypatch, capsys):
     """The in-sandbox entry writes the record to the spec's record_path
@@ -619,6 +632,12 @@ def test_review_entry_writes_the_record_file_atomically(
     spec.write_text(json.dumps({
         "seat": "reviewer", "prompt": "p", "cwd": str(tmp_path),
         "max_turns": 1, "timeout_min": 0.05,
+        # F-59: the provider travels as NAMES; the entry rebuilds the
+        # literal env from exactly these keys.
+        "env_keys": ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
+                     "API_TIMEOUT_MS"],
+        "credential_key": "ANTHROPIC_AUTH_TOKEN",
+        "provider": {"kind": "zai", "endpoint_host": "api.z.ai"},
         "cli_path": str(tmp_path / "claude"),
         "record_path": str(record_dir / RECORD_FILE_NAME),
     }))
@@ -660,9 +679,8 @@ def test_review_non_regular_record_files_are_refused(tmp_path, monkeypatch):
     with pytest.raises(SessionConfigError, match="record"):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
-            factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
+            factory_root=tmp_path, max_turns=1, timeout_min=1,
         )
-
     # A FIFO at the record path — must not hang.
     def plant_fifo(spec, record_path):
         import shutil
@@ -676,9 +694,8 @@ def test_review_non_regular_record_files_are_refused(tmp_path, monkeypatch):
     with pytest.raises(SessionConfigError, match="record"):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
-            factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
+            factory_root=tmp_path, max_turns=1, timeout_min=1,
         )
-
     # Non-UTF-8 bytes.
     def plant_bytes(spec, record_path):
         import shutil
@@ -691,9 +708,8 @@ def test_review_non_regular_record_files_are_refused(tmp_path, monkeypatch):
     with pytest.raises(SessionConfigError, match="record"):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
-            factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
+            factory_root=tmp_path, max_turns=1, timeout_min=1,
         )
-
     # A record nested past the parse's recursion limit: refused (the
     # F-49 parse-boundary rule — the record file is session-writable, so
     # its parse must never crash the orchestrator).
@@ -704,10 +720,8 @@ def test_review_non_regular_record_files_are_refused(tmp_path, monkeypatch):
     with pytest.raises(SessionRecordError, match="valid record"):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
-            factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
+            factory_root=tmp_path, max_turns=1, timeout_min=1,
         )
-
-
 def test_review_stderr_tail_is_capped(tmp_path, monkeypatch):
     """The stderr tail in the message is capped (2000 chars): a 50 KB
     stderr cannot flood the terminal or the attempt notes."""
@@ -720,12 +734,10 @@ def test_review_stderr_tail_is_capped(tmp_path, monkeypatch):
     with pytest.raises(SessionConfigError) as excinfo:
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
-            factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
-        )
+            factory_root=tmp_path, max_turns=1, timeout_min=1,
+    )
     assert "E" * 2000 in str(excinfo.value)
     assert "E" * 2001 not in str(excinfo.value)
-
-
 def test_review_other_record_fields_are_not_bounded():
     """Only permission_denials is bounded (the AC's scope): a huge
     ``result`` or ``reason`` rides the record whole — classified in the
@@ -755,7 +767,7 @@ def test_review_fanout_cleans_up_record_dirs(tmp_path, monkeypatch):
     _entry_stub(monkeypatch, {}, on_run=on_run)
     session_mod.run_sessions_parallel(
         [("reviewer", "r1"), ("reviewer", "r2")], run.root, {},
-        factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
+        factory_root=tmp_path, max_turns=1, timeout_min=1,
     )
     assert all(not p.parent.exists() for p in paths), paths
 
@@ -841,11 +853,9 @@ def test_review_record_read_is_single_open(monkeypatch, tmp_path):
     with pytest.raises(SessionConfigError):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
-            factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
-        )
+            factory_root=tmp_path, max_turns=1, timeout_min=1,
+    )
     assert len(opens) <= 1, opens
-
-
 # =======================================================================
 # Review round 1 (four findings + the timeout-visibility classify)
 # =======================================================================
@@ -867,8 +877,8 @@ def test_review_round1_named_saved_files_exist(tmp_path, monkeypatch):
     with pytest.raises(SessionConfigError) as excinfo:
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
-            factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
-        )
+            factory_root=tmp_path, max_turns=1, timeout_min=1,
+    )
     message = str(excinfo.value)
     import re as _re
     named = [Path(m) for m in _re.findall(r"/[^\s;]+\.txt", message)]
@@ -891,15 +901,13 @@ def test_review_round1_named_saved_files_exist(tmp_path, monkeypatch):
     with pytest.raises(SessionConfigError) as excinfo:
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
-            factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
-        )
+            factory_root=tmp_path, max_turns=1, timeout_min=1,
+    )
     message = str(excinfo.value)
     assert "stderr copy was not written" in message, message
     import re as _re2
     named = [Path(m) for m in _re2.findall(r"/[^\s;]+\.txt", message)]
     assert named and all(p.exists() for p in named), (message, named)
-
-
 def test_review_round1_record_read_is_size_bounded(tmp_path, monkeypatch):
     """Finding 2: the record read is bounded — a planted record past
     RECORD_MAX_BYTES is refused naming the bound, without reading the
@@ -918,7 +926,7 @@ def test_review_round1_record_read_is_size_bounded(tmp_path, monkeypatch):
     with pytest.raises(SessionConfigError, match="record size bound"):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
-            factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
+            factory_root=tmp_path, max_turns=1, timeout_min=1,
         )
 
     # Just under the cap: parses and is used (the whole serialized record
@@ -933,11 +941,9 @@ def test_review_round1_record_read_is_size_bounded(tmp_path, monkeypatch):
     _entry_stub(monkeypatch, {}, returncode=1, on_run=plant_under)
     record = session_mod.run_session_sandboxed(
         "implementer", "p", run.root, {},
-        factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
+        factory_root=tmp_path, max_turns=1, timeout_min=1,
     )
     assert record.status == "completed" and record.result == "y" * 400
-
-
 def test_review_round1_nondict_denial_entries_are_bounded():
     """Finding 3: the AC-3 total claim holds for ANY entry shape —
     non-dict entries and dict entries with large fields are capped per
@@ -982,10 +988,13 @@ def test_review_round1_timeout_record_use_is_visible(tmp_path, monkeypatch):
         exc.force_closed_pipes = ()
         raise exc
 
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "tok"
+                        if service == "factory-zai" else None)
     monkeypatch.setattr(session_mod, "run_sandboxed", fake)
     record = session_mod.run_session_sandboxed(
         "implementer", "p", run.root, {},
-        factory_root=tmp_path, max_turns=1, timeout_min=1, token="tok",
+        factory_root=tmp_path, max_turns=1, timeout_min=1,
         trace_sink=events.append,
     )
     assert record.status == "completed"

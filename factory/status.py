@@ -55,6 +55,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from factory.config import (
+    CONFIG_FILE,
+    ConfigError,
+    FactoryConfig,
+    load_config,
+)
 from factory.egress import strip_control_sequences
 from factory.runs import project_component
 from factory.vent import VENT_CATEGORIES, weeks_vents
@@ -502,6 +508,130 @@ def _render_metrics(metrics: dict[str, Any], notes: list[str]) -> list[str]:
     return lines
 
 
+# F-59 AC-4: the four usage fields the attempt records carry (validated
+# at the record boundary; an unknown count is None here, never 0).
+_USAGE_FIELDS = ("input", "cache_read", "cache_write", "output")
+
+
+def _fmt_millions(count: int | None) -> str:
+    """One usage count as human tokens: 1.2M / 890k / unknown."""
+    if count is None:
+        return "unknown"
+    if count >= 1_000_000:
+        value = count / 1_000_000
+        return f"{value:.2f}M" if value < 10 else f"{value:.1f}M"
+    if count >= 10_000:
+        return f"{round(count / 1_000)}k"
+    return f"{count:,}"
+
+
+def _provider_rows(queue: dict) -> "list[tuple[tuple[str, str], dict]]":
+    """Aggregate (kind, model) usage over every attempt that carries an
+    F-59 provider record, in first-seen order. R1-5: an attempt with the
+    per-(kind, model) breakdown contributes each row of it (the records'
+    own parent-stamped providers); an attempt with only the primary
+    provider contributes there. Attempts without any provider record
+    (before F-59, or stub-runner rounds) count once as ``legacy``.
+
+    R1-6: a column with ANY unknown count renders unknown — collected
+    values per column, never a partial sum presented as the total."""
+    rows: "dict[tuple[str, str], dict]" = {}
+    legacy = 0
+
+    def bucket(kind: str, model: str) -> dict:
+        key = (kind, model)
+        if key not in rows:
+            rows[key] = {name: [] for name in _USAGE_FIELDS}
+        return rows[key]
+
+    def add(kind: str, model: str, usage: dict) -> None:
+        cells = bucket(kind, model)
+        for name in _USAGE_FIELDS:
+            value = usage.get(name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                value = None
+            if value is not None and value < 0:
+                value = None
+            cells[name].append(value)
+
+    for task in queue.get("tasks") or []:
+        for attempt in task.get("attempts") or []:
+            breakdown = attempt.get("provider_usage")
+            primary = attempt.get("provider")
+            if isinstance(breakdown, list) and breakdown:
+                for row in breakdown:
+                    if not isinstance(row, dict) or not row.get("kind"):
+                        continue
+                    add(str(row["kind"]), str(row.get("model") or "?"),
+                        row.get("usage") or {})
+            elif isinstance(primary, dict) and primary.get("kind"):
+                add(str(primary["kind"]),
+                    str(primary.get("model") or "?"),
+                    attempt.get("token_usage") or {})
+            else:
+                legacy += 1
+    if legacy:
+        rows[("legacy", "(attempts before F-59)")] = {
+            "attempts": legacy, **{name: [None] for name in _USAGE_FIELDS}}
+    return list(rows.items())
+
+
+def _column(values: "list | None") -> "int | None":
+    """One column's total: None (unknown) when ANY collected value is
+    unknown (R1-6 — never a partial sum), else the sum."""
+    values = values or []
+    if any(value is None for value in values):
+        return None
+    return sum(values)
+
+
+def _estimate_cost(rates: "dict[str, float] | None",
+                   row: dict) -> "str":
+    """The estimated cost of one provider row from its per-million
+    rates; ``n/a`` when any part is unknown or unpriced — never $0.00."""
+    if rates is None:
+        return "n/a"
+    total = 0.0
+    for name in _USAGE_FIELDS:
+        value = _column(row.get(name) or [])
+        if value is None:
+            return "n/a"
+        total += (value / 1_000_000) * rates[name]
+    return f"${total:.2f}"
+
+
+def _render_providers(queue: dict,
+                      config: "FactoryConfig | None") -> "list[str]":
+    """The F-59 AC-4 provider section: per kind+model token totals and
+    an estimated cost from the owner-maintained price table. A missing
+    price is n/a; an invalid usage count is unknown — neither is 0."""
+    rows = _provider_rows(queue)
+    lines = ["## Providers", ""]
+    if not rows:
+        lines.append("- no provider records yet (no attempts recorded)")
+        return lines
+    lines.append("| provider | model | in | cache read | cache write | out | est. cost |")
+    lines.append("|---|---|---|---|---|---|---|")
+    prices = (config.prices if config is not None else {}) or {}
+    for (kind, model), row in rows:
+        if kind == "legacy":
+            lines.append(f"| (no provider record) | — | {row.get('attempts')} "
+                         "attempts before F-59 | | | | n/a |")
+            continue
+        rates = prices.get(kind, {}).get(model)
+        lines.append(
+            f"| {kind} | {model} "
+            f"| {_fmt_millions(_column(row.get('input'))) } "
+            f"| {_fmt_millions(_column(row.get('cache_read')))} "
+            f"| {_fmt_millions(_column(row.get('cache_write')))} "
+            f"| {_fmt_millions(_column(row.get('output')))} "
+            f"| {_estimate_cost(rates, row)} |")
+    lines.append("")
+    lines.append("Estimates from the owner-maintained price table "
+                 "(config.yaml `prices`); a missing price shows n/a.")
+    return lines
+
+
 def render_status(
     queue: dict,
     *,
@@ -509,6 +639,7 @@ def render_status(
     factory_root: Path | str,
     now: datetime | None = None,
     repo: Path | str | None = None,
+    config: "FactoryConfig | None" = None,
 ) -> str:
     """Render the status page for one project.
 
@@ -520,6 +651,9 @@ def render_status(
         now: The clock for the week windows; defaults to UTC now.
         repo: The project repo, for merge times and revert detection;
             unreadable history degrades to a note, never a crash.
+        config: The factory config (F-59). None loads it from
+            ``<factory_root>/config.yaml``; a caller that already holds
+            one passes it through.
 
     Returns:
         The markdown page. Read-only: nothing under ``factory_root`` or
@@ -666,6 +800,14 @@ def render_status(
             notes.append(str(exc))
     metrics = compute_metrics(queue, commits=commits)
     lines += [""] + _render_metrics(metrics, notes)
+    # -- Providers (F-59 AC-4) -------------------------------------------
+    if config is None:
+        try:
+            config = load_config(Path(factory_root) / CONFIG_FILE)
+        except ConfigError as exc:
+            notes.append(f"factory config unreadable, no cost estimates: {exc}")
+            config = None
+    lines += [""] + _render_providers(queue, config)
     if notes:
         lines += ["", "## Notes", ""]
         lines += [f"- {note}" for note in notes]

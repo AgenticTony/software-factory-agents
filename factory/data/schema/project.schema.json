@@ -55,10 +55,66 @@
         "plugins": { "$ref": "#/$defs/toolkitNameList" },
         "mcp_servers": { "$ref": "#/$defs/toolkitNameList" }
       }
+    },
+    "providerKind": {
+      "enum": ["zai", "anthropic", "bedrock", "vertex", "anthropic_compatible"]
+    },
+    "providerModels": {
+      "type": "object",
+      "description": "One model id per seat role. The seats' CLI model override comes from this map (F-59); a seat may only run a model of its resolved provider.",
+      "required": ["implementer", "reviewer", "verifier", "importer"],
+      "additionalProperties": false,
+      "properties": {
+        "implementer": { "type": "string", "minLength": 1 },
+        "reviewer": { "type": "string", "minLength": 1 },
+        "verifier": { "type": "string", "minLength": 1 },
+        "importer": { "type": "string", "minLength": 1 }
+      }
+    },
+    "providerBlock": {
+      "type": "object",
+      "description": "The project's model provider (F-59). Owner-approved profile security content: data_owner, provider, providers_allowed and seat_providers are hashed as F-63 security groups, so a client repo cannot change its provider (or flip itself to self) without re-approval. region is required for bedrock/vertex and refused for the others; base_url is required for and allowed only with anthropic_compatible (https, exact host, no userinfo/query/fragment, no IP literal or localhost — refused at load).",
+      "required": ["kind", "models"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "$ref": "#/$defs/providerKind" },
+        "models": { "$ref": "#/$defs/providerModels" },
+        "region": { "type": "string", "minLength": 1, "description": "Cloud region (required for bedrock/vertex). Pattern-checked per kind at load; never free text interpolated into a host." },
+        "base_url": { "type": "string", "minLength": 1, "description": "The Anthropic-compatible endpoint (required for and allowed only with anthropic_compatible). https only; exact-host rule, no IP literal or localhost." }
+      }
+    },
+    "seatProviderBlock": {
+      "type": "object",
+      "description": "A seat's provider override (F-59 AC-5): only a kind from the project's owner-approved providers_allowed list. The override carries its own model (and region/base_url where its kind needs them, under the same load rules).",
+      "required": ["kind", "model"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "$ref": "#/$defs/providerKind" },
+        "model": { "type": "string", "minLength": 1 },
+        "region": { "type": "string", "minLength": 1 },
+        "base_url": { "type": "string", "minLength": 1 }
+      }
     }
   },
   "properties": {
     "name": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+    "data_owner": {
+      "enum": ["self", "client"],
+      "description": "Whose data the repo holds (F-59). ABSENT MEANS self: an owner repo with no block keeps today's Z.ai default. A client project (data_owner: client) must declare an explicit non-zai provider — a client repo with no provider block, or with kind: zai, refuses to load, with the reason named."
+    },
+    "provider": { "$ref": "#/$defs/providerBlock" },
+    "providers_allowed": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/providerKind" },
+      "uniqueItems": true,
+      "description": "Provider kinds a SEAT may override to (F-59 AC-5, for F-20's second reviewer). Owner-approved security content: widening it refuses the run until re-approval. A client project may not list zai."
+    },
+    "seat_providers": {
+      "type": "object",
+      "description": "Seat role -> provider override (F-59 AC-5). Every kind must come from providers_allowed; the override's host joins only that seat's sandbox egress, never the implementer's.",
+      "propertyNames": { "enum": ["implementer", "reviewer", "verifier", "importer"] },
+      "additionalProperties": { "$ref": "#/$defs/seatProviderBlock" }
+    },
     "repo": {
       "type": "object",
       "required": ["path", "default_branch", "remote"],

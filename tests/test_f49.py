@@ -396,7 +396,9 @@ def test_ac_3(tmp_path: Path, monkeypatch):
                              result=_proposal(_wo("WO-0")))
 
     monkeypatch.setattr("factory.importer.run_session_sandboxed", fake_session)
-    monkeypatch.setattr("factory.importer.seat_token", lambda: "tok")
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "tok"
+                        if service == "factory-zai" else None)
     importer_fixture_approve(tmp_path / "froot", git_repo)  # F-63
     run_import(git_repo, factory_root=tmp_path / "froot")
     # At 200+ listed docs the turn count is ceiling-capped either way

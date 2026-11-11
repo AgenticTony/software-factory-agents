@@ -235,13 +235,16 @@ def test_ac_1(tmp_path: Path, monkeypatch):
         return run_session_sandboxed(
             seat, prompt, Path(run_dir), profile,
             factory_root=env.root, max_turns=kwargs["max_turns"],
-            timeout_min=kwargs["timeout_min"], token="f64-timeout-token",
+            timeout_min=kwargs["timeout_min"],
             protected=kwargs.get("protected", ()),
             system_prompt=kwargs.get("system_prompt"),
             run_id=kwargs.get("run_id"), task_id=kwargs.get("task_id"),
             trace_sink=kwargs.get("trace_sink"),
         )
 
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "f64-timeout-token"
+                        if service == "factory-zai" else None)
     monkeypatch.setattr(session_mod, "run_sandboxed", plant_and_hang)
     result = env.run(timeout_runner)
     monkeypatch.undo()

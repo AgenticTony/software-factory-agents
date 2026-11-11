@@ -1002,10 +1002,11 @@ def test_push_content_refusal_precedes_the_push(tmp_path, monkeypatch):
     still passes every existing fence (PR text, sentinels — the token
     matches no shape), and the push-content fence refuses the publish:
     nothing reaches the remote, no PR opens, publish_refused."""
-    import factory.orchestrator as orch
 
     env = _Env(tmp_path)
-    monkeypatch.setattr(orch, "seat_token", lambda: FAKE_TOKEN)
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: FAKE_TOKEN
+                        if service == "factory-zai" else None)
     result = env.run(_Seats())
     assert result.outcome == "needs_human", result
     assert result.escalation == "publish_refused", result

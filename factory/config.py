@@ -16,6 +16,12 @@ The file is YAML at ``<factory_root>/config.yaml`` (absent = defaults)::
       end: "12:00"     # exclusive
     reviewers: 2       # L2 reviewer sessions per review (F-38), >= 1
     final_review_repeats: 1   # failed final review repeats (F-41), >= 0
+    prices:            # F-59: per kind+model USD per MILLION tokens;
+                      # input / cache_read / cache_write / output. A
+                      # missing (kind, model) renders n/a in factory
+                      # status, never 0. Owner-maintained.
+      bedrock:
+        claude-sonnet-5-5: {input: 3.0, cache_read: 0.3, cache_write: 3.75, output: 15.0}
 
 Anything malformed is refused with :class:`ConfigError` — a window that
 silently failed to parse would let the factory spend the quota at the
@@ -74,6 +80,12 @@ class FactoryConfig:
     peak_window: PeakWindow | None = field(default=DEFAULT_PEAK_WINDOW)
     reviewers: int = DEFAULT_REVIEWERS
     final_review_repeats: int = DEFAULT_FINAL_REVIEW_REPEATS
+    # F-59 AC-4: the owner-maintained price table — kind -> model ->
+    # {input, cache_read, cache_write, output} in USD per million
+    # tokens. Missing entries are n/a in status, never 0; the table is
+    # display-only (estimates), never gate state.
+    prices: "dict[str, dict[str, dict[str, float]]]" = field(
+        default_factory=dict)
 
 
 def _clock(value, key: str) -> time:
@@ -139,6 +151,40 @@ def _final_review_repeats(raw) -> int:
     return raw
 
 
+_PRICE_FIELDS = ("input", "cache_read", "cache_write", "output")
+
+
+def _prices(raw) -> "dict[str, dict[str, dict[str, float]]]":
+    """Validate the ``prices`` table (F-59): kind -> model -> the four
+    per-million rates, each a finite number >= 0. A malformed table is a
+    ConfigError — a wrong price silently applied to every status page is
+    worse than a loud refusal."""
+    if not isinstance(raw, dict):
+        raise ConfigError(f"prices must be a mapping, got {raw!r}")
+    table: "dict[str, dict[str, dict[str, float]]]" = {}
+    for kind, models in raw.items():
+        if not isinstance(models, dict):
+            raise ConfigError(f"prices.{kind} must be a mapping, got {models!r}")
+        for model, rates in models.items():
+            if not isinstance(rates, dict) or set(rates) != set(_PRICE_FIELDS):
+                raise ConfigError(
+                    f"prices.{kind}.{model} needs exactly "
+                    f"{list(_PRICE_FIELDS)}, got "
+                    f"{sorted(rates) if isinstance(rates, dict) else rates!r}"
+                )
+            for field_name, value in rates.items():
+                if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                        or value < 0:
+                    raise ConfigError(
+                        f"prices.{kind}.{model}.{field_name} must be a "
+                        f"number >= 0, got {value!r}"
+                    )
+            table.setdefault(str(kind), {})[str(model)] = {
+                name: float(rates[name]) for name in _PRICE_FIELDS
+            }
+    return table
+
+
 def load_config(path: Path | str | None) -> FactoryConfig:
     """Load the factory config.
 
@@ -163,7 +209,8 @@ def load_config(path: Path | str | None) -> FactoryConfig:
         return FactoryConfig()
     if not isinstance(raw, dict):
         raise ConfigError(f"factory config {path} must be a mapping")
-    unknown = sorted(set(raw) - {"peak_window", "reviewers", "final_review_repeats"})
+    unknown = sorted(set(raw) - {"peak_window", "reviewers",
+                                  "final_review_repeats", "prices"})
     if unknown:
         raise ConfigError(f"factory config {path}: unknown keys {unknown}")
     return FactoryConfig(
@@ -175,6 +222,7 @@ def load_config(path: Path | str | None) -> FactoryConfig:
             _final_review_repeats(raw["final_review_repeats"])
             if "final_review_repeats" in raw else DEFAULT_FINAL_REVIEW_REPEATS
         ),
+        prices=_prices(raw["prices"]) if "prices" in raw else {},
     )
 
 

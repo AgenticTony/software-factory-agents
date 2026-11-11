@@ -329,6 +329,9 @@ def _git_repo(path: Path) -> Path:
 
 
 def test_unparsable_record_saves_full_stdout(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     """A record file that never arrived whole raises SessionRecordError
     naming files that hold the full raw stdout AND stderr (redacted,
     0600) — the 56 turns are never lost to a diagnosis again. F-56
@@ -358,9 +361,8 @@ def test_unparsable_record_saves_full_stdout(tmp_path: Path, monkeypatch):
             "reviewer", "the prompt", run_dir,
             {"docs_allowlist": [], "network_allowlist": []},
             factory_root=factory_root, settings_path=settings_path,
-            max_turns=1, timeout_min=0.05, token="tok",
-            cli_path=tmp_path / "claude", protected=(),
-        )
+            max_turns=1, timeout_min=0.05,
+            cli_path=tmp_path / "claude", protected=())
     message = str(excinfo.value)
     assert "exit 1" in message
     assert "boom: partial write" in message
@@ -394,6 +396,12 @@ def test_entry_writes_the_record_atomically(tmp_path: Path, monkeypatch):
     spec.write_text(json.dumps({
         "seat": "reviewer", "prompt": "p", "cwd": str(tmp_path),
         "max_turns": 1, "timeout_min": 0.05,
+        # F-59: the provider travels as NAMES; the entry rebuilds the
+        # literal env from exactly these keys.
+        "env_keys": ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
+                     "API_TIMEOUT_MS"],
+        "credential_key": "ANTHROPIC_AUTH_TOKEN",
+        "provider": {"kind": "zai", "endpoint_host": "api.z.ai"},
         "cli_path": str(tmp_path / "claude"),
         "record_path": str(record_path),
     }))
@@ -501,6 +509,9 @@ def test_staged_check_agrees_with_plan_import(tmp_path: Path):
 def test_scratch_files_land_in_the_session_tmp(tmp_path: Path, monkeypatch):
     """run_session_sandboxed(scratch_files=...) stages files into the
     session's TMPDIR — the reviewer scratch, reachable from its cwd."""
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     run_dir = _git_repo(tmp_path / "run")
     settings_path = tmp_path / "sandbox" / "probe.json"
     settings_path.parent.mkdir(parents=True)
@@ -523,7 +534,7 @@ def test_scratch_files_land_in_the_session_tmp(tmp_path: Path, monkeypatch):
         "reviewer", "the prompt", run_dir,
         {"docs_allowlist": [], "network_allowlist": []},
         factory_root=tmp_path / "root", settings_path=settings_path,
-        max_turns=1, timeout_min=0.05, token="tok",
+        max_turns=1, timeout_min=0.05,
         cli_path=tmp_path / "claude", protected=(),
         scratch_files={"proposal.schema.json": '{"type": "object"}'},
     )
@@ -544,7 +555,7 @@ def test_scratch_file_names_must_be_bare(tmp_path: Path, monkeypatch):
             {"docs_allowlist": [], "network_allowlist": []},
             factory_root=tmp_path / "root",
             settings_path=tmp_path / "sandbox" / "s.json",
-            max_turns=1, timeout_min=0.05, token="tok",
+            max_turns=1, timeout_min=0.05,
             cli_path=tmp_path / "claude", protected=(),
             scratch_files={"../escape.txt": "x"},
         )
@@ -567,7 +578,9 @@ def test_real_import_session_stages_the_proposal_schema(
         )
 
     monkeypatch.setattr("factory.importer.run_session_sandboxed", fake)
-    monkeypatch.setattr("factory.importer.seat_token", lambda: "tok")
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "tok"
+                        if service == "factory-zai" else None)
     importer_fixture_approve(tmp_path / "froot", repo)  # F-63
     result = run_import(repo, factory_root=tmp_path / "froot")
     assert result.plan.project == "proj"
@@ -694,6 +707,9 @@ def test_scratch_files_refuse_without_the_review_guard(
     refuses before anything starts: the scratch would be the clone's own
     run/.tmp, and a staged file could ride that seat's diff. Nothing
     uses that path today — it must not exist (round-3 review nit)."""
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     run_dir = _git_repo(tmp_path / "run")
 
     def never(cmd, *args, **kwargs):
@@ -706,7 +722,7 @@ def test_scratch_files_refuse_without_the_review_guard(
             {"docs_allowlist": [], "network_allowlist": []},
             factory_root=tmp_path / "root",
             settings_path=tmp_path / "sandbox" / "s.json",
-            max_turns=1, timeout_min=0.05, token="tok",
+            max_turns=1, timeout_min=0.05,
             cli_path=tmp_path / "claude", protected=(),
             scratch_files={"proposal.schema.json": "{}"},
         )

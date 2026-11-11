@@ -87,9 +87,29 @@ SESSION_ENV_ALLOWLIST = frozenset(
         "GIT_AUTHOR_EMAIL",
         "GIT_COMMITTER_NAME",
         "GIT_COMMITTER_EMAIL",
+        # F-59 (bedrock - the pinned CLI's native shape, verified against
+        # the bundled 2.1.301 binary): the provider use flag, the scoped
+        # bearer token (set, the CLI's AWS credential chain never runs -
+        # no ~/.aws, no profiles, no IMDS) and the region the runtime
+        # host is derived from.
+        "CLAUDE_CODE_USE_BEDROCK",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_REGION",
     }
 )
 SESSION_ENV_PREFIXES = ("LC_",)
+
+# F-59: provider credential/selection namespaces are NEVER inherited
+# from the ambient environment - they ride a session ONLY as the
+# resolver's literal ``env=`` extras (which the SESSION allowlist above
+# admits by exact name). Stripping the prefixes from the AMBIENT half is
+# belt-and-braces: the ambient allowlist (PATH/LANG/TZ/LC_*) already
+# excludes them, so this guard holds even if that list is ever widened.
+# It must NOT run on the merged env - scrub_env-style - or it would eat
+# the resolver's own keys (AWS_REGION is the seat's, not ambient).
+_PROVIDER_ENV_PREFIXES = (
+    "ANTHROPIC_", "AWS_", "GOOGLE_", "CLOUDSDK_", "CLAUDE_CODE_",
+)
 
 # Seconds to wait for output after the process group is killed: pipe buffer
 # drains fast when every writer is dead; a process that escaped the group
@@ -574,6 +594,15 @@ def sandbox_env(
         for key, value in os.environ.items()
         if key in AMBIENT_ENV_ALLOWLIST or key.startswith(AMBIENT_ENV_PREFIXES)
     }
+    # F-59: no ambient provider credential or selection name survives to
+    # the child env - only the resolver's literal extras (applied below,
+    # exact-name allowlisted) may carry a provider's names.
+    env = {
+        key: value
+        for key, value in env.items()
+        if not any(key.upper().startswith(prefix)
+                   for prefix in _PROVIDER_ENV_PREFIXES)
+    }
     if "PATH" in env:
         env["PATH"] = _path_outside_home(env["PATH"])
     if extra:
@@ -795,7 +824,7 @@ def build_settings(
     profile: dict,
     run_dir: Path,
     *,
-    model_endpoint: str,
+    model_endpoint: "str | Sequence[str]",
     forbidden_env: tuple[str, ...] = (),
     factory_root: Path | None = None,
     toolchain: "Sequence[Path] | None" = None,
@@ -815,8 +844,11 @@ def build_settings(
             optional here).
         run_dir: The session's run dir — the only writable, self-readable
             path inside the sandbox.
-        model_endpoint: The seat's model endpoint (Z.ai base URL or bare
-            host). Its hostname joins the network allowlist.
+        model_endpoint: The seat's model endpoint(s) - the F-59
+            resolver's ``egress_hosts`` (a bare host or base URL, or a
+            sequence of them: one for every kind today, more only where
+            a kind needs several). Their hostnames join the network
+            allowlist ahead of the profile's own entries.
         forbidden_env: Keychain-derived env names denied in addition to the
             structural GitHub set (same list the orchestrator scrubs).
         factory_root: Explicit factory root. When omitted it is derived from
@@ -933,8 +965,13 @@ def build_settings(
     _refuse_unsafe_factory_root(factory_root)
     if toolchain is None:
         toolchain = default_toolchain()
+    # F-59: the resolver's inference host(s) - one endpoint for most
+    # kinds, more only where a kind needs them. A bare string (one host)
+    # stays the F-05 shape every existing caller and test uses.
+    endpoints = ((model_endpoint,) if isinstance(model_endpoint, str)
+                 else tuple(model_endpoint))
     allowed_domains = [
-        _endpoint_host(model_endpoint),
+        *(_endpoint_host(endpoint) for endpoint in endpoints),
         *profile.get("docs_allowlist", []),
         *profile.get("network_allowlist", []),
     ]

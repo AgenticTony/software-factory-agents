@@ -566,6 +566,9 @@ def test_session_escapee_reaches_the_trace_sink(tmp_path: Path, monkeypatch):
     normal return AND on the timeout raise. F-56 re-seat: the record the
     fake entry leaves travels by the file (record_path_for), so the
     timeout leg keeps its record and still raises only the timeout."""
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     import factory.session as session_module
 
     record = {"seat": "implementer", "status": "completed", "reason": None,
@@ -588,9 +591,8 @@ def test_session_escapee_reaches_the_trace_sink(tmp_path: Path, monkeypatch):
     cli.chmod(0o755)
     session_module._run_prepared(
         "implementer", "p", run.root, {}, run.settings_path,
-        factory_root=root, max_turns=1, timeout_min=1, token="tok",
-        cli_path=cli, trace_sink=events.append, run_id=run.run_id,
-    )
+        factory_root=root, max_turns=1, timeout_min=1,
+        cli_path=cli, trace_sink=events.append, run_id=run.run_id)
     assert [e["type"] for e in events] == ["sandbox_escapee"], events
     assert events[0]["label"] == "session:implementer"
     assert events[0]["streams"] == ["stdout"]
@@ -608,7 +610,7 @@ def test_session_escapee_reaches_the_trace_sink(tmp_path: Path, monkeypatch):
     with pytest.raises(subprocess.TimeoutExpired):
         session_module._run_prepared(
             "implementer", "p", run.root, {}, run.settings_path,
-            factory_root=root, max_turns=1, timeout_min=1, token="tok",
+            factory_root=root, max_turns=1, timeout_min=1,
             cli_path=cli, trace_sink=events.append, run_id=run.run_id,
         )
     assert [(e["type"], e["timed_out"]) for e in events] == [

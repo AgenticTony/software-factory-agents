@@ -177,9 +177,9 @@ def test_ac_1(rehearsal, monkeypatch):
 
     # Setup really installs both trees, end to end through the real sandbox,
     # under that ambient PATH (the sanitised child PATH passes the guard).
+    from factory.provider import ZAI_BASE_URL as DEFAULT_BASE_URL
     from factory.runs import cleanup_run, create_run
     from factory.sandbox import build_settings, run_sandboxed, write_settings
-    from factory.session import DEFAULT_BASE_URL
 
     monkeypatch.setenv("PATH", ambient)
     run = create_run("rehearsal-fixture", fixture.repo, factory_root=root)

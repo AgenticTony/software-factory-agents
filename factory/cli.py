@@ -39,6 +39,7 @@ from factory.importer import (
 from factory.orchestrator import run_loop, run_once
 from factory.prbody import PRBodyError
 from factory.progress import ProgressLogError
+from factory.provider import run_secrets
 from factory.publish import PublishError, PushRefused
 from factory.replay import ReplayError, replay_lines, resolve_replay_files
 from factory.runs import (
@@ -48,7 +49,7 @@ from factory.runs import (
     project_component,
 )
 from factory.sandbox import SandboxError
-from factory.session import SessionConfigError, seat_token
+from factory.session import SessionConfigError
 from factory.state import TaskQueue, run_lease_held
 from factory.status import StatusError, render_status
 from factory.tick import TickError, tick_steps
@@ -501,6 +502,21 @@ def _run_status(args: argparse.Namespace) -> int:
         return 130
 
 
+def _keep_path_profile(args: argparse.Namespace) -> dict:
+    """The import repo's profile for the keep path's secrets (F-59).
+
+    Best effort BY DESIGN: this runs inside an except branch — the
+    import already refused, and its refusal may be exactly why the
+    profile will not load. An unloadable profile returns {} (a self
+    project shape: no provider block, the zai default), never turns a
+    keep into a crash; the egress seam's pattern redaction still runs
+    over whatever is saved."""
+    try:
+        return load_profile(Path(args.repo) / ".factory" / "project.yaml")
+    except (ContractError, OSError):
+        return {}
+
+
 def _run_import(args: argparse.Namespace) -> int:
     """Dispatch the import subcommand (F-12). Proposes ``tasks.json``
     from the project's planning docs, shows the full diff and writes
@@ -571,7 +587,11 @@ def _run_import(args: argparse.Namespace) -> int:
                 # the saved copy passes the egress seam with the token.
                 # Round 2: a TUPLE — this was a parenthesised string,
                 # iterated character by character, scrubbing nothing.
-                secrets=(seat_token() or "",),
+                # F-59: every provider token the project's profile
+                # resolves to (best effort here — the import already
+                # refused; a profile that cannot load contributes no
+                # secrets, and the seam still pattern-redacts).
+                secrets=run_secrets(_keep_path_profile(args)),
             )
             if kept is not exc:
                 raise kept from exc

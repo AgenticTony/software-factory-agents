@@ -144,7 +144,9 @@ def _patch_session(monkeypatch, record_factory):
         return record_factory(kwargs)
 
     monkeypatch.setattr("factory.importer.run_session_sandboxed", fake)
-    monkeypatch.setattr("factory.importer.seat_token", lambda: "tok")
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "tok"
+                        if service == "factory-zai" else None)
     return captured
 
 

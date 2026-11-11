@@ -95,6 +95,11 @@ from factory.prompts import (
     assemble_verifier_prompt,
     prompt_versions,
 )
+from factory.provider import (
+    ProviderError,
+    resolve_provider,
+    run_secrets,
+)
 from factory.publish import (
     GIT_NET_ENV,
     PublishError,
@@ -126,13 +131,11 @@ from factory.sandbox import (
     write_settings,
 )
 from factory.session import (
-    DEFAULT_BASE_URL,
     SessionRecord,
     parse_scope_requests,
     probe_session_interpreter,
     run_session_sandboxed,
     run_sessions_parallel,
-    seat_token,
 )
 from factory.state import (
     ELIGIBLE_KINDS,
@@ -161,10 +164,13 @@ __all__ = [
 SessionRunner = Callable[..., SessionRecord]
 OpenPR = Callable[[PullRequest], str]
 
-# A failed session whose reason names HTTP 429, a rate limit or a quota.
-# (?<!\d)429(?!\d), not \b429\b: the runner's reason is "api_error_429",
-# and "_" is a word character.
-_QUOTA = re.compile(r"(?<!\d)429(?!\d)|rate[ _-]?limit|quota", re.IGNORECASE)
+# A failed session whose reason names HTTP 429, a rate limit, a quota or
+# a provider throttle (F-59: Bedrock's ThrottlingException — so F-64's
+# quota requeue still works on the SAME provider, never as a fallback to
+# another one). (?<!\d)429(?!\d), not \b429\b: the runner's reason is
+# "api_error_429", and "_" is a word character.
+_QUOTA = re.compile(
+    r"(?<!\d)429(?!\d)|rate[ _-]?limit|quota|throttl", re.IGNORECASE)
 
 # L0 escalation classes, most severe first (one escalation per attempt).
 # credential_added leads: the model provider saw the token (rotate it), and
@@ -435,7 +441,12 @@ def _gate_settings(profile: dict, clean: RunDir, factory_root: Path) -> None:
     host loopback port (see build_settings' docstring).
     """
     settings = build_settings(
-        profile, clean.root, model_endpoint=DEFAULT_BASE_URL,
+        profile, clean.root,
+        # F-59: the project's own provider hosts (zai for a self project).
+        # The gate env carries no credential, so the entry is inert here -
+        # it joins the allowlist only because build_settings always adds
+        # the model endpoint.
+        model_endpoint=resolve_provider(profile, None).egress_hosts,
         factory_root=factory_root,
         local_binding=bool((profile.get("sandbox") or {}).get("allow_local_binding")),
     )
@@ -570,6 +581,65 @@ def _tokens(record: SessionRecord | None, key: str) -> int:
     usage = (record.tokens if record else None) or {}
     value = usage.get(key) or 0
     return int(value) if isinstance(value, (int, float)) else 0
+
+
+def _attempt_usage(records) -> "dict | None":
+    """The F-59 AC-4 usage block summed over an attempt's records.
+
+    Session-REPORTED telemetry (validated at the record boundary by
+    ``record_field_error`` / ``_usage_counts``): non-negative ints only.
+    Any unknown count makes its total unknown — None, never 0 — and a
+    round whose records reported no usage at all omits the block (the
+    stub-runner and pre-F-59 shapes). It drives no decision."""
+    blocks = [getattr(r, "usage", None) for r in records or []
+              if r is not None]
+    if not blocks or all(block is None for block in blocks):
+        return None
+    total: dict = {}
+    for key in ("input", "cache_read", "cache_write", "output"):
+        values = [(block or {}).get(key) for block in blocks]
+        if any(v is None for v in values):
+            total[key] = None
+        else:
+            known = [v for v in values if v is not None]
+            total[key] = sum(known)
+    return total
+
+
+def _attempt_provider_usage(records, primary: dict) -> "list[dict]":
+    """The R1-5 per-(kind, model) usage breakdown over an attempt's
+    records: each record's usage is attributed to its own
+    PARENT-STAMPED provider (the spec's record the F-59 transport
+    stamps — never a field the session can influence in a real run); a
+    record with none (stub seats, pre-F-59 records) attributes to the
+    attempt's primary provider. Telemetry only, like the totals."""
+    groups: "dict[tuple[str, str], dict]" = {}
+    order: "list[tuple[str, str]]" = []
+    for record in records or []:
+        if record is None:
+            continue
+        block = getattr(record, "provider", None)
+        if isinstance(block, dict) and block.get("kind"):
+            kind = str(block["kind"])
+            model = str(block.get("model") or "?")
+        else:
+            kind = str(primary.get("kind"))
+            model = str(primary.get("model") or "?")
+        key = (kind, model)
+        if key not in groups:
+            groups[key] = {name: 0 for name in
+                           ("input", "cache_read", "cache_write", "output")}
+            order.append(key)
+        usage = getattr(record, "usage", None) or {}
+        for name in groups[key]:
+            value = usage.get(name)
+            if value is None or isinstance(value, bool) \
+                    or not isinstance(value, int) or value < 0:
+                groups[key][name] = None  # unknown poisons its column
+            elif groups[key][name] is not None:
+                groups[key][name] += value
+    return [{"kind": kind, "model": model, "usage": groups[(kind, model)]}
+            for kind, model in order]
 
 
 def _session_turns(record) -> int:
@@ -2082,7 +2152,8 @@ def _sweep_stale_prs(
                         clean.root, clean.settings_path,
                         srt_bin_path=srt_bin_path,
                         on_escapee=_sweep_trace_sink(
-                            factory_root, project, work.run_id, task_id),
+                            factory_root, project, work.run_id, task_id,
+                            profile=profile),
                     )
                     live = queue.get(task_id)
                     l0 = run_l0(profile, clean.root, default_sha, merged_sha,
@@ -2144,20 +2215,24 @@ def _sweep_stale_prs(
 
 
 def _sweep_trace_sink(
-    factory_root: Path, project: str, run_id: str, task_id: str
+    factory_root: Path, project: str, run_id: str, task_id: str,
+    profile: dict | None = None,
 ) -> "Callable[[dict], None]":
     """A trace sink for the stale-PR sweep's gate runner (F-47, I-9).
 
     The sweep runs L0/L1 outside any attempt, so no :class:`TraceWriter`
     exists for it; the writer is created on the first event (an escapee
     is the only thing this sink is handed), so a clean sweep leaves no
-    trace file behind."""
+    trace file behind. F-59: the literal secrets are every provider
+    token the profile's run would hold (:func:`factory.provider.
+    run_secrets`) — a Bedrock project's sweep scrubs its own token."""
     writer: list[TraceWriter] = []
+    secrets = run_secrets(profile or {})
 
     def sink(event: dict) -> None:
         if not writer:
             writer.append(TraceWriter(factory_root, project, run_id, task_id,
-                                      extra_secrets=(seat_token() or "",)))
+                                      extra_secrets=secrets))
         writer[0].append(event)
 
     return sink
@@ -2345,12 +2420,26 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
     # the flag resets with every round.
     round_attempt_landed = False
 
+    # F-59: the attempt's provider record comes from the PARENT's
+    # resolver — the implementer seat's spec — resolved once, before any
+    # session or run dir exists. A profile whose provider cannot run
+    # here (vertex today) refuses as an environment failure that spends
+    # no attempt, with the reason named.
+    try:
+        provider_record = resolve_provider(
+            profile, "implementer").provider_record()
+    except ProviderError as exc:
+        raise RunError(f"the project's provider cannot run here: {exc}") \
+            from exc
+
     work = create_run(project, source, factory_root=ctx.factory_root, ref=default_branch)
     # F-43: the run's egress secrets — every literal this run holds that
-    # session text must never carry out (the seat token today; F-59 adds
-    # per-provider credentials). One tuple feeds the trace writer AND the
-    # egress seam below, so no channel scrubs a different set.
-    egress_secrets = (seat_token() or "",)
+    # session text must never carry out. F-59: that is every provider
+    # token the profile's seats resolve to (the project's kind plus each
+    # seat override's — one resolver helper, not five copies). One tuple
+    # feeds the trace writer AND the egress seam below, so no channel
+    # scrubs a different set.
+    egress_secrets = run_secrets(profile)
     # F-30: this run's live trace — one writer per run, appended to as the
     # events happen and never allowed to change the run itself (AC-5's
     # failure policy lives in the writer). The seat token is handed over
@@ -2402,7 +2491,20 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                     getattr(r, "sandbox_bypass_denials", 0) or 0
                     for r in records if r is not None
                 ),
+                # F-59 AC-4: the attempt's provider record — from the
+                # PARENT's resolver, never a session's claim — and the
+                # summed session-reported usage (validated; unknown
+                # counts stay unknown). Never a credential.
+                "provider": provider_record,
             }
+            usage = _attempt_usage(records)
+            if usage is not None:
+                record["token_usage"] = usage
+            # R1-5: the per-(kind, model) breakdown — a reviewer on
+            # another provider or model is never priced under the
+            # implementer's kind+model.
+            record["provider_usage"] = _attempt_provider_usage(
+                records, provider_record)
             models = [f"{r.seat}={r.model}" for r in records if r and r.model]
             if models:
                 record["model"] = " ".join(models)

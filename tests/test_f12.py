@@ -690,7 +690,9 @@ def _forbid_in_process_session(monkeypatch):
 
     monkeypatch.setattr("factory.session.run_session", in_process)
     monkeypatch.setattr("factory.importer.run_session", in_process, raising=False)
-    monkeypatch.setattr("factory.importer.seat_token", lambda: "tok")
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "tok"
+                        if service == "factory-zai" else None)
 
 
 def test_default_import_session_runs_sandboxed_never_in_process(

@@ -138,6 +138,13 @@ from claude_agent_sdk import (
 from claude_agent_sdk import query as sdk_query
 
 from factory.egress import check_secrets, scrub_session_text
+from factory.provider import (
+    ProviderError,
+    anthropic_family_env,
+    keychain_service,
+    provider_token,
+    resolve_provider,
+)
 from factory.runs import (
     FACTORY_ROOT_DEFAULT,
     GIT_HARDENING,
@@ -168,9 +175,12 @@ from factory.vent import (
     vent_server,
 )
 
-DEFAULT_BASE_URL = "https://api.z.ai/api/anthropic"
 DEFAULT_TIMEOUT_MS = 600_000
-KEYCHAIN_SERVICE = "factory-zai"
+# F-59: the provider constants live in factory.provider (the ONE
+# resolver, imported with the package imports above).
+# KEYCHAIN_SERVICE stays as the zai-kind item name every refusal
+# message names.
+KEYCHAIN_SERVICE = keychain_service("zai")
 # The pinned SDK version (pyproject pins claude-agent-sdk exactly); used
 # in refusal messages so the fix names the pin to reinstall.
 _SDK_VERSION = importlib.metadata.version("claude-agent-sdk")
@@ -657,57 +667,50 @@ def _window_environ(seat_env: dict[str, str]) -> dict[str, str]:
 
 
 def session_env(base_url: str, token: str, timeout_ms: int) -> dict[str, str]:
-    """The session env: exactly the three Z.ai seat names.
+    """The Anthropic-family session env: exactly the three seat names.
 
-    Deliberately literal — this function reads nothing from the ambient
-    environment, so no GitHub token, keychain secret or inherited
-    ``ANTHROPIC_*`` value can appear in a session by construction.
+    F-59: the builder itself lives in :mod:`factory.provider`
+    (``anthropic_family_env`` — the ONE resolver owns every provider's
+    literal env); this delegate keeps the name the F-06 contract tests
+    and callers import. Deliberately literal — nothing here reads the
+    ambient environment, so no GitHub token, keychain secret or
+    inherited ``ANTHROPIC_*`` value can appear in a session by
+    construction.
     """
-    return {
-        "ANTHROPIC_BASE_URL": base_url,
-        "ANTHROPIC_AUTH_TOKEN": token,
-        "API_TIMEOUT_MS": str(int(timeout_ms)),
-    }
+    return anthropic_family_env(base_url, token, timeout_ms)
 
 
 def seat_token() -> str | None:
     """The Z.ai model token, or None where no credential exists.
 
-    Lookup order: the macOS keychain item ``factory-zai`` (the production
-    path per DESIGN D2), then the ambient ``ANTHROPIC_AUTH_TOKEN`` — but
-    only when the ambient ``ANTHROPIC_BASE_URL`` names the Z.ai endpoint:
-    a token exported for another provider (or with no base URL, i.e.
-    api.anthropic.com) belongs to that provider and must never be sent to
-    Z.ai. On the Linux CI runner neither exists and this returns None,
-    which callers must treat as "no session can authenticate here".
+    F-59: the lookup itself lives in :func:`factory.provider.provider_token`
+    (the ONE resolver's per-kind credential rule); this delegate keeps
+    the name the F-06 contract tests import. Rule, unchanged: the macOS
+    keychain item ``factory-zai`` first (the production path per DESIGN
+    D2), then the ambient ``ANTHROPIC_AUTH_TOKEN`` — but only when the
+    ambient ``ANTHROPIC_BASE_URL`` names the Z.ai endpoint: a token
+    exported for another provider (or with no base URL, i.e.
+    api.anthropic.com) belongs to that provider and must never be sent
+    to Z.ai. On the Linux CI runner neither exists and this returns
+    None, which callers must treat as "no session can authenticate
+    here".
     """
-    keychain = _keychain_token()
-    if keychain is not None:
-        return keychain
-    ambient_url = os.environ.get("ANTHROPIC_BASE_URL", "").rstrip("/")
-    if ambient_url != DEFAULT_BASE_URL:
-        return None
-    return os.environ.get("ANTHROPIC_AUTH_TOKEN") or None
+    return provider_token("zai")
 
 
-def _keychain_token() -> str | None:
-    """The ``factory-zai`` keychain item's secret, or None where absent.
+def _keychain_token(service: str = KEYCHAIN_SERVICE) -> str | None:
+    """The ``service`` keychain item's secret, or None where absent.
 
-    Its own function so tests can stub the keychain step and exercise the
-    env-fallback rules hermetically on a Mac that has the item.
+    F-59: per-kind keychain lookup (``factory-<kind>``) — the
+    implementation moved to the resolver
+    (:func:`factory.provider._keychain_token`); this delegate keeps the
+    seam the F-06 tests stub. Its own function so tests can stub the
+    keychain step and exercise the env-fallback rules hermetically on a
+    Mac that has the item.
     """
-    try:
-        proc = subprocess.run(
-            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None  # no macOS keychain here (or it hung) — try the env
-    if proc.returncode == 0 and proc.stdout.strip():
-        return proc.stdout.strip()
-    return None
+    from factory import provider as _provider
+
+    return _provider._keychain_token(service)
 
 
 # ----------------------------------------------------------------- hooks --
@@ -1162,8 +1165,9 @@ def build_options(
     cwd: Path,
     max_turns: int,
     *,
-    base_url: str,
-    token: str,
+    env: "Mapping[str, str] | None" = None,
+    base_url: str | None = None,
+    token: str | None = None,
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
     protected: "Sequence[str]" = (),
     cli_path: Path | None = None,
@@ -1218,9 +1222,26 @@ def build_options(
     attempt accounting.
     """
     seat_config = _seat(seat)
+    # F-59: the resolver's literal env when the caller resolved a
+    # provider (every sandboxed seat), else the EXPLICIT Anthropic-family
+    # base_url (the in-process/test shape; token may be empty for a fake
+    # run that spawns no subprocess - the real entry point refused
+    # earlier when no credential exists). No default URL: a caller that
+    # names neither has no provider to run, and build_options never
+    # picks one itself.
+    if env is None and base_url is None:
+        raise SessionConfigError(
+            "build_options needs the resolved provider env (F-59 "
+            "factory.provider) or the Anthropic-family base_url - it "
+            "never picks a provider itself"
+        )
+    seat_env = (
+        dict(env) if env is not None
+        else session_env(base_url or "", token or "", timeout_ms)
+    )
     options = ClaudeAgentOptions(
         cwd=str(Path(cwd)),
-        env=session_env(base_url, token, timeout_ms),
+        env=seat_env,
         max_turns=max_turns,
         system_prompt=system_prompt
         if system_prompt is not None
@@ -1359,6 +1380,18 @@ class SessionRecord:
     # them — the record is session-written, so the field is bounds-and-
     # shape checked, never trusted.
     scope_requests: list[dict[str, Any]] = field(default_factory=list)
+    # F-59 AC-4: the provider record ({kind, model, region |
+    # endpoint_host}) and the session-REPORTED token usage ({input,
+    # cache_read, cache_write, output}). The provider field is RE-STAMPED
+    # by the parent's resolver spec on every path a record leaves
+    # ``_run_prepared`` (R2-1): the in-sandbox carry sets the initial
+    # value, but the record file is session-writable, so the parent's
+    # overwrite is the fact. The usage
+    # counts are telemetry like num_turns since F-64: validated
+    # (non-negative ints; else unknown), never driving a decision.
+    # NEVER a credential on either field (asserted by test_f59).
+    provider: dict[str, Any] | None = None
+    usage: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1444,6 +1477,24 @@ def record_field_error(record: SessionRecord) -> str | None:
         return bad("permission_denials",
                    f"a {type(record.permission_denials).__name__}, not a "
                    "list")
+    # F-59 AC-4: provider/usage are dict-or-None; usage counts are the
+    # F-64 telemetry rule (non-bool non-negative ints or None - a
+    # forged count renders unknown downstream, never raw, never 0).
+    if record.provider is not None and not isinstance(record.provider, dict):
+        return bad("provider",
+                   f"a {type(record.provider).__name__}, not an object")
+    if record.usage is not None and not isinstance(record.usage, dict):
+        return bad("usage", f"a {type(record.usage).__name__}, not an object")
+    if isinstance(record.usage, dict):
+        for name in ("input", "cache_read", "cache_write", "output"):
+            value = record.usage.get(name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) \
+                    or value < 0:
+                return bad(f"usage.{name}",
+                           f"a {type(value).__name__}, not a non-negative "
+                           "integer")
     return None
 
 
@@ -1577,6 +1628,29 @@ def _failure_reason(message: ResultMessage) -> str:
     return message.subtype or "is_error"
 
 
+def _usage_counts(usage: Any) -> "dict[str, Any] | None":
+    """The F-59 AC-4 usage block out of the SDK's usage dict:
+    ``{input, cache_read, cache_write, output}``, each a validated
+    non-negative int or None (unknown) - the F-64 telemetry rule, so a
+    forged or unparsable count renders unknown downstream, never 0 and
+    never raw. None when the SDK reported nothing."""
+    if not isinstance(usage, dict):
+        return None
+    def count(name: str) -> Any:
+        value = usage.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) \
+                or value < 0:
+            return None
+        return value
+    block = {
+        "input": count("input_tokens"),
+        "cache_read": count("cache_read_input_tokens"),
+        "cache_write": count("cache_creation_input_tokens"),
+        "output": count("output_tokens"),
+    }
+    return block if any(v is not None for v in block.values()) else None
+
+
 def _record_from(
     message: ResultMessage, seat: str, duration_ms: int
 ) -> SessionRecord:
@@ -1594,6 +1668,7 @@ def _record_from(
         model=_primary_model(message.model_usage),
         models=sorted((message.model_usage or {}).keys()),
         tokens=message.usage,
+        usage=_usage_counts(message.usage),
         total_cost_usd=message.total_cost_usd,
         result=message.result,
         permission_denials=getattr(message, "permission_denials", None),
@@ -1784,8 +1859,10 @@ async def run_session(
     timeout_min: float,
     *,
     query_fn: Any = None,
-    base_url: str = DEFAULT_BASE_URL,
+    env: "Mapping[str, str] | None" = None,
+    base_url: str | None = None,
     token: str | None = None,
+    provider: "Mapping[str, Any] | None" = None,
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
     protected: "Sequence[str]" = (),
     cli_path: Path | None = None,
@@ -1814,10 +1891,21 @@ async def run_session(
         query_fn: Injected ``query`` for tests (a fake async generator
             function with the SDK's keyword signature). Default: the real
             ``claude_agent_sdk.query``.
-        base_url/token/timeout_ms: The Z.ai seat env (see
-            :func:`session_env`). ``token`` may be empty for in-process
-            fake runs that spawn no subprocess; the real entry point
-            refuses earlier when no token exists.
+        env/base_url/token/timeout_ms: The seat env. ``env`` is the
+            F-59 resolver's literal provider env (every sandboxed seat);
+            the Anthropic-family ``base_url``/``token`` pair builds the
+            same three names via :func:`session_env` (the in-process/
+            test shape). There is NO default base URL: a caller that
+            names neither has no provider. ``token`` doubles as the
+            scrub secret when ``env`` is given (the credential the env
+            carries); it may be empty for in-process fake runs that
+            spawn no subprocess, and the real entry point refuses
+            earlier when no credential exists.
+        provider: The F-59 provider record stamped on this session's
+            record (kind/model/region-or-endpoint_host, from the parent
+            resolver's spec - never a credential, never the session's
+            own claim: the parent re-stamps ITS attempt fields from ITS
+            resolver regardless).
         protected: Protected-path globs for the hook.
         cli_path: Explicit Claude Code CLI path (inside the sandbox the
             ambient PATH can't be relied on).
@@ -1889,8 +1977,9 @@ async def run_session(
         seat,
         cwd,
         max_turns,
+        env=env,
         base_url=base_url,
-        token=token or "",
+        token=token,
         timeout_ms=timeout_ms,
         protected=protected,
         cli_path=cli_path,
@@ -1935,6 +2024,13 @@ async def run_session(
         # parent validates and escalates; nothing here widens anything.
         if scope_collector is not None:
             record.scope_requests = list(scope_collector.requests)
+        # ...and the provider record (F-59 AC-4): kind/model/region-or-
+        # endpoint_host from the parent resolver's spec, whatever the
+        # outcome. NEVER a credential; and the parent's own attempt
+        # fields come from ITS resolver, not from this record - the
+        # session cannot claim a different provider to any effect.
+        if provider is not None:
+            record.provider = dict(provider)
         return record
 
     result_message: ResultMessage | None = None
@@ -2118,8 +2214,9 @@ def probe_session_interpreter(
     interpreter's own site-packages, not the runner, and that was the
     failing import; and the seat token/base URL, which reach the child
     as env and select no filesystem surface. The endpoint in the
-    settings is :data:`DEFAULT_BASE_URL`, the same default a session
-    gets when no override is passed.
+    settings carry the profile's own provider hosts (the F-59 resolver,
+    ``seat=None`` — zai for a self project), the same hosts a session of
+    that profile gets.
 
     Args:
         profile: The loaded ``project.yaml`` mapping (allowlists).
@@ -2140,7 +2237,8 @@ def probe_session_interpreter(
         run_dir = root / "runs" / "probe" / "sdk-import"
         run_dir.mkdir(parents=True)
         settings = build_settings(
-            profile, run_dir, model_endpoint=DEFAULT_BASE_URL,
+            profile, run_dir,
+            model_endpoint=resolve_provider(profile, None).egress_hosts,
             # _bundled_cli() is a Path here or the probe cannot run at
             # all; the cast keeps the [None] impossible shape typed away.
             toolchain=default_toolchain(
@@ -2178,12 +2276,11 @@ def run_session_sandboxed(
     settings_path: Path | None = None,
     max_turns: int,
     timeout_min: float,
-    base_url: str = DEFAULT_BASE_URL,
+    role: str | None = None,
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
     protected: "Sequence[str]" = (),
     model: str | None = None,
     system_prompt: str | None = None,
-    token: str | None = None,
     cli_path: Path | None = None,
     srt_bin_path: Path | None = None,
     teardown_grace_sec: float = 120.0,
@@ -2223,9 +2320,12 @@ def run_session_sandboxed(
         system_prompt: The assembled seat prompt (F-09) — text, never a
             path: the repo (prompts included) is unreadable inside the
             sandbox, so the orchestrator assembles it outside.
-        token: The Z.ai token; default :func:`seat_token`. None and no
-            credential available → :class:`SessionConfigError` (refuses to
-            start a session that cannot authenticate).
+        The credential is NEVER a parameter (R1-2): the resolver looks
+        it up per kind (keychain ``factory-<kind>``, then the per-kind
+        ambient rule). No credential for the seat's own provider →
+        :class:`SessionConfigError` (refuses to start a session that
+        cannot authenticate — never a fallback to another provider);
+        tests drive the keychain/env seam.
         cli_path: Explicit CLI override (tests). Default: the SDK's
             bundled binary; missing bundle → SessionConfigError rather
             than silently running an unpinned CLI.
@@ -2279,13 +2379,29 @@ def run_session_sandboxed(
             recordless timeout raises, carrying the failure helper's
             facts as a note.
     """
-    token = token if token is not None else seat_token()
-    if not token:
+    # F-59: the ONE resolver decides the provider for this seat (the
+    # profile's own block, or the seat's owner-allowed override) and the
+    # credential that goes with it. NO default URL, NO cross-provider
+    # fallback, and NO caller-supplied raw credential (R1-2: an opaque
+    # token cannot be bound to a kind, so the constructor takes none —
+    # tests drive the keychain/env seam): a client project with no
+    # credential for ITS provider refuses here, naming the provider and
+    # its keychain item.
+    try:
+        spec = resolve_provider(profile, role if role is not None else seat)
+    except ProviderError as exc:
+        raise SessionConfigError(str(exc)) from exc
+    credential = provider_token(spec.kind, base_url=spec.base_url)
+    if not credential:
         raise SessionConfigError(
-            "no Z.ai token available: create the keychain item with "
-            f"`security add-generic-password -s {KEYCHAIN_SERVICE} -w <key>` "
-            "(or run where ANTHROPIC_AUTH_TOKEN is set). The factory refuses "
-            "to start a session that cannot authenticate."
+            f"no {spec.kind} credential available: create the keychain "
+            f"item with `security add-generic-password -s "
+            f"{keychain_service(spec.kind)} -w <key>`"
+            + (" (or run where ANTHROPIC_AUTH_TOKEN names this "
+               "provider's endpoint)" if spec.kind != "bedrock"
+               else " (or run where AWS_BEARER_TOKEN_BEDROCK is set)")
+            + ". The factory refuses to start a session that cannot "
+            "authenticate - and never falls back to another provider."
         )
 
     run_dir = Path(run_dir)
@@ -2333,9 +2449,10 @@ def run_session_sandboxed(
         record = _run_prepared(
             seat, prompt, run_dir, profile, settings_path,
             factory_root=factory_root, max_turns=max_turns,
-            timeout_min=timeout_min, base_url=base_url, timeout_ms=timeout_ms,
+            timeout_min=timeout_min, spec=spec,
+            timeout_ms=timeout_ms,
             protected=protected, model=model, system_prompt=system_prompt,
-            token=token, cli_path=cli_path, srt_bin_path=srt_bin_path,
+            cli_path=cli_path, srt_bin_path=srt_bin_path,
             teardown_grace_sec=teardown_grace_sec,
             read_only=review_guard, writable_roots=reviewer_writable,
             run_id=run_id, task_id=task_id, trace_sink=trace_sink,
@@ -2526,19 +2643,15 @@ def _fanout_sandboxed(
     spanning every session) and the scratch naming are the fan-out's own.
     Per-session artifacts (settings, staged runner, staged toolkit,
     scratch) are removed on every exit path; ``cleanup_run``'s sweep
-    remains the crash backstop for all of them."""
-    token = session_kwargs.get("token")
-    if token is None:
-        token = seat_token()
-        session_kwargs["token"] = token
-    if not token:
-        raise SessionConfigError(
-            "no Z.ai token available: create the keychain item with "
-            f"`security add-generic-password -s {KEYCHAIN_SERVICE} -w <key>` "
-            "(or run where ANTHROPIC_AUTH_TOKEN is set). The factory refuses "
-            "to start a session that cannot authenticate."
-        )
+    remains the crash backstop for all of them.
 
+    F-59: no token is pre-resolved here. Every seat resolves its own
+    provider (the project's, or its owner-allowed override) inside
+    :func:`_run_prepared`, so a fan-out whose seats run different
+    providers carries only each seat's own credential - and a seat with
+    no credential for ITS provider refuses (the first refusal surfaces
+    through ``future.result()``, exactly like the old pre-check, but
+    named for the seat's own provider)."""
     run_dir = Path(run_dir)
     factory_root, base = _derive_settings_path(run_dir, factory_root, settings_path)
     base.parent.mkdir(parents=True, exist_ok=True)
@@ -2615,12 +2728,11 @@ def _run_prepared(
     factory_root: Path | None = None,
     max_turns: int,
     timeout_min: float,
-    base_url: str = DEFAULT_BASE_URL,
+    spec: "Any" = None,
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
     protected: "Sequence[str]" = (),
     model: str | None = None,
     system_prompt: str | None = None,
-    token: str = "",
     cli_path: Path | None = None,
     srt_bin_path: Path | None = None,
     teardown_grace_sec: float = 120.0,
@@ -2642,7 +2754,10 @@ def _run_prepared(
     option threads through exactly once: F-22's ``toolkit=`` (not built
     here) grows this signature, its staging lands beside the runner
     staging below, and both callers pick it up from their ``**kwargs``
-    unchanged.
+    unchanged. F-59: it is also where the seat's PROVIDER is resolved —
+    ``spec`` (already resolved by ``run_session_sandboxed``) or resolved
+    here from the profile for the fan-out's seats, with the credential
+    looked up per kind and the no-credential refusal naming the kind.
 
     ``scratch`` (F-38 review finding 1): the session's own ``(home, tmp)``
     dirs — HOME/TMPDIR/CLAUDE_CODE_TMPDIR point there and the settings'
@@ -2660,6 +2775,34 @@ def _run_prepared(
             "claude-agent-sdk==" + _SDK_VERSION + "`). Sandboxed sessions run "
             "the bundled, version-pinned CLI and never an auto-updating one."
         )
+
+    # F-59: the seat's provider — resolved by the caller (the single-
+    # session path) or here (the fan-out's seats) — and its credential,
+    # looked up by the resolver for THAT spec. No raw-credential
+    # parameter exists (R1-2: an opaque token cannot be bound to a
+    # kind); no credential for the seat's OWN provider is the named
+    # refusal, never a fallback to another provider.
+    if spec is None:
+        try:
+            spec = resolve_provider(profile, seat)
+        except ProviderError as exc:
+            raise SessionConfigError(str(exc)) from exc
+    credential = provider_token(spec.kind, base_url=spec.base_url) or ""
+    if not credential:
+        raise SessionConfigError(
+            f"no {spec.kind} credential available: create the keychain "
+            f"item with `security add-generic-password -s "
+            f"{keychain_service(spec.kind)} -w <key>` — the factory refuses "
+            "to start a session that cannot authenticate, and never falls "
+            "back to another provider (F-59)."
+        )
+    seat_env = spec.env(credential, timeout_ms)
+    # F-59 AC-5: the seat's model — the project's provider.models map for
+    # this role (an explicit override still wins; none has meant "the
+    # CLI default", which stays the shape for a self project with no
+    # provider block).
+    if model is None:
+        model = spec.model
 
     runner_dir = _stage_runner(settings_path.with_name(settings_path.name + "-runner"))
     # F-56: the record file's dir — fresh for THIS session (a fan-out
@@ -2695,7 +2838,14 @@ def _run_prepared(
                 "cwd": str(run_dir),
                 "max_turns": max_turns,
                 "timeout_min": timeout_min,
-                "base_url": base_url,
+                # F-59: the provider travels as NAMES and the record
+                # block — never the credential VALUE (the token rides
+                # the sandbox env, not this file, which the session can
+                # read). The in-sandbox entry rebuilds the literal env
+                # from exactly these keys.
+                "env_keys": list(spec.env_keys),
+                "credential_key": spec.credential_key,
+                "provider": spec.provider_record(),
                 "timeout_ms": timeout_ms,
                 "protected": list(protected),
                 "model": model,
@@ -2724,7 +2874,7 @@ def _run_prepared(
     settings = build_settings(
         profile,
         run_dir,
-        model_endpoint=base_url,
+        model_endpoint=spec.egress_hosts,
         factory_root=factory_root,
         toolchain=default_toolchain(extra=[cli]),
         allow_read=allow_read,
@@ -2741,11 +2891,7 @@ def _run_prepared(
             [sys.executable, "-c", _entry_bootstrap(runner_dir), str(spec_path)],
             run_dir,
             settings_path,
-            env={
-                "ANTHROPIC_AUTH_TOKEN": token,
-                "ANTHROPIC_BASE_URL": base_url,
-                "API_TIMEOUT_MS": str(int(timeout_ms)),
-            },
+            env=seat_env,
             timeout=timeout_min * 60.0 + teardown_grace_sec,
             srt_bin_path=srt_bin_path,
             scratch=scratch,
@@ -2756,13 +2902,13 @@ def _run_prepared(
             # forwarder ignores (transport can only lose events, never
             # crash a run; the file is the one record).
             on_stdout_line=(
-                trace_line_forwarder(trace_sink, secret=token)
+                trace_line_forwarder(trace_sink, secret=credential)
                 if trace_sink is not None else None
             ),
         )
     except subprocess.TimeoutExpired as exc:
         _report_escapee(seat, exc, True, trace_sink, run_dir, factory_root,
-                        run_id, task_id, token)
+                        run_id, task_id, credential)
         # The outer wall clock fired. The record file is still read
         # first: a session that finished and delivered its record before
         # the runner hung (teardown, a straggler in the drain) is a
@@ -2770,6 +2916,9 @@ def _run_prepared(
         # completed session, whatever happened to the process around it.
         saved_record = _read_record_quietly(record_path)
         if saved_record is not None:
+            # R2-1: the timeout path re-stamps the same way — the parent
+            # owns the provider fact whatever the file claims.
+            saved_record.provider = spec.provider_record()
             # Review round 1 (the classify item): the record is USED but
             # never silently — one event names the fact, so a record that
             # only exists because the runner hung (and the file was
@@ -2786,10 +2935,10 @@ def _run_prepared(
         # session text to any new callee (the F-43 AC-6 tripwire).
         out_text = exc.output if isinstance(exc.output, str) else ""
         err_text = exc.stderr if isinstance(exc.stderr, str) else ""
-        tail = scrub_session_text(err_text, (token,))[:RECORD_STDERR_TAIL_CHARS]
+        tail = scrub_session_text(err_text, (credential,))[:RECORD_STDERR_TAIL_CHARS]
         saved = _save_session_stdout(
             out_text, run_dir, factory_root,
-            secrets=(token,), stderr=err_text,
+            secrets=(credential,), stderr=err_text,
         )
         exc.add_note(_record_failure_text(
             "the sandboxed session entry was killed at the orchestrator's "
@@ -2799,9 +2948,18 @@ def _run_prepared(
         ))
         raise
     _report_escapee(seat, proc, False, trace_sink, run_dir, factory_root,
-                    run_id, task_id, token)
+                    run_id, task_id, credential)
 
-    return _read_record(record_path, proc, run_dir, factory_root, token)
+    record = _read_record(record_path, proc, run_dir, factory_root,
+                          credential)
+    # R2-1: the parent RE-STAMPS the provider from ITS resolver's spec on
+    # every path that returns a record — the record file is
+    # session-writable, so its provider claim is evidence of nothing;
+    # usage stays session-reported telemetry (validated), but WHO ran is
+    # the parent's fact. Covers the single session and every fan-out
+    # seat (they all return through here).
+    record.provider = spec.provider_record()
+    return record
 
 
 def _open_record_once(path: Path) -> "tuple[str | None, str | None]":
@@ -3117,9 +3275,11 @@ def _save_session_stdout(
 
 
 # python -c <bootstrap> <spec.json> — the in-sandbox entry point (see
-# :func:`_entry_bootstrap` / :func:`_stage_runner`). The Z.ai token arrives
-# via the environment (the orchestrator's run_sandboxed call); everything
-# else is in the spec file.
+# :func:`_entry_bootstrap` / :func:`_stage_runner`). The provider
+# credential arrives via the environment (the orchestrator's
+# run_sandboxed call, built by the F-59 resolver); everything else —
+# including the env NAMES, never the credential value — is in the spec
+# file.
 def _main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if len(argv) != 1:
@@ -3127,12 +3287,33 @@ def _main(argv: list[str] | None = None) -> int:
         return 2
     try:
         spec = json.loads(Path(argv[0]).read_text())
-        token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
-        if not token:
+        # F-59: the provider env arrives as NAMES in the spec (never the
+        # credential value - the file is session-readable) and VALUES in
+        # the sandbox env. Only these exact keys are read: nothing
+        # ambient crosses, whatever else the environment holds.
+        env_keys: list[str] = [
+            str(key) for key in (spec.get("env_keys") or []) if key
+        ]
+        credential_key = str(spec.get("credential_key") or "")
+        if not env_keys or not credential_key:
             raise SessionConfigError(
-                "no ANTHROPIC_AUTH_TOKEN in the environment — the orchestrator "
-                f"passes the Z.ai token via the sandbox env (keychain item "
-                f"{KEYCHAIN_SERVICE!r})"
+                "the spec names no env_keys/credential_key — the "
+                "orchestrator and the staged runner disagree on the F-59 "
+                "provider transport; re-stage the runner (the factory "
+                "package copies itself per session, so both halves "
+                "always match)"
+            )
+        env = {
+            key: os.environ[key]
+            for key in env_keys
+            if os.environ.get(key)
+        }
+        credential = env.get(credential_key, "")
+        if not credential:
+            raise SessionConfigError(
+                f"no {credential_key} in the environment — the "
+                "orchestrator passes the provider credential via the "
+                "sandbox env (keychain item per provider kind)"
             )
         if not spec.get("record_path"):
             raise SessionConfigError(
@@ -3158,7 +3339,7 @@ def _main(argv: list[str] | None = None) -> int:
                 project=propose_cfg["project"],
                 schema=propose_cfg["schema"],
                 record_paths=tuple(propose_cfg.get("record_paths") or ()),
-                secrets=(token,),
+                secrets=(credential,),
                 scratch_dir=scratch,
             )
         record = asyncio.run(
@@ -3168,8 +3349,8 @@ def _main(argv: list[str] | None = None) -> int:
                 Path(spec["cwd"]),
                 spec["max_turns"],
                 spec["timeout_min"],
-                base_url=spec.get("base_url") or DEFAULT_BASE_URL,
-                token=token,
+                env=env,
+                token=credential,
                 timeout_ms=spec.get("timeout_ms") or DEFAULT_TIMEOUT_MS,
                 protected=spec.get("protected") or (),
                 model=spec.get("model"),
@@ -3178,6 +3359,10 @@ def _main(argv: list[str] | None = None) -> int:
                 run_id=spec.get("run_id"),
                 task_id=spec.get("task_id"),
                 toolkit=spec.get("toolkit"),
+                # F-59 AC-4: the provider record travels in the spec
+                # (parent-written), stamps the session record, and never
+                # carries a credential.
+                provider=spec.get("provider"),
                 # F-30: tool_call events ride stdout as prefixed lines;
                 # the orchestrator's on_stdout_line callback appends them
                 # to the trace (the trace path is not writable in here).

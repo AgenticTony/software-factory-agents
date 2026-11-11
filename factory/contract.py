@@ -32,6 +32,7 @@ import re
 import tomllib
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import jsonschema
 import yaml
@@ -920,6 +921,197 @@ _ALLOWLIST_LABEL = r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
 _ALLOWLIST_HOST_RE = re.compile(rf"{_ALLOWLIST_LABEL}(\.{_ALLOWLIST_LABEL})+")
 
 
+# F-59: region shapes, pattern-checked so a region is never free text
+# interpolated into a host. Bedrock: the AWS partition shape
+# (eu-north-1, us-gov-west-1, il-central-1). Vertex: the cloud-region
+# shape (us-east5, europe-west1, asia-south2) plus the three specials
+# the pinned CLI's URL builder names (global, us, eu).
+_PROVIDER_REGION_RES: dict[str, re.Pattern[str]] = {
+    "bedrock": re.compile(r"^[a-z]{2}(-gov)?(-[a-z]+)+-\d$"),
+    "vertex": re.compile(r"^[a-z]+(-[a-z]+)*\d$|^(global|us|eu)$"),
+}
+_REGION_KINDS = ("bedrock", "vertex")
+_BASE_URL_KIND = "anthropic_compatible"
+
+
+def _provider_field_error(kind: str, block: dict, *, seat: str | None,
+                          origin: str) -> str | None:
+    """Why one provider block (the project's own, or a seat override)
+    cannot stand — the field-named refusal F-59 AC-1 requires."""
+    who = "provider" if seat is None else f"seat_providers.{seat}"
+    region = block.get("region")
+    base_url = block.get("base_url")
+    if kind in _REGION_KINDS and not region:
+        return (f"{who}.region is required for kind {kind!r} — the "
+                "inference host is derived from it and the factory "
+                "refuses to guess a region")
+    if kind not in _REGION_KINDS and region is not None:
+        return (f"{who}.region is refused for kind {kind!r}: only "
+                f"{list(_REGION_KINDS)} derive their endpoint from a "
+                "region")
+    if kind == _BASE_URL_KIND and not base_url:
+        return (f"{who}.base_url is required for kind {kind!r} — the "
+                "endpoint is the project's own choice, not a default")
+    if kind != _BASE_URL_KIND and base_url is not None:
+        return (f"{who}.base_url is allowed only with kind "
+                f"{_BASE_URL_KIND!r}, not {kind!r}")
+    if region is not None:
+        pattern = _PROVIDER_REGION_RES[kind]
+        if not pattern.fullmatch(str(region)):
+            return (f"{who}.region {region!r} is not a valid {kind} "
+                    "region (pattern-checked: a region is never free "
+                    "text that could reach a host)")
+    if base_url is not None:
+        problem = _provider_base_url_error(str(base_url))
+        if problem is not None:
+            return f"{who}.base_url {base_url!r} {problem}"
+    return None
+
+
+def _provider_base_url_error(base_url: str) -> str | None:
+    """Why ``base_url`` cannot be an anthropic_compatible endpoint."""
+    from factory.provider import model_host_owner
+
+    parts = urlsplit(base_url)
+    if parts.scheme != "https":
+        return "must be https:// (the endpoint carries the provider token)"
+    if parts.username or parts.password:
+        return "must carry no userinfo (user:password@ is not an endpoint)"
+    if parts.query or parts.fragment:
+        return "must carry no query or fragment"
+    host = parts.hostname or ""
+    if host == "localhost" or host.endswith(".localhost"):
+        return "must not name localhost"
+    if (not _ALLOWLIST_HOST_RE.fullmatch(host)
+            or host.rsplit(".", 1)[-1].isdigit()):
+        return ("must be one exact DNS host (the F-63 exact-host rule: "
+                "no wildcard, IP literal, port, path or padding)")
+    # R1-1: the HOST is the control, not the kind label — an
+    # anthropic_compatible alias of a known model provider's host is the
+    # "client source reaches the unapproved provider" path. Name the
+    # owner and the right kind for it; refuse for every data_owner (a
+    # self project has no reason to alias its own or another provider
+    # either).
+    owner = model_host_owner(host)
+    if owner is not None:
+        return (f"names {host!r}, a {owner}-owned model host — use kind "
+                f"{owner!r} for that provider (the anthropic_compatible "
+                "kind is for endpoints NO known provider family owns)")
+    return None
+
+
+def _check_provider_semantics(data: dict, origin: str) -> None:
+    """F-59: the provider choice is load-refused prose-and-steel.
+
+    Every rule here is the front half of the WO's goal — the owner
+    approves the provider — made mechanical at load: a client project
+    with no provider, or with zai, refuses; region/base_url presence and
+    shapes are per kind; a seat override only from providers_allowed;
+    and no allowlist entry names another provider's model host (or a
+    client repo's network_allowlist would reopen Z.ai). The approval
+    half is the F-63 group hash (data_owner / provider /
+    providers_allowed / seat_providers); this check only decides
+    whether the content can stand at all."""
+    from factory.provider import (
+        bedrock_runtime_host,
+        model_host_owner,
+        vertex_hosts,
+    )
+
+    owner = data.get("data_owner", "self")
+    block = data.get("provider")
+    allowed = data.get("providers_allowed") or []
+    seats = data.get("seat_providers") or {}
+
+    if owner == "client" and not isinstance(block, dict):
+        raise ContractError(
+            f"{origin}: a client project (data_owner: client) must "
+            "declare an explicit provider block — client source may not "
+            "reach the default Z.ai endpoint (F-59); name the owner-"
+            "approved provider in project.yaml"
+        )
+    if isinstance(block, dict):
+        kind = block.get("kind")
+        if owner == "client" and kind == "zai":
+            raise ContractError(
+                f"{origin}: provider.kind is zai on a client project — "
+                "client source may not go to the Z.ai endpoint (no DPA, "
+                "processing outside the EU, a consumer plan); F-59 "
+                "refuses the load"
+            )
+        error = _provider_field_error(str(kind), block, seat=None,
+                                      origin=origin)
+        if error is not None:
+            raise ContractError(f"{origin}: {error} (F-59)")
+        models = block.get("models")
+        if not isinstance(models, dict) or not models:
+            raise ContractError(
+                f"{origin}: provider.models is required — one model id "
+                "per seat (implementer, reviewer, verifier, importer); "
+                "the schema types the map"
+            )
+    if owner == "client" and "zai" in allowed:
+        raise ContractError(
+            f"{origin}: providers_allowed names zai on a client project "
+            "— no seat of a client project may reach the Z.ai endpoint "
+            "(F-59)"
+        )
+    for seat, entry in seats.items():
+        if not isinstance(entry, dict):
+            continue  # the schema types the block
+        kind = str(entry.get("kind"))
+        if kind not in allowed:
+            raise ContractError(
+                f"{origin}: seat_providers.{seat} names provider "
+                f"{kind!r} which is not in the project's "
+                f"providers_allowed {allowed!r} — a seat runs the "
+                "project's provider or one the owner allowed (F-59 AC-5)"
+            )
+        error = _provider_field_error(kind, entry, seat=str(seat),
+                                      origin=origin)
+        if error is not None:
+            raise ContractError(f"{origin}: {error} (F-59)")
+    # "No other model endpoint" (AC-3): an egress allowlist entry naming
+    # a model host that is not EXACTLY one of the project's own (or a
+    # seat override's) inference hosts refuses — otherwise a client
+    # repo's allowlist reopens Z.ai, and a same-kind entry would reopen
+    # another REGION (a data-residency hole, not a convenience).
+    own_hosts: set[str] = set()
+    for block in [block if isinstance(block, dict) else {},
+                  *(e for e in seats.values() if isinstance(e, dict))]:
+        kind = str(block.get("kind") or "")
+        region = block.get("region")
+        base_url = block.get("base_url")
+        if kind == "zai":
+            own_hosts.add("api.z.ai")
+        elif kind == "anthropic":
+            own_hosts.add("api.anthropic.com")
+        elif kind == "bedrock" and region:
+            own_hosts.add(bedrock_runtime_host(str(region)))
+        elif kind == "vertex" and region:
+            own_hosts.update(vertex_hosts(str(region)))
+        elif kind == "anthropic_compatible" and base_url:
+            own_hosts.add(urlsplit(str(base_url)).hostname or "")
+    for key in ("network_allowlist", "docs_allowlist"):
+        for entry in data.get(key) or []:
+            if not isinstance(entry, str):
+                continue
+            provider_kind = model_host_owner(entry)
+            if provider_kind is None:
+                continue
+            if entry in own_hosts:
+                continue
+            raise ContractError(
+                f"{origin}: {key} entry {entry!r} is a model-provider "
+                f"host of kind {provider_kind!r}, not this project's "
+                "own inference host — the sandbox allowlist is the "
+                "egress boundary of a session holding the provider "
+                "token, and a client repo may not reopen another model "
+                "endpoint (or another region of its own kind) through "
+                "it (F-59 AC-3)"
+            )
+
+
 def _check_allowlist_hosts(data: dict, origin: str) -> None:
     """Refuse any network/docs allowlist entry that is not one exact
     lowercase DNS host (F-63 AC-3).
@@ -963,6 +1155,7 @@ def _check_profile_semantics(data: dict, origin: str, *,
     Raises:
         ContractError: On the first semantic violation found.
     """
+    _check_provider_semantics(data, origin)
     sentinels = data.get("sentinels") or {}
     risk_globs = (data.get("paths") or {}).get("risk") or {}
     for flag, entries in sentinels.items():

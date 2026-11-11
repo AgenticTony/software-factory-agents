@@ -117,6 +117,13 @@ from factory.contract import (
     validate_queue,
 )
 from factory.egress import check_secrets, scrub_session_text, scrub_session_value
+from factory.provider import (
+    ProviderError,
+    keychain_service,
+    provider_token,
+    resolve_provider,
+    run_secrets,
+)
 from factory.runs import (
     FACTORY_ROOT_DEFAULT,
     GIT_HARDENING,
@@ -134,7 +141,6 @@ from factory.session import (
     SessionRecord,
     SessionRecordError,
     run_session_sandboxed,
-    seat_token,
 )
 from factory.state import (
     RunInProgressError,
@@ -2175,10 +2181,14 @@ def _repair_refused_proposal(
                 workspace, profile,
                 factory_root=root, settings_path=run.settings_path,
                 max_turns=r_turns, timeout_min=r_timeout,
+                # F-59/R1-2: the reviewer SEAT config with the importer
+                # ROLE's provider + model; the credential is looked up
+                # by the resolver for THAT spec inside the constructor —
+                # never passed raw, never crossed between kinds.
+                role="importer",
                 protected=list(
                     (profile.get("paths") or {}).get("protected") or []
                 ),
-                token=next((s for s in secrets if s), None),
                 run_id=run_id,
                 # F3 (review round 1): the settings half of "no doc
                 # re-reading" — the source repo and its docs dir are
@@ -2561,7 +2571,6 @@ def run_import(
     # tasks.json (committed and PUSHED by the owner; on a public repo
     # that is the open web) and the refused-output save. The session may
     # hold the token in its env; nothing it echoes may come back out.
-    egress_secrets = (seat_token() or "",)
     if queue_path is None:
         queue_path = repo / ".factory" / "tasks.json"
     queue_path = Path(queue_path)
@@ -2570,9 +2579,18 @@ def run_import(
     profile: dict | None = None
     if existing_doc is not None:
         project = existing_doc["project"]
+        # The profile is the provider truth even when the queue exists
+        # (F-59): load it for the resolver; a missing profile keeps the
+        # pre-F-59 zai default via run_secrets({}).
+        profile = (load_profile(repo / ".factory" / "project.yaml")
+                   if (repo / ".factory" / "project.yaml").is_file() else {})
     else:
         profile = load_profile(repo / ".factory" / "project.yaml")
         project = profile["name"]
+    # F-59: every provider token the profile's seats resolve to (the
+    # project's kind plus seat overrides) — a Bedrock project's importer
+    # scrubs its own token, not only the Z.ai one.
+    egress_secrets = run_secrets(profile)
     # The ONE listing for the whole run (F-49 review round 1, finding 3):
     # the prompt, the scaled budget and the summary's truncated-doc names
     # all describe the same docs — computed before the session runs, so
@@ -2604,23 +2622,27 @@ def run_import(
     if session is not None:
         text = session(prompt)
     else:
-        if profile is None:
+        if profile is None or "name" not in profile:
             # The sandbox settings (docs/network allowlists, protected
-            # paths) come from the profile; no profile, no session.
+            # paths) come from the profile; no profile, no session. With
+            # an existing queue the profile may have been loaded earlier
+            # only for the resolver's secrets (F-59) — the strict load
+            # here still refuses when it is missing.
             profile = load_profile(repo / ".factory" / "project.yaml")
-            # F-62 AC-3: with an existing queue, the session runs under
-            # the QUEUE's project (the namespace every path builder
-            # uses); the profile must agree — a queue naming another
-            # project's namespace under this repo's contract is
-            # refused before anything is spent.
-            if existing_doc is not None and project != profile["name"]:
-                raise ImportRefused(
-                    f"the queue at {queue_path} names project "
-                    f"{project!r} but the profile at "
-                    f"{repo / '.factory' / 'project.yaml'} names "
-                    f"{profile['name']!r}: a queue and profile that "
-                    "disagree cannot name one project's namespace"
-                )
+        # F-62 AC-3: with an existing queue, the session runs under the
+        # QUEUE's project (the namespace every path builder uses); the
+        # profile must agree — a queue naming another project's
+        # namespace under this repo's contract is refused before
+        # anything is spent (and before the F-63 approval check, so the
+        # refusal names the actual disagreement).
+        if existing_doc is not None and project != profile["name"]:
+            raise ImportRefused(
+                f"the queue at {queue_path} names project "
+                f"{project!r} but the profile at "
+                f"{repo / '.factory' / 'project.yaml'} names "
+                f"{profile['name']!r}: a queue and profile that "
+                "disagree cannot name one project's namespace"
+            )
         # F-63 AC-2: the importer session and its repair seat run under
         # the profile's security-relevant content — the owner must have
         # approved it before any session starts. The check hashes THIS
@@ -2895,12 +2917,23 @@ def sdk_import_session(
             names srt's exit path). The last three salvage the scratch's
             last proposal, when one exists, before cleanup.
     """
-    token = seat_token()
+    # F-59: the importer seat's provider — the ONE resolver (the
+    # profile's own block; the importer ROLE's model), the per-kind
+    # credential, the named refusal. Never a fallback: a client project
+    # whose provider has no credential refuses here.
+    try:
+        spec = resolve_provider(profile, "importer")
+    except ProviderError as exc:
+        raise ImportRefused(f"the importer session cannot run: {exc}") \
+            from exc
+    token = provider_token(spec.kind, base_url=spec.base_url)
     if not token:
         raise ImportRefused(
-            "no Z.ai token available (keychain item factory-zai), so the "
-            "importer session cannot run; prepare a proposal elsewhere and "
-            "review it with `factory import --proposal <file>`"
+            f"no {spec.kind} credential available (keychain item "
+            f"{keychain_service(spec.kind)}), so the importer session "
+            "cannot run; prepare a proposal elsewhere and review it with "
+            "`factory import --proposal <file>` — the importer never "
+            "falls back to another provider (F-59)"
         )
     root = Path(factory_root) if factory_root else FACTORY_ROOT_DEFAULT
     repo = Path(repo)
@@ -2935,8 +2968,14 @@ def sdk_import_session(
                 "reviewer", prompt, run.root, profile,
                 factory_root=root, settings_path=run.settings_path,
                 max_turns=max_turns, timeout_min=timeout_min,
+                # F-59: the reviewer SEAT config with the importer ROLE's
+                # provider + model (the resolver's seat is the role).
+                # R1-2: no raw token — the constructor resolves the
+                # credential for the spec (the refusal above already
+                # named a missing one).
+                role="importer",
                 protected=list((profile.get("paths") or {}).get("protected") or []),
-                token=token, run_id=run.run_id,
+                run_id=run.run_id,
                 scratch_files={
                     PROPOSAL_SCHEMA_NAME: json.dumps(
                         build_proposal_schema(_load_tasks_schema()), indent=2

@@ -314,11 +314,18 @@ def _write_f06_plugin(tmp: Path, *, seat_token: str | None) -> Path:
     so this test can prove opt-in behaviour without ever spending."""
     plugin = tmp / "f51_f06_plugin.py"
     plugin.write_text(textwrap.dedent(f"""
+        import factory.provider as provider
         import factory.runs as runs
         import factory.session as session
 
 
         def pytest_configure(config):
+            # F-59: the credential lookup lives in the ONE resolver;
+            # both spellings are faked so the direct zai delegate and
+            # every resolver-driven construction see the same value.
+            provider.provider_token = (
+                lambda kind, **_: {seat_token!r} if kind == "zai" else None
+            )
             session.seat_token = lambda: {seat_token!r}
 
             def _boom(*args, **kwargs):
@@ -1263,10 +1270,18 @@ def test_review_the_conftest_spend_guard_is_pinned(tmp_path: Path):
     scratch.mkdir()
     plugin = scratch / "f51_guard_plugin.py"
     plugin.write_text(textwrap.dedent("""
+        import factory.provider as provider
         import factory.session as session
 
         def pytest_configure(config):
-            session._keychain_token = lambda: "FAKE-KEYCHAIN-TOKEN"
+            # F-59: the keychain step lives in the resolver now; the
+            # session delegate keeps its seam for the direct calls.
+            provider._keychain_token = (
+                lambda service: "FAKE-KEYCHAIN-TOKEN"
+            )
+            session._keychain_token = (
+                lambda service="factory-zai": "FAKE-KEYCHAIN-TOKEN"
+            )
     """))
     probe = scratch / "test_probe.py"
     probe.write_text(

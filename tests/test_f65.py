@@ -673,9 +673,10 @@ def test_ac_3(monkeypatch):
     # path carrying it, appear nowhere: not in the note, the findings or
     # the progress log.
     SEAT_TOKEN = "fake-seat-token-eyJhbGci.fake.fake"
-    import factory.orchestrator as orch
 
-    monkeypatch.setattr(orch, "seat_token", lambda: SEAT_TOKEN)
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: SEAT_TOKEN
+                        if service == "factory-zai" else None)
 
     def _record_with(requests):
         rec = SessionRecord(
@@ -730,7 +731,8 @@ def test_ac_3(monkeypatch):
     assert SEAT_TOKEN not in json.dumps(
         ProgressLog.for_task(env.root, "fixture", "T-1").entries()
     )
-    monkeypatch.setattr(orch, "seat_token", lambda: None)
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: None)
 
     # --- Y15: the parent bound holds — 25 valid requests keep 20, the
     # rest dropped by name.
@@ -831,7 +833,9 @@ def test_ac_3(monkeypatch):
                 (Path(run_dir) / f"evil-{SEAT_TOKEN}.py").write_text("E\n")
             return record
 
-    monkeypatch.setattr(orch, "seat_token", lambda: SEAT_TOKEN)
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: SEAT_TOKEN
+                        if service == "factory-zai" else None)
     seats = TokenNamedDrift(drift_rounds=10)
     env = Env(_tmp(), tasks=[_task(scope=SCOPE)])
     result = env.run(seats)
@@ -839,7 +843,8 @@ def test_ac_3(monkeypatch):
     note = env.task()["attempts"][-1]["note"]
     assert SEAT_TOKEN not in note, note
     assert "[redacted]" in note  # scrubbed, not merely omitted
-    monkeypatch.setattr(orch, "seat_token", lambda: None)
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: None)
 
     # --- one that reverts in round 2 opens a PR.
     seats = Drifting(drift_rounds=1)
