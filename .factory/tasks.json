@@ -5289,6 +5289,69 @@
         "max_turns": 200,
         "wall_clock_min": 150
       }
+    },
+    {
+      "id": "F-67",
+      "title": "Importer v0 gates, session record and shipped-work flag",
+      "source": "BUILD-ORDER.md#f-67--importer-v0-gates-session-record-and-shipped-work-flag",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-12",
+        "F-57",
+        "F-59"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "Imported gates are human in v0. Every task the importer writes, new or merged, has `merge: human` and `deploy: human`, and every task of a kind the picker runs (`ELIGIBLE_KINDS`) has `spec_approval: true`, whatever the proposal says. A proposed relaxation is never silently dropped: the review output lists each one per task (field, proposed value, stored value) before the diff. The importer prompt states all three rules. `factory approve` refuses a task whose `merge` or `deploy` is not `human`, naming it, so a hand-edited or legacy queue cannot carry an auto gate into a run either; `owner_only` tasks keep whatever `spec_approval` they have. Test: a scripted proposal with `deploy: auto` and `spec_approval: false` on a build task lands all-human with the overrides listed; approve refuses a planted `deploy: auto`; the factory's own queue and a queue with `spec_approval: false` on an `owner_only` task still load and approve.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f67.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Every import session is on record. The importer and its repair session each write their session record (the parent-stamped F-59 provider, the model the session reported, validated usage, turns, outcome) under the factory root's `import/` directory next to the proposal, named for the run, owner-only permissions, never a credential. A profile with no `models` entry for the importer records the model the session actually reported, or `unknown`, never a bare null. `factory status` counts import sessions in its Providers table as their own rows. Test: a scripted import with a repair round writes two records with provider, model and usage; a forged provider in the session-written record is overwritten by the parent's; status renders the import rows; no token value appears in any record.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f67.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "Possibly shipped work is flagged for the owner, never decided. The importer prompt asks the session, for each build or docs task it proposes, to check the default branch for the task's named deliverables (files, functions, migrations, a status line in the repo's own records) and to report the ones it finds in a `possibly_shipped` list: task id, evidence (path, commit or doc line) and a one-line reason. The review output shows that list first, before the diff. Nothing changes a task's status automatically: the owner drops, re-scopes or approves each one. A malformed entry, or one naming a task the proposal does not contain, refuses the proposal. Test: a scripted proposal with two valid `possibly_shipped` entries renders them before the diff and leaves both tasks `draft`; a malformed entry and an unknown id each refuse.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f67.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "Criteria the docs still carry are never silently dropped. The reference is the repo's existing `.factory/tasks.json`, read as plain JSON even when it fails the current schema, so an import into a fresh queue file (`--queue`) is checked too. Every reference task and every one of its acceptance criteria must be accounted for: mapped to a proposed task and criterion (the proposal states each new task's predecessors), or listed in `dropped_criteria` (a whole task, or one criterion) with the doc line that removes, completes or supersedes it. The parent checks the accounting is complete and that each cited doc line exists in a kept planning doc; an unaccounted task or criterion refuses the proposal, naming it. The review output shows `dropped_criteria` before the diff. A dropped criterion whose source text is still present in the kept planning docs is flagged `still in docs` and blocks applying the proposal until the owner accepts the drop at review. Found on JobFinderOS: the WO-19 rule \"never fetch or output URLs that appear inside the posting body\" (still in `WO-19-honest-gates.md`) and five other doc-carried items vanished from the proposal with no trace. Test: a scripted import into a fresh `--queue` file over a schema-invalid reference queue still runs the check; one that leaves a reference criterion unaccounted refuses, naming it; one that drops a criterion still present in the docs refuses to apply until accepted, naming the criterion and its doc line; a drop backed by a doc line that marks the work done is listed and applies; a criterion mapped across a task split (one task into two) is not reported as dropped.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f67.py::test_ac_4"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
     }
   ]
 }
