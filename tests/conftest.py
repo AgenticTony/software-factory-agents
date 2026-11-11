@@ -19,17 +19,25 @@ def _no_ambient_spend(monkeypatch):
     The keychain lookup is stubbed to "not found" and any ambient
     ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL is stripped from the test
     environment, so a future ungated real-session test fails to
-    AUTHENTICATE instead of spending. With ``FACTORY_LIVE_TESTS=1`` the
-    guard stands down (the owner opted in; the f06 live halves then run
-    on the real credential). Tests that need their own shapes still
-    monkeypatch on top, as before.
+    AUTHENTICATE instead of spending. F-59: the lookup lives in the ONE
+    resolver (factory.provider) — the guard stubs the resolver's seam
+    and the session delegate's, and strips the per-provider ambient
+    credential names (the Bedrock bearer token) with them. With
+    ``FACTORY_LIVE_TESTS=1`` the guard stands down (the owner opted in;
+    the f06 live halves then run on the real credential). Tests that
+    need their own shapes still monkeypatch on top, as before.
     """
     if os.environ.get("FACTORY_LIVE_TESTS") == "1":
         return
+    import factory.provider as provider_module
     import factory.session as session_module
 
-    monkeypatch.setattr(session_module, "_keychain_token", lambda: None)
-    for name in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+    monkeypatch.setattr(provider_module, "_keychain_token",
+                        lambda service: None)
+    monkeypatch.setattr(session_module, "_keychain_token",
+                        lambda service=None: None)
+    for name in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+                 "AWS_BEARER_TOKEN_BEDROCK"):
         monkeypatch.delenv(name, raising=False)
 
 

@@ -576,6 +576,9 @@ def test_ac_6(tmp_path: Path):
 
 
 def test_ac_7(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     """A session gets exactly its project's toolkit and nothing from the
     owner's personal Claude setup (a planted skill and MCP server stay
     invisible); the toolkit loads from a read-only staged copy outside
@@ -673,9 +676,8 @@ def test_ac_7(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(session_mod, "run_sandboxed", fake_run_sandboxed)
     session_mod.run_session_sandboxed(
         seat="implementer", prompt="p", run_dir=run_dir, profile=profile,
-        max_turns=1, timeout_min=1, token="stub-token",
-        toolkit=resolved, factory_root=tmp_path,
-    )
+        max_turns=1, timeout_min=1,
+        toolkit=resolved, factory_root=tmp_path)
     spec = json.loads(Path(spec_seen["path"]).read_text())
     assert spec["toolkit"]["staged"] == str(staged)
     assert Path(spec["toolkit"]["staged"]) not in run_dir.parents
@@ -875,6 +877,9 @@ def test_staged_toolkit_is_cleaned_up(tmp_path: Path, monkeypatch):
     """The F-06 cleanup contract covers the staged toolkit: a session
     with a toolkit leaves no ``-toolkit`` copy under ``sandbox/`` after
     ``cleanup_run`` (the staged copy is per-session, never a cache)."""
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     from factory import session as session_mod
     from factory.runs import RunDir, cleanup_run
 
@@ -895,7 +900,7 @@ def test_staged_toolkit_is_cleaned_up(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(session_mod, "run_sandboxed", fake_run_sandboxed)
     session_mod.run_session_sandboxed(
         seat="implementer", prompt="p", run_dir=run_root, profile={},
-        max_turns=1, timeout_min=1, token="stub-token",
+        max_turns=1, timeout_min=1,
         toolkit=resolved, factory_root=tmp_path,
     )
     staged = settings_path.with_name(settings_path.name + "-toolkit")
@@ -1435,7 +1440,7 @@ def test_review8_session_neutralizes_control_vars_in_the_mcp_child_env(
 JFOS_DOCS = [
     "fastapi.tiangolo.com", "docs.sqlalchemy.org", "alembic.sqlalchemy.org",
     "docs.pydantic.dev", "pypdf.readthedocs.io", "supabase.com",
-    "nextjs.org", "react.dev", "tailwindcss.com", "docs.z.ai",
+    "nextjs.org", "react.dev", "tailwindcss.com",
     "resend.com", "developers.cloudflare.com", "render.com",
 ]
 JFOS_NETWORK = [

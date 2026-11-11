@@ -59,15 +59,24 @@ from factory.state import now_iso
 
 # The security-relevant profile content AC-2 covers: group name -> the
 # key path it is read from. A missing key hashes as null, so REMOVING a
-# group is a change. F-59 will add "provider" and "data_owner" here (its
-# work order says so); an approval that predates a new group never
-# matches it — re-approval, never silent acceptance.
+# group is a change. F-59 adds "data_owner", "provider",
+# "providers_allowed" and "seat_providers" (its work order says so: the
+# provider choice is the owner's); an approval that predates a new group
+# never matches it — re-approval, never silent acceptance.
 PROFILE_SECURITY_GROUPS: dict[str, tuple[str, ...]] = {
     "commands": ("commands",),
     "sentinels": ("sentinels",),
     "network_allowlist": ("network_allowlist",),
     "docs_allowlist": ("docs_allowlist",),
     "sandbox": ("sandbox",),
+    # F-59 AC-1: the goal-level core — a client repo flipping itself to
+    # self, changing provider kind/region/base_url/models, widening its
+    # allowed list or re-pointing a seat refuses the run until the owner
+    # re-approves, through this group mechanism (not a new one).
+    "data_owner": ("data_owner",),
+    "provider": ("provider",),
+    "providers_allowed": ("providers_allowed",),
+    "seat_providers": ("seat_providers",),
     "repo.remote": ("repo", "remote"),
     # R1 fix 1: repo.path decides WHICH checkout every run clones
     # (orchestrator → create_run's source). Unapproved, an approved
@@ -322,7 +331,7 @@ def require_profile_approval(profile: dict, factory_root: Path | str, *,
             f"{profile['name']!r} — run `factory approve --profile` once "
             "so the owner has seen the security-relevant content (commands, "
             "sentinels, network/docs allowlists, sandbox, repo, paths, "
-            "live_checks, toolkit)"
+            "live_checks, toolkit, provider, data_owner)"
         )
     changed = changed_groups(profile, approval)
     if changed:

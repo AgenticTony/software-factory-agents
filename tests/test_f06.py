@@ -30,8 +30,8 @@ import pytest
 from _support import live_session_gate
 from claude_agent_sdk import CLINotFoundError, ResultMessage
 
+from factory.provider import ZAI_BASE_URL as DEFAULT_BASE_URL
 from factory.session import (
-    DEFAULT_BASE_URL,
     SEATS,
     SessionConfigError,
     SessionRecord,
@@ -88,6 +88,9 @@ def _results_query(*messages):
 
 
 def _run(query_fn, **kwargs):
+    # F-59: run_session has no default provider any more — the helper
+    # owns the in-process fake's base URL.
+    kwargs.setdefault("base_url", DEFAULT_BASE_URL)
     kwargs.setdefault("cwd", REPO)
     kwargs.setdefault("max_turns", 5)
     kwargs.setdefault("timeout_min", 10)
@@ -214,9 +217,9 @@ def test_ac_3(tmp_path: Path, monkeypatch):
     # refuse loudly rather than spawn a session that cannot authenticate.
     # Monkeypatched to None so the owner's real keychain item cannot answer
     # first — and so the refusal is proven even with the live opt-in set.
-    import factory.session as session_mod
 
-    monkeypatch.setattr(session_mod, "seat_token", lambda: None)
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: None)
     with pytest.raises(SessionConfigError, match="factory-zai"):
         run_session_sandboxed(
             seat="implementer",
@@ -227,9 +230,7 @@ def test_ac_3(tmp_path: Path, monkeypatch):
             max_turns=2,
             timeout_min=1,
             protected=[".git/config"],
-            token=None,
-            srt_bin_path=None,
-        )
+            srt_bin_path=None)
     monkeypatch.undo()
 
     # --- live half (explicit opt-in only; never credential-inferred) ---------
@@ -643,9 +644,9 @@ def test_ac_4(tmp_path: Path, monkeypatch):
     on the explicit ``FACTORY_LIVE_TESTS=1`` opt-in (F-51/m-21) and fails
     loudly when the opt-in is set but the credential is missing.
     """
-    import factory.session as session_mod
 
-    monkeypatch.setattr(session_mod, "seat_token", lambda: None)
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: None)
     with pytest.raises(SessionConfigError, match="factory-zai"):
         run_session_sandboxed(
             seat="implementer",
@@ -823,7 +824,13 @@ def test_entry_refuses_to_start_without_a_token(tmp_path: Path, monkeypatch):
                 "cwd": str(tmp_path),
                 "max_turns": 1,
                 "timeout_min": 0.5,
-                "base_url": DEFAULT_BASE_URL,
+                # F-59: the provider travels as NAMES; the refusal under
+                # test is the missing CREDENTIAL in the env.
+                "env_keys": ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
+                             "API_TIMEOUT_MS"],
+                "credential_key": "ANTHROPIC_AUTH_TOKEN",
+                "provider": {"kind": "zai",
+                             "endpoint_host": "api.z.ai"},
                 "timeout_ms": 60000,
                 "protected": [],
             }
@@ -1060,9 +1067,16 @@ def _sandbox_stub(monkeypatch, captured):
     (spec path = last argv element) and the written settings, and return a
     completed-session record without spawning anything. F-56 re-seat: the
     record now travels by the file the spec names (written here as the
-    in-sandbox entry would), and stdout carries no record line."""
+    in-sandbox entry would), and stdout carries no record line.
+
+    R1-2: the constructor takes no raw credential — the stub plants the
+    zai keychain item the session resolves."""
 
     from factory import session as session_mod
+
+    monkeypatch.setattr(
+        "factory.provider._keychain_token",
+        lambda service: "t" if service == "factory-zai" else None)
 
     def fake_run_sandboxed(cmd, run_dir, settings_path, **kwargs):
         captured["cmd"] = cmd
@@ -1103,7 +1117,6 @@ def test_review2_default_settings_path_uses_the_factory_root(tmp_path: Path):
             profile={},
             max_turns=1,
             timeout_min=1,
-            token="stub-token",
         )
     assert captured["settings_path"] == (
         factory_root / "sandbox" / "proj-20260101T000000Z-ab12cd.json"
@@ -1131,7 +1144,6 @@ def test_review2_settings_and_runner_are_cleaned_up(tmp_path: Path):
             profile={},
             max_turns=1,
             timeout_min=1,
-            token="stub-token",
         )
     assert captured["settings_path"] == run.settings_path
     cleanup_run(run)
@@ -1231,11 +1243,14 @@ def test_review4_bash_guard_covers_optioned_and_quoted_forms():
 # --- Finding 5: sessions ran the auto-updating ~/.local CLI instead of
 # the CLI bundled with the pinned SDK. ----------------------------------- --
 
-def test_review5_sandboxed_sessions_use_the_sdk_bundled_cli(tmp_path: Path):
+def test_review5_sandboxed_sessions_use_the_sdk_bundled_cli(tmp_path: Path, monkeypatch):
     """The spec handed to the sandboxed entry names the CLI bundled inside
     the pinned claude_agent_sdk package, and that binary's directory joins
     the sandbox allowRead (toolchain) entries. ~/.local/bin/claude is
     never auto-picked: sandboxed sessions require the pinned CLI."""
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     import claude_agent_sdk
 
     from factory import session as session_mod
@@ -1265,7 +1280,6 @@ def test_review5_sandboxed_sessions_use_the_sdk_bundled_cli(tmp_path: Path):
             profile={},
             max_turns=1,
             timeout_min=1,
-            token="stub-token",
         )
     spec = json.loads(Path(captured["spec_path"]).read_text())
     assert spec["cli_path"] == str(bundled)
@@ -1277,10 +1291,13 @@ def test_review5_sandboxed_sessions_use_the_sdk_bundled_cli(tmp_path: Path):
 # --- Finding 6: .session-spec.json landed in the clone as an untracked
 # file a `git add -A` would commit. --------------------------------------- --
 
-def test_review6_spec_never_lands_in_the_clone(tmp_path: Path):
+def test_review6_spec_never_lands_in_the_clone(tmp_path: Path, monkeypatch):
     """After a sandboxed session is prepared, the clone's working tree is
     byte-identical to a fresh clone: the spec lives in the staged runner
     dir outside the run dir."""
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     import subprocess
 
     from factory import session as session_mod
@@ -1299,7 +1316,6 @@ def test_review6_spec_never_lands_in_the_clone(tmp_path: Path):
             profile={},
             max_turns=1,
             timeout_min=1,
-            token="stub-token",
         )
     assert not (run.root / ".session-spec.json").exists()
     status = subprocess.run(
@@ -1325,9 +1341,9 @@ def test_review7_ambient_token_requires_the_zai_base_url(monkeypatch):
     real factory-zai item cannot answer first. Each result is reduced to a
     bool before asserting, so a failure never prints a credential.
     """
-    from factory import session as session_mod
 
-    monkeypatch.setattr(session_mod, "_keychain_token", lambda: None)
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: None)
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "an-anthropic-key")
     got_none = seat_token() is None
@@ -1528,14 +1544,16 @@ def test_review10_overlapping_sessions_refuse_and_keep_the_env(monkeypatch):
 
     async def first():
         return await run_session(
-            "implementer", "p", REPO, 5, 10, query_fn=first_query
+            "implementer", "p", REPO, 5, 10, query_fn=first_query,
+            base_url=DEFAULT_BASE_URL
         )
 
     async def second():
         await first_window_open.wait()
         try:
             await run_session(
-                "implementer", "p", REPO, 5, 10, query_fn=second_query
+                "implementer", "p", REPO, 5, 10, query_fn=second_query,
+                base_url=DEFAULT_BASE_URL
             )
             return "ran"
         except SessionConfigError:
@@ -1586,7 +1604,9 @@ def test_review11_non_sdk_errors_still_close_the_stream():
         return stream
 
     with pytest.raises(RuntimeError, match="runner bug"):
-        asyncio.run(run_session("implementer", "p", REPO, 5, 5, query_fn=bug_query))
+        asyncio.run(run_session(
+            "implementer", "p", REPO, 5, 5, query_fn=bug_query,
+            base_url=DEFAULT_BASE_URL))
     assert streams[0].closed, "a propagating error must still close the stream"
 
 

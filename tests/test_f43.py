@@ -219,9 +219,10 @@ def test_ac_1(tmp_path, monkeypatch):
     seats = _Seats(_review_with_finding())
     # The run's egress secrets are exactly the seat token the orchestrator
     # hands the trace writer today; plant ours there.
-    import factory.orchestrator as orch
 
-    monkeypatch.setattr(orch, "seat_token", lambda: SEAT_TOKEN)
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: SEAT_TOKEN
+                        if service == "factory-zai" else None)
     result = env.run(seats)
     assert result.outcome == "pr_opened", result
     (pr,) = env.prs
@@ -583,7 +584,8 @@ _EGRESS_MODULES = {
             # The CLI's keep path (test_review3 asserts its secrets);
             # apply_import (the scrubbed plan — the scrub-before-plan
             # rule); nothing else in the CLI may receive session text.
-            "keep_refused_import_output", "seat_token", "apply_import",
+            "keep_refused_import_output", "run_secrets",
+            "load_profile", "apply_import",
         },
     },
     "factory/eval.py": {
@@ -801,7 +803,9 @@ def _wo_task(title: str, acceptance: str) -> dict:
 
 def test_review1(tmp_path, monkeypatch):
     repo = _import_repo(tmp_path)
-    monkeypatch.setattr("factory.importer.seat_token", lambda: SEAT_TOKEN)
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: SEAT_TOKEN
+                        if service == "factory-zai" else None)
     title = (f"Add search (env {SEAT_TOKEN}; echo {ENV_ECHO_ZAI}; "
              f"clear {SCREEN_CLEAR})")
     acceptance = f"search works; env said {ENV_ECHO} and {ENV_ECHO_ZAI}"
@@ -830,7 +834,9 @@ def test_review2(tmp_path, monkeypatch):
     repo = _import_repo(tmp_path)
     root = tmp_path / "home-factory"
     monkeypatch.setattr("factory.importer.FACTORY_ROOT_DEFAULT", root)
-    monkeypatch.setattr("factory.importer.seat_token", lambda: SEAT_TOKEN)
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: SEAT_TOKEN
+                        if service == "factory-zai" else None)
     importer_fixture_approve(root, repo)  # F-63: the real session's profile
     # A proposal naming the wrong project refuses AFTER the session ran;
     # its title carries both planted secrets (the real-session keep path).
@@ -878,7 +884,7 @@ def _is_secrets_expr_ok(value: ast.AST, assigned: dict) -> bool:
       IS a tuple by construction);
     * an IfExp whose BOTH arms are acceptable;
     * a Name the same module assigns only from acceptable expressions
-      (``egress_secrets = (seat_token() or "",)``; ``secrets =
+      (``egress_secrets = run_secrets(profile)`` — F-59; ``secrets =
       check_secrets(secrets)`` at a guard), or a parameter pass-through
       (``secrets=secrets`` — the callee's own guarded parameter; only the
       names ``secrets``/``extra_secrets``, never a name that could be a
@@ -886,7 +892,13 @@ def _is_secrets_expr_ok(value: ast.AST, assigned: dict) -> bool:
     """
     if isinstance(value, (ast.Tuple, ast.List)):
         return True
-    if isinstance(value, ast.Call) and _callee_name(value) == "check_secrets":
+    if isinstance(value, ast.Call) and _callee_name(value) in (
+        "check_secrets",
+        # F-59: the resolver's secrets normalizer (run_secrets ->
+        # tuple by construction, the same guarantee check_secrets
+        # gives); one deliberate, reviewable widening.
+        "run_secrets",
+    ):
         return True
     if isinstance(value, ast.IfExp):
         return (_is_secrets_expr_ok(value.body, assigned)
@@ -959,19 +971,20 @@ def test_review3():
 
     # (b) Mutations: every bad shape trips the rule, naming file:line.
     cli = (REPO_ROOT / "factory" / "cli.py").read_text()
-    # round 2's shape: a parenthesised string.
+    # round 2's shape: the F-59 line indexed to a bare string.
     round2 = _secrets_shape_offenders(
         "factory/cli.py",
-        cli.replace('secrets=(seat_token() or "",),',
-                    'secrets=(seat_token() or ""),'),
+        cli.replace("secrets=run_secrets(_keep_path_profile(args)),",
+                    "secrets=run_secrets(_keep_path_profile(args))[0],"),
     )
     assert round2 and "factory/cli.py" in round2[0], round2
     # an IfExp whose true arm is a str (a tuple in the else arm used to
     # pass the round-2 subtree rule).
     ifexp = _secrets_shape_offenders(
         "factory/cli.py",
-        cli.replace('secrets=(seat_token() or "",),',
-                    'secrets=((seat_token() or "") if True else ()),'),
+        cli.replace("secrets=run_secrets(_keep_path_profile(args)),",
+                    "secrets=(run_secrets(_keep_path_profile(args))[0]"
+                    " if True else ()),"),
     )
     assert ifexp, "a str-valued IfExp with a tuple else-arm passed the rule"
     # a str-bound Name.
@@ -982,15 +995,16 @@ def test_review3():
     assert name_case and "secrets= is not a sequence" in name_case[0], (
         "a str-bound name passed the rule"
     )
-    # finding 6's mutation: orchestrator's assignment loses its comma.
+    # finding 6's mutation shape, on the F-59 line: indexing the
+    # normalizer's tuple yields a bare string.
     orch = (REPO_ROOT / "factory" / "orchestrator.py").read_text()
     comma_drop = _secrets_shape_offenders(
         "factory/orchestrator.py",
-        orch.replace('egress_secrets = (seat_token() or "",)',
-                     'egress_secrets = (seat_token() or "")'),
+        orch.replace("egress_secrets = run_secrets(profile)",
+                     "egress_secrets = run_secrets(profile)[0]"),
     )
     assert comma_drop and "orchestrator.py" in comma_drop[0], (
-        "the orchestrator comma-drop mutation did not trip, named"
+        "the orchestrator indexing mutation did not trip, named"
     )
 
     # (c) Tripwire mutations (finding 3 of round 1, unchanged): a new
@@ -1029,6 +1043,9 @@ def test_review4():
 
 
 def test_review5(tmp_path, monkeypatch):
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: SEAT_TOKEN
+                        if service == "factory-zai" else None)
     import factory.session as session_mod
 
     # build_settings asserts the canonical runs layout (F-28).
@@ -1048,8 +1065,7 @@ def test_review5(tmp_path, monkeypatch):
     with pytest.raises(SessionConfigError) as exc:
         session_mod._run_prepared(
             "reviewer", "do it", run_dir, {"name": "fixture"}, settings,
-            max_turns=2, timeout_min=1, token=SEAT_TOKEN, cli_path=cli,
-        )
+            max_turns=2, timeout_min=1, cli_path=cli)
     message = str(exc.value)
     assert SEAT_TOKEN not in message, "the literal token reached the error"
     assert ZAI_KEY not in message, "the Z.ai-shaped echo reached the error"
@@ -1154,7 +1170,9 @@ def test_review9(tmp_path, monkeypatch):
     # the deterministic class); the scrub CALL COUNTS are what this test
     # pins, plus the normal-run body behaviour below.
     env = _Env(tmp_path)
-    monkeypatch.setattr(orch, "seat_token", lambda: SEAT_TOKEN)
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: SEAT_TOKEN
+                        if service == "factory-zai" else None)
     counts = {"value": 0, "text": 0}
     real_value, real_text = orch.scrub_session_value, orch.scrub_session_text
     monkeypatch.setattr(
@@ -1241,11 +1259,15 @@ def test_review11_cli_keep_scrubs_literal(tmp_path, monkeypatch, capsys):
     repo = _import_repo(tmp_path)
     root = tmp_path / "home-factory"
     monkeypatch.setattr("factory.importer.FACTORY_ROOT_DEFAULT", root)
-    monkeypatch.setattr("factory.importer.seat_token", lambda: SEAT_TOKEN)
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: SEAT_TOKEN
+                        if service == "factory-zai" else None)
     importer_fixture_approve(root, repo)  # F-63: the real session's profile
     # The CLI's keep path uses ITS OWN seat_token import — plant there
     # too, or the test would scrub with the real keychain item.
-    monkeypatch.setattr("factory.cli.seat_token", lambda: SEAT_TOKEN)
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: SEAT_TOKEN
+                        if service == "factory-zai" else None)
     # A queue the plan will differ from: a second task, distinct id, with
     # the token in its title — session text via the real-session keep path
     # (the CLI keep keys on the session being real).

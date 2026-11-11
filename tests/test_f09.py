@@ -1011,6 +1011,9 @@ def test_review9_implementer_sandbox_still_writes(tmp_path):
 def test_review9_session_builds_read_only_settings_for_the_reviewer(
     tmp_path, monkeypatch
 ):
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     # Wiring: run_session_sandboxed passes read_only=True to build_settings
     # exactly for the reviewer seat (and not for the implementer).
     import factory.session as session_module
@@ -1032,18 +1035,19 @@ def test_review9_session_builds_read_only_settings_for_the_reviewer(
 
     session_module.run_session_sandboxed(
         "reviewer", "review it", repo, profile,
-        settings_path=settings_path, max_turns=5, timeout_min=1,
-        token="t", cli_path=Path("/bin/echo"),
-    )
+        settings_path=settings_path, max_turns=5, timeout_min=1, cli_path=Path("/bin/echo"))
     session_module.run_session_sandboxed(
         "implementer", "build it", repo, profile,
         settings_path=settings_path, max_turns=5, timeout_min=1,
-        token="t", cli_path=Path("/bin/echo"),
+        cli_path=Path("/bin/echo"),
     )
     assert calls == [True, False]
 
 
 def test_review9_workspace_integrity_checked_after_review(tmp_path, monkeypatch):
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     # The orchestrator-side backstop: even if some future path lets the
     # reviewer write (a settings bug, an srt regression), HEAD and the
     # working tree are verified unchanged after every reviewer session — a
@@ -1076,7 +1080,7 @@ def test_review9_workspace_integrity_checked_after_review(tmp_path, monkeypatch)
         "reviewer", "review it", repo, profile,
         settings_path=tmp_path / "s.json", factory_root=tmp_path,
         max_turns=5, timeout_min=1,
-        token="t", cli_path=Path("/bin/echo"),
+        cli_path=Path("/bin/echo"),
     )
     assert record.status == "failed"
     assert record.reason == "reviewer_mutated_workspace"
@@ -1095,6 +1099,9 @@ def test_review9_workspace_integrity_checked_after_review(tmp_path, monkeypatch)
 
 
 def test_review9_clean_review_passes_the_integrity_check(tmp_path, monkeypatch):
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     # The quiet path: a review that only reads returns its record
     # untouched, and the implementer is never subjected to the check.
     import factory.session as session_module
@@ -1116,7 +1123,7 @@ def test_review9_clean_review_passes_the_integrity_check(tmp_path, monkeypatch):
             seat, "do it", repo, profile,
             settings_path=tmp_path / "s.json", factory_root=tmp_path,
             max_turns=5, timeout_min=1,
-            token="t", cli_path=Path("/bin/echo"),
+            cli_path=Path("/bin/echo"),
         )
         assert record.status == "completed"
         assert record.reason is None
@@ -1174,6 +1181,9 @@ def test_review10_excludes_still_cover_real_scratch_dirs(tmp_path):
 
 
 def test_review10_review_leaves_real_scratch_dirs(tmp_path, monkeypatch):
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     # Finding 2: the symlinks must not outlive the review — a later
     # implementer run in the same run dir would write $HOME/$TMPDIR through
     # links pointing outside its sandbox. The review leaves the plain
@@ -1196,7 +1206,7 @@ def test_review10_review_leaves_real_scratch_dirs(tmp_path, monkeypatch):
         "reviewer", "review it", repo, profile,
         settings_path=tmp_path / "s.json", factory_root=tmp_path,
         max_turns=5, timeout_min=1,
-        token="t", cli_path=Path("/bin/echo"),
+        cli_path=Path("/bin/echo"),
     )
     assert record.status == "completed"
     assert (repo / ".home").is_dir() and not (repo / ".home").is_symlink()
@@ -1209,6 +1219,9 @@ def test_review10_review_leaves_real_scratch_dirs(tmp_path, monkeypatch):
 
 
 def test_review10_implementer_scratch_writable_after_a_review(tmp_path, monkeypatch):
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     # The owner's exact repro shape: after a reviewer session leaves real
     # dirs, an implementer-style sandboxed write to $HOME and $TMPDIR inside
     # the same run dir must succeed (source writes stay the implementer's to
@@ -1228,7 +1241,7 @@ def test_review10_implementer_scratch_writable_after_a_review(tmp_path, monkeypa
         "reviewer", "review it", repo, profile,
         settings_path=tmp_path / "s.json", factory_root=tmp_path,
         max_turns=5, timeout_min=1,
-        token="t", cli_path=Path("/bin/echo"),
+        cli_path=Path("/bin/echo"),
     )
     # The next run in the same dir is an implementer: writable run dir.
     settings = build_settings(
@@ -1268,11 +1281,14 @@ def _review(session_module, repo, profile, tmp_path):
     return session_module.run_session_sandboxed(
         "reviewer", "review it", repo, profile,
         settings_path=tmp_path / "s.json", factory_root=tmp_path,
-        max_turns=5, timeout_min=1, token="t", cli_path=Path("/bin/echo"),
+        max_turns=5, timeout_min=1, cli_path=Path("/bin/echo"),
     )
 
 
 def test_review11_backstop_restores_when_the_review_times_out(tmp_path, monkeypatch):
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     # The backstop must hold on the exits a misbehaving reviewer is most
     # likely to take: an outer timeout still propagates, but only after
     # HEAD and the tree are restored.
@@ -1295,6 +1311,10 @@ def test_review11_backstop_restores_when_the_review_times_out(tmp_path, monkeypa
 def test_review11_backstop_restores_when_the_entry_returns_no_record(
     tmp_path, monkeypatch
 ):
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
+
     import factory.session as session_module
 
     repo, profile = _sandbox_repo(tmp_path)
@@ -1312,6 +1332,9 @@ def test_review11_backstop_restores_when_the_entry_returns_no_record(
 
 
 def test_review11_scratch_torn_down_when_setup_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     # The scratch symlinks are created before settings are built; a setup
     # failure after them must still leave plain .home/.tmp directories.
     import factory.session as session_module
@@ -1346,6 +1369,9 @@ def _quiet_record(cmd, settings_path):
 
 
 def test_review11_new_branch_counts_as_mutation(tmp_path, monkeypatch):
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     # HEAD and porcelain alone miss a new ref: a branch or tag the reviewer
     # creates is a mutation, and the restore removes it.
     import factory.session as session_module
@@ -1365,6 +1391,9 @@ def test_review11_new_branch_counts_as_mutation(tmp_path, monkeypatch):
 
 
 def test_review11_branch_switch_counts_as_mutation(tmp_path, monkeypatch):
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     # Same commit, different branch: HEAD's sha is unchanged, but the run
     # is no longer on the branch the orchestrator pushes.
     import factory.session as session_module
@@ -1390,6 +1419,9 @@ def test_review11_branch_switch_counts_as_mutation(tmp_path, monkeypatch):
     reason="nested seatbelt cannot apply a profile (INC-007)",
 )
 def test_review11_ignored_artifact_counts_as_mutation(tmp_path, monkeypatch):
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     # A file written into a gitignored dir is invisible to plain porcelain.
     # It counts as a mutation and is removed, while ignored files that
     # existed before the review (a warm cache) survive the restore.
@@ -1418,6 +1450,10 @@ def test_review11_ignored_artifact_counts_as_mutation(tmp_path, monkeypatch):
 def test_review11_quiet_review_with_preexisting_ignored_files_passes(
     tmp_path, monkeypatch
 ):
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
+
     # The guard must not flag the warm cache or scratch as a mutation.
     import factory.session as session_module
 

@@ -88,7 +88,9 @@ def _patch_real_session(monkeypatch, records) -> ScriptedRunner:
     scripted so the Nth call returns the Nth record."""
     runner = ScriptedRunner(records)
     monkeypatch.setattr("factory.importer.run_session_sandboxed", runner)
-    monkeypatch.setattr("factory.importer.seat_token", lambda: "tok")
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "tok"
+                        if service == "factory-zai" else None)
     return runner
 
 
@@ -144,7 +146,9 @@ def _fake_sdk(monkeypatch, record: SessionRecord) -> None:
         return record.result or ""
 
     monkeypatch.setattr(importer_mod, "sdk_import_session", fake_sdk)
-    monkeypatch.setattr("factory.importer.seat_token", lambda: "tok")
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "tok"
+                        if service == "factory-zai" else None)
 
 
 def _seed_ready_task(repo: Path) -> None:
@@ -561,7 +565,9 @@ def test_ac_1_accepted_set_persists_crash_safe(tmp_path, monkeypatch):
                              reason="wall_clock")
 
     monkeypatch.setattr("factory.importer.run_session_sandboxed", aborts)
-    monkeypatch.setattr("factory.importer.seat_token", lambda: "tok")
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "tok"
+                        if service == "factory-zai" else None)
     with pytest.raises(ImportRefused) as excinfo:
         run_import(repo, factory_root=root)
     assert "its last proposal was saved to" in str(excinfo.value)
@@ -871,8 +877,9 @@ def test_ac_4_refuses_without_the_live_opt_in(tmp_path, monkeypatch, capsys):
     nothing spends: with a fake credential and bombs under the real
     seams, the refusal still comes first (the live path is unreachable
     from the suite)."""
-    monkeypatch.setattr("factory.importer.seat_token", lambda: "FAKE-TOKEN")
-    monkeypatch.setattr("factory.session.seat_token", lambda: "FAKE-TOKEN")
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "FAKE-TOKEN"
+                        if service == "factory-zai" else None)
 
     def bomb(*args, **kwargs):
         raise AssertionError("the importer eval spent a real session")
@@ -1203,7 +1210,9 @@ def test_f3_repair_settings_deny_the_source_repo(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setattr(session_mod, "run_sandboxed", fake_run_sandboxed)
-    monkeypatch.setattr("factory.importer.seat_token", lambda: "tok")
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "tok"
+                        if service == "factory-zai" else None)
     # run_session_sandboxed stays REAL: the settings under test are the
     # ones the real session machinery writes.
     result = None
@@ -1348,7 +1357,9 @@ def test_g1_repair_answer_passes_the_egress_seam(tmp_path, monkeypatch):
     the summary (the scrub runs BEFORE plan_import, like the original
     proposal's)."""
     token = fake_token("f57-g1")
-    monkeypatch.setattr("factory.importer.seat_token", lambda: token)
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: token
+                        if service == "factory-zai" else None)
     monkeypatch.setattr("factory.importer.run_session_sandboxed",
                         ScriptedRunner([
                             _completed(_proposal(_broken_wo())),
@@ -1572,7 +1583,9 @@ def test_r2_2_forged_propose_calls_never_render(tmp_path, monkeypatch, calls):
     record, refused through keep and repair; the token never appears in
     the message, the saved file, or anything else the factory writes."""
     token = fake_token("f57-r2-2")
-    monkeypatch.setattr("factory.importer.seat_token", lambda: token)
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: token
+                        if service == "factory-zai" else None)
     record = _completed("not json")
     record.propose_calls = calls
     _fake_sdk(monkeypatch, record)
@@ -1596,7 +1609,9 @@ def test_r2_2_forged_repair_turns_never_render(tmp_path, monkeypatch):
     token = fake_token("f57-r2-2")
     import factory.eval as eval_mod
 
-    monkeypatch.setattr("factory.importer.seat_token", lambda: token)
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: token
+                        if service == "factory-zai" else None)
 
     def _drive(num_turns, root):
         runner = ScriptedRunner([
@@ -1792,7 +1807,9 @@ def test_r3_1_forged_import_record_field(tmp_path, monkeypatch, forged):
     salvage runs, no AttributeError, and a token-shaped value never
     reaches the message."""
     token = fake_token("f57-r3")
-    monkeypatch.setattr("factory.importer.seat_token", lambda: token)
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: token
+                        if service == "factory-zai" else None)
     values = {"TOK": token}
     forged = {
         key: (values.get(value, value) if isinstance(value, str) else value)
@@ -1820,7 +1837,9 @@ def test_r3_1_forged_repair_record_field(tmp_path, monkeypatch, forged):
     import naming the KEPT ORIGINAL (the repair ran; its output is not
     trusted), never a traceback, never the token."""
     token = fake_token("f57-r3")
-    monkeypatch.setattr("factory.importer.seat_token", lambda: token)
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: token
+                        if service == "factory-zai" else None)
     values = {"TOK": token}
     forged = {
         key: (values.get(value, value) if isinstance(value, str) else value)
@@ -1911,19 +1930,20 @@ def _planted_timeout_run(monkeypatch, tmp_path, record_doc):
         path.write_text(json.dumps(record_doc))
         raise subprocess.TimeoutExpired(cmd=command, timeout=90.0)
 
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "tok"
+                        if service == "factory-zai" else None)
     monkeypatch.setattr(session_mod, "run_sandboxed", plant_and_hang)
     try:
         run_session_sandboxed(
             "reviewer", "import", repo,
             {"docs_allowlist": [], "network_allowlist": []},
             factory_root=tmp_path, settings_path=tmp_path / "s.json",
-            max_turns=2, timeout_min=0.05, token="tok",
+            max_turns=2, timeout_min=0.05,
         )
     except subprocess.TimeoutExpired as exc:
         return exc
     return ("USED",)
-
-
 @pytest.mark.parametrize("forged", [
     {"result": 5},
     {"status": {"x": fake_token("f57-q03")}, "reason": None},

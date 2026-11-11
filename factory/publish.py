@@ -189,7 +189,8 @@ def check_push_content(
 
     The orchestrator calls this directly after ``check_pr_text`` and
     before :func:`push_branch``, with the same ``egress_secrets`` tuple
-    (the seat token today). Nothing is pushed: the refusal is the same
+    (every provider token the run's profile resolves to, F-59). Nothing
+    is pushed: the refusal is the same
     :class:`PushRefused` the PR-text fence raises, so the existing
     escalation path (``publish_refused``) handles it unchanged.
 
@@ -215,7 +216,9 @@ def check_push_content(
     Secrets shorter than the scrub floor are ignored
     (:func:`factory.sentinels.is_scrubbable_secret` — the same rule the
     PR-text fence and the egress seam apply; ``egress_secrets`` is
-    ``(seat_token() or "",)``, and an empty token must match nothing).
+    the run's provider tokens (:func:`factory.provider.run_secrets` over
+    the run's profile — F-59), and an empty sequence must match
+    nothing).
 
     The refusal names the object kind and its path (or the commit SHA)
     and the encoding — never the secret or the matched bytes: the

@@ -487,6 +487,9 @@ def test_ac_2(tmp_path: Path):
 
 
 def test_sandboxed_spec_carries_run_and_task_ids(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("factory.provider._keychain_token",
+                        lambda service: "t"
+                        if service == "factory-zai" else None)
     """The sandboxed runner is a separate process: the run/task ids travel
     in the spec, so the in-sandbox collector can stamp every record."""
     from factory import session as session_mod
@@ -509,9 +512,8 @@ def test_sandboxed_spec_carries_run_and_task_ids(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(session_mod, "run_sandboxed", fake_run_sandboxed)
     session_mod.run_session_sandboxed(
         seat="implementer", prompt="p", run_dir=run.root, profile={},
-        max_turns=1, timeout_min=1, token="stub-token",
-        run_id=run.run_id, task_id="T-9",
-    )
+        max_turns=1, timeout_min=1,
+        run_id=run.run_id, task_id="T-9")
     cleanup_run(run)
     assert captured["spec"]["run_id"] == run.run_id
     assert captured["spec"]["task_id"] == "T-9"
