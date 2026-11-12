@@ -46,8 +46,29 @@ from factory.approvals import (
     ApprovalLedger,
     ApprovalLedgerError,
 )
-from factory.contract import NON_EXECUTABLE_KINDS, ContractError, acceptance_hash
+from factory.contract import (
+    NON_EXECUTABLE_KINDS,
+    ContractError,
+    acceptance_hash,
+    budget_floor,
+    load_profile,
+)
 from factory.egress import escape_approval_text
+from factory.gates import (
+    GateError,
+    contract_test_files,
+    default_branch_files,
+    scope_risk_flags,
+)
+from factory.gates import (
+    matches as _glob_match,
+)
+from factory.gates import (
+    ref_path as _ref_path,
+)
+from factory.gates import (
+    scope_matches as _scope_match,
+)
 from factory.mergeorder import gh_pr_state
 from factory.progress import ProgressLog, ProgressLogError
 from factory.publish import PublishError
@@ -103,16 +124,23 @@ class ApprovalDeclined(ApprovalError):
     """The human answered no to the confirmation prompt."""
 
 
-def render_contract(task: dict) -> str:
+def render_contract(task: dict, *, warnings: list | None = None) -> str:
     """Render the contract a human is about to approve.
 
     Everything the approval decision depends on, nothing else: identity,
     risk, dependencies, the acceptance items with their checks, owner
     steps and slices. Open owner steps list first — they cap how far the
-    task can ever be advanced.
+    task can ever be advanced. F-71 adds the declared dependencies (the
+    pre-spend policy they trigger) and, when the caller computed them,
+    the protected-ref WARNING block (AC-2: a criterion whose test file
+    the scope cannot touch can only go green through a protected-path
+    change).
 
     Args:
         task: The task record.
+        warnings: :func:`protected_ref_warnings` results, when the
+            caller ran them (single approval and runnable reconcile
+            targets); None renders none.
 
     Returns:
         The contract as plain text, one fact per line.
@@ -120,6 +148,11 @@ def render_contract(task: dict) -> str:
     budget = task.get("budget") or {}
     risk = task.get("risk") or []
     deps = task.get("depends_on") or []
+    dependencies = task.get("dependencies") or []
+    dependencies_shown = ", ".join(
+        "{}:{}".format(entry.get("ecosystem"), entry.get("name"))
+        for entry in dependencies if isinstance(entry, dict)
+    ) if dependencies else "(none declared)"
 
     def show(value) -> str:
         # F-63 R2-1: every interpolated value escapes its control
@@ -145,6 +178,11 @@ def render_contract(task: dict) -> str:
         f"  source: {show(task.get('source'))}",
         f"  risk: {show(', '.join(risk) if risk else '(none)')}",
         f"  depends_on: {show(', '.join(deps) if deps else '(none)')}",
+        # F-71 AC-4: the declared dependencies are the pre-spend policy
+        # — a direct manifest addition must be listed here, and listing
+        # any refuses --yes (a human looks at what gets installed).
+        f"  dependencies (F-71; --yes refused while set): "
+        f"{show(dependencies_shown)}",
         # F-65 AC-1: the file scope is half of what the owner is
         # approving — L0 fails anything outside these globs, and widening
         # them later is a new contract needing re-approval.
@@ -159,6 +197,16 @@ def render_contract(task: dict) -> str:
             lines.append(
                 f"      check: {show(check.get('type'))} {show(check.get('ref'))}"
             )
+    # F-71 AC-2: the protected-ref warnings render INSIDE the contract,
+    # right where the criteria they name sit — the owner answers the
+    # same y/N prompt with them in view.
+    for criterion, file in warnings or []:
+        lines.append(
+            f"  WARNING — {show(criterion)}: its test file {show(file)} is "
+            "a protected path this contract's scope cannot touch: the "
+            "criterion can only go green through a protected-path change "
+            "(L0 fails it). Confirm with the risk in view."
+        )
     for step in task.get("owner_steps") or []:
         mark = "x" if step.get("done") else " "
         lines.append(f"  owner step [{mark}]: {show(step.get('text'))}")
@@ -227,25 +275,225 @@ def check_v0_gates(task: dict) -> None:
             )
 
 
+def _ref_runnable_error(ref: str) -> str | None:
+    """Why a ``test`` check ref is not runnable as written (F-71 AC-2),
+    or None. The exact form is ``<repo-relative path>::<name>``, one or
+    more non-empty, unpadded ``::`` name segments — the same split L1
+    uses (:func:`factory.gates.ref_path`)."""
+    if "::" not in ref:
+        return f"ref {ref!r} is not <path>::<name> — the runner cannot collect it"
+    path = _ref_path(ref)
+    if path is None or not path.strip():
+        return f"ref {ref!r} names no test-file path"
+    if path != path.strip():
+        return f"ref {ref!r} pads the file path"
+    if path.startswith("/"):
+        return f"ref {ref!r} is absolute — refs are repo-relative"
+    if ".." in path.split("/"):
+        return f"ref {ref!r} climbs out of the repo (..)"
+    names = ref.split("::")[1:]
+    if not names or any(not name.strip() for name in names):
+        return f"ref {ref!r} names an empty test name"
+    if any(name != name.strip() for name in names):
+        return f"ref {ref!r} pads a test name with whitespace"
+    return None
+
+
+def _check_refs_runnable(task: dict) -> None:
+    """Refuse a contract whose checks cannot run as written (F-71 AC-2).
+
+    A prose ref or an empty command is a paid run discovering a broken
+    contract mid-spend — the exact waste this work order exists to
+    prevent. Applied wherever an approval makes the task runnable
+    (the ``require_scope`` boundary: finished work's refs were proven
+    by the run that validated it).
+    """
+    task_id = task.get("id")
+    for item in task.get("acceptance") or []:
+        check = item.get("check") if isinstance(item, dict) else None
+        if not isinstance(check, dict):
+            continue
+        criterion = item.get("id", "?")
+        kind = check.get("type")
+        if kind == "test":
+            ref = check.get("ref")
+            if not isinstance(ref, str):
+                continue  # the schema's own refusal names the shape
+            reason = _ref_runnable_error(ref)
+            if reason is not None:
+                raise ApprovalError(
+                    f"{task_id}: {criterion}'s check is not runnable — "
+                    f"{reason}… name the exact test "
+                    "(tests/test_<task>.py::test_ac_N for a new file)"
+                )
+        elif kind == "command":
+            command = check.get("ref")
+            if isinstance(command, str) and not command.strip():
+                raise ApprovalError(
+                    f"{task_id}: {criterion}'s command check is empty — "
+                    "a paid run cannot prove it"
+                )
+
+
+def _approval_profile(queue: TaskQueue) -> dict:
+    """The profile an approval judges against (F-71): loaded from the
+    same default as ``approve --profile`` — next to the queue.
+
+    Fail closed twice: a runnable kind's approval without a loadable
+    profile is refused, the path named — and a profile naming another
+    project than the queue is refused too (the F-62 pair rule: judging
+    one project's contract against another project's risk globs is how
+    a paid run gets wasted). The profile carries the risk globs and the
+    budget floor the pre-spend checks run on.
+    """
+    path = Path(queue.path).parent / "project.yaml"
+    try:
+        profile = load_profile(path)
+    except ContractError as exc:
+        raise ApprovalError(
+            f"cannot approve a runnable contract without a loadable "
+            f"profile next to the queue — {path}: {exc}"
+        ) from exc
+    queue_project = (queue.doc or {}).get("project")
+    if profile.get("name") != queue_project:
+        raise ApprovalError(
+            f"cannot approve a runnable contract against a mismatched "
+            f"profile: the queue names project {queue_project!r} but "
+            f"{path} names {profile.get('name')!r} (F-62 pair rule)"
+        )
+    return profile
+
+
+def _tracked_files(repo: Path, default_branch: str) -> list[str]:
+    """The tracked files of the branch the RUN builds on (F-71 AC-1,
+    R1-3): the remote default after a fetch when the repo has an origin
+    (:func:`factory.gates.default_branch_files`), else the local
+    default — never the working tree (an untracked file is not a place
+    the contract reaches; a deleted-at-base file is not either)."""
+    try:
+        return default_branch_files(repo, default_branch)
+    except GateError as exc:
+        raise ApprovalError(
+            f"cannot compute the scope's risk flags: {exc}"
+        ) from exc
+
+
+def protected_ref_warnings(task: dict, profile: dict) -> list:
+    """The protected-ref warnings (F-71 AC-2): ``(criterion, file)``
+    for every test ref whose file sits under the profile's protected
+    paths while the declared scope cannot touch that file.
+
+    Not a refusal: the criterion can still go green through a
+    protected-path change the owner knowingly allows (the wo19
+    calibration-pin case). The warning block renders in the contract
+    and ``--yes`` is refused for a task carrying one — a human answers
+    the prompt with the risk in view.
+    """
+    scope_paths = _scope_paths(task)
+    protected = (profile.get("paths") or {}).get("protected") or []
+    warnings = []
+    for item in task.get("acceptance") or []:
+        check = item.get("check") if isinstance(item, dict) else None
+        if not (isinstance(check, dict) and check.get("type") == "test"):
+            continue
+        ref = check.get("ref")
+        if not isinstance(ref, str):
+            continue
+        file = _ref_path(ref)
+        if not file:
+            continue
+        if _glob_match(file, protected) and not _scope_match(file, scope_paths):
+            warnings.append((item.get("id", "?"), file))
+    return warnings
+
+
+def _prespend_checks(task: dict, queue: TaskQueue) -> list:
+    """The F-71 pre-spend checks of a contract a session WILL run
+    (AC-1 risk coverage, AC-3 budget floor; AC-2's ref refusals ride
+    :func:`_check_approvable`). Returns the protected-ref warnings for
+    the contract render.
+
+    Fail closed on every doubt: a missing profile, an unreadable
+    default branch, an uncovered risk flag, a starved budget — each
+    refuses, because each is exactly the shape of a paid run wasted
+    before any validation layer runs (the pilot's two failed runs).
+    """
+    task_id = task.get("id")
+    if task.get("kind") not in ELIGIBLE_KINDS:
+        return []
+    profile = _approval_profile(queue)
+    # AC-1: the risk flags the declared scope can reach must be
+    # declared — computed on the branch the run builds on, plus L0's
+    # implicit allowances (the task's own contract test files, the
+    # profile's generated globs) and the literal scope paths, through
+    # the same matcher L0 uses (gates.scope_risk_flags).
+    repo = Path(profile.get("repo", {}).get("path", ".")).expanduser()
+    risk_globs = (profile.get("paths") or {}).get("risk") or {}
+    tracked = _tracked_files(
+        repo, profile.get("repo", {}).get("default_branch", "main"))
+    computed = scope_risk_flags(
+        _scope_paths(task), risk_globs, tracked,
+        generated_globs=(profile.get("paths") or {}).get("generated") or (),
+        extra_files=contract_test_files(task),
+    )
+    declared = set(task.get("risk") or [])
+    missing = {flag: paths for flag, paths in computed.items()
+               if flag not in declared}
+    if missing:
+        detail = "; ".join(
+            f"{flag} (reached via {', '.join(paths[:3])}"
+            + (f", +{len(paths) - 3} more" if len(paths) > 3 else "") + ")"
+            for flag, paths in sorted(missing.items())
+        )
+        raise ApprovalError(
+            f"{task_id}: the declared scope reaches risk paths the "
+            f"contract's risk flags do not declare — {detail}. Declare "
+            "them (the run escalates risk_path_touched on the diff "
+            "otherwise); F-71"
+        )
+    # AC-3: a runnable task below the profile's budget floor starves
+    # before any validation layer runs (the pilot's run 1 died twice
+    # inside 30 turns).
+    floor = budget_floor(profile)
+    budget = task.get("budget") or {}
+    below = {
+        field: (budget.get(field), floor[field])
+        for field in ("max_turns", "wall_clock_min")
+        if isinstance(budget.get(field), int) and budget[field] < floor[field]
+    }
+    if below:
+        detail = ", ".join(
+            f"{field} {value} is below the floor {flr}"
+            for field, (value, flr) in sorted(below.items())
+        )
+        raise ApprovalError(
+            f"{task_id}: refusing to approve a budget that starves a run — "
+            f"{detail} (the profile's budget floor; F-71)"
+        )
+    return protected_ref_warnings(task, profile)
+
+
 def _check_approvable(task: dict, *, require_scope: bool = True) -> None:
     """Refusals that apply to any approval, single or reconcile.
 
     Args:
         task: The task record.
-        require_scope: Demand the F-65 declared file scope. True for
-            every approval of future work (``factory approve``, a
-            reconcile to a runnable status). False only when a
-            reconcile records work that was ALREADY built and validated
-            (``in_review`` and beyond): no session will run it, and a
-            finished task that is ever re-opened still meets the
-            run-time ``scope_missing`` refusal before a session starts.
+        require_scope: Demand the F-65 declared file scope (and, with
+            it, F-71's runnable-check refusals). True for every
+            approval of future work (``factory approve``, a reconcile
+            to a runnable status). False only when a reconcile records
+            work that was ALREADY built and validated (``in_review``
+            and beyond): no session will run it, and a finished task
+            that is ever re-opened still meets the run-time
+            ``scope_missing`` refusal before a session starts.
 
     Raises:
         ApprovalError: When the task is not a draft, is of a
             non-executable kind, has no acceptance items (AC-1), carries
             a non-human merge/deploy gate (:func:`check_v0_gates`,
-            F-67), or — F-65 — is of a kind the picker runs but declares
-            no file scope.
+            F-67), — F-65 — is of a kind the picker runs but declares
+            no file scope, or — F-71 AC-2 — names a check a runner
+            cannot run (on the runnable boundary).
     """
     task_id = task.get("id")
     kind = task.get("kind")
@@ -278,6 +526,10 @@ def _check_approvable(task: dict, *, require_scope: bool = True) -> None:
             "globs this task may change); the run refuses scope-less "
             "tasks (F-65)"
         )
+    # F-71 AC-2 rides the same runnable boundary as the scope: a ref a
+    # runner cannot run is a paid run discovering the break mid-spend.
+    if require_scope:
+        _check_refs_runnable(task)
 
 
 def _scope_paths(task: dict) -> list:
@@ -343,13 +595,41 @@ def approve_task(
     """
     task = queue.get(task_id)  # StateError (a ContractError) if unknown
     _check_approvable(task)
+    # F-71: the pre-spend checks (risk coverage over the default branch,
+    # the budget floor) and the protected-ref warnings, on the same
+    # runnable boundary the scope rides — a contract a session WILL run
+    # is checked before the session is spent on it.
+    warnings = _prespend_checks(task, queue)
     risk = task.get("risk") or []
     if assume_yes and risk:
         raise ApprovalError(
             f"{task_id}: risk flags ({', '.join(risk)}) require interactive "
             "approval; --yes is not accepted for risk-flagged tasks"
         )
-    echo(render_contract(task))
+    # F-71 AC-2: a protected-ref warning is a refusal of --yes, not of
+    # the approval — the owner can still answer y at the prompt.
+    if assume_yes and warnings:
+        detail = ", ".join(
+            f"{criterion} ({file})" for criterion, file in warnings)
+        raise ApprovalError(
+            f"{task_id}: {detail} — a test file the scope cannot touch is "
+            "protected, so its criterion can only go green through a "
+            "protected-path change; --yes is not accepted while a "
+            "contract carries that warning (F-71)"
+        )
+    # F-71 AC-4: a contract that declares dependencies installs them;
+    # a human looks at what gets installed.
+    if assume_yes and task.get("dependencies"):
+        shown = ", ".join(
+            "{}:{}".format(entry.get("ecosystem"), entry.get("name"))
+            for entry in task["dependencies"] if isinstance(entry, dict)
+        )
+        raise ApprovalError(
+            f"{task_id}: the contract declares dependencies ({shown}) "
+            "— --yes is not accepted for contracts that install "
+            "packages (F-71)"
+        )
+    echo(render_contract(task, warnings=warnings))
     if not assume_yes and not confirm(f"Approve {task_id}?"):
         raise ApprovalDeclined(f"{task_id}: approval declined")
     _freeze_contract(task, approved_by)
@@ -911,7 +1191,20 @@ def _reconcile_entry(
             f"dependency not met ({', '.join(open_deps)}); reconcile entries "
             "in dependency order",
         )
-    echo(render_contract(task))
+    # F-71: an entry whose target makes the task runnable takes the
+    # same approval checks as `factory approve` — the F-65 scope and
+    # F-71 ref refusals first, then the pre-spend checks (profile, risk
+    # coverage, floor), whose warnings render in the contract. The
+    # refusal becomes a failed RESULT here (reconcile never raises);
+    # proven-criteria targets record built work and take none of these.
+    warnings: list = []
+    if target not in _PROVEN_REQUIRED_TARGETS:
+        try:
+            _check_approvable(task, require_scope=True)
+            warnings = _prespend_checks(task, queue)
+        except ContractError as exc:
+            return ReconcileResult(tid, "failed", str(exc))
+    echo(render_contract(task, warnings=warnings))
     markers = ", ".join(
         f"{escape_approval_text(str(ac))}={escape_approval_text(str(m))}"
         for ac, m in sorted(entry["criteria"].items())
@@ -928,9 +1221,10 @@ def _reconcile_entry(
         # move (the approve_task order): an entry for a task that never
         # moved is harmless history, an approved task the ledger doesn't
         # cover would be demoted straight back (F-63).
-        # The F-65 scope is a run-time boundary: demanded when this
-        # reconcile makes the task runnable, not when it records work
-        # already built and validated (the proven-criteria targets).
+        # The F-65 scope (and F-71's pre-spend checks, run above for the
+        # render) is a run-time boundary: demanded when this reconcile
+        # makes the task runnable, not when it records work already
+        # built and validated (the proven-criteria targets).
         _check_approvable(
             task, require_scope=target not in _PROVEN_REQUIRED_TARGETS)
         _freeze_contract(task, approved_by)

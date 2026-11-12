@@ -235,6 +235,19 @@
           }
         },
         "acceptance": { "type": "array", "items": { "$ref": "#/$defs/acceptance_item" } },
+        "dependencies": {
+          "type": "array",
+          "description": "F-71 AC-4: the dependencies this contract adds. Inside contract_hash (a widened list is a new contract). Names normalised per ecosystem (PEP 503 for pypi, lowercase for npm); a direct manifest addition not declared here escalates new_dependency. Declaring any refuses --yes at approval (a human looks).",
+          "items": {
+            "type": "object",
+            "required": ["ecosystem", "name"],
+            "additionalProperties": false,
+            "properties": {
+              "ecosystem": { "enum": ["pypi", "npm"] },
+              "name": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
         "acceptance_hash": { "type": "string", "description": "sha256 of canonical acceptance JSON, set at spec approval" },
         "approved_by": { "type": "string" },
         "approved_at": { "type": "string", "format": "date-time" },

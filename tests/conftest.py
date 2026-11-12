@@ -42,6 +42,27 @@ def _no_ambient_spend(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_registry_network(monkeypatch):
+    """F-71: no test may reach a package registry. The registry client's
+    ONE network seam fails closed (an unreachable registry) unless the
+    test injects its own stub at the client's construction — the same
+    posture as _no_ambient_spend: an unstubbed reach is a deterministic
+    in-test failure, never live network traffic."""
+    try:
+        import factory.registry as registry_module
+    except ImportError:
+        return  # pre-F-71 tree (red-first runs)
+
+    def _unreachable(ecosystem, name):
+        raise registry_module.RegistryError(
+            f"{ecosystem} registry unreachable: the test suite never "
+            "touches the network (stub get_json to answer for a package)"
+        )
+
+    monkeypatch.setattr(registry_module, "_http_get_json", _unreachable)
+
+
+@pytest.fixture(autouse=True)
 def _pin_factory_root_default(monkeypatch, tmp_path):
     """F-63: no test may write into the real ~/factory — including the
     approval ledger.

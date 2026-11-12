@@ -85,8 +85,10 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument(
         "--yes",
         action="store_true",
-        help="non-interactive confirmation (refused for risk-flagged tasks, "
-             "and never accepted for --profile or --adopt)",
+        help="non-interactive confirmation (refused for risk-flagged "
+             "tasks, contracts carrying a protected-ref warning or "
+             "declared dependencies (F-71), and never accepted for "
+             "--profile or --adopt)",
     )
     approve.add_argument(
         "--reconcile-bootstrap",

@@ -280,6 +280,19 @@ paths:
     # accounting) judge the protected importer/approve/session/status/
     # schema modules — same precedent, protected from the day they exist.
     - "tests/test_f67.py"
+    # F-71: the pre-spend-check contract tests (scope risk coverage,
+    # runnable refs, the budget floor, the dependency policy) judge the
+    # protected approve/importer/l0/gates/contract/approvals modules and
+    # the two new dependency judge modules below — same precedent.
+    - "tests/test_f71.py"
+    # F-71: the dependency policy is judge surface — deps.py decides
+    # what a manifest change means, registry.py decides whether a
+    # package may be installed, and the generator writes the near-miss
+    # lists the registry check reads. A session weakening any of them
+    # edits what judges it.
+    - "factory/deps.py"
+    - "factory/registry.py"
+    - "scripts/generate_top_packages.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 
