@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -52,11 +53,49 @@ def _task(status: str = "draft", **extra) -> dict:
         ],
         "attempts": [],
         "links": {},
-        "budget": {"size": "S", "max_attempts": 3, "max_turns": 20,
+        # F-71 re-seat: the default budget floor is 60/30 — the fixture
+        # sits above it (a runnable reconcile target refuses below).
+        "budget": {"size": "S", "max_attempts": 3, "max_turns": 60,
                    "wall_clock_min": 30},
     }
     task.update(extra)
     return task
+
+
+def _write_approval_profile(tmp_path: Path) -> None:
+    """The profile an approval-of-runnable-work reads (F-71): beside the
+    queue, no risk globs, one committed file in its repo."""
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    (repo / "src.txt").write_text("fixture\n", encoding="utf-8")
+    for args in (
+        ("init", "-q", "-b", "main"),
+        ("config", "user.email", "fixture@factory.local"),
+        ("config", "user.name", "fixture"),
+        ("add", "-A"),
+        ("commit", "-q", "-m", "base"),
+    ):
+        subprocess.run(["git", "-C", str(repo), *args], check=True,
+                       capture_output=True, text=True)
+    (tmp_path / "project.yaml").write_text(
+        "name: fixture\n"
+        "repo:\n"
+        f"  path: {repo}\n"
+        "  default_branch: main\n"
+        "  remote: https://example.invalid/fixture.git\n"
+        "commands:\n"
+        "  setup: 'true'\n"
+        "  test: 'true'\n"
+        "paths:\n"
+        "  risk: {}\n"
+        "  protected: []\n"
+        "deploy:\n"
+        "  mechanism: none\n"
+        "  auto_on_merge: false\n"
+        "live_checks: {}\n"
+        "docs_allowlist: []\n",
+        encoding="utf-8",
+    )
 
 
 def _reconcile(tmp_path: Path, ledger_text: str, task: dict):
@@ -65,6 +104,7 @@ def _reconcile(tmp_path: Path, ledger_text: str, task: dict):
         {"version": 1, "project": "fixture", "tasks": [task]}, indent=2) + "\n")
     ledger = tmp_path / "BOOTSTRAP.md"
     ledger.write_text(ledger_text)
+    _write_approval_profile(tmp_path)
     results = reconcile_bootstrap(
         TaskQueue(queue_path), ledger, approved_by="owner",
         confirm=lambda _q: True, echo=lambda _t: None,

@@ -87,6 +87,10 @@ PROFILE_SECURITY_GROUPS: dict[str, tuple[str, ...]] = {
     "repo.path": ("repo", "path"),
     "repo.default_branch": ("repo", "default_branch"),
     "repo.branch_protection": ("repo", "branch_protection"),
+    # F-71 AC-3: the budget floor is the owner's own spending policy —
+    # changing it re-approval-gates every profile (a floor is what a
+    # paid run starves against).
+    "budget_floor": ("budget_floor",),
     "paths.protected": ("paths", "protected"),
     "paths.risk": ("paths", "risk"),
     # F-65 AC-4: the generated-file list widens every task's effective

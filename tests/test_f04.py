@@ -12,6 +12,7 @@ unmentioned criteria).
 import copy
 import json
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -69,6 +70,47 @@ def _queue_file(tmp_path, tasks, name="tasks.json"):
     path.write_text(
         json.dumps({"version": 1, "project": "fixture", "tasks": tasks}, indent=2)
     )
+    # F-71 re-seat: approval of a runnable kind reads the profile next
+    # to the queue (risk globs, budget floor) and the repo's default
+    # branch. An honest minimal pair beside the queue: no risk globs,
+    # the default floor (the fixture budget 80/60 sits above it), one
+    # committed file.
+    profile = tmp_path / "project.yaml"
+    if not profile.exists():
+        repo = tmp_path / "repo"
+        repo.mkdir(exist_ok=True)
+        (repo / "impl.py").write_text("x = 0\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config",
+                        "user.email", "fixture@factory.local"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config",
+                        "user.name", "fixture"], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"],
+                       check=True, capture_output=True)
+        profile.write_text(
+            "name: fixture\n"
+            "repo:\n"
+            f"  path: {repo}\n"
+            "  default_branch: main\n"
+            "  remote: https://example.invalid/fixture.git\n"
+            "commands:\n"
+            "  setup: 'true'\n"
+            "  test: 'true'\n"
+            "paths:\n"
+            "  risk: {}\n"
+            "  protected: []\n"
+            "deploy:\n"
+            "  mechanism: none\n"
+            "  auto_on_merge: false\n"
+            "live_checks: {}\n"
+            "docs_allowlist: []\n",
+            encoding="utf-8",
+        )
     return path
 
 

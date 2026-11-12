@@ -73,11 +73,13 @@ flips it, per the verifier's standing rule):
 Deferred beyond v0 (needs the F-05 sandbox network allowlist): the
 ``new_dependency`` registry checks (package exists, older than 30 days,
 not a near-miss of a popular name). L0 records the escalation; the checks
-run when there is a sandbox to run them in.
+run when there is a sandbox to run them in. F-71 builds them: they run
+PARENT-side (L0 runs in the orchestrator, outside the sandbox) against
+the public registry APIs through :mod:`factory.registry`, over the
+dependency declarations the contract now carries.
 """
 
 import configparser
-import copy
 import json
 import posixpath
 import re
@@ -86,6 +88,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 
+from factory import deps
 from factory.attribution import attribution_match
 from factory.contract import default_protected_control, runner_config_policy
 from factory.egress import strip_control_sequences
@@ -165,12 +168,17 @@ class L0Report(GateReport):
 
     ``escalations`` name the immediate-stop classes in VALIDATOR-SPEC
     (protected path, risk path, new dependency): they need a human even
-    when the verdict itself is a pass.
+    when the verdict itself is a pass. ``dependency_checks`` (F-71 AC-4)
+    carries one entry per added package the registry policy judged
+    (verdict, first release, near-miss, declared), plus one manifest-
+    level entry per manifest it could not parse — the evidence behind
+    any ``new_dependency`` escalation.
     """
 
     layer: ClassVar[str] = "L0"
     escalations: list = field(default_factory=list)
     risk_flags_added: list = field(default_factory=list)
+    dependency_checks: list = field(default_factory=list)
     preexisting_notes: list = field(default_factory=list)
     sentinel_results: list = field(default_factory=list)
 
@@ -181,6 +189,7 @@ class L0Report(GateReport):
             "findings": self.findings_as_dicts(),
             "escalations": self.escalations,
             "risk_flags_added": self.risk_flags_added,
+            "dependency_checks": self.dependency_checks,
             "commands": self.commands_as_dicts(),
             "preexisting_notes": self.preexisting_notes,
             "sentinel_results": self.sentinel_results,
@@ -316,85 +325,10 @@ def _failure_marker(output: str) -> str | None:
 # Anything else — an unknown ``tool.*`` table included — compares, and a
 # difference escalates: a new table class that can carry dependencies
 # fails closed until a human allowlists it here.
-_INERT_PYPROJECT_PATHS = (
-    "project.name",
-    "project.description",
-    "project.readme",
-    "project.version",
-    "project.urls",
-    "project.scripts",
-    "tool.ruff",
-    "tool.pytest",
-    "tool.coverage",
-    "tool.mypy",
-    "tool.setuptools.package-data",
-)
-
-
-def _strip_inert(doc: dict) -> dict:
-    """A deep copy of a parsed pyproject with every :data:`_INERT_PYPROJECT_PATHS`
-    entry removed, for whole-document comparison. Tables the stripping
-    empties are pruned (``[tool.ruff]`` alone leaves ``tool: {}`` on one
-    side and no ``tool`` key on the other — equal in meaning, unequal as
-    dicts); an empty table carries no dependency, so pruning it is not a
-    hole."""
-    stripped = copy.deepcopy(doc)
-    for dotted in _INERT_PYPROJECT_PATHS:
-        parts = dotted.split(".")
-        node: Any = stripped
-        for part in parts[:-1]:
-            if not isinstance(node, dict) or part not in node:
-                node = None
-                break
-            node = node[part]
-        if isinstance(node, dict):
-            node.pop(parts[-1], None)
-    return _prune_empty(stripped)
-
-
-def _prune_empty(node: Any) -> Any:
-    """Recursively drop dict entries whose value is (or prunes to) an
-    empty dict; scalars, lists and empty lists pass through untouched."""
-    if not isinstance(node, dict):
-        return node
-    pruned = {}
-    for key, value in node.items():
-        value = _prune_empty(value)
-        if isinstance(value, dict) and not value:
-            continue
-        pruned[key] = value
-    return pruned
-
-
-def _pyproject_surface_unchanged(change, path: str, *, repo, base_ref, head_ref) -> bool:
-    """Whether a manifest touch leaves pyproject.toml's dependency surface
-    untouched — the one structurally parsed manifest (F-31 run blocker:
-    a ``[tool.setuptools.package-data]``-only edit falsely escalated
-    ``new_dependency`` and skipped every remaining gate).
-
-    The WHOLE parsed document compares, minus the inert allowlist
-    (:data:`_INERT_PYPROJECT_PATHS`) — dependency-bearing tables outside
-    the obvious three (PEP 735 dependency-groups, dynamic dependencies,
-    tool.uv.sources, tool.poetry.*) escalate rather than slipping through.
-
-    True ONLY for a plain modification (status M) of a root
-    ``pyproject.toml`` with refs supplied, whose merge-base and head
-    sides both parse and compare equal. Every doubt — another manifest
-    path, an added/deleted/renamed pyproject, missing refs, a git or
-    TOML failure — answers False, and the caller escalates exactly as
-    the path-match rule always did.
-    """
-    if path != "pyproject.toml" or change.status != "M":
-        return False
-    if repo is None or not base_ref or not head_ref:
-        return False
-    try:
-        merge_base = _git(Path(repo), "merge-base", base_ref, head_ref).strip()
-        before = tomllib.loads(_git(Path(repo), "show", f"{merge_base}:pyproject.toml"))
-        after = tomllib.loads(_git(Path(repo), "show", f"{head_ref}:pyproject.toml"))
-        return _strip_inert(before) == _strip_inert(after)
-    except (GateError, tomllib.TOMLDecodeError, TypeError, UnicodeDecodeError):
-        return False
+_INERT_PYPROJECT_PATHS = deps._INERT_PYPROJECT_PATHS
+_strip_inert = deps._strip_inert
+_prune_empty = deps._prune_empty
+_pyproject_surface_unchanged = deps.pyproject_surface_unchanged
 
 
 def _pytest_config_at(repo: Path, ref: str, path: str, tables: list) -> tuple[dict, str | None]:
@@ -520,7 +454,8 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
                       matched_flags: set | None = None, *,
                       repo: Path | str | None = None,
                       base_ref: str | None = None,
-                      head_ref: str | None = None):
+                      head_ref: str | None = None,
+                      dependency_analyser=None):
     """Apply the L0 diff policy to a set of changed paths.
 
     FAIL classes (findings): protected path touched (added, modified or
@@ -676,7 +611,15 @@ def check_diff_policy(profile: dict, changes: list, task: dict | None = None,
             if _matches(path, manifests) and not _pyproject_surface_unchanged(
                 change, path, repo=repo, base_ref=base_ref, head_ref=head_ref,
             ):
-                escalations.add("new_dependency")
+                # F-71 AC-4: with an analyser (run_l0 always passes one),
+                # a manifest change passes only when every added package
+                # is declared (direct ones) and passes the registry
+                # checks — the analyser records its evidence on
+                # ``.checks`` for the report. Without one (direct
+                # callers), the pre-F-71 blanket rule holds: escalate.
+                if dependency_analyser is None \
+                        or not dependency_analyser.allows(change, path):
+                    escalations.add("new_dependency")
             # F-46 AC-4 (M-4): test-runner configuration is protected
             # whatever the profile says — a runner the implementer
             # reshapes judges its own tests.
@@ -965,6 +908,7 @@ def run_l0(
     baseline: dict | None = None,
     timeout_sec: int = 600,
     runner: CommandRunner | None = None,
+    registry_client=None,
 ) -> L0Report:
     """Run the full L0 gate on a checkout of the slice's branch.
 
@@ -982,13 +926,18 @@ def run_l0(
         repo: Repository holding ``base_ref`` and ``head_ref``.
         base_ref: Base ref (compared from the merge-base).
         head_ref: The slice's branch ref.
-        task: The task record (risk flags, contract test refs).
+        task: The task record (risk flags, contract test refs,
+            dependencies).
         baseline: Baseline mapping; when ``None``, loaded from the
             profile's ``baselines`` path as committed at ``base_ref``.
         timeout_sec: Per-command wall-clock cap.
         runner: Executes each profile command. Default: unconfined
             :func:`~factory.gates.run_command`; F-10 passes the sandboxed
             runner (the commands execute the agent's code).
+        registry_client: The F-71 registry client for added-dependency
+            checks (parent-side, outside the sandbox). Default: the real
+            :class:`factory.registry.RegistryClient`; tests inject a
+            stub at its ONE network seam.
 
     Returns:
         The ``L0Report``; verdict is ``"fail"`` iff any finding exists.
@@ -997,6 +946,8 @@ def run_l0(
         GateError: If git can't produce the diff (bad refs, git missing),
             or the checkout isn't a clean tree at ``head_ref``.
     """
+    from factory.registry import RegistryClient
+
     repo = Path(repo)
     _assert_checkout(repo, head_ref)
     changes = diff_file_changes(repo, base_ref, head_ref)
@@ -1006,9 +957,17 @@ def run_l0(
     # computation per run (F-25 review finding 7).
     risk_globs = (profile.get("paths") or {}).get("risk") or {}
     matched = matched_risk_flags(risk_globs, changes)
+    # F-71 AC-4: the added-dependency policy — parent-side, at the same
+    # refs the diff came from. The client is injectable so no test ever
+    # touches the network; the real one runs in the orchestrator.
+    analyser = deps.DependencyAnalyser(
+        task or {}, repo, base_ref, head_ref,
+        client=registry_client or RegistryClient(),
+    )
     findings, escalations, risk_flags_added, _matched = check_diff_policy(
         profile, changes, task, matched_flags=matched,
         repo=repo, base_ref=base_ref, head_ref=head_ref,
+        dependency_analyser=analyser,
     )
     # F-42 AC-1: the branch's own commit messages carry no AI attribution
     # — before anything is pushed, on every round (each round re-runs L0,
@@ -1170,6 +1129,7 @@ def run_l0(
         findings=findings,
         escalations=escalations,
         risk_flags_added=risk_flags_added,
+        dependency_checks=list(analyser.checks),
         command_results=results,
         preexisting_notes=sorted(set(preexisting)),
         sentinel_results=sentinel_results,

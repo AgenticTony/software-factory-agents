@@ -1156,6 +1156,21 @@ def _check_profile_semantics(data: dict, origin: str, *,
         ContractError: On the first semantic violation found.
     """
     _check_provider_semantics(data, origin)
+    # F-71 AC-3: a budget floor above the task schema's F-64 caps would
+    # refuse every contract (nothing could satisfy it), so it refuses at
+    # load, the field named.
+    floor = data.get("budget_floor")
+    if isinstance(floor, dict):
+        for field, cap in budget_caps().items():
+            value = floor.get(field)
+            if isinstance(value, int) and not isinstance(value, bool) \
+                    and value > cap:
+                raise ContractError(
+                    f"{origin}: budget_floor.{field} is {value}, above the "
+                    f"task budget cap of {cap} (F-64) — a floor no contract "
+                    "can satisfy; lower the floor or raise the cap by owner "
+                    "decision"
+                )
     sentinels = data.get("sentinels") or {}
     risk_globs = (data.get("paths") or {}).get("risk") or {}
     for flag, entries in sentinels.items():
@@ -1268,6 +1283,51 @@ def default_protected_control(schema_path: Path | None = None) -> list:
             "refusing to guess it"
         ) from exc
     return copy.deepcopy(globs)
+
+
+# F-71 AC-3: the floor's defaults, as named constants — the owner's to
+# confirm at review (the spec's 60/30 are the pilot-informed proposal:
+# run 1 died twice inside 30 turns with nothing validated).
+BUDGET_FLOOR_DEFAULT_TURNS = 60
+BUDGET_FLOOR_DEFAULT_WALL_MIN = 30
+
+
+@functools.lru_cache(maxsize=1)
+def budget_caps(schema_path: Path | None = None) -> dict[str, int]:
+    """The task budget maxima (F-64's caps) read from the tasks schema.
+
+    ``{"max_turns": …, "wall_clock_min": …}`` — the ceiling a profile's
+    ``budget_floor`` must stay inside. Read from the schema so the floor
+    rule can never drift from the cap it bounds (a cap change moves both).
+    """
+    schema = _schema_document(
+        schema_path if schema_path is not None else SCHEMA_DIR / "tasks.schema.json"
+    )
+    budget = schema.get("$defs", {}).get("task", {}).get(
+        "properties", {}).get("budget", {}).get("properties", {})
+    caps: dict[str, int] = {}
+    for field in ("max_turns", "wall_clock_min"):
+        cap = budget.get(field, {}).get("maximum")
+        if not isinstance(cap, int):
+            raise ContractError(
+                "tasks.schema.json carries no integer maximum for "
+                f"budget.{field} — the F-71 floor cannot be bounded"
+            )
+        caps[field] = cap
+    return caps
+
+
+def budget_floor(profile: dict) -> dict[str, int]:
+    """The effective budget floor of a (loaded) profile: the declared
+    ``budget_floor`` over the :data:`BUDGET_FLOOR_DEFAULT_*` defaults —
+    a partial declaration keeps the other field's default."""
+    declared = profile.get("budget_floor")
+    declared = declared if isinstance(declared, dict) else {}
+    return {
+        "max_turns": declared.get("max_turns", BUDGET_FLOOR_DEFAULT_TURNS),
+        "wall_clock_min": declared.get(
+            "wall_clock_min", BUDGET_FLOOR_DEFAULT_WALL_MIN),
+    }
 
 
 def apply_profile_defaults(profile: dict, schema_path: Path | None = None) -> dict:

@@ -58,6 +58,7 @@ include = ["factory*"]
 "factory" = [
     "dashboard_static/*",
     "data/schema/*.json",
+    "data/top_packages/*.txt",
     "data/toolkit/**/*",
     "data/prompts/**/*",
 ]

@@ -763,6 +763,16 @@ def test_default_import_session_runs_sandboxed_never_in_process(
         "pytest.toml", "**/pytest.toml",
         ".pytest.toml", "**/.pytest.toml",
         ".factory/**",  # F-63 AC-4: the factory-control default joined
+        # F-71 R2-4: the registry-redirecting config files joined the
+        # schema-level default (an honest re-seat — the list is meant to
+        # widen; that is the finding's point).
+        ".npmrc", "**/.npmrc",
+        ".yarnrc", "**/.yarnrc",
+        ".yarnrc.yml", "**/.yarnrc.yml",
+        "pip.conf", "**/pip.conf",
+        "pip.ini", "**/pip.ini",
+        "uv.toml", "**/uv.toml",
+        ".pypirc", "**/.pypirc",
     ]
     # The clone and its sandbox files are disposable: gone afterwards.
     assert not run_dir.exists()

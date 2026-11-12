@@ -185,6 +185,114 @@ def _scope_glob_match(pat_segs: tuple, path_segs: tuple) -> bool:
     return _scope_glob_match(rest, path_segs[1:])
 
 
+def scope_risk_flags(scope_paths, risk_globs: dict, tracked_files, *,
+                     generated_globs=(), extra_files=()) -> dict:
+    """The risk flags a contract's declared scope can reach (F-71 AC-1).
+
+    ONE implementation, shared by approval (:mod:`factory.approve`) and
+    the importer's normalisation (:mod:`factory.importer`) — the same
+    rule that judges a scope at approval judges the proposal the
+    importer writes. Candidates:
+
+    * every tracked file on the repo's DEFAULT branch that matches any
+      scope glob (:func:`scope_matches` — the caller supplies
+      :func:`default_branch_files`, never the working tree: a file that
+      exists only untracked is not a place this contract reaches);
+    * L0's implicit allowances (R1-7): the tracked files matching the
+      profile's ``paths.generated`` globs, plus every named contract
+      test file (``extra_files`` — files the task will create), so a
+      risk glob covering what the run may legitimately touch demands
+      its flag at approval exactly as L0's matcher will at run time;
+    * plus every literal (glob-free) scope path, which covers files the
+      task will create that do not exist yet.
+
+    Each candidate goes through the SAME risk matcher L0 uses
+    (:func:`matches` via :func:`factory.sentinels.matched_risk_flags`'s
+    rule — fnmatch, ``*`` crossing ``/``, over-match on purpose), never
+    a second matcher.
+
+    Args:
+        scope_paths: The task's ``scope.paths`` globs.
+        risk_globs: The profile's ``paths.risk`` mapping.
+        tracked_files: The default branch's tracked repo-relative paths.
+        generated_globs: The profile's ``paths.generated`` globs.
+        extra_files: The task's own contract test files (repo-relative).
+
+    Returns:
+        ``{flag: [reaching paths, in candidate order]}`` for every flag
+        at least one candidate reaches; flags with no reach are absent.
+    """
+    scope_paths = list(scope_paths or [])
+    literals = [p for p in scope_paths if isinstance(p, str)
+                and not any(c in p for c in "*?")]
+    candidates: list[str] = []
+    for path in tracked_files:
+        if (scope_matches(path, scope_paths)
+                or (generated_globs and scope_matches(path, generated_globs))) \
+                and path not in candidates:
+            candidates.append(path)
+    for extra in extra_files:
+        if isinstance(extra, str) and extra and extra not in candidates:
+            candidates.append(extra)
+    for literal in literals:
+        if literal not in candidates:
+            candidates.append(literal)
+    reaching: dict[str, list[str]] = {}
+    for flag, globs in (risk_globs or {}).items():
+        paths = [p for p in candidates if matches(p, globs)]
+        if paths:
+            reaching[flag] = paths
+    return reaching
+
+
+def default_branch_files(repo, default_branch: str, *,
+                         fetch_timeout_sec: int = 60) -> list:
+    """The tracked files of the branch a RUN will build on (R1-3).
+
+    The run builds on the REMOTE default, not the owner checkout's
+    local branch (the pilot's checkout sat 11 commits behind origin and
+    on another branch) — so when the repo has an ``origin`` remote, it
+    is fetched (forced refspec, timed out, prompt-disabled) and the
+    tree read from ``refs/remotes/origin/<default>``. A repo with no
+    ``origin`` (a fixture, a local-only repo) is its own truth and
+    reads its local default branch. Never the working tree.
+
+    Raises:
+        GateError: the fetch or the tree listing failed (a fetch
+            failure is fail closed — the remote truth is what the run
+            will build on, and approving against a stale or unreadable
+            one is the exact waste F-71 exists to prevent).
+    """
+    repo = Path(repo)
+    remote = subprocess.run(
+        ["git", *GIT_HARDENING, "-C", str(repo), "remote", "get-url",
+         "origin"],
+        capture_output=True, text=True,
+    )
+    ref = default_branch
+    if remote.returncode == 0 and remote.stdout.strip():
+        tracking = f"refs/remotes/origin/{default_branch}"
+        try:
+            subprocess.run(
+                ["git", *GIT_HARDENING, "-C", str(repo), "fetch", "-q",
+                 "origin", f"+refs/heads/{default_branch}:{tracking}"],
+                capture_output=True, text=True, timeout=fetch_timeout_sec,
+                check=True,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                OSError) as exc:
+            stderr = getattr(exc, "stderr", "")
+            detail = stderr.strip() if isinstance(stderr, str) else str(exc)
+            raise GateError(
+                f"cannot fetch origin/{default_branch} in {repo} — the run "
+                "builds on the remote default and approval judges against "
+                f"it: {detail or exc}"
+            ) from exc
+        ref = tracking
+    listing = git(repo, "ls-tree", "-r", "--name-only", ref)
+    return [line for line in listing.splitlines() if line.strip()]
+
+
 def is_test_file(path: str) -> bool:
     return matches(path, TEST_GLOBS)
 

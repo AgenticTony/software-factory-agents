@@ -140,6 +140,7 @@ from factory.approvals import require_profile_approval
 from factory.contract import (
     SCHEMA_DIR,
     ContractError,
+    budget_floor,
     canonical_json,
     iter_schema_violations,
     load_profile,
@@ -152,6 +153,12 @@ from factory.egress import (
     escape_approval_text,
     scrub_session_text,
     scrub_session_value,
+)
+from factory.gates import (
+    GateError,
+    contract_test_files,
+    default_branch_files,
+    scope_risk_flags,
 )
 from factory.provider import (
     ProviderError,
@@ -207,6 +214,7 @@ SPEC_FIELDS = (
     "scope",
     "acceptance",
     "budget",
+    "dependencies",
     "owner_steps",
     "slices",
 )
@@ -972,6 +980,16 @@ def build_import_prompt(
         "- priority is P1–P3 only — the values listed above; P0 is not a",
         "  priority level this queue knows.",
         '- a check whose type is anything but "manual" must carry ref.',
+        "- a TEST check's ref is EXACT (F-71): <repo-relative path>::",
+        "  <test name>, one or more :: segments, never an absolute or ..",
+        "  path, never an empty or whitespace-padded name. Approval and",
+        "  this importer both refuse anything else. For a NEW test file",
+        "  the convention is tests/test_<task>.py::test_ac_N.",
+        "- a COMMAND check's ref is the full command, non-empty (F-71).",
+        "- a task that adds a dependency declares it (F-71): dependencies",
+        '  is a list of {"ecosystem": "pypi"|"npm", "name"} entries —',
+        "  every package a direct manifest gains must be declared, or",
+        "  the run escalates. Names are normalised (PEP 503 / lowercase).",
         "- owner_steps you propose are objects with text and done: false —",
         "  done_at, done_by and evidence are written when the owner ticks",
         '  them, never by you. Slices you propose always have status "todo".',
@@ -1377,6 +1395,31 @@ class GateOverride:
 
 
 @dataclass(frozen=True)
+class RiskAddition:
+    """One risk flag the parent ADDED to a proposal's ``risk`` (F-71
+    AC-1): the flag, the reaching paths (capped for render), and whether
+    the task was new. Adding is the conservative direction — the parent
+    never removes a flag; rendered with the overrides, before the diff."""
+
+    task_id: str
+    flag: str
+    reaching: tuple
+    new_task: bool
+
+
+@dataclass(frozen=True)
+class BudgetClamp:
+    """One budget field the parent clamped UP to the profile's floor
+    (F-71 AC-3): never down. Rendered with the overrides, before the
+    diff."""
+
+    task_id: str
+    field: str
+    proposed: int
+    clamped_to: int
+
+
+@dataclass(frozen=True)
 class ShippedFlag:
     """Possibly-shipped work (F-67 AC-3): flagged for the owner, never
     decided. ``evidence_found`` is None when the evidence is not a
@@ -1458,6 +1501,11 @@ class ImportPlan:
     # F-67 AC-1: every gate the parent forced (rendered before the
     # diff — a relaxation is never silently dropped).
     gate_overrides: list[GateOverride] = field(default_factory=list)
+    # F-71 AC-1/AC-3: the risk flags the parent added and the budget
+    # fields it clamped up to the floor — rendered in the SAME section
+    # as the gate overrides, before the diff.
+    risk_additions: list[RiskAddition] = field(default_factory=list)
+    budget_clamps: list[BudgetClamp] = field(default_factory=list)
     # F-67 AC-3: possibly-shipped work, flagged for the owner (rendered
     # FIRST — before the overrides and the diff).
     shipped: list[ShippedFlag] = field(default_factory=list)
@@ -1643,25 +1691,18 @@ def _merge_task(
 def _normalise_gates(
     task: dict, stored: dict | None,
 ) -> list[GateOverride]:
-    """Force v0 gates on one proposed task (F-67 AC-1), in place.
-
-    The ONE normalisation step the parent applies to EVERY task the
-    importer writes — new and merged, whatever the proposal says
-    (``"auto"``, ``"Human"``, a boolean, a missing key): ``merge`` and
-    ``deploy`` become ``"human"``, and ``spec_approval`` becomes ``True``
-    for kinds the picker runs (:data:`factory.state.ELIGIBLE_KINDS`).
-    Other kinds keep what the proposal says (the pilot's owner-only
-    tasks carry ``spec_approval: false`` by design). Every change is
-    recorded as a :class:`GateOverride` — a relaxation is never silently
-    dropped; the summary lists them before the diff.
+    """The gate half of the ONE normalisation step (F-67 AC-1), in
+    place. Whatever the proposal says (``"auto"``, ``"Human"``, a
+    boolean, a missing key): ``merge``/``deploy`` become ``"human"``,
+    and ``spec_approval`` becomes ``True`` for kinds the picker runs.
+    Every change is a :class:`GateOverride`.
 
     A proposal whose ``gates`` is not an object is left alone: the
-    proposal-schema check refuses it right after, with the shape named.
-    A merged task whose proposal OMITS ``gates`` is left alone too: the
+    proposal-schema check refuses it right after, the shape named. A
+    merged task whose proposal OMITS ``gates`` is left alone too: the
     stored gates survive (F-12 AC-3), and a stored auto gate is caught
-    where it matters — :func:`factory.approve.check_v0_gates` refuses it
-    at approval.
-    """
+    by :func:`factory.approve.check_v0_gates` at approval. See
+    :func:`_normalise_task` — the step's entry point."""
     gates = task.get("gates")
     if not isinstance(gates, dict):
         return []
@@ -1687,6 +1728,152 @@ def _normalise_gates(
     if task.get("kind") in ELIGIBLE_KINDS:
         _force("spec_approval", True)
     return overrides
+
+
+def _refusal_error(ref: str) -> str | None:
+    """Why a proposed test ref is not runnable (F-71 AC-2), or None.
+
+    The parent refuses an inexact ref in a proposal the same way
+    approval does — the shape is :func:`factory.approve._ref_runnable_error`'s,
+    re-stated here so the refusal names the criterion the same way."""
+    from factory.approve import _ref_runnable_error
+
+    return _ref_runnable_error(ref)
+
+
+def _normalise_task(
+    task: dict, stored: dict | None, *,
+    profile: dict | None = None,
+    tracked_files: list | None = None,
+) -> tuple[list[GateOverride], list[RiskAddition], list[BudgetClamp]]:
+    """The ONE normalisation step the parent applies to EVERY task the
+    importer writes — new and merged — inside :func:`plan_import`,
+    before the schema check judges the normalised task and the merge
+    builds the diff. F-67's gate forcing; F-71's pre-spend half:
+
+    * AC-2 — a proposed acceptance's test refs must be EXACT
+      (``<repo-relative path>::<name>``; an empty command ref refuses
+      too). The parent refuses the proposal the same way approval
+      does, the criterion named. Judged on what the PROPOSAL carries:
+      a merged task whose proposal omits ``acceptance`` keeps its
+      stored criteria, and approval judges those.
+    * AC-1 — the risk flags the task's effective scope (proposed if
+      carried, else stored) can reach are ADDED to ``risk`` when
+      missing. Adding is the conservative direction; a flag is never
+      removed. Each addition is listed with the overrides.
+    * AC-3 — the effective budget (proposed if carried, else stored) is
+      clamped UP to the profile's budget floor, never down; each clamp
+      is listed with the overrides.
+
+    The risk/floor halves need the profile (risk globs, floor) and the
+    repo's default-branch tracked files; without a profile (direct
+    callers, and a queue beside no profile file) they are skipped —
+    approval's fail-closed checks stand behind that. Refusable classes
+    (non-executable kinds) are left alone: they never spend.
+
+    Raises:
+        ImportRefused: A proposed test ref is not runnable, or a
+            proposed command check's ref is empty.
+    """
+    overrides = _normalise_gates(task, stored)
+    task_id = task.get("id", "?")
+    if task.get("kind") not in ELIGIBLE_KINDS:
+        return overrides, [], []
+    additions: list[RiskAddition] = []
+    clamps: list[BudgetClamp] = []
+
+    # AC-2: the refs the PROPOSAL itself carries.
+    if "acceptance" in task:
+        for item in task.get("acceptance") or []:
+            check = item.get("check") if isinstance(item, dict) else None
+            if not isinstance(check, dict):
+                continue
+            criterion = item.get("id", "?")
+            if check.get("type") == "test":
+                ref = check.get("ref")
+                if isinstance(ref, str):
+                    reason = _refusal_error(ref)
+                    if reason is not None:
+                        raise ImportRefused(
+                            f"task {task_id}: {criterion}'s check is not "
+                            f"runnable — {reason}; write the exact ref "
+                            "(tests/test_<task>.py::test_ac_N for a new "
+                            "test file; F-71)"
+                        )
+            elif check.get("type") == "command":
+                command = check.get("ref")
+                if isinstance(command, str) and not command.strip():
+                    raise ImportRefused(
+                        f"task {task_id}: {criterion}'s command check is "
+                        "empty — a run cannot prove it (F-71)"
+                    )
+
+    # AC-1/AC-3 halves need the profile's rules.
+    if not profile:
+        return overrides, additions, clamps
+
+    # AC-1: compute the flags the effective scope reaches, add misses.
+    effective_scope = task.get("scope")
+    if not isinstance(effective_scope, dict) or not effective_scope.get(
+            "paths"):
+        effective_scope = (
+            stored.get("scope") if isinstance(stored, dict) else None
+        )
+    risk_globs = (profile.get("paths") or {}).get("risk") or {}
+    if risk_globs and isinstance(effective_scope, dict) \
+            and effective_scope.get("paths") and tracked_files is not None:
+        computed = scope_risk_flags(
+            effective_scope.get("paths") or [], risk_globs, tracked_files,
+            generated_globs=(profile.get("paths") or {}).get("generated")
+            or (),
+            extra_files=contract_test_files(task),
+        )
+        effective_risk = task.get("risk")
+        if not isinstance(effective_risk, list):
+            stored_risk = (
+                stored.get("risk") if isinstance(stored, dict) else None
+            )
+            effective_risk = stored_risk if isinstance(
+                stored_risk, list) else []
+        missing = {
+            flag: paths for flag, paths in computed.items()
+            if flag not in effective_risk
+        }
+        if missing:
+            task["risk"] = sorted(set(effective_risk) | set(missing))
+            additions = [
+                RiskAddition(
+                    task_id=task_id, flag=flag,
+                    reaching=tuple(paths[:3]), new_task=stored is None,
+                )
+                for flag, paths in sorted(missing.items())
+            ]
+
+    # AC-3: clamp the effective budget UP to the floor, never down.
+    floor = budget_floor(profile)
+    effective_budget = task.get("budget")
+    if not isinstance(effective_budget, dict):
+        stored_budget = (
+            stored.get("budget") if isinstance(stored, dict) else None
+        )
+        effective_budget = stored_budget if isinstance(
+            stored_budget, dict) else None
+    if isinstance(effective_budget, dict):
+        clamped = dict(effective_budget)
+        touched = False
+        for field, minimum in floor.items():
+            value = clamped.get(field)
+            if isinstance(value, int) and not isinstance(value, bool) \
+                    and value < minimum:
+                clamps.append(BudgetClamp(
+                    task_id=task_id, field=f"budget.{field}",
+                    proposed=value, clamped_to=minimum,
+                ))
+                clamped[field] = minimum
+                touched = True
+        if touched:
+            task["budget"] = clamped
+    return overrides, additions, clamps
 
 
 def _format_violations(head: str, lines: list[str]) -> str:
@@ -1732,6 +1919,7 @@ def plan_import(
     reference: dict | None = None,
     doc_texts: dict[str, str] | None = None,
     repo: Path | None = None,
+    profile: dict | None = None,
 ) -> ImportPlan:
     """Build the import plan: merged document, per-task changes,
     out-of-scope matches and the full diff. Validates the merged
@@ -1740,9 +1928,10 @@ def plan_import(
 
     F-67 adds three parent-side stages, in order after the per-task
     rules: the v0 gate normalisation (every task the importer writes,
-    new and merged — :func:`_normalise_gates`), the possibly-shipped
-    validation (:func:`_validate_possibly_shipped`) and the criteria
-    accounting (:func:`_account_reference`).
+    new and merged — :func:`_normalise_task`, which F-71 extends with
+    the pre-spend half), the possibly-shipped validation
+    (:func:`_validate_possibly_shipped`) and the criteria accounting
+    (:func:`_account_reference`).
 
     Args:
         existing_doc: The queue as it is on disk, or None for a fresh
@@ -1761,6 +1950,11 @@ def plan_import(
         repo: The project repo, for possibly-shipped evidence existence
             checks. None skips the check (the flag renders
             ``evidence not found`` for path-shaped evidence).
+        profile: The loaded project profile (F-71): its ``paths.risk``
+            drive the risk-flag additions, its ``budget_floor`` the
+            clamps, and its presence gates both. None or empty skips
+            those halves (approval's fail-closed checks stand behind
+            that); :func:`run_import` passes whatever it loaded.
 
     Raises:
         ImportRefused: The proposal names another project, omits or
@@ -1769,7 +1963,10 @@ def plan_import(
             fields or statuses, names an unknown out-of-scope record —
             or the merged document would not validate (AC-1); or (F-67)
             a malformed/unknown ``possibly_shipped`` entry, or a
-            reference task/criterion the proposal leaves unaccounted.
+            reference task/criterion the proposal leaves unaccounted;
+            or (F-71) a proposed test ref that is not runnable, an
+            empty command ref, or a repo whose default branch cannot be
+            listed for the risk computation.
     """
     proposed_project = proposal.get("project")
     if proposed_project is not None and proposed_project != project:
@@ -1786,6 +1983,28 @@ def plan_import(
     froms: set[str] = set()
     from_triples: list[tuple[str, str, "dict | None"]] = []
     gate_overrides: list[GateOverride] = []
+    risk_additions: list[RiskAddition] = []
+    budget_clamps: list[BudgetClamp] = []
+    # F-71 AC-1: the default branch's tracked files, computed ONCE for
+    # the whole plan (the risk computation runs per task) — and only
+    # when the profile declares risk globs. Fail closed: a repo whose
+    # default branch cannot be listed cannot have its scopes checked,
+    # so the import refuses rather than writing tasks whose risk flags
+    # nobody computed.
+    tracked_files: list | None = None
+    if profile and repo is not None \
+            and (profile.get("paths") or {}).get("risk"):
+        default_branch = (profile.get("repo") or {}).get(
+            "default_branch") or "main"
+        try:
+            # R1-3: the branch the run builds on — the remote default
+            # after a fetch when the repo has an origin (the pilot's
+            # checkout sat behind origin), else the local default.
+            tracked_files = default_branch_files(repo, default_branch)
+        except GateError as exc:
+            raise ImportRefused(
+                f"cannot compute the proposals' risk flags: {exc} (F-71)"
+            ) from exc
     seen: set[str] = set()
     for index, raw in enumerate(proposal.get("tasks", [])):
         task, match, task_predecessors, task_froms = _task_from_proposal(
@@ -1797,11 +2016,16 @@ def plan_import(
                 "ambiguous"
             )
         seen.add(task["id"])
-        # F-67 AC-1: the ONE normalisation step, applied to every task
-        # the importer writes — new and merged — before the schema check
-        # judges the normalised gates and the merge builds the diff.
-        gate_overrides.extend(
-            _normalise_gates(task, by_id.get(task["id"])))
+        # F-67 AC-1 / F-71: the ONE normalisation step, applied to every
+        # task the importer writes — new and merged — before the schema
+        # check judges the normalised task and the merge builds the diff.
+        task_overrides, task_additions, task_clamps = _normalise_task(
+            task, by_id.get(task["id"]),
+            profile=profile, tracked_files=tracked_files,
+        )
+        gate_overrides.extend(task_overrides)
+        risk_additions.extend(task_additions)
+        budget_clamps.extend(task_clamps)
         # F-67 AC-4: the accounting metadata, collected beside the tasks.
         predecessors[task["id"]] = task_predecessors
         froms.update(ref for ref, _text, _check in task_froms)
@@ -1980,6 +2204,8 @@ def plan_import(
         diff=diff,
         base_doc=copy.deepcopy(existing_doc),
         gate_overrides=gate_overrides,
+        risk_additions=risk_additions,
+        budget_clamps=budget_clamps,
         shipped=shipped,
         dropped=dropped,
         rewritten=rewritten,
@@ -2130,9 +2356,12 @@ def render_summary(plan: ImportPlan) -> str:
             "with the proposal's from-mapped criteria to see every one)"
         )
     # F-67 AC-1: the forced gate overrides, before the diff — a
-    # relaxation is never silently dropped.
+    # relaxation is never silently dropped. F-71 adds the risk flags
+    # the parent added and the budget fields it clamped up to the
+    # floor, in the SAME section, same order.
     lines += ["", "## Gate overrides", ""]
-    if not plan.gate_overrides:
+    if not (plan.gate_overrides or plan.risk_additions
+            or plan.budget_clamps):
         lines.append("- none (v0 forces human gates; nothing was changed)")
     for override in plan.gate_overrides:
         origin = "new task" if override.new_task else "existing task"
@@ -2143,6 +2372,21 @@ def render_summary(plan: ImportPlan) -> str:
         lines.append(
             f"- {show(override.task_id)}: {override.field} proposed "
             f"{override.proposed!r} -> forced {forced!r} ({origin}{stored})"
+        )
+    # F-71 AC-1: every risk flag the parent added — the conservative
+    # direction; never a removal (that would be the session's).
+    for addition in plan.risk_additions:
+        origin = "new task" if addition.new_task else "existing task"
+        reach = ", ".join(addition.reaching)
+        lines.append(
+            f"- {show(addition.task_id)}: risk +{show(addition.flag)} "
+            f"(the scope reaches {show(reach)}; {origin})"
+        )
+    # F-71 AC-3: every budget field clamped UP to the floor — never down.
+    for clamp in plan.budget_clamps:
+        lines.append(
+            f"- {show(clamp.task_id)}: {clamp.field} {clamp.proposed} -> "
+            f"{clamp.clamped_to} (clamped up to the profile's budget floor)"
         )
     if plan.truncated_docs:
         # F-49 AC-3 (m-4): the proposal was built from a capped view —
@@ -3110,6 +3354,16 @@ def build_repair_prompt(*, project: str, violations: str) -> str:
         "- priority is P1–P3 only — the values listed above; P0 is not a",
         "  priority level this queue knows.",
         '- a check whose type is anything but "manual" must carry ref.',
+        "- a TEST check's ref is EXACT (F-71): <repo-relative path>::",
+        "  <test name>, one or more :: segments, never an absolute or ..",
+        "  path, never an empty or whitespace-padded name. Approval and",
+        "  this importer both refuse anything else. For a NEW test file",
+        "  the convention is tests/test_<task>.py::test_ac_N.",
+        "- a COMMAND check's ref is the full command, non-empty (F-71).",
+        "- a task that adds a dependency declares it (F-71): dependencies",
+        '  is a list of {"ecosystem": "pypi"|"npm", "name"} entries —',
+        "  every package a direct manifest gains must be declared, or",
+        "  the run escalates. Names are normalised (PEP 503 / lowercase).",
         "- Never set status, acceptance_hash, approved_at, approved_by,",
         "  attempts, links or out_of_scope. Every task is imported as",
         "  draft; approval is the owner's act (factory approve).",
@@ -3419,13 +3673,15 @@ def _repair_refused_proposal(
                 try:
                     # EXACTLY the chain the original proposal faced —
                     # the same parse, the same scrub, the same plan
-                    # (F-67: the same criteria accounting too).
+                    # (F-67: the same criteria accounting; F-71: the
+                    # same pre-spend normalisation).
                     proposal = scrub_session_value(
                         parse_proposal(text), secrets
                     )
                     plan = plan_import(
                         existing_doc, proposal, records, project=project,
                         reference=reference, doc_texts=doc_texts, repo=repo,
+                        profile=profile,
                     )
                 except ImportRefused as second:
                     writer.append({
@@ -3958,7 +4214,8 @@ def run_import(
                 )
             plan = plan_import(existing_doc, proposal, records,
                                project=project, reference=reference,
-                               doc_texts=doc_texts, repo=repo)
+                               doc_texts=doc_texts, repo=repo,
+                               profile=profile)
         except ImportRefused as exc:
             refused = exc
         if refused is not None:

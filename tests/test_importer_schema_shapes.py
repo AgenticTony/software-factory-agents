@@ -64,7 +64,8 @@ def _wo(tid: str = "WO-1", **overrides) -> dict:
             {
                 "id": "AC-1",
                 "text": "it works",
-                "check": {"type": "test", "ref": f"tests/test_{tid.lower()}.py"},
+                "check": {"type": "test",
+                         "ref": f"tests/test_{tid.lower()}.py::test_ac_1"},  # F-71: exact
             }
         ],
         "budget": {"size": "S", "max_attempts": 3, "max_turns": 20,
@@ -496,7 +497,7 @@ def test_staged_check_agrees_with_plan_import(tmp_path: Path):
         "priority P0": {"priority": "P0"},
         "acceptance id AC1": {"acceptance": [{
             "id": "AC1", "text": "t",
-            "check": {"type": "test", "ref": "tests/x.py"}}]},
+            "check": {"type": "test", "ref": "tests/x.py::test_ac_1"}}]},  # F-71: exact
         "invented check type": {"acceptance": [{
             "id": "AC-1", "text": "t",
             "check": {"type": "grep", "ref": "app"}}]},
@@ -669,7 +670,7 @@ def test_self_check_commands_run_in_the_real_sandbox(tmp_path: Path):
             "tasks": [_wo("WO-9", status="ready", priority="P0",
                           acceptance=[{"id": "AC1", "text": "t",
                                        "check": {"type": "test",
-                                                 "ref": "tests/x.py"}}])],
+                                                 "ref": "tests/x.py::test_ac_1"}}])],  # F-71: exact
         })
         (stage / "proposal.json").write_text(broken)
         proc = run_line(shape_check)
