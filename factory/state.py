@@ -273,6 +273,34 @@ def credential_recovery_eligible(task: dict) -> bool:
 
 ATTEMPTS_RESET_ESCALATIONS = ("attempts_exhausted",)
 
+# F-72 AC-4: the two escalation classes the owner answers with
+# `factory recover --accept` — both are "the work is fine, the contract's
+# policy question is mine", which is exactly what an escalation draft PR
+# plus a one-command acceptance settles. Every other escalation keeps its
+# current exit (credential_added rotates, scope_change_needed re-approves,
+# protected_path_touched/sentinel_failed mean the diff breaks a standing
+# rule an accept cannot waive).
+ACCEPT_RECOVERY_ESCALATIONS = ("new_dependency", "risk_path_touched")
+
+
+def escalation_accept_eligible(task: dict) -> bool:
+    """Whether the owner's accept/reject word may move this task (F-72).
+
+    True only for a ``needs_human`` task whose last attempt escalated
+    ``new_dependency``/``risk_path_touched`` and which still holds an
+    ESCALATION draft PR (``links.pr`` + ``links.escalation_pr``) — the
+    accept re-runs L0 on that PR's exact head, so no PR means nothing to
+    accept. The sweep never consults this predicate: it is `factory
+    recover`'s gate alone.
+    """
+    attempts = task.get("attempts") or []
+    links = task.get("links") or {}
+    return (task.get("status") == "needs_human"
+            and bool(attempts)
+            and attempts[-1].get("escalation") in ACCEPT_RECOVERY_ESCALATIONS
+            and bool(links.get("pr"))
+            and links.get("escalation_pr") is True)
+
 # F-65 AC-3: the declared-scope escalations. Both park a task with no
 # GitHub signal at all (nothing was pushed; the task never reached a
 # PR), so like credential_added the only honest exit is the owner's:
@@ -1196,6 +1224,126 @@ class TaskQueue:
         task["status"] = new_status
         self.save()
         return new_status
+
+    def recover_accept(self, task_id: str, *, ledger, sha: str,
+                       evidence: str, done_by: str | None = None) -> str:
+        """Move an accepted escalation to ``in_review``: the one writer
+        of the F-72 accept edge (``needs_human → in_review`` beside the
+        F-26 re-open edge — same pair, different gate).
+
+        The gate lives HERE, not in the command (the recover_credential
+        precedent): the task must be parked on a
+        ``new_dependency``/``risk_path_touched`` escalation holding an
+        escalation draft PR (:func:`escalation_accept_eligible`), and the
+        owner ledger must hold the waiver for EXACTLY this (task,
+        escalation, SHA) judged against the task's CURRENT contract hash
+        — a different SHA (any new commit on the branch), a different
+        class, or a contract changed since the acceptance moves nothing.
+        On the move, ``links.escalation_pr`` clears: the PR is now a
+        normal ``in_review`` PR (marked ready), re-validated and reported
+        by the sweep like every factory PR.
+
+        Args:
+            task_id: Task parked on an accept-able escalation.
+            ledger: The :class:`~factory.approvals.ApprovalLedger` holding
+                the waiver (required, never None).
+            sha: The PR head SHA the waiver covers — the caller re-reads
+                it from GitHub right before this call, so a force-push
+                between the y and the move refuses HERE rather than
+                accepting a different commit.
+            evidence: What the owner checked; must not be blank.
+            done_by: Who accepted (recorded by the command's log entry).
+
+        Returns:
+            ``"in_review"``.
+
+        Raises:
+            StateError: Unknown task, blank evidence, or a missing ledger.
+            TransitionError: The task isn't accept-eligible, or the
+                ledger holds no waiver for exactly this key.
+        """
+        if not (evidence or "").strip():
+            raise StateError(f"{task_id}: escalation acceptance requires evidence")
+        if ledger is None:
+            raise StateError(
+                f"{task_id}: escalation acceptance requires the approval "
+                "ledger — the waiver is the gate"
+            )
+        task = self.get(task_id)
+        if not escalation_accept_eligible(task):
+            raise TransitionError(
+                f"{task_id}: escalation acceptance needs a needs_human task "
+                "whose last attempt escalated new_dependency or "
+                "risk_path_touched and which holds an escalation draft PR "
+                "(links.pr + links.escalation_pr) — the supported reasons "
+                "are exactly those two"
+            )
+        escalation = task["attempts"][-1]["escalation"]
+        chash = contract_hash(task)
+        if not ledger.has_escalation_waiver(
+                task_id, escalation, sha, contract_hash_value=chash):
+            raise TransitionError(
+                f"{task_id}: no owner waiver for ({escalation}, head "
+                f"{sha[:12]}) against the current contract — the waiver is "
+                "keyed to the exact SHA and contract; a new commit on the "
+                "branch or a changed contract voids it (re-run "
+                "recover --accept)"
+            )
+        reason = RECOVERY_TRANSITIONS.get((_status_of(task), "in_review"))
+        assert reason is not None  # the pair is in the recovery table
+        _check_kind_rules(task, _status_of(task), "in_review")
+        _check_slice_rules(task, "in_review")
+        _check_owner_step_rules(task, "in_review")
+        task["status"] = "in_review"
+        links = {k: v for k, v in (task.get("links") or {}).items()
+                 if k != "escalation_pr"}
+        task["links"] = links  # the PR is a normal in_review PR now
+        self.save()
+        return "in_review"
+
+    def reject_escalation(self, task_id: str) -> str:
+        """Reject an escalation draft PR: the one writer of the F-72
+        reject edge (``needs_human → draft`` — the contract-changed edge's
+        pair, gated here on an accept-eligible escalation instead).
+
+        The rejection clears the contract's approval markers
+        (``acceptance_hash``/``approved_at``/``approved_by``): the whole
+        point is that the contract can now change, and a changed contract
+        needs fresh approval — the old approval authorises nothing (the
+        F-63 hash check: a changed contract has no ledger entry). Every
+        attempt record stays (append-only).
+
+        Args:
+            task_id: Task parked on an accept-able escalation holding an
+                escalation draft PR.
+
+        Returns:
+            ``"draft"``.
+
+        Raises:
+            TransitionError: The task isn't accept-eligible (the same two
+                escalation classes, the same PR link).
+        """
+        task = self.get(task_id)
+        if not escalation_accept_eligible(task):
+            raise TransitionError(
+                f"{task_id}: escalation rejection needs a needs_human task "
+                "whose last attempt escalated new_dependency or "
+                "risk_path_touched and which holds an escalation draft PR "
+                "— the supported reasons are exactly those two"
+            )
+        reason = ALLOWED_TRANSITIONS.get((_status_of(task), "draft"))
+        assert reason is not None  # needs_human → draft is in the table
+        _check_kind_rules(task, _status_of(task), "draft")
+        _check_slice_rules(task, "draft")
+        _check_owner_step_rules(task, "draft")
+        task["status"] = "draft"
+        # The approval markers go: a draft carries no frozen contract, and
+        # the next approval re-freezes fresh fields over the stale ones.
+        for marker in ("acceptance_hash", "approved_at", "approved_by"):
+            task.pop(marker, None)
+        self.save()
+        return "draft"
 
     def transition_path(self, task_id: str, statuses: list) -> None:
         """Move a task through a sequence of legal transitions in one save.

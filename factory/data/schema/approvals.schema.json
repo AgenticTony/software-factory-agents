@@ -9,17 +9,21 @@
   "properties": {
     "n": { "type": "integer", "minimum": 1, "description": "Entry number; set by the ledger, must equal the line number." },
     "prev": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the previous line (genesis 0*64 for line 1); set by the ledger." },
-    "kind": { "enum": ["task", "profile"], "description": "task: this exact contract (contract_hash) is approved to act on. profile: these per-group hashes of the profile's security-relevant content are approved." },
+    "kind": { "enum": ["task", "profile", "escalation_waiver"], "description": "task: this exact contract (contract_hash) is approved to act on. profile: these per-group hashes of the profile's security-relevant content are approved. escalation_waiver (F-72): the owner accepted ONE escalation class on ONE exact PR head SHA — the key (task_id, escalation, sha) a recover --accept re-run checks; a different SHA, class or contract voids it." },
     "project": { "type": "string", "pattern": "^[a-z0-9-]+$", "description": "The project this approval binds to; must equal the file's own project — a ledger copied from another project's file refuses to load." },
     "approved_by": { "type": "string", "minLength": 1 },
     "approved_at": { "type": "string", "format": "date-time" },
-    "task_id": { "type": "string", "minLength": 1, "description": "kind=task: the approved task's id." },
-    "contract_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "kind=task: factory.contract.contract_hash(task) at approval time." },
+    "task_id": { "type": "string", "minLength": 1, "description": "kind=task and kind=escalation_waiver: the task's id." },
+    "contract_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "kind=task: factory.contract.contract_hash(task) at approval time. kind=escalation_waiver: the contract hash the accept judged — a contract changed since the escalation is a different contract and needs its own acceptance." },
     "groups": {
       "type": "object",
       "description": "kind=profile: group name -> SHA-256 of that group's canonical content (a missing key hashes as null). Group names: factory.approvals.PROFILE_SECURITY_GROUPS.",
       "additionalProperties": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
-    }
+    },
+    "escalation": { "type": "string", "enum": ["new_dependency", "risk_path_touched"], "description": "kind=escalation_waiver: the ONE class waived (F-72 AC-4 — the only two classes recover --accept answers)." },
+    "sha": { "type": "string", "pattern": "^[0-9a-f]{40,64}$", "description": "kind=escalation_waiver: the exact PR head SHA the waiver covers; any new commit on the branch voids it." },
+    "released_sha": { "type": "string", "pattern": "^[0-9a-f]{40,64}$", "description": "kind=escalation_waiver, optional (F-72 R2-F1 guard 2): the clean commit the accept released (same parent, same tree, no [skip ci], lease-pushed) — the sweep's waiver match accepts it as the same acceptance; any other new commit matches neither and voids the waiver." },
+    "evidence": { "type": "string", "minLength": 1, "description": "kind=escalation_waiver: what the owner checked before accepting." }
   },
   "allOf": [
     {
@@ -29,6 +33,10 @@
     {
       "if": { "properties": { "kind": { "const": "profile" } }, "required": ["kind"] },
       "then": { "required": ["groups"] }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "escalation_waiver" } }, "required": ["kind"] },
+      "then": { "required": ["task_id", "escalation", "sha", "evidence", "contract_hash"] }
     }
   ]
 }

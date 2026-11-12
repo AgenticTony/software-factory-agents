@@ -253,15 +253,20 @@ def test_ac_4(tmp_path: Path):
     assert result.outcome == "needs_human"
     assert result.escalation == "review_not_converging"
     # F-38: each review round is a two-session fan-out plus a verifier
-    # (the repeat finding needs voting) — 2 rounds, not 3.
+    # (the repeat finding needs voting) — 2 rounds, not 3. F-72: the
+    # round-2 stop runs ONE arbiter seat first (this Scripted's arbiter
+    # answers unparseably, so the arbiter failed and the escalation the
+    # test pinned still fires).
     assert [c[0] for c in seats.calls] == [
         "implementer", "reviewer", "reviewer", "verifier",
-    ] * 2
+    ] * 2 + ["arbiter"]
     task = env.task()
     assert task["status"] == "needs_human"
     assert len(task["attempts"]) == 2
     assert task["attempts"][-1]["escalation"] == "review_not_converging"
-    assert env.prs == []
+    # F-72: the bounced review's work is kept as ONE draft PR — never a
+    # validated one.
+    assert len(env.prs) == 1 and env.prs[0].draft
 
     # Contrast: a genuinely new finding each round is progress — the budget,
     # not convergence, ends it.
@@ -835,7 +840,9 @@ def test_review19_an_unanchored_fileless_blocker_does_not_flip_a_pass(tmp_path: 
     second = env.report(2)["L2"]
     assert second["findings"] and second["verdict"] == "fail"
     assert not second["dropped"]
-    assert env.prs == []
+    # F-72: the spent budget's work is kept as one DRAFT PR — the drop
+    # still never flipped anything into a validated PR.
+    assert len(env.prs) == 1 and env.prs[0].draft
 
 
 def test_review20_mentioning_an_ac_changes_nothing(tmp_path: Path):

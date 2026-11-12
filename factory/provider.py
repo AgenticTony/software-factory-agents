@@ -85,7 +85,18 @@ PROVIDER_KINDS = ("zai", "anthropic", "bedrock", "vertex",
                   "anthropic_compatible")
 
 # The seat model roles (project.schema.json's provider.models keys).
-SEAT_ROLES = ("implementer", "reviewer", "verifier", "importer")
+# F-72 adds ``arbiter`` — the review-dispute seat. It has NO required
+# model of its own: it defaults to the reviewer's provider and model
+# (resolve_provider routes an un-overridden arbiter seat at the reviewer
+# role), so an existing profile needs no change to run one, and the
+# owner may override it with ``seat_providers.arbiter`` under the same
+# providers_allowed rule as every seat (an F-63 security group, so the
+# override re-approval-gates the profile).
+SEAT_ROLES = ("implementer", "reviewer", "verifier", "importer", "arbiter")
+
+# Seats whose default resolution is ANOTHER seat's: the arbiter runs the
+# reviewer's provider and model unless the owner overrode it (F-72 AC-2).
+SEAT_DEFAULTS = {"arbiter": "reviewer"}
 
 # One keychain item per kind: ``factory-<kind>``. ``factory-zai`` is the
 # production item DESIGN D2 named, unchanged (keychain_service("zai") is
@@ -350,6 +361,12 @@ def resolve_provider(profile: Mapping[str, Any],
             model = override.get("model")
             region = override.get("region")
             base_url = override.get("base_url")
+        elif seat in SEAT_DEFAULTS:
+            # F-72 AC-2: an un-overridden arbiter IS the reviewer's seat —
+            # the reviewer's provider override (if any) and the reviewer's
+            # model. The owner's pending decision is the override hook;
+            # the default picks nothing new.
+            return resolve_provider(profile, SEAT_DEFAULTS[seat])
         else:
             model = models.get(seat)
 

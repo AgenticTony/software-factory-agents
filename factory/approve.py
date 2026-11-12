@@ -35,6 +35,7 @@ routed to ``awaiting_owner``, which is what the evidence supports.
 """
 
 import getpass
+import json
 import re
 import subprocess
 from collections import namedtuple
@@ -659,15 +660,26 @@ def recover_task(
     assume_yes: bool = False,
     evidence: str | None = None,
     reset_attempts: bool = False,
+    accept: bool = False,
+    reject: bool = False,
     done_by: str | None = None,
     factory_root: Path | None = None,
     pr_state: Callable[[str], str] | None = None,
+    pr_head: "Callable[[str], str] | None" = None,
+    pr_ready: "Callable[[str], None] | None" = None,
+    pr_close: "Callable[[str], None] | None" = None,
+    session_runner: Callable | None = None,
     confirm: Callable[[str], bool] = input_confirm,
     echo: Callable[[str], None] = print,
 ) -> str:
     """Queue a fix round for a parked escalation (F-26 round-5 finding 2;
     credential_added re-queue per TASK-CONTRACT §credential_added;
-    attempts_exhausted budget reset per the F-31 fix review).
+    attempts_exhausted budget reset per the F-31 fix review; and — F-72
+    AC-4 — the one-command answer to an escalation draft PR:
+    ``--accept --evidence`` re-validates the PR's exact head with one
+    escalation class waived and, on pass, marks it ready and moves the
+    task ``needs_human → in_review``; ``--reject`` closes the PR and
+    returns the task to ``draft`` with its approval markers cleared.
 
     ``factory recover`` is the owner's explicit fix-round word — the one
     recovery intent GitHub cannot express for a ``pr_closed`` task: its
@@ -709,14 +721,18 @@ def recover_task(
         queue: The queue to write through (its only writer path).
         task_id: Task to recover.
         assume_yes: Skip the confirmation prompt (never allowed for a
-            credential_added or attempts_exhausted task).
-        evidence: Required for a credential_added or attempts_exhausted
-            task: what the owner checked; persisted in the task's
-            progress log.
+            credential_added, attempts_exhausted, scope or accept/reject
+            recovery).
+        evidence: Required for a credential_added, attempts_exhausted or
+            scope task, and for ``--accept``: what the owner checked;
+            persisted in the task's progress log and the accept waiver.
         reset_attempts: Required for an attempts_exhausted task: the
             explicit budget grant. Without it the command refuses and
             says why — the flag is the owner's acknowledgment that new
             attempts are being spent.
+        accept: The F-72 one-command answer to an escalation draft PR
+            (new_dependency/risk_path_touched only).
+        reject: The F-72 rejection: close the PR, task → draft.
         done_by: Who confirmed a recovery (default: the git user, like
             ``factory tick``); recorded in the log entry and the reset
             marker.
@@ -724,11 +740,21 @@ def recover_task(
             ``~/factory``).
         pr_state: GitHub PR-state seam (default
             :func:`factory.mergeorder.gh_pr_state`); injected in tests.
+        pr_head: PR head-SHA seam (default
+            :func:`factory.publish.gh_pr_head_sha`); the accept path only.
+        pr_ready: PR ready seam (default :func:`factory.publish.
+            gh_pr_ready`); the accept path only.
+        pr_close: PR close seam (default :func:`factory.publish.
+            gh_pr_close`); the reject path only.
+        session_runner: Seat runner for the accept round's review fan-out
+            (default :func:`factory.session.run_session_sandboxed`);
+            injected in tests.
         confirm: Interactive confirmation callable; injected in tests.
         echo: Output callable for the summary; injected in tests.
 
     Returns:
-        The new status: ``ready`` or ``blocked``.
+        The new status (``ready``, ``blocked``, ``in_review`` or
+        ``draft``).
 
     Raises:
         ApprovalError: On any refusal, or an unknown task.
@@ -737,6 +763,14 @@ def recover_task(
         ContractError: If the resulting queue wouldn't validate.
     """
     task = queue.get(task_id)  # StateError (a ContractError) if unknown
+    if accept or reject:
+        return _recover_escalation_pr(
+            queue, task_id, task, accept=accept, reject=reject,
+            evidence=evidence, assume_yes=assume_yes, done_by=done_by,
+            factory_root=factory_root, pr_head=pr_head, pr_ready=pr_ready,
+            pr_close=pr_close, session_runner=session_runner,
+            confirm=confirm, echo=echo,
+        )
     if credential_recovery_eligible(task):
         return _recover_credential_task(
             queue, task_id, task, evidence=evidence, assume_yes=assume_yes,
@@ -796,6 +830,200 @@ def recover_task(
         else "ready"
     )
     queue.transition(task_id, new_status)  # the gated edge (state enforces)
+    return new_status
+
+
+def _recover_escalation_pr(
+    queue: TaskQueue,
+    task_id: str,
+    task: dict,
+    *,
+    accept: bool,
+    reject: bool,
+    evidence: str | None,
+    assume_yes: bool,
+    done_by: str | None,
+    factory_root: Path | None,
+    pr_head: "Callable[[str], str] | None",
+    pr_ready: "Callable[[str], None] | None",
+    pr_close: "Callable[[str], None] | None",
+    session_runner: Callable | None,
+    confirm: Callable[[str], bool],
+    echo: Callable[[str], None],
+) -> str:
+    """The F-72 one-command answer to an escalation draft PR.
+
+    Eligible only for a ``new_dependency``/``risk_path_touched``
+    escalation holding an escalation draft PR (the state layer's
+    :func:`~factory.state.escalation_accept_eligible` — re-checked there,
+    the credential/attempts precedent). Both paths are interactive only:
+    ``--yes`` is refused, the confirmation IS the gate.
+
+    ``--accept --evidence``: read the PR's head SHA from GitHub and show
+    it with the escalation and the L0 report summary; on y, record the
+    waiver (task, escalation, head SHA, evidence, who, when) in the
+    approval ledger, re-run L0 on that exact SHA with ONLY that class
+    waived and continue L1 and review as a normal round
+    (:func:`factory.orchestrator.recover_accept_round`); on pass, mark
+    the PR ready and move the task ``needs_human → in_review``. Any new
+    commit on the branch voids the waiver (the head is re-read before
+    the ready mark). A failed re-run keeps the task ``needs_human`` with
+    the new findings and the PR draft.
+
+    ``--reject``: close the escalation PR, move the task
+    ``needs_human → draft`` and clear the contract's approval markers —
+    the contract can now change, and the old approval authorises nothing
+    (the F-63 hash check).
+    """
+    from factory.publish import gh_pr_close, gh_pr_head_sha, gh_pr_ready
+    from factory.runs import RunError
+    from factory.state import escalation_accept_eligible
+
+    if accept and reject:
+        raise ApprovalError(
+            f"{task_id}: give --accept or --reject, not both"
+        )
+    if not escalation_accept_eligible(task):
+        raise ApprovalError(
+            f"{task_id}: --accept/--reject answer an escalation draft PR — "
+            "a needs_human task whose last attempt escalated "
+            "new_dependency or risk_path_touched and which holds one "
+            "(links.pr + links.escalation_pr). The supported reasons are "
+            "exactly those two; every other escalation keeps its current "
+            "exit (re-open or close the PR on GitHub, re-approve a "
+            "changed contract, or grant a budget reset)."
+        )
+    if assume_yes:
+        raise ApprovalError(
+            f"{task_id}: escalation acceptance is interactive only — "
+            "--yes is not accepted; the point is that a human judged the "
+            "work on the PR"
+        )
+    attempts = task.get("attempts") or []
+    escalation = attempts[-1].get("escalation")
+    url = task["links"]["pr"]
+    who = done_by or default_approver()
+
+    if reject:
+        echo(
+            f"{task_id}: {task.get('title')}\n"
+            f"  escalation: {escalation}\n"
+            f"  PR: {url} (draft)\n"
+            "  reject closes the PR and returns the task to draft with "
+            "its approval markers cleared — the contract can change, and "
+            "re-approval is required before anything runs again."
+        )
+        if not confirm(f"Reject the escalation PR for {task_id}?"):
+            raise ApprovalDeclined(f"{task_id}: escalation rejection declined")
+        # R1-F8: the STATE moves first — a close failure then leaves a
+        # draft task with an open PR (visible, closable by hand), never a
+        # needs_human task holding a PR gh already closed (which a retry
+        # would refuse on).
+        new_status = queue.reject_escalation(task_id)
+        try:
+            (pr_close or gh_pr_close)(url)
+        except PublishError as exc:
+            raise ApprovalError(
+                f"{task_id}: rejected to draft, but closing {url} failed "
+                f"({exc}) — close it by hand; the task no longer holds it"
+            ) from exc
+        try:
+            ProgressLog.for_task(
+                factory_root or FACTORY_ROOT_DEFAULT,
+                queue.doc.get("project") or "unknown", task_id,
+            ).append({
+                "outcome": "recovered",
+                "escalation": escalation,
+                "done_by": who,
+                "recovered_at": now_iso(),
+                "note": f"escalation PR {url} closed; {task_id} rejected "
+                        f"to draft by {who} (approval markers cleared)",
+            })
+        except ProgressLogError as exc:
+            raise ApprovalError(
+                f"{task_id}: moved to draft, but the progress log could "
+                f"not be written — the rejection is NOT durably recorded: "
+                f"{exc}"
+            ) from exc
+        return new_status
+
+    # --accept
+    if evidence is None or not evidence.strip():
+        raise ApprovalError(
+            f"{task_id}: escalation acceptance requires --evidence — what "
+            "you checked on the PR before accepting it (e.g. 'read the "
+            "diff; requests is the documented client')"
+        )
+    head = (pr_head or gh_pr_head_sha)(url)
+    # The stored L0 report's summary, beside the head the evidence covers.
+    summary = ""
+    report_path = attempts[-1].get("validator_report")
+    if report_path and Path(report_path).is_file():
+        try:
+            l0 = json.loads(Path(report_path).read_text()).get("L0") or {}
+            summary = "escalations: " + ", ".join(l0.get("escalations") or [])
+        except (ValueError, OSError):
+            summary = ""
+    echo(
+        f"{task_id}: {task.get('title')}\n"
+        f"  escalation: {escalation} {summary}\n"
+        f"  PR: {url}\n"
+        f"  PR head: {head}\n"
+        f"  evidence: {evidence.strip()}\n"
+        + render_contract(task)
+        + "\n  accept records the waiver in the ledger, re-runs L0 on that "
+        "exact head with only this escalation class waived, continues L1 "
+        "and review, and — on pass — marks the PR ready and moves the "
+        "task to in_review. Any new commit on the branch voids the waiver."
+    )
+    if not confirm(f"Accept {escalation} on {task_id} at {head[:12]}?"):
+        raise ApprovalDeclined(f"{task_id}: escalation acceptance declined")
+    from factory.orchestrator import recover_accept_round
+
+    try:
+        new_status = recover_accept_round(
+            queue, task_id,
+            ledger=ApprovalLedger.for_project(
+                factory_root or FACTORY_ROOT_DEFAULT,
+                queue.doc.get("project") or "unknown",
+            ),
+            sha=head, evidence=evidence.strip(), done_by=who,
+            factory_root=(factory_root or FACTORY_ROOT_DEFAULT),
+            session_runner=session_runner,
+            pr_head=pr_head or gh_pr_head_sha,
+            pr_ready=pr_ready or gh_pr_ready,
+        )
+    except RunError as exc:
+        raise ApprovalError(str(exc)) from exc
+    except PublishError as exc:
+        # R2-F1 guard 2: the lease refusal (the remote moved between the
+        # acceptance and the release) and any push/ready failure arrive
+        # as PublishError — the owner hears them as refusals, never a
+        # traceback.
+        raise ApprovalError(
+            f"{task_id}: the acceptance's release failed ({exc}) — the "
+            "task stays needs_human and the PR stays draft; re-read the "
+            "PR head and accept again"
+        ) from exc
+    try:
+        ProgressLog.for_task(
+            factory_root or FACTORY_ROOT_DEFAULT,
+            queue.doc.get("project") or "unknown", task_id,
+        ).append({
+            "outcome": "recovered",
+            "escalation": escalation,
+            "evidence": evidence.strip(),
+            "done_by": who,
+            "recovered_at": now_iso(),
+            "note": f"{escalation} accepted at head {head[:12]} by {who} "
+                    f"({url} marked ready, {task_id} → in_review): "
+                    f"{evidence.strip()}",
+        })
+    except ProgressLogError as exc:
+        raise ApprovalError(
+            f"{task_id}: moved to {new_status}, but the progress log could "
+            f"not be written — the acceptance is NOT durably recorded: {exc}"
+        ) from exc
     return new_status
 
 

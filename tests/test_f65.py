@@ -839,8 +839,13 @@ def test_ac_3(monkeypatch):
     seats = TokenNamedDrift(drift_rounds=10)
     env = Env(_tmp(), tasks=[_task(scope=SCOPE)])
     result = env.run(seats)
-    assert result.escalation == "scope_change_needed"
+    # F-72: the scope escalation keeps the work as a draft PR — and the
+    # push fence REFUSES it, because the drift file's NAME carries the
+    # seat token (a tree entry in the published range). The refusal is
+    # the recorded escalation, the original in the note — scrubbed.
+    assert result.escalation == "publish_refused"
     note = env.task()["attempts"][-1]["note"]
+    assert "scope_change_needed" in note
     assert SEAT_TOKEN not in note, note
     assert "[redacted]" in note  # scrubbed, not merely omitted
     monkeypatch.setattr("factory.provider._keychain_token",

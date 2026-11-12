@@ -302,6 +302,64 @@ class ApprovalLedger(ProgressLog):
             "approved_at": now_iso(),
         })
 
+    # ------------------------------------------------- F-72 escalation waivers --
+
+    def record_escalation_waiver(self, task: dict, *, escalation: str,
+                                 sha: str, evidence: str, approved_by: str,
+                                 contract_hash_value: str,
+                                 released_sha: str | None = None) -> dict:
+        """Record the owner's acceptance of ONE escalation class on ONE
+        exact PR head SHA (F-72 AC-4).
+
+        The waiver is keyed by ``(task_id, escalation, sha)`` — a
+        different SHA, a different class, or a second escalation class on
+        the same SHA is NOT waived — and pins the contract hash the
+        acceptance judged, so a contract changed since the escalation is
+        a different acceptance question. Idempotent per key: an
+        identical waiver (a re-run after a crash mid-accept) appends
+        nothing new.
+
+        ``released_sha`` (F-72 R2-F1 guard 2): the clean commit the
+        accept RELEASED (same parent, same tree, no ``[skip ci]``,
+        lease-pushed). A later waiver entry carries it so the F-26 sweep
+        matches the branch's new head against the acceptance; any OTHER
+        new commit matches neither and voids it.
+        """
+        entry = {
+            "kind": "escalation_waiver",
+            "project": self.project,
+            "task_id": task["id"],
+            "escalation": escalation,
+            "sha": sha,
+            "evidence": evidence.strip(),
+            "contract_hash": contract_hash_value,
+            "approved_by": approved_by,
+            "approved_at": now_iso(),
+        }
+        if released_sha is not None:
+            entry["released_sha"] = released_sha
+        return self._append(entry)
+
+    def has_escalation_waiver(self, task_id: str, escalation: str,
+                              sha: str, *,
+                              contract_hash_value: str | None = None) -> bool:
+        """Whether the owner ever accepted THIS exact (task, escalation,
+        SHA) waiver — with the released SHA (F-72 R2-F1 guard 2) accepted
+        as the same acceptance. With ``contract_hash_value``, the entry
+        must also have judged exactly that contract — a contract changed
+        since the escalation is not covered by the old acceptance."""
+        for record in self.entries():
+            if not (record.get("kind") == "escalation_waiver"
+                    and record.get("task_id") == task_id
+                    and record.get("escalation") == escalation
+                    and sha in (record.get("sha"), record.get("released_sha"))):
+                continue
+            if (contract_hash_value is not None
+                    and record.get("contract_hash") != contract_hash_value):
+                continue
+            return True
+        return False
+
 
 def changed_groups(profile: dict, approval: dict) -> "list[str]":
     """The security groups whose current hash differs from the approval's
