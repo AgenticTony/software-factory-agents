@@ -5680,8 +5680,8 @@
     },
     {
       "id": "F-73",
-      "title": "Attempt continuity: ready clones, kept usage, retries that resume",
-      "source": "BUILD-ORDER.md#f-73--attempt-continuity-ready-clones-kept-usage-retries-that-resume",
+      "title": "Ready clones: the factory's identity and setup before the session",
+      "source": "BUILD-ORDER.md#f-73--ready-clones-the-factorys-identity-and-setup-before-the-session",
       "kind": "build",
       "priority": "P1",
       "status": "draft",
@@ -5699,7 +5699,7 @@
       "acceptance": [
         {
           "id": "AC-1",
-          "text": "Failed sessions keep their usage. When the SDK raises after it has delivered a `ResultMessage` (`ResultError` on `error_max_turns`, `error_during_execution`, an API error result), the session record is built from that message: `status: failed`, the reason, `num_turns`, model, usage and cost exactly as for a completed session, through the same validation (F-64 telemetry, F-59 provider stamp). A failure with no result delivered (wall clock, a transport error before any result) keeps today's bare record, and its usage renders `unknown`, never 0, in the trace, the attempt record and `factory status`. Test: a scripted stream that yields an error `ResultMessage` and then raises `ResultError` produces a record with the message's turns, model and usage; the trace's `session_end` carries them; `factory status` sums them into the week's quota line. A stream that raises with no prior result renders `unknown`, and the week's total is marked partial rather than silently lower.",
+          "text": "The clone is ready before the session. In each attempt, after the run branch is checked out and before the implementer's first session, the parent: - sets the factory's commit identity (the same name and email the orchestrator commits with) as repo-local git config in the clone; - runs the profile's `commands.setup` there, with the same runner, sandbox and timeout L0 uses for setup. The implementer prompt says setup has run, names the command, and says commits are made as the configured identity, never another. A setup that exits non-zero, or that leaves tracked files modified or untracked files git does not ignore, starts no session. The attempt is recorded failed with reason `setup_failed`, the output tail and the dirty paths. That failure spends no attempt budget (no session ran) and stops `factory loop` like an orchestrator error, because a broken setup fails every task. Test: a scripted setup that creates a gitignored venv lets a scripted implementer commit as the factory identity and see the venv. A failing setup starts no session, records `setup_failed`, and leaves the attempt budget unchanged. A setup that writes an un-ignored file refuses, naming it.",
           "check": {
             "type": "test",
             "ref": "tests/test_f73.py::test_ac_1"
@@ -5707,18 +5707,109 @@
         },
         {
           "id": "AC-2",
-          "text": "The clone is ready before the session. In each attempt, after the run branch is checked out and before the implementer's first session, the parent: - sets the factory's commit identity (the same name and email the orchestrator commits with) as repo-local git config in the clone; - runs the profile's `commands.setup` there, with the same runner, sandbox and timeout L0 uses for setup. The implementer prompt says setup has run and names the command. A setup that exits non-zero, or that leaves tracked files modified or untracked files git does not ignore, starts no session. The attempt is recorded failed with reason `setup_failed`, the output tail and the dirty paths. That failure spends no attempt budget (no session ran) and stops `factory loop` like an orchestrator error, because a broken setup fails every task. Test: a scripted setup that creates a gitignored venv lets a scripted implementer commit as the factory identity and see the venv. A failing setup starts no session, records `setup_failed`, and leaves the attempt budget unchanged. A setup that writes an un-ignored file refuses, naming it.",
+          "text": "Nothing is published under another identity. Before any push (the validated publish and the F-72 escalation push), the parent checks the author and committer of every commit in base..head. If any is not the factory identity, the branch is rebuilt as one commit on the base under the factory identity. This uses F-72's squash with its tree assertion: the tree pushed is exactly the validated tree. The attempt record notes the foreign identities found (escaped). The run is not failed: the content was validated, and only the attribution is corrected. Test: a scripted implementer that commits with `-c user.name=<other> -c user.email=<other>` reaches a PR whose pushed history carries only the factory identity, with the validated tree unchanged, and the note names the foreign identity. A run whose commits are all factory-authored keeps its round commits, so this never squashes unnecessarily.",
           "check": {
             "type": "test",
             "ref": "tests/test_f73.py::test_ac_2"
           }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 150,
+        "wall_clock_min": 120
+      }
+    },
+    {
+      "id": "F-74",
+      "title": "Attempt telemetry and resuming retries (deferred)",
+      "source": "BUILD-ORDER.md#f-74--attempt-telemetry-and-resuming-retries-deferred",
+      "kind": "build",
+      "priority": "P2",
+      "status": "draft",
+      "depends_on": [
+        "F-73"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "Failed sessions keep their usage. When the SDK raises after it has delivered a `ResultMessage` (`ResultError` on `error_max_turns`, `error_during_execution`, an API error result), the session record is built from that message: `status: failed`, the reason, `num_turns`, model, usage and cost exactly as for a completed session, through the same validation (F-64 telemetry, F-59 provider stamp). A failure with no result delivered (wall clock, a transport error before any result) keeps today's bare record, and its usage renders `unknown`, never 0, in the trace, the attempt record and `factory status`. Test: a scripted stream that yields an error `ResultMessage` and then raises `ResultError` produces a record with the message's turns, model and usage; the trace's `session_end` carries them; `factory status` sums them into the week's quota line. A stream that raises with no prior result renders `unknown`, and the week's total is marked partial rather than silently lower.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f74.py::test_ac_1"
+          }
         },
         {
-          "id": "AC-3",
+          "id": "AC-2",
           "text": "A retry resumes from what the last attempt left. When an attempt starts on a branch that already carries commits from an earlier attempt of the same run, its prompt gains a handoff section the parent builds: - the previous attempt's outcome and reason; - the branch's commits since the base (subject lines and a diffstat, capped); - the current red/green of every contract check, which the parent runs on the branch head with L1's runner before the session starts. Commit subjects and test output are session-originated: they go in under the prompt's untrusted-data framing, escaped and capped. The section says the branch already holds the earlier work and the session continues it. Test: a scripted attempt 1 that commits a green AC-1 and dies at max turns gives attempt 2 a prompt showing that commit, AC-1 green, the other criteria red, and the max-turns reason. A commit subject carrying instructions or ESC/bidi bytes renders escaped under the untrusted heading. 500 commits stay within the cap.",
           "check": {
             "type": "test",
-            "ref": "tests/test_f73.py::test_ac_3"
+            "ref": "tests/test_f74.py::test_ac_2"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
+    },
+    {
+      "id": "F-75",
+      "title": "CI is part of done: a red PR gets a fix round",
+      "source": "BUILD-ORDER.md#f-75--ci-is-part-of-done-a-red-pr-gets-a-fix-round",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-72"
+      ],
+      "risk": [
+        "factory_control",
+        "external_service"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "The run waits for its PR's CI. After a validated publish opens or updates a PR, the parent polls the checks on the exact pushed SHA until every check settles, or until `ci_wait_min` (config, default 30) passes. All green: the run ends `pr_opened` as today. No checks reported on the SHA after the window: `pr_opened` with the note \"no CI reported\", the ready rule's current behaviour. Window spent with checks still pending: `pr_opened` with the note \"CI pending\", and AC-3 decides readiness later. The wait counts against the run's wall clock, not its session turns. Test: scripted check states (green, red, pending until timeout, none) on the exact SHA produce each outcome. A check reported for a different SHA is ignored.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f75.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Red CI becomes a fix round on the same branch. When any check fails, the parent first re-runs the failed jobs once, because CI flakes are real (the pilot hit one). Only a second red counts. Then the next implementer round starts on the PR branch's head, in the same clone, with findings for each failing check: its name and the failing log's tail (`gh run view --log-failed`). The tail is capped, scrubbed of run secrets and escaped, under the prompt's untrusted-data framing, because CI output is produced by code a session wrote. The round counts against `max_attempts` and runs L0, L1 and review as usual. Its push updates the same PR through the same push fence, as a fast-forward, never a force-push, and CI is awaited again. If attempts run out with CI still red, the task goes `needs_human` with a new escalation `ci_failed`: the PR stays open (converted to draft), and the note names the failing checks and the stored log tail. Test: a scripted CI that is red on head 1 and green on head 2 gives one fix round whose prompt carries the failing check and its log tail, then `pr_opened` on the same PR URL. A flake (red, then green on re-run) gives no fix round. Red on every head exhausts to `ci_failed` with the PR drafted. A log tail carrying instructions or ESC/bidi bytes renders escaped under the untrusted heading.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f75.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "Nothing is reported ready on red or unknown CI. `factory run` and the sweep report a factory PR `ready` only when every check on its current head is green. This extends F-58's green-CI rule from `branch_protection: unavailable` repos to every repo. A PR whose CI went red after the run ended (the AC-1 pending case, or a later re-run) is listed as `not ready: CI red` with the failing check names, and it waits for the owner. Test: a PR with a red check on its head is never in the ready list, on a protected repo and an unprotected one alike, and the not-ready line names the check.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f75.py::test_ac_3"
           }
         }
       ],
