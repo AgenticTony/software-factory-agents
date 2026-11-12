@@ -853,7 +853,9 @@ def test_ac_4(tmp_path: Path):
                 ["git", "-C", str(c), "checkout", "-q", branch], check=True)
             (c / "impl.py").write_text("def answer():\n    return 45\n")
             subprocess.run(
-                ["git", "-C", str(c), "commit", "-qam", "race"], check=True)
+                ["git", "-C", str(c), "-c", "user.name=Fixture",
+                 "-c", "user.email=fixture@example.com",
+                 "commit", "-qam", "race"], check=True)
             subprocess.run(
                 ["git", "-C", str(c), "push", "-q", "origin", branch],
                 check=True)
@@ -880,8 +882,10 @@ def test_ac_4(tmp_path: Path):
     subprocess.run(["git", "clone", "-q", str(env.remote), str(clone)], check=True)
     subprocess.run(["git", "-C", str(clone), "checkout", "-q", branch], check=True)
     (clone / "impl.py").write_text("def answer():\n    return 43\n")
-    subprocess.run(["git", "-C", str(clone), "commit", "-qam", "move head"],
-                   check=True)
+    subprocess.run(["git", "-C", str(clone), "-c", "user.name=Fixture",
+                   "-c", "user.email=fixture@example.com",
+                   "commit", "-qam", "move head"],
+                  check=True)
     subprocess.run(["git", "-C", str(clone), "push", "-q", "origin", branch],
                    check=True)
     moved_head = env.remote_branch_sha(branch)
@@ -1031,8 +1035,10 @@ def test_ac_4(tmp_path: Path):
                    check=True)
     (clone / "unrelated.txt").write_text("moved\n")
     subprocess.run(["git", "-C", str(clone), "add", "-A"], check=True)
-    subprocess.run(["git", "-C", str(clone), "commit", "-qm", "advance main"],
-                   check=True)
+    subprocess.run(["git", "-C", str(clone), "-c", "user.name=Fixture",
+                   "-c", "user.email=fixture@example.com",
+                   "commit", "-qm", "advance main"],
+                  check=True)
     subprocess.run(["git", "-C", str(clone), "push", "-q", "origin", "main"],
                    check=True)
     ledger_approve(env.root, env.queue_path)
@@ -1051,8 +1057,10 @@ def test_ac_4(tmp_path: Path):
     subprocess.run(["git", "-C", str(pr_clone), "checkout", "-q", branch],
                    check=True)
     (pr_clone / "impl.py").write_text("def answer():\n    return 44\n")
-    subprocess.run(["git", "-C", str(pr_clone), "commit", "-qam", "move pr"],
-                   check=True)  # impl.py is tracked: -am stages it
+    subprocess.run(["git", "-C", str(pr_clone), "-c", "user.name=Fixture",
+                   "-c", "user.email=fixture@example.com",
+                   "commit", "-qam", "move pr"],
+                  check=True)  # impl.py is tracked: -am stages it
     subprocess.run(["git", "-C", str(pr_clone), "push", "-q", "origin",
                     branch], check=True)
     ledger_approve(env.root, env.queue_path)
