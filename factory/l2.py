@@ -1073,6 +1073,114 @@ class VerifierOutcome(NamedTuple):
     error: str | None
 
 
+# F-72 AC-2: what one arbiter session's ruling did to the repeated
+# findings. ``rulings`` is ``[{"id", "ruling", "reason"}]`` in finding
+# order (one ruling per finding, exactly), ``error`` is set iff the
+# session's output was not a valid ruling — an unverifiable arbiter
+# settles nothing and the attempt escalates review_not_converging.
+ARBITER_RULINGS = ("valid", "invalid", "contract")
+
+
+class ArbiterOutcome(NamedTuple):
+    """The arbiter's rulings over the repeated findings (F-72 AC-2)."""
+
+    rulings: list
+    error: str | None
+
+
+def parse_arbiter_rulings(output: Any, finding_ids: Sequence[str]) -> ArbiterOutcome:
+    """Parse the arbiter's rulings over the repeated findings (F-72 AC-2).
+
+    The protocol is one object ``{"rulings": [{"id", "ruling", "reason"}]}``
+    — extracted with the same candidate machinery as the reviewer's
+    verdict. Every violation makes the WHOLE ruling invalid (the arbiter
+    failed): a ruling for an unknown finding id, a missing ruling, a
+    duplicate ruling, a ruling outside ``valid | invalid | contract``, or
+    a missing reason. A session that states TWO ruling objects with
+    differing content has called the ruling tool twice and is refused the
+    same way a two-verdict review is — picking either would be a guess.
+
+    Args:
+        output: The arbiter session's result text (or None / non-text
+            when the session failed — same treatment).
+        finding_ids: The ids of the repeated findings the arbiter was
+            asked to rule on.
+
+    Returns:
+        The :class:`ArbiterOutcome`. On ``error``, ``rulings`` is empty.
+    """
+
+    def invalid(reason: str) -> ArbiterOutcome:
+        return ArbiterOutcome(rulings=[], error=reason)
+
+    if not isinstance(output, str):
+        return invalid(
+            f"the arbiter produced no ruling text ({type(output).__name__}): "
+            "a failed or aborted session settles nothing"
+        )
+    try:
+        data = _extract_json(output)
+    except _InvalidVerdict as exc:
+        return invalid(f"no valid ruling JSON in the arbiter output ({exc})")
+    if not isinstance(data, dict) or not isinstance(data.get("rulings"), list):
+        return invalid("ruling JSON must be an object with a 'rulings' list")
+    # A session that called the ruling tool twice and said two different
+    # things is refused outright (the two-verdict rule, one layer up):
+    # every balanced/fenced object in the output that carries a rulings
+    # list must agree with the chosen one, canonically.
+    others: list = []
+    for span in [*_FENCE.findall(output), *_balanced_objects(output)]:
+        try:
+            candidate = json.loads(span, object_pairs_hook=_no_duplicate_keys)
+        except (json.JSONDecodeError, _DuplicateKey, ValueError):
+            continue
+        if isinstance(candidate, dict) and "rulings" in candidate:
+            others.append(json.dumps(candidate, sort_keys=True))
+    chosen = json.dumps(data, sort_keys=True)
+    if any(other != chosen for other in others):
+        return invalid(
+            "the arbiter output carries differing ruling objects (the "
+            "ruling tool called twice, disagreeing with itself): neither "
+            "stands"
+        )
+
+    known = set(finding_ids)
+    seen: set[str] = set()
+    rulings: list[dict] = []
+    for index, ruling in enumerate(data["rulings"]):
+        if not isinstance(ruling, dict):
+            return invalid(f"ruling {index} is not an object")
+        rid = ruling.get("id")
+        if rid not in known:
+            return invalid(
+                f"ruling {index} names an unknown finding id: {rid!r}"
+            )
+        if rid in seen:
+            return invalid(
+                f"two rulings for finding {rid!r}: an ambiguous ruling is "
+                "no ruling"
+            )
+        seen.add(rid)
+        verdict = ruling.get("ruling")
+        if verdict not in ARBITER_RULINGS:
+            return invalid(
+                f"ruling for {rid!r} is not one of {list(ARBITER_RULINGS)}: "
+                f"{verdict!r}"
+            )
+        reason = ruling.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            return invalid(f"ruling for {rid!r} carries no reason")
+        rulings.append({"id": rid, "ruling": verdict,
+                        "reason": reason.strip()})
+    missing = [rid for rid in finding_ids if rid not in seen]
+    if missing:
+        return invalid(
+            f"no ruling for finding(s) {missing!r}: every repeated finding "
+            "must be ruled"
+        )
+    return ArbiterOutcome(rulings=rulings, error=None)
+
+
 def parse_verifier_vote(output: Any, findings: Sequence[L2Finding]) -> VerifierOutcome:
     """Parse the verifier's vote over the union findings (F-38).
 

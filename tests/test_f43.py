@@ -513,9 +513,14 @@ _EGRESS_MODULES = {
             "_store", "gate_checks", "session_end", "run_end", "phase",
             "_log_vents", "_is_quota", "_tokens", "_turns_spent", "finish",
             "RunResult", "LoopResult", "transition", "render",
-            # Verdict plumbing (pure merges/parses over finding objects).
+            # Verdict plumbing (pure merges/parses over finding objects);
+            # F-72's parse_arbiter_rulings is the same class (the arbiter
+            # verdict's parse — its output reaches egress only through
+            # the guarded reports channel). _esc (F-72 R1-F4) IS the seam
+            # composed: scrub_session_text then escape_approval_text.
             "apply_vote", "apply_convergence", "final_review_verdict",
-            "parse_reviews_with_retry", "parse_verifier_vote", "_review_drops",
+            "parse_reviews_with_retry", "parse_verifier_vote",
+            "parse_arbiter_rulings", "_review_drops", "_esc",
             # Prompt builders: session text riding INTO a session's prompt
             # is the review flow itself (ingress), not egress.
             "_implementer_prompt", "_reviewer_prompt", "_verifier_prompt",

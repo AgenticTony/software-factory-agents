@@ -70,14 +70,15 @@
     },
     "providerModels": {
       "type": "object",
-      "description": "One model id per seat role. The seats' CLI model override comes from this map (F-59); a seat may only run a model of its resolved provider.",
+      "description": "One model id per seat role (arbiter optional — it defaults to the reviewer's model, F-72). The seats' CLI model override comes from this map (F-59); a seat may only run a model of its resolved provider.",
       "required": ["implementer", "reviewer", "verifier", "importer"],
       "additionalProperties": false,
       "properties": {
         "implementer": { "type": "string", "minLength": 1 },
         "reviewer": { "type": "string", "minLength": 1 },
         "verifier": { "type": "string", "minLength": 1 },
-        "importer": { "type": "string", "minLength": 1 }
+        "importer": { "type": "string", "minLength": 1 },
+        "arbiter": { "type": "string", "minLength": 1 }
       }
     },
     "providerBlock": {
@@ -120,8 +121,8 @@
     },
     "seat_providers": {
       "type": "object",
-      "description": "Seat role -> provider override (F-59 AC-5). Every kind must come from providers_allowed; the override's host joins only that seat's sandbox egress, never the implementer's.",
-      "propertyNames": { "enum": ["implementer", "reviewer", "verifier", "importer"] },
+      "description": "Seat role -> provider override (F-59 AC-5). Every kind must come from providers_allowed; the override's host joins only that seat's sandbox egress, never the implementer's. F-72: the arbiter seat may be overridden here; without an override it resolves to the reviewer's provider and model.",
+      "propertyNames": { "enum": ["implementer", "reviewer", "verifier", "importer", "arbiter"] },
       "additionalProperties": { "$ref": "#/$defs/seatProviderBlock" }
     },
     "repo": {

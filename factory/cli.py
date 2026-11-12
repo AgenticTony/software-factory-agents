@@ -138,27 +138,45 @@ def build_parser() -> argparse.ArgumentParser:
         "task_id",
         help="task id to recover (stale_base/pr_closed, "
              "credential_added with --evidence, attempts_exhausted "
-             "with --evidence and --reset-attempts, or a scope_missing/"
+             "with --evidence and --reset-attempts, a scope_missing/"
              "scope_change_needed escalation with --evidence after the "
-             "widened contract is re-approved)")
+             "widened contract is re-approved, or — F-72 — an "
+             "escalation draft PR answered with --accept/--reject)")
     recover.add_argument(
         "--yes", action="store_true",
         help="non-interactive confirmation (never allowed for "
-             "credential_added, attempts_exhausted or a scope escalation)",
+             "credential_added, attempts_exhausted, a scope escalation "
+             "or an escalation-PR accept/reject)",
     )
     recover.add_argument(
         "--evidence", default=None,
         help="required for credential_added/attempts_exhausted/scope "
-             "escalations: what you checked (e.g. 'test fixture, not a "
-             "real credential', 'all attempts died to the sandbox bind "
-             "bug, fixed in PR #NN', or 'widened to cover the fixture "
-             "the session's reason named')",
+             "escalations and for --accept: what you checked (e.g. 'test "
+             "fixture, not a real credential', 'all attempts died to the "
+             "sandbox bind bug, fixed in PR #NN', or 'read the diff; "
+             "requests is the documented client')",
     )
     recover.add_argument(
         "--reset-attempts", action="store_true",
         help="required for attempts_exhausted: grant a fresh attempt "
              "budget (history is kept; the budget counts only attempts "
              "after the reset marker)",
+    )
+    recover.add_argument(
+        "--accept", action="store_true",
+        help="F-72: accept the escalation draft PR's work — records the "
+             "waiver (task, escalation, PR head SHA, evidence, who, "
+             "when), re-runs L0 on that exact head with only that class "
+             "waived, continues L1 and review, and on pass marks the PR "
+             "ready and moves the task to in_review. new_dependency/"
+             "risk_path_touched only; interactive, no --yes",
+    )
+    recover.add_argument(
+        "--reject", action="store_true",
+        help="F-72: reject the escalation draft PR — closes it and "
+             "returns the task to draft with its approval markers "
+             "cleared (the contract can change; re-approval required). "
+             "new_dependency/risk_path_touched only; interactive, no --yes",
     )
     recover.add_argument(
         "--done-by", default=None,
@@ -392,11 +410,19 @@ def _run_recover(args: argparse.Namespace) -> int:
         status = recover_task(
             TaskQueue(args.queue), args.task_id, assume_yes=args.yes,
             evidence=args.evidence, reset_attempts=args.reset_attempts,
+            accept=args.accept, reject=args.reject,
             done_by=args.done_by,
             factory_root=(Path(args.factory_root) if args.factory_root
                           else None),
         )
-        print(f"{args.task_id}: needs_human -> {status} (fix round queued)")
+        if status == "in_review":
+            print(f"{args.task_id}: needs_human -> in_review "
+                  "(escalation accepted; PR marked ready)")
+        elif status == "draft":
+            print(f"{args.task_id}: needs_human -> draft "
+                  "(escalation rejected; contract re-approval required)")
+        else:
+            print(f"{args.task_id}: needs_human -> {status} (fix round queued)")
         return 0
     except (ApprovalError, ContractError) as exc:
         print(f"factory recover: {exc}", file=sys.stderr)
@@ -821,8 +847,21 @@ def _run_orchestrator(args: argparse.Namespace) -> int:
                 print(f"    not ready: {line}")
             for task_id in result.unledgered:
                 print(f"    unledgered (not acted on): {task_id}")
+        # F-72 AC-5: one line per task parked during the loop — id,
+        # reason, and the escalation draft PR (or "no PR"). A parked
+        # batch is NOT a clean finish: the exit code below says so.
+        for result in loop.parked:
+            where = result.pr or "no PR"
+            print(f"  parked: {result.task_id} "
+                  f"({result.escalation}) — {where}")
         print(f"factory loop: stopped ({loop.stop_reason}) after {len(loop.results)} run(s)")
-        return _EXIT[loop.stop_reason]
+        code = _EXIT[loop.stop_reason]
+        if loop.parked and code == 0:
+            # Parked tasks at the end: non-zero, so a script never reads
+            # "parked" as "all done" (F-72 AC-5). A quota/error stop
+            # already exits non-zero and keeps its own meaning.
+            code = 1
+        return code
     except _RUN_ERRORS as exc:
         print(f"factory {args.command}: {exc}", file=sys.stderr)
         return 2

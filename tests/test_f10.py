@@ -331,8 +331,12 @@ def test_ac_2(tmp_path: Path):
     assert len(task["attempts"]) == 3
     assert all(a["outcome"] != "pass" for a in task["attempts"])
     assert task["attempts"][-1]["escalation"] == "attempts_exhausted"
-    assert env.prs == []
-    assert env.remote_branches() == {"refs/heads/main"}  # nothing was pushed
+    # F-72: the spent budget's work is kept as ONE escalation draft PR —
+    # never validated, never reported ready.
+    assert len(env.prs) == 1 and env.prs[0].draft
+    assert len([b for b in env.remote_branches()
+                if b.startswith("refs/heads/factory/")]) == 1
+    assert task["links"].get("escalation_pr") is True
     # Three implementer rounds, no reviewer (L0's test gate failed: the line stopped).
     assert [c[0] for c in seats.calls] == ["implementer"] * 3
     # Findings went back: round 2's prompt carries round 1's numbered L0 finding.
@@ -416,7 +420,8 @@ def test_reviewer_fail_is_retried_then_exhausted(tmp_path: Path):
     )
     assert "scope creep 1" in seats.prompts("implementer")[1]
     assert env.task()["attempts"][-1]["escalation"] == "attempts_exhausted"
-    assert env.prs == []
+    # F-72: the spent budget's work is kept as one escalation draft PR.
+    assert len(env.prs) == 1 and env.prs[0].draft
 
 
 def test_l0_escalation_stops_immediately(tmp_path: Path):
@@ -430,7 +435,13 @@ def test_l0_escalation_stops_immediately(tmp_path: Path):
     assert task["attempts"][0]["escalation"] == "risk_path_touched"
     assert "payments" in task["risk"]  # the dynamic flag is written onto the task
     assert task["gates"]["merge"] == "human"
-    assert env.prs == []
+    # F-72 R2-F1 part 1 (owner decision "1 yes, A with guards"): the
+    # guarded classes keep no work on GitHub — risk_path_touched still
+    # pushes (it is not a guarded class; the owner accepts it later), so
+    # the draft PR stands, never validated.
+    assert len(env.prs) == 1 and env.prs[0].draft
+    assert task["links"].get("pr") == result.pr
+    assert task["links"].get("escalation_pr") is True
 
 
 # --- AC-3: quota/429 stops the loop, marks quota_exhausted, no retry -------
@@ -1469,18 +1480,26 @@ def test_review2_orchestrator_error_records_attempts_and_bounds_the_loop(
     monkeypatch.setattr(orch, "run_l1", boom)
     # Review round 2: each loop stops at the first error, so a persistent
     # crash is bounded across invocations by the attempt budget (3 here).
-    stops = [env.loop(Seats()).stop_reason for _ in range(4)]
+    # F-72: the final invocation PARKS the attempts_exhausted escalation
+    # and runs on — the loop's stop is queue_empty, the parked task named.
+    loops = [env.loop(Seats()) for _ in range(4)]
 
-    assert stops == ["error", "error", "error", "escalation"]
+    assert [lp.stop_reason for lp in loops] == [
+        "error", "error", "error", "queue_empty"]
+    last = loops[-1]
+    assert [p.escalation for p in last.parked] == ["attempts_exhausted"]
     task = env.task()
     assert task["status"] == "needs_human"
     attempts = task["attempts"]
     assert attempts[-1]["escalation"] == "attempts_exhausted"
     assert any(a.get("escalation") == "orchestrator_error" for a in attempts)
     assert all(a.get("escalation") != "quota_exhausted" for a in attempts)
-    # nothing was ever pushed: the remote still holds only its cloned main
+    # nothing was ever pushed: each crashed run's clone died with its
+    # work, and the fresh 4th run holds no commits to keep (F-72 keeps
+    # THIS run's work, not the dead clones' ghosts).
     assert not any(b.startswith("refs/heads/factory/")
                    for b in env.remote_branches())
+    assert env.prs == []
 
 
 def test_review2_new_escalations_are_schema_valid(tmp_path):

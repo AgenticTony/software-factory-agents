@@ -310,6 +310,17 @@ class Seats:
                 seat=seat, status="completed", num_turns=2, model="stub-model",
                 tokens={"input_tokens": 60, "output_tokens": 10}, result=script,
             )
+        if seat == "arbiter":
+            # F-72: these F-41 scenarios script no arbiter, so the seat
+            # answers with an UNPARSEABLE ruling — the arbiter failed and
+            # the round escalates review_not_converging exactly as the
+            # final-exhaustion path did before the seat existed (the
+            # outcome these tests pinned).
+            return SessionRecord(
+                seat=seat, status="completed", num_turns=1, model="stub-model",
+                tokens={"input_tokens": 60, "output_tokens": 10},
+                result="I read the findings; they seem fine to me.",
+            )
         if seat == "verifier":
             votes = []
             match = None
@@ -430,7 +441,9 @@ def test_ac_2(tmp_path: Path):
     result = env.run(seats)
     assert result.outcome == "needs_human", result
     assert result.escalation == "review_not_converging"
-    assert env.prs == []
+    # F-72: the work is kept as ONE escalation draft PR (never
+    # validated — the review_not_converging escalation stands).
+    assert len(env.prs) == 1 and env.prs[0].draft
     final_report = env.report(2)["L2"]
     assert final_report["verdict"] == "fail"  # AC-6: the major fails it
     assert final_report["dropped"] == []  # AC-2: nothing was out of scope
@@ -506,7 +519,9 @@ def test_ac_3(tmp_path: Path):
     result = env.run(seats)
     assert result.outcome == "needs_human", result
     assert result.escalation == "review_not_converging"
-    assert env.prs == []
+    # F-72: the work is kept as ONE escalation draft PR (never
+    # validated — the review_not_converging escalation stands).
+    assert len(env.prs) == 1 and env.prs[0].draft
     task = env.task()
     assert [a["outcome"] for a in task["attempts"]] == ["fail", "fail", "escalated"]
     assert task["attempts"][-1]["escalation"] == "review_not_converging"
@@ -616,7 +631,8 @@ def test_ac_4(tmp_path: Path, monkeypatch):
     result2 = env2.run(seats2)
     assert result2.outcome == "needs_human", result2
     assert result2.escalation == "budget_exhausted"
-    assert env2.prs == []
+    # F-72: the budget-exhausted run's work is kept as one draft PR.
+    assert len(env2.prs) == 1 and env2.prs[0].draft
     assert seats2.seats().count("reviewer") == 4  # the final fan-out never started
     attempt2 = env2.task()["attempts"][-1]
     assert "final review" in attempt2["note"]
@@ -748,7 +764,9 @@ def test_ac_6(tmp_path: Path):
     })
     result = env.run(seats)
     assert result.outcome == "needs_human", result
-    assert env.prs == []
+    # F-72: the work is kept as ONE escalation draft PR (never
+    # validated — the review_not_converging escalation stands).
+    assert len(env.prs) == 1 and env.prs[0].draft
     assert env.report(1)["L2"]["verdict"] == "fail"
 
     # REVIEW.md and prompts/reviewer.md state the rule (and the prompt

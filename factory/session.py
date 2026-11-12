@@ -594,6 +594,18 @@ SEATS: dict[str, SeatConfig] = {
         disallowed_tools=("Write", "Edit", "NotebookEdit"),
         permission_mode="bypassPermissions",
     ),
+    "arbiter": SeatConfig(
+        name="arbiter",
+        allowed_tools=(VENT_QUALIFIED_NAME,),
+        # F-72 AC-2: the arbiter rules repeated review findings valid,
+        # invalid or contract — the third judge seat, with the verifier's
+        # exact read-only contract. It runs in the WORK clone (the round's
+        # clean clone is gone by the time a review stops converging), so
+        # the integrity guard matters twice over: a ruling bought with a
+        # workspace write would ride the NEXT round's `git add -A`.
+        disallowed_tools=("Write", "Edit", "NotebookEdit"),
+        permission_mode="bypassPermissions",
+    ),
 }
 
 
@@ -2412,12 +2424,13 @@ def run_session_sandboxed(
     )
 
     # Reviewer integrity (owner review rounds 2 and 4): the reviewer — and,
-    # since F-38, the verifier, which judges the reviewers' findings —
-    # gets a read-only sandbox and a workspace guard (branch, HEAD, tree,
+    # since F-38, the verifier, which judges the reviewers' findings, and
+    # since F-72 the arbiter, which rules on repeated findings — gets a
+    # read-only sandbox and a workspace guard (branch, HEAD, tree,
     # refs, ignored files; see _GitState). The scratch links exist
     # BEFORE the baseline so their (untracked) presence can never look
     # like a mutation between the two snapshots.
-    review_guard = seat in ("reviewer", "verifier")
+    review_guard = seat in ("reviewer", "verifier", "arbiter")
     reviewer_writable: tuple[Path, ...] = ()
     baseline: _GitState | None = None
     record: SessionRecord | None = None

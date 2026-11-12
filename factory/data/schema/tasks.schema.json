@@ -293,6 +293,10 @@
             "pr": { "type": "string" },
             "branch": { "type": "string" },
             "execution_record": { "type": "string" },
+            "escalation_pr": {
+              "type": "boolean",
+              "description": "F-72: links.pr is an ESCALATION draft PR — the run's work kept for the owner's judgement, never validated as a PR. While set, the sweep never re-validates it or reports it ready, it never counts against repo.concurrency, and only `factory recover --accept` (new_dependency/risk_path_touched) or the owner's own hand-merge advances the task; accept clears the marker (the PR is then a normal in_review PR)."
+            },
             "step": { "type": "string", "description": "e.g. SoloAdventurer execution-order step number" },
             "merged": {
               "type": "string",

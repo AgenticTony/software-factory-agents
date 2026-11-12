@@ -285,6 +285,14 @@ paths:
     # protected approve/importer/l0/gates/contract/approvals modules and
     # the two new dependency judge modules below — same precedent.
     - "tests/test_f71.py"
+    # F-72: the escalation-recovery contract tests (guarded retries that
+    # keep no trace in published history, the arbiter seat, the escalation
+    # draft PR, the SHA-keyed accept waiver, the parking loop) judge the
+    # protected orchestrator/state/approve/publish/provider/session/
+    # approvals modules and the schemas — same precedent, protected from
+    # the day they exist.
+    - "tests/test_f72.py"
+    - "tests/_support/f72.py"
     # F-71: the dependency policy is judge surface — deps.py decides
     # what a manifest change means, registry.py decides whether a
     # package may be installed, and the generator writes the near-miss

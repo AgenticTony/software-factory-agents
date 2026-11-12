@@ -251,7 +251,9 @@ def test_ac_3(rehearsal, monkeypatch):
             run_rehearsal(fixture, root, now=lambda: OFF_PEAK)
     result = exc.value.result
     assert result.outcome == "needs_human", result
-    assert not exc.value.prs
+    # F-72: the escalation keeps the run's work as DRAFT PRs only —
+    # a rehearsal never opens a validated PR.
+    assert all(pr.draft for pr in exc.value.prs)
     findings = [f["id"] for f in (result.reports.get("L1") or {}).get("findings") or []]
     assert "test_not_green" in findings, result.reports["L1"]
 
@@ -268,7 +270,9 @@ def test_ac_3(rehearsal, monkeypatch):
             run_rehearsal(fixture, root, now=lambda: OFF_PEAK)
     result = exc.value.result
     assert result.outcome == "needs_human", result
-    assert not exc.value.prs
+    # F-72: the escalation keeps the run's work as DRAFT PRs only —
+    # a rehearsal never opens a validated PR.
+    assert all(pr.draft for pr in exc.value.prs)
     findings = [f["id"] for f in (result.reports.get("L0") or {}).get("findings") or []]
     assert "setup_failed" in findings, result.reports["L0"]
     setup = next(c for c in result.reports["L0"]["commands"] if c["name"] == "setup")
@@ -441,7 +445,9 @@ def test_review1_path_leak_covers_absolute_home_entries(rehearsal, monkeypatch):
             run_rehearsal(fixture, root, now=lambda: OFF_PEAK)
     result = exc.value.result
     assert result.outcome == "needs_human", result
-    assert not exc.value.prs
+    # F-72: the escalation keeps the run's work as DRAFT PRs only —
+    # a rehearsal never opens a validated PR.
+    assert all(pr.draft for pr in exc.value.prs)
     findings = [f["id"] for f in (result.reports.get("L0") or {}).get("findings") or []]
     assert "setup_failed" in findings, result.reports["L0"]
     setup = next(c for c in result.reports["L0"]["commands"] if c["name"] == "setup")

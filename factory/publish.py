@@ -29,6 +29,7 @@ fsmonitor): the run's clone was written by an agent.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
 import select
@@ -482,13 +483,21 @@ def remote_call(cmd: Sequence[str], *, env_extra: dict | None = None,
 
 @dataclass(frozen=True)
 class PullRequest:
-    """What the orchestrator asks the PR seam to open."""
+    """What the orchestrator asks the PR seam to open.
+
+    ``draft`` (F-72 AC-3): open the PR as a DRAFT — the shape an
+    escalation PR takes, visibly not-ready-for-review. ``label``: one
+    label the PR carries (the factory's escalation label); ``None`` opens
+    without one (the validated path, unchanged).
+    """
 
     remote: str
     base: str
     head: str
     title: str
     body: str
+    draft: bool = False
+    label: str | None = None
 
 
 def check_branch(branch: str, *, created: set[str] | frozenset[str], default_branch: str) -> str:
@@ -526,6 +535,7 @@ def push_branch(
     sha: str,
     created: set[str] | frozenset[str],
     default_branch: str,
+    lease_sha: str | None = None,
 ) -> None:
     """Push the validated commit, and nothing else, to the remote URL.
 
@@ -536,16 +546,25 @@ def push_branch(
         sha: The commit L0/L1/L2 validated — the object actually pushed;
             the branch name is only the remote label it lands on.
         created: Branch names this run created; anything else is refused.
+            The accept-release path (F-72 R2-F1 guard 2) passes the
+            branch it read from the task's links — the LEASE, not the
+            creation memory, is that push's real guard.
         default_branch: ``repo.default_branch`` — never pushed.
+        lease_sha: When set, the push is a release (F-72 R2-F1 guard 2):
+            a force-push allowed ONLY if the remote ref still holds
+            exactly ``lease_sha`` (``--force-with-lease``) — a concurrent
+            push between the owner's acceptance and the release refuses
+            instead of overwriting it.
 
     Raises:
         PushRefused: See :func:`check_branch`, or ``sha`` isn't a full
             object name; raised before git runs.
-        PublishError: The push failed, or the remote ref did not read
-            back as exactly ``sha`` (the publish is unconfirmed and no
-            PR may be opened about it). A call that exceeds its timeout
-            raises :class:`RemoteCallTimeout` (a PublishError) — the run
-            lease is never held open by a hung remote (F-45 AC-3).
+        PublishError: The push failed (including a lease mismatch — the
+            remote moved), or the remote ref did not read back as exactly
+            ``sha`` (the publish is unconfirmed and no PR may be opened
+            about it). A call that exceeds its timeout raises
+            :class:`RemoteCallTimeout` (a PublishError) — the run lease
+            is never held open by a hung remote (F-45 AC-3).
     """
     ref = check_branch(branch, created=created, default_branch=default_branch)
     if not _SHA_RE.match(sha or ""):
@@ -553,13 +572,19 @@ def push_branch(
             f"refusing to push {branch!r}: the validated commit must be a full "
             f"sha, got {sha!r}"
         )
-    proc = remote_call(
-        [
-            "git", *GIT_HARDENING, "-C", str(repo), "push", "--no-follow-tags",
-            "--porcelain", remote_url, f"{sha}:{ref}",
-        ],
-        what=f"git push of {ref}",
-    )
+    if lease_sha is not None and not _SHA_RE.match(lease_sha):
+        raise PushRefused(
+            f"refusing to push {branch!r}: the lease must be a full sha, "
+            f"got {lease_sha!r}"
+        )
+    argv = [
+        "git", *GIT_HARDENING, "-C", str(repo), "push", "--no-follow-tags",
+        "--porcelain",
+    ]
+    if lease_sha is not None:
+        argv.append(f"--force-with-lease={ref}:{lease_sha}")
+    argv += [remote_url, f"{sha}:{ref}"]
+    proc = remote_call(argv, what=f"git push of {ref}")
     if proc.returncode != 0:
         raise PublishError(f"git push of {ref} failed: {proc.stderr.strip()[:1000]}")
     probe = remote_call(
@@ -620,11 +645,18 @@ def gh_pr_create(pr: PullRequest, *, gh_bin: Path | str | None = None) -> str:
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as fh:
         fh.write(pr.body)
         body_path = Path(fh.name)
+    # F-72 AC-3: a draft PR (the escalation shape) and its one label.
+    # gh refuses --label for a label the repo does not carry — the
+    # escalation PR then fails into pr_create_failed, honest: the label
+    # is part of the contract, never silently skipped.
+    flags = ["--draft"] if pr.draft else []
+    if pr.label:
+        flags += ["--label", pr.label]
     try:
         proc = remote_call(
             [
                 gh, "pr", "create", "--repo", slug, "--base", pr.base, "--head", pr.head,
-                "--title", pr.title, "--body-file", str(body_path),
+                "--title", pr.title, "--body-file", str(body_path), *flags,
             ],
             env_extra=GH_NET_ENV, what=f"gh pr create ({pr.head} into {pr.base})",
         )
@@ -636,3 +668,80 @@ def gh_pr_create(pr: PullRequest, *, gh_bin: Path | str | None = None) -> str:
     if not urls:
         raise PublishError(f"gh pr create printed no PR URL: {proc.stdout.strip()[:500]}")
     return urls[-1]
+
+
+def gh_pr_head_sha(pr_url: str, *, gh_bin: Path | str | None = None) -> str:
+    """The PR's current head commit SHA, from GitHub (F-72 AC-4).
+
+    The accept path re-runs L0 on the EXACT head the owner judged — and
+    re-reads it before publishing, so a force-push between the confirm
+    and the re-run voids the waiver instead of validating a different
+    commit than the one the evidence covered.
+
+    Raises:
+        PublishError: gh is missing, the lookup failed, or the answer
+            carried no usable ``headRefOid`` — an unknown head is never
+            guessed (the F-45 rule).
+    """
+    gh = str(gh_bin) if gh_bin else shutil.which("gh")
+    if not gh:
+        raise PublishError(
+            "cannot read the PR head: gh is not installed (F-72 recover "
+            "checks the exact head SHA with `gh pr view`)"
+        )
+    proc = remote_call(
+        [gh, "pr", "view", pr_url, "--json", "headRefOid"],
+        env_extra=GH_NET_ENV, what=f"gh pr view head ({pr_url})",
+    )
+    if proc.returncode != 0:
+        raise PublishError(
+            f"cannot read the head of {pr_url}: {proc.stderr.strip()[:300]}"
+        )
+    try:
+        doc = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        doc = None
+    sha = doc.get("headRefOid") if isinstance(doc, dict) else None
+    if not isinstance(sha, str) or not _SHA_RE.match(sha.strip()):
+        raise PublishError(
+            f"gh pr view {pr_url} printed no usable headRefOid "
+            f"(stdout {proc.stdout[:200]!r}): the head is unresolvable, "
+            "never guessed"
+        )
+    return sha.strip()
+
+
+def gh_pr_ready(pr_url: str, *, gh_bin: Path | str | None = None) -> None:
+    """Mark a draft PR ready for review (F-72 AC-4 — the accept path's
+    final act; the escalation PR becomes a normal in_review PR)."""
+    gh = str(gh_bin) if gh_bin else shutil.which("gh")
+    if not gh:
+        raise PublishError(
+            "cannot mark the PR ready: gh is not installed (F-72 recover)"
+        )
+    proc = remote_call(
+        [gh, "pr", "ready", pr_url],
+        env_extra=GH_NET_ENV, what=f"gh pr ready ({pr_url})",
+    )
+    if proc.returncode != 0:
+        raise PublishError(
+            f"gh pr ready failed for {pr_url}: {proc.stderr.strip()[:300]}"
+        )
+
+
+def gh_pr_close(pr_url: str, *, gh_bin: Path | str | None = None) -> None:
+    """Close a PR (F-72 AC-4 — the reject path's act on the escalation
+    PR; closing is the owner's rejection, never a merge)."""
+    gh = str(gh_bin) if gh_bin else shutil.which("gh")
+    if not gh:
+        raise PublishError(
+            "cannot close the PR: gh is not installed (F-72 recover)"
+        )
+    proc = remote_call(
+        [gh, "pr", "close", pr_url],
+        env_extra=GH_NET_ENV, what=f"gh pr close ({pr_url})",
+    )
+    if proc.returncode != 0:
+        raise PublishError(
+            f"gh pr close failed for {pr_url}: {proc.stderr.strip()[:300]}"
+        )

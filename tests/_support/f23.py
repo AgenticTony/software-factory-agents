@@ -243,6 +243,18 @@ class Scripted:
                 self.round_reviews = 0
             else:
                 self.round_reviews += 1
+        if seat == "arbiter":
+            # F-72: these pre-F-72 scenarios script no arbiter, so the
+            # seat answers with an UNPARSEABLE ruling — the arbiter
+            # failed, and the round escalates review_not_converging
+            # exactly as it did before the seat existed (the outcome the
+            # importing tests pinned).
+            return SessionRecord(
+                seat=seat, status="completed", num_turns=1,
+                model="stub-model",
+                tokens={"input_tokens": 60, "output_tokens": 10},
+                result="I read the findings; they seem fine to me.",
+            )
         if seat == "implementer":
             body = self.impls[min(round_no - 1, len(self.impls) - 1)]
             (run_dir / "impl.py").write_text(body)
