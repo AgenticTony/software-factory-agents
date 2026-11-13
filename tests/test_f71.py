@@ -245,7 +245,7 @@ def test_ac_1(tmp_path: Path):
     doc = json.loads((REPO / ".factory" / "tasks.json").read_text())
     profile_text = (REPO / ".factory" / "project.yaml").read_text()
     profile_text = profile_text.replace(
-        "path: ~/Desktop/Software_Factory_Agents", f"path: {factory_repo}")
+        "path: ~/Developer/Software_Factory_Agents", f"path: {factory_repo}")
     (control / "project.yaml").write_text(profile_text)
     for task in doc["tasks"]:
         if task.get("kind") not in ("build", "docs"):

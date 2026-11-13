@@ -5,7 +5,7 @@
 name: soloadventurer-web
 
 repo:
-  path: ~/Desktop/SoloAdventurerWeb
+  path: ~/Developer/SoloAdventurerWeb
   default_branch: main
   remote: https://github.com/AgenticTony/soloadventurer_web_app.git
   merge_method: squash             # CLAUDE.md "Merge method: squash"
@@ -54,11 +54,11 @@ live_checks:
     command: vercel ls --prod
     when: every_deploy
   preflight:
-    command: python ~/Desktop/SoloAdventurer_app/scripts/preflight.py   # diffs DEPLOYED Supabase project vs repo
+    command: python ~/Developer/SoloAdventurer_app/scripts/preflight.py   # diffs DEPLOYED Supabase project vs repo
     secrets: [SA_SUPABASE_ACCESS_TOKEN]                                 # TODO(verify) what preflight.py needs
     when: risk:rls
   schema_refs:
-    command: python ~/Desktop/SoloAdventurer_app/scripts/check-schema-refs.py   # phantom-table ratchet — TODO(verify) it scans web too
+    command: python ~/Developer/SoloAdventurer_app/scripts/check-schema-refs.py   # phantom-table ratchet — TODO(verify) it scans web too
     when: every_deploy
 
 holdouts:
@@ -80,5 +80,5 @@ network_allowlist:
 
 cross_repo:
   - name: soloadventurer-mobile
-    path: ~/Desktop/SoloAdventurer_app
+    path: ~/Developer/SoloAdventurer_app
     reason: Owns the shared Supabase schema, RLS, edge functions and migrations. Web only consumes. Any task that depends on or touches the backend is cross_repo → needs_human in v0.
