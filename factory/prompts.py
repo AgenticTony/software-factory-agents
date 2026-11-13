@@ -75,7 +75,7 @@ def load_prompt(name: str) -> str:
 
 def _repo_root(profile: dict) -> Path:
     """The project's repo root: ``repo.path`` expanded (real profiles write
-    ``~/Desktop/...``) and resolved, so containment checks compare real
+    ``~/Developer/...``) and resolved, so containment checks compare real
     filesystem locations, not spellings."""
     repo_path = (profile.get("repo") or {}).get("path") or "."
     return Path(repo_path).expanduser().resolve()
