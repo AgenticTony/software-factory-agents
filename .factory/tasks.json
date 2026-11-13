@@ -5821,6 +5821,51 @@
         "max_turns": 200,
         "wall_clock_min": 150
       }
+    },
+    {
+      "id": "F-76",
+      "title": "Stale-base re-validation: re-run once, and a way back for an open PR",
+      "source": "BUILD-ORDER.md#f-76--stale-base-re-validation-re-run-once-and-a-way-back-for-an-open-pr",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-75"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "A failing re-validation runs once more before it parks. When L0 or L1 on the merged tree fails a command (setup, lint, typecheck, test or an extra command exits non-zero), the sweep re-runs L0 and L1 once on a fresh clean clone of the same merged SHA, with the same runner and timeout. Only a second failure escalates `stale_base`. The stored `<run-id>-revalidate.json` keeps both runs, and the note says it failed twice. A pass on the re-run is a pass: `links.revalidated` is stamped as today, and the progress entry names the first run's failing findings as \"failed once, passed on re-run\" so a flaky test stays visible. A merge conflict and L0 escalations (e.g. `new_dependency`, `protected_path_touched`) are deterministic, so they never re-run and park as today. The re-run must not be able to turn a real failure green: it gets a fresh clean clone of the merged SHA and never reuses the first run's tree, venv, caches or temp files. Test: a scripted gate runner that fails then passes gives no escalation, stamps `links.revalidated` and writes a progress note naming the flaked finding. Fails twice gives `stale_base` with both runs in the report. A merge conflict runs nothing and parks. An L0 escalation parks after one run. A deterministic failure that leaves state behind in the first clone (a file the second run would read) still fails twice.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f76.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "A parked stale_base PR can be re-validated on the owner's word, keeping its work. `factory recover <task-id> --revalidate` takes a task parked on `stale_base` whose PR GitHub reports open, and runs the sweep's re-validation of the PR's current head against the current remote default head: the same code path including AC-1's re-run, not a copy. Pass: the task moves `needs_human → in_review`, `links.revalidated` is stamped, and the progress log gains an entry (outcome `recovered`, the default SHA, the report name, `done_by`). From there the PR is reported ready or not ready by the F-75 CI rule like any in_review PR. Fail: the task stays `needs_human`, the new report is stored, and the command exits non-zero naming the failing step. The edge is written only by a dedicated state-layer method, gated to a `stale_base` escalation holding an open PR link and a passing re-validation of that exact (PR head, default head) pair. The generic transition and the sweep still refuse it. Refused, with nothing written: any other escalation, a closed or merged PR (the existing edges own those), or a PR state gh cannot answer (fails closed). No model session runs and no attempt is spent. The command takes the run lease like every queue writer and asks no confirmation: a passing re-validation is the evidence, so it needs no y/N. Docs: TASK-CONTRACT's recovery table and the `stale_base` paragraph, and VALIDATOR-SPEC's merge-order paragraph, name the re-run and the new exit. Test: a parked task whose open PR re-validates clean goes to in_review with the stamp and a `recovered` log entry. A failing re-validation leaves it parked with a stored report and a non-zero exit. A `pr_closed`, `credential_added` or closed-PR `stale_base` task is refused untouched. An unknown PR state is refused. The generic `needs_human → in_review` transition still refuses a `stale_base` task.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f76.py::test_ac_2"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 150,
+        "wall_clock_min": 120
+      }
     }
   ]
 }
