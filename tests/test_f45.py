@@ -47,7 +47,12 @@ from _support.f63 import ledger_approve
 from factory import orchestrator as orch
 from factory import publish
 from factory.contract import acceptance_hash
-from factory.mergeorder import Protection, classify_protection, gh_pr_state
+from factory.mergeorder import (
+    CIState,
+    Protection,
+    classify_protection,
+    gh_pr_state,
+)
 from factory.progress import ProgressLog, ProgressLogError
 from factory.publish import PublishError, PullRequest, gh_pr_create, push_branch
 from factory.runs import RunError
@@ -322,7 +327,11 @@ def test_ac_1(tmp_path: Path, monkeypatch):
     exactly as two processes do.
     """
     env = Env(tmp_path)  # one task: the sweep runs on the idle tick
-    assert env.run(Seats()).outcome == "pr_opened"
+    # F-75 AC-3: the sweep CI-gates every repo's ready line now — this
+    # arm's PR is green by construction, so a green-answer ci_state seam
+    # keeps "re-validated → ready" true (the publish wait shares it).
+    green_ci = lambda remote, sha: CIState("success")  # noqa: E731
+    assert env.run(Seats(), ci_state=green_ci).outcome == "pr_opened"
     assert env.task()["status"] == "in_review"
     # An unrelated remote advance: the PR is stale, so the sweep MUST clone
     # (create_run) before it can conclude anything.
@@ -344,7 +353,7 @@ def test_ac_1(tmp_path: Path, monkeypatch):
 
     def target():
         try:
-            box["result"] = env.run(Seats())
+            box["result"] = env.run(Seats(), ci_state=green_ci)
         except BaseException as exc:  # noqa: BLE001 — asserted below
             box["exc"] = exc
 

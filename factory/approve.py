@@ -72,7 +72,7 @@ from factory.gates import (
 )
 from factory.mergeorder import gh_pr_state
 from factory.progress import ProgressLog, ProgressLogError
-from factory.publish import PublishError
+from factory.publish import PublishError, PushRefused
 from factory.runs import FACTORY_ROOT_DEFAULT
 from factory.state import (
     ELIGIBLE_KINDS,
@@ -995,11 +995,12 @@ def _recover_escalation_pr(
         )
     except RunError as exc:
         raise ApprovalError(str(exc)) from exc
-    except PublishError as exc:
+    except (PublishError, PushRefused) as exc:
         # R2-F1 guard 2: the lease refusal (the remote moved between the
         # acceptance and the release) and any push/ready failure arrive
-        # as PublishError — the owner hears them as refusals, never a
-        # traceback.
+        # as PublishError — and, since F-75's lease PRE-CHECK, a moved
+        # remote refuses as PushRefused BEFORE any git push runs — the
+        # owner hears both as refusals, never a traceback.
         raise ApprovalError(
             f"{task_id}: the acceptance's release failed ({exc}) — the "
             "task stays needs_human and the PR stays draft; re-read the "

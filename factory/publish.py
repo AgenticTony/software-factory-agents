@@ -577,6 +577,42 @@ def push_branch(
             f"refusing to push {branch!r}: the lease must be a full sha, "
             f"got {lease_sha!r}"
         )
+    if lease_sha is not None:
+        # F-75: a leased push (a CI fix round's update, or the accept
+        # release) REFUSES before any git push when the remote ref no
+        # longer holds exactly ``lease_sha`` — someone pushed or
+        # force-pushed under the wait. The --force-with-lease below is
+        # the atomic guard against the check-then-push race; this
+        # pre-check makes the refusal a deterministic PushRefused (the
+        # publish's own refusal class) instead of a bare git failure
+        # reading as orchestrator_error.
+        probe = remote_call(
+            ["git", *GIT_HARDENING, "-C", str(repo), "ls-remote", remote_url,
+             ref],
+            what=f"lease pre-check of {ref}",
+        )
+        if probe.returncode != 0:
+            raise PublishError(
+                f"could not check {ref} before the leased push (ls-remote "
+                f"failed): {probe.stderr.strip()[:300]}"
+            )
+        # R1-S3: ls-remote PATTERNS match on a ref's trailing components
+        # (``refs/heads/x/refs/heads/<branch>`` matches too) — pick the
+        # line whose ref equals ``ref`` EXACTLY; no match reads as
+        # "nothing".
+        got = ""
+        for line in probe.stdout.splitlines():
+            line_sha, _, line_ref = line.partition("\t")
+            if line_ref.strip() == ref:
+                got = line_sha.strip()
+                break
+        if got != lease_sha:
+            raise PushRefused(
+                f"refusing the leased push of {branch!r}: the remote ref "
+                f"holds {got or 'nothing'}, not the leased commit "
+                f"{lease_sha[:12]} — someone pushed to the branch since it "
+                "was last read; refusing instead of overwriting"
+            )
     argv = [
         "git", *GIT_HARDENING, "-C", str(repo), "push", "--no-follow-tags",
         "--porcelain",
@@ -726,6 +762,32 @@ def gh_pr_ready(pr_url: str, *, gh_bin: Path | str | None = None) -> None:
     if proc.returncode != 0:
         raise PublishError(
             f"gh pr ready failed for {pr_url}: {proc.stderr.strip()[:300]}"
+        )
+
+
+def gh_pr_draft(pr_url: str, *, gh_bin: Path | str | None = None) -> None:
+    """Convert an open PR to a draft (``gh pr ready --undo``) — F-75's
+    ``ci_failed`` exit: the run's own PR stays open for the owner, but
+    visibly not-ready-for-review while its CI is red.
+
+    Raises:
+        PublishError: gh is missing or the call failed (a PR already in
+            draft also answers non-zero — the caller's note names it; a
+            failed conversion never loses the PR).
+    """
+    gh = str(gh_bin) if gh_bin else shutil.which("gh")
+    if not gh:
+        raise PublishError(
+            "cannot convert the PR to a draft: gh is not installed (F-75)"
+        )
+    proc = remote_call(
+        [gh, "pr", "ready", pr_url, "--undo"],
+        env_extra=GH_NET_ENV, what=f"gh pr ready --undo ({pr_url})",
+    )
+    if proc.returncode != 0:
+        raise PublishError(
+            f"converting {pr_url} to a draft failed: "
+            f"{proc.stderr.strip()[:300]}"
         )
 
 

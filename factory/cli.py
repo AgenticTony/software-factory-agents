@@ -805,7 +805,12 @@ def _run_extra(result) -> str:
         ]
         if named:
             return "; ".join(named)
-    return result.pr or result.escalation or ""
+    # F-75: a pr_opened whose CI window ended unsettled carries its
+    # note ("CI pending" / "no CI reported").
+    detail = result.pr or result.escalation or ""
+    if getattr(result, "note", None):
+        detail = f"{detail} — {result.note}".strip(" —")
+    return detail
 
 
 def _run_orchestrator(args: argparse.Namespace) -> int:

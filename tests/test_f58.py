@@ -673,14 +673,23 @@ def test_ac_5(tmp_path: Path):
     assert result.ready_prs == []
     assert result.not_ready_prs
 
-    # --- real protection: zero CI calls, readiness as before ---
+    # --- real protection: F-75 AC-3 extends the green-CI ready rule to
+    # EVERY repo, so the sweep consults the PR head's checks here too (a
+    # red PR is never ready whatever GitHub's protection enforces at
+    # merge time). The RUN-refusal half above stays unavailable-only:
+    # this repo's default head is never asked about. ---
     strict_env = Env(tmp_path / "strict", tasks=[_task()])
-    strict_env.push_branch("factory/t-3")
+    strict_sha = strict_env.push_branch("factory/t-3")
     strict_env.force_in_review(branch="factory/t-3")
-    zero = CIRecorder()
-    result = strict_env.run(ci_state=zero)
-    assert zero.calls == [], "with real protection no CI call is made"
-    assert result.ready_prs, "the ready line stands on up-to-date alone"
+    strict_default = _git(strict_env.remote, "rev-parse", "refs/heads/main")
+    green = CIRecorder({
+        strict_default: _ci("success"),
+        strict_sha: _ci("success", checks=(("live-network", "success"),)),
+    })
+    result = strict_env.run(ci_state=green)
+    assert strict_sha in green.calls, (
+        "F-75: a protected repo's PR readiness is CI-gated too")
+    assert result.ready_prs, "the ready line stands on up-to-date + green CI"
     assert result.not_ready_prs == []
 
 

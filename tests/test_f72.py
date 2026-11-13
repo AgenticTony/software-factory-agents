@@ -63,14 +63,17 @@ PYPROJECT_WITH_DEP = (
 def _run_once(env: Env72):
     from _support.f72 import OFF_PEAK
 
-    from factory.mergeorder import Protection
+    from factory.mergeorder import CIState, Protection
     from factory.orchestrator import run_once
 
+    # F-75 AC-3: the sweep CI-gates every repo's ready line — these arms'
+    # PRs are healthy by construction, so the seam answers green.
     return run_once(
         env.queue_path, factory_root=env.root, session_runner=Seats(),
         open_pr=env.open_pr, now=lambda: OFF_PEAK,
         protection=lambda r, b: Protection(checked=True, strict=True),
         pr_state=lambda url: "open",
+        ci_state=lambda r, sha: CIState("success"),
     )
 
 

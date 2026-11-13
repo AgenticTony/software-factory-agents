@@ -293,6 +293,13 @@ paths:
     # the day they exist.
     - "tests/test_f72.py"
     - "tests/_support/f72.py"
+    # F-75: same precedent — the CI-is-part-of-done contract tests
+    # (the publish-path wait, the flake re-run, the same-PR fix round,
+    # the leased fast-forward update, ci_failed, the every-repo ready
+    # rule) judge the protected orchestrator/ci/publish/mergeorder/
+    # config modules and the schema — protected from the day they exist.
+    - "tests/test_f75.py"
+    - "tests/_support/f75.py"
     # F-71: the dependency policy is judge surface — deps.py decides
     # what a manifest change means, registry.py decides whether a
     # package may be installed, and the generator writes the near-miss

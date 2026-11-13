@@ -253,6 +253,9 @@ _CI_STATUS_FAILED = frozenset({"failure", "error"})
 
 _CI_PER_PAGE = 100
 _CI_MAX_PAGES = 30  # 3000 checks; beyond that the answer is refused, not cut
+# F-75: how much of a check's output summary the state carries — the
+# CI-feedback findings quote it for checks that have no Actions log.
+_CI_SUMMARY_CAP = 2000
 
 
 @dataclass(frozen=True)
@@ -267,11 +270,19 @@ class CIState:
 
     ``checks``: every check as ``(name, conclusion-or-state)`` — what the
     refusal messages name, so "live-network failed" is legible.
+
+    ``summaries`` (F-75): the per-check output text GitHub holds — a
+    check-run's ``output.summary``, a legacy status entry's
+    ``description`` — as ``(name, text)``. Only what exists; the F-58
+    consumers (refusal messages, the ready rule) read ``checks`` and are
+    unchanged. A summary longer than the fetch cap is cut at it, never
+    dropped (it is evidence, not a status).
     """
 
     state: str
     checks: "tuple[tuple[str, str], ...]" = ()
     detail: str = ""
+    summaries: "tuple[tuple[str, str], ...]" = ()
 
 
 def classify_ci(
@@ -299,6 +310,7 @@ def classify_ci(
     all return ``unresolvable``.
     """
     checks: list[tuple[str, str]] = []
+    summaries: list[tuple[str, str]] = []
     failed = False
     pending = False
     for run in check_runs:
@@ -333,6 +345,14 @@ def classify_ci(
                 )
             checks.append((name, str(status)))
             pending = True
+        # F-75: the check's own output summary, when GitHub holds one
+        # (Actions writes it; other apps may too). A non-dict output or a
+        # non-str summary is absence, not unresolvable — the summary is
+        # evidence beside the conclusion, never the conclusion itself.
+        output = run.get("output")
+        summary = output.get("summary") if isinstance(output, dict) else None
+        if isinstance(summary, str) and summary.strip():
+            summaries.append((name, summary[:_CI_SUMMARY_CAP]))
     if status_doc is not None:
         entries = status_doc.get("statuses")
         if entries is None:
@@ -352,6 +372,9 @@ def classify_ci(
                 return CIState("unresolvable",
                                detail=f"status entry {context!r} has no state")
             checks.append((context, state))
+            if isinstance(entry.get("description"), str) \
+                    and entry["description"].strip():
+                summaries.append((context, entry["description"][:_CI_SUMMARY_CAP]))
             if state in _CI_STATUS_FAILED:
                 failed = True
             elif state == "pending":
@@ -362,12 +385,12 @@ def classify_ci(
                     detail=f"status entry {context!r} has unknown state {state!r}",
                 )
     if failed:
-        return CIState("failed", tuple(checks))
+        return CIState("failed", tuple(checks), summaries=tuple(summaries))
     if pending:
-        return CIState("pending", tuple(checks))
+        return CIState("pending", tuple(checks), summaries=tuple(summaries))
     if not checks:
         return CIState("none")
-    return CIState("success", tuple(checks))
+    return CIState("success", tuple(checks), summaries=tuple(summaries))
 
 
 def _gh_api(gh: str, args: list[str], _run: Callable) -> subprocess.CompletedProcess:
