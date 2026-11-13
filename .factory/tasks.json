@@ -5821,6 +5821,60 @@
         "max_turns": 200,
         "wall_clock_min": 150
       }
+    },
+    {
+      "id": "F-76",
+      "title": "Stale-base re-validation: re-run once, a way back for an open PR, and a fix round for a PR that goes red later",
+      "source": "BUILD-ORDER.md#f-76--stale-base-re-validation-re-run-once-a-way-back-for-an-open-pr-and-a-fix-round-for-a-pr-that-goes-red-later",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-75"
+      ],
+      "risk": [
+        "factory_control",
+        "external_service"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "A failing re-validation runs once more before it parks. When L0 or L1 on the merged tree fails a command (setup, lint, typecheck, test or an extra command exits non-zero), the sweep re-runs L0 and L1 once on a fresh clean clone of the same merged SHA, with the same runner and timeout. Only a second failure escalates `stale_base`. The stored `<run-id>-revalidate.json` keeps both runs, and the note says it failed twice. A pass on the re-run is a pass: `links.revalidated` is stamped as today, and the progress entry names the first run's failing findings as \"failed once, passed on re-run\" so a flaky test stays visible. A merge conflict and L0 escalations (e.g. `new_dependency`, `protected_path_touched`) are deterministic, so they never re-run and park as today. The re-run must not be able to turn a real failure green: it gets a fresh clean clone of the merged SHA and never reuses the first run's tree, venv, caches or temp files. Test: a scripted gate runner that fails then passes gives no escalation, stamps `links.revalidated` and writes a progress note naming the flaked finding. Fails twice gives `stale_base` with both runs in the report. A merge conflict runs nothing and parks. An L0 escalation parks after one run. A deterministic failure that leaves state behind in the first clone (a file the second run would read) still fails twice.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f76.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "A parked stale_base PR can be re-validated on the owner's word, keeping its work. `factory recover <task-id> --revalidate` takes a task parked on `stale_base` whose PR GitHub reports open, and runs the sweep's re-validation of the PR's current head against the current remote default head: the same code path including AC-1's re-run, not a copy. Pass: the task moves `needs_human → in_review`, `links.revalidated` is stamped, and the progress log gains an entry (outcome `recovered`, the default SHA, the report name, `done_by`). From there the PR is reported ready or not ready by the F-75 CI rule like any in_review PR. Fail: the task stays `needs_human`, the new report is stored, and the command exits non-zero naming the failing step. The edge is written only by a dedicated state-layer method, gated to a `stale_base` escalation holding an open PR link and a passing re-validation of that exact (PR head, default head) pair. The generic transition and the sweep still refuse it. Refused, with nothing written: any other escalation, a closed or merged PR (the existing edges own those), or a PR state gh cannot answer (fails closed). No model session runs and no attempt is spent. The command takes the run lease like every queue writer and asks no confirmation: a passing re-validation is the evidence, so it needs no y/N. Docs: TASK-CONTRACT's recovery table and the `stale_base` paragraph, and VALIDATOR-SPEC's merge-order paragraph, name the re-run and the new exit. Test: a parked task whose open PR re-validates clean goes to in_review with the stamp and a `recovered` log entry. A failing re-validation leaves it parked with a stored report and a non-zero exit. A `pr_closed`, `credential_added` or closed-PR `stale_base` task is refused untouched. An unknown PR state is refused. The generic `needs_human → in_review` transition still refuses a `stale_base` task.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f76.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "A factory PR in review whose CI settles red gets F-75's fix round. When the sweep has proved an in-review factory PR current (up to date, re-validated or cached for the current default head) and its CI on that head has settled red (every check finished, at least one failed: F-75's settle rule, never a pending or unresolvable state), it runs F-75's flake guard once per head (re-run the failed Actions jobs, wait again). If the PR is still red, the task takes F-75's CI fix round on that PR: the `in_review → in_progress` fix-round edge, a clone of the PR branch's head, one finding per failing check (name plus the capped, scrubbed, escaped `--log-failed` tail under the untrusted-data heading), L0, L1 and review as usual, a fast-forward leased push through the push fence that updates the same PR, then F-75's CI wait. The round reuses F-75's code in `factory/ci.py` and the orchestrator; it does not copy it. It counts against `max_attempts`. With the budget already spent, no session runs: the task goes `needs_human` on `ci_failed` with the PR converted to draft, as F-75 exhausts today. It acts only when the PR's head is the SHA the factory last pushed or validated. A head moved by anyone else is reported (`not ready: head moved outside the factory`) and never built on. The peak window and the one-open-PR concurrency rule apply as for any run, and at most one sweep fix round starts per run. An F-72 escalation draft PR, a merged PR and a parked task are never touched. Docs: the TASK-CONTRACT and VALIDATOR-SPEC prose that says a red in-review PR waits for the owner is updated. F-75's own spec text stays as built history. Test: an in-review PR red on its head gets one flake re-run, then a fix round whose prompt carries the failing check and its tail, and its push updates the same PR URL. Red then green on the re-run gives no fix round and a `ready` line. Pending or unresolvable gives no action. A spent budget gives `ci_failed` with the PR drafted and no session. A head pushed by someone else gives no fix round and the not-ready line. An escalation draft PR and the peak window give no fix round.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f76.py::test_ac_3"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 200,
+        "wall_clock_min": 150
+      }
     }
   ]
 }
