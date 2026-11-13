@@ -65,7 +65,11 @@ REVIEW_FAIL = json.dumps({
 SEAT_TOKEN = fake_token("f30-seat")
 
 EVENT_TYPES = {"phase_start", "phase_end", "tool_call", "gate_check",
-               "session_end", "run_end"}
+               "session_end", "run_end",
+               # F-75: the publish-path CI wait's events — a per-poll
+               # note (window ended, unreadable state) and the settled
+               # verdict with its polls/detail.
+               "ci_wait", "ci_settled"}
 PHASES = {"setup", "implementer", "L0", "L1", "L2", "publish"}
 
 

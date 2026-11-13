@@ -1263,7 +1263,15 @@ def test_review_the_conftest_spend_guard_is_pinned(tmp_path: Path):
     dir is asserted byte-identical before and after. Mutation-proven:
     the guard disabled → the no-opt-in leg goes red."""
     def _tests_dir_snapshot() -> list:
-        return sorted(str(p.relative_to(TESTS_DIR)) for p in TESTS_DIR.iterdir())
+        # __pycache__ is an interpreter artifact, not a stray file: under
+        # xdist, pytest's assertion rewriter writes a test module's .pyc
+        # on ITS worker's first import — whenever that lands relative to
+        # this snapshot is scheduling, not this test writing (a race the
+        # F-75 suite run exposed; the pin's target is stray FILES).
+        return sorted(
+            str(p.relative_to(TESTS_DIR)) for p in TESTS_DIR.iterdir()
+            if p.name != "__pycache__"
+        )
 
     before = _tests_dir_snapshot()
     scratch = tmp_path / "probe"

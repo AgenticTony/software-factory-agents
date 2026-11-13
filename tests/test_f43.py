@@ -527,6 +527,20 @@ _EGRESS_MODULES = {
             "dumps",
         },
     },
+    "factory/ci.py": {
+        "names": (), "extra_attrs": ("stdout", "stderr"),
+        # F-75: gh's stdout IS attacker text here (CI logs are produced
+        # by code a session wrote), so unlike publish.py/mergeorder.py
+        # this module is watched. ci.py only BOUNDS and buckets the
+        # bytes — the egress seam itself lives in the orchestrator
+        # (_ci_finding_lines: scrub_session_text → escape_approval_text,
+        # the _esc composition) and in the stored report's
+        # scrub_session_value. CIHelperError carries gh's stderr into
+        # its message, which leaves only through the trace writer
+        # (scrubbed at write, F-30) and never a prompt, note or PR.
+        "allow": {"strip", "rstrip", "splitlines", "partition", "find",
+                  "CIHelperError"},
+    },
     "factory/importer.py": {
         # ``proposal`` is the parsed session output; ``text`` the session's
         # raw output — the two forms importer session text takes.

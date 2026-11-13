@@ -16,6 +16,8 @@ The file is YAML at ``<factory_root>/config.yaml`` (absent = defaults)::
       end: "12:00"     # exclusive
     reviewers: 2       # L2 reviewer sessions per review (F-38), >= 1
     final_review_repeats: 1   # failed final review repeats (F-41), >= 0
+    ci_wait_min: 30    # F-75: minutes a run waits for its PR's CI, >= 0
+                       # (0 = don't wait — the pre-F-75 behaviour)
     prices:            # F-59: per kind+model USD per MILLION tokens;
                       # input / cache_read / cache_write / output. A
                       # missing (kind, model) renders n/a in factory
@@ -41,6 +43,7 @@ DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 CONFIG_FILE = "config.yaml"
 DEFAULT_REVIEWERS = 2
 DEFAULT_FINAL_REVIEW_REPEATS = 1
+DEFAULT_CI_WAIT_MIN = 30
 
 
 class ConfigError(Exception):
@@ -75,11 +78,19 @@ class FactoryConfig:
     a whole number >= 0, default 1. Zero means the first failed final
     review escalates ``review_not_converging`` at once — nothing is
     published with an unresolved blocking or major finding either way.
+
+    ``ci_wait_min`` (F-75) bounds how long a run waits, after a
+    validated publish, for the PR's CI on the exact pushed SHA: a whole
+    number >= 0, default 30. The wait also counts against the run's
+    remaining wall clock (the smaller bound wins). Zero disables the
+    wait — the pre-F-75 behaviour, where the publish path never read
+    CI at all (the sweep's ready rule still applies).
     """
 
     peak_window: PeakWindow | None = field(default=DEFAULT_PEAK_WINDOW)
     reviewers: int = DEFAULT_REVIEWERS
     final_review_repeats: int = DEFAULT_FINAL_REVIEW_REPEATS
+    ci_wait_min: int = DEFAULT_CI_WAIT_MIN
     # F-59 AC-4: the owner-maintained price table — kind -> model ->
     # {input, cache_read, cache_write, output} in USD per million
     # tokens. Missing entries are n/a in status, never 0; the table is
@@ -151,6 +162,17 @@ def _final_review_repeats(raw) -> int:
     return raw
 
 
+def _ci_wait_min(raw) -> int:
+    """Validate the ``ci_wait_min`` knob (F-75): a whole number >= 0.
+    Same bool refusal as ``reviewers`` — ``true`` must not read as a
+    silent 1-minute wait, and a negative wait is no wait at all."""
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ConfigError(f"ci_wait_min must be a whole number >= 0, got {raw!r}")
+    if raw < 0:
+        raise ConfigError(f"ci_wait_min must be a whole number >= 0, got {raw!r}")
+    return raw
+
+
 _PRICE_FIELDS = ("input", "cache_read", "cache_write", "output")
 
 
@@ -196,8 +218,8 @@ def load_config(path: Path | str | None) -> FactoryConfig:
 
     Raises:
         ConfigError: The file is unreadable, not a mapping, has unknown
-            keys, or carries a malformed ``peak_window``, ``reviewers`` or
-            ``final_review_repeats``.
+            keys, or carries a malformed ``peak_window``, ``reviewers``,
+            ``final_review_repeats`` or ``ci_wait_min``.
     """
     if path is None or not Path(path).exists():
         return FactoryConfig()
@@ -210,7 +232,8 @@ def load_config(path: Path | str | None) -> FactoryConfig:
     if not isinstance(raw, dict):
         raise ConfigError(f"factory config {path} must be a mapping")
     unknown = sorted(set(raw) - {"peak_window", "reviewers",
-                                  "final_review_repeats", "prices"})
+                                  "final_review_repeats", "ci_wait_min",
+                                  "prices"})
     if unknown:
         raise ConfigError(f"factory config {path}: unknown keys {unknown}")
     return FactoryConfig(
@@ -221,6 +244,10 @@ def load_config(path: Path | str | None) -> FactoryConfig:
         final_review_repeats=(
             _final_review_repeats(raw["final_review_repeats"])
             if "final_review_repeats" in raw else DEFAULT_FINAL_REVIEW_REPEATS
+        ),
+        ci_wait_min=(
+            _ci_wait_min(raw["ci_wait_min"])
+            if "ci_wait_min" in raw else DEFAULT_CI_WAIT_MIN
         ),
         prices=_prices(raw["prices"]) if "prices" in raw else {},
     )

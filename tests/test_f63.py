@@ -36,7 +36,7 @@ from factory.contract import (
 )
 from factory.gates import FileChange
 from factory.l0 import check_diff_policy
-from factory.mergeorder import Protection
+from factory.mergeorder import CIState, Protection
 from factory.orchestrator import run_once
 from factory.session import SessionRecord
 from factory.state import TaskQueue
@@ -341,9 +341,10 @@ def test_ac_1(tmp_path: Path):
     assert (env.task().get("links") or {}).get("revalidated") is None
     assert result.ready_prs == []
     assert result.unledgered == ["T-1"]
-    # approved: the same sweep now acts on it
+    # approved: the same sweep now acts on it (F-75 AC-3: its ready line
+    # is CI-gated like every repo's — the PR is green by construction)
     ledger_approve(env.root, env.queue_path)
-    result = env.run(NoSessions())
+    result = env.run(NoSessions(), ci_state=lambda r, sha: CIState("success"))
     assert result.outcome == "idle", result
     assert env.task()["links"]["revalidated"]["default"] == _git(
         env.repo, "rev-parse", "HEAD"

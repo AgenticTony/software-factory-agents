@@ -31,6 +31,7 @@ from _support.f63 import ledger_approve
 
 from factory.contract import SCHEMA_DIR, ContractError, acceptance_hash, load_profile
 from factory.mergeorder import (
+    CIState,
     MergeOrderError,
     Protection,
     admission,
@@ -2030,29 +2031,32 @@ def test_review43_run_reports_each_ready_pr_against_main(tmp_path: Path):
     owner step "merge factory PRs only after `factory run` has reported
     them ready against the current main" — need a visible report. Every
     open PR the sweep found up to date (or re-validated) on the current
-    remote head is named on the result: ``<url> against main@<sha12>``."""
+    remote head is named on the result: ``<url> against main@<sha12>``.
+    F-75 AC-3: "ready" also means CI green on the head — this arm's PR
+    is green by construction (a green ci_state seam)."""
     env = Env(tmp_path, tasks=[_task("T-1")])
-    assert env.run(Seats()).outcome == "pr_opened"
+    green = lambda r, sha: CIState("success")  # noqa: E731
+    assert env.run(Seats(), ci_state=green).outcome == "pr_opened"
     url = env.task("T-1")["links"]["pr"]
     head = _git(env.remote, "rev-parse", "refs/heads/main")
 
-    up_to_date = env.run(Seats())
+    up_to_date = env.run(Seats(), ci_state=green)
     assert up_to_date.outcome == "idle"
     assert up_to_date.ready_prs == [f"{url} against main@{head[:12]}"]
 
     # main moves (no conflict): re-validated on the new head, then ready.
     moved = env.advance_remote_main(None, extra_file="unrelated.txt")
-    revalidated = env.run(Seats())
+    revalidated = env.run(Seats(), ci_state=green)
     assert revalidated.outcome == "idle"
     assert revalidated.ready_prs == [f"{url} against main@{moved[:12]}"]
 
     # The ls-remote cache hit still reports it ready (nothing re-run).
-    cached = env.run(Seats())
+    cached = env.run(Seats(), ci_state=green)
     assert cached.ready_prs == [f"{url} against main@{moved[:12]}"]
 
     # Not ready: a stale PR that fails re-validation, a PR whose state
     # is unknown — neither may be reported ready.
-    unknown = env.run(Seats(), pr_state=lambda u: None)
+    unknown = env.run(Seats(), ci_state=green, pr_state=lambda u: None)
     assert unknown.ready_prs == []
     env.advance_remote_main("def answer():\n    return 99\n",
                             message="conflicting remote change")

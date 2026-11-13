@@ -92,7 +92,10 @@ ALLOWED_TRANSITIONS: dict[tuple[str, str], str] = {
     ("in_progress", "draft"): "contract changed",
     ("in_review", "deploying"): "PR merged",
     ("in_review", "in_progress"): "you rejected the PR; fix round",
-    ("in_review", "needs_human"): "stale base failed re-validation on the new default head (F-26)",
+    ("in_review", "needs_human"): (
+        "stale base failed re-validation on the new default head (F-26), "
+        "or the PR's CI stayed red through the fix rounds (F-75 ci_failed)"
+    ),
     ("in_review", "draft"): "contract changed",
     ("deploying", "needs_human"): "L4 live check failed (reverted)",
     ("deploying", "awaiting_owner"): "L4 passed, owner steps still open",
@@ -271,7 +274,7 @@ def credential_recovery_eligible(task: dict) -> bool:
             and attempts[-1].get("escalation") in CREDENTIAL_RECOVERY_ESCALATIONS)
 
 
-ATTEMPTS_RESET_ESCALATIONS = ("attempts_exhausted",)
+ATTEMPTS_RESET_ESCALATIONS = ("attempts_exhausted", "ci_failed")
 
 # F-72 AC-4: the two escalation classes the owner answers with
 # `factory recover --accept` — both are "the work is fine, the contract's
@@ -349,7 +352,10 @@ def attempts_reset_eligible(task: dict) -> bool:
     """Whether the owner's budget-reset word may move this task.
 
     True only for a ``needs_human`` task whose last attempt escalated
-    ``attempts_exhausted``. Before the F-31 fix round that escalation had
+    ``attempts_exhausted`` — or, F-75, ``ci_failed``: the same shape (a
+    run whose rounds are genuinely spent, published work parked on a
+    red PR), the same honest exit — a human granting a fresh budget with
+    evidence. Before the F-31 fix round that escalation had
     no exit at all — the attempts are genuinely spent, so a plain re-queue
     would park the task straight back; the only honest exit is a human
     granting a fresh budget with evidence (three F-31 attempts died to a
@@ -1127,7 +1133,8 @@ class TaskQueue:
         if not attempts_reset_eligible(task):
             raise TransitionError(
                 f"{task_id}: attempt reset needs a needs_human task whose "
-                "last attempt escalated attempts_exhausted"
+                "last attempt escalated attempts_exhausted (or ci_failed, "
+                "F-75)"
             )
         slice_id = task["attempts"][-1].get("slice_id") or task_id
         new_status = (
