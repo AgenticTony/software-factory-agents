@@ -5824,8 +5824,8 @@
     },
     {
       "id": "F-76",
-      "title": "Stale-base re-validation: re-run once, and a way back for an open PR",
-      "source": "BUILD-ORDER.md#f-76--stale-base-re-validation-re-run-once-and-a-way-back-for-an-open-pr",
+      "title": "Stale-base re-validation: re-run once, a way back for an open PR, and a fix round for a PR that goes red later",
+      "source": "BUILD-ORDER.md#f-76--stale-base-re-validation-re-run-once-a-way-back-for-an-open-pr-and-a-fix-round-for-a-pr-that-goes-red-later",
       "kind": "build",
       "priority": "P1",
       "status": "draft",
@@ -5833,7 +5833,8 @@
         "F-75"
       ],
       "risk": [
-        "factory_control"
+        "factory_control",
+        "external_service"
       ],
       "gates": {
         "spec_approval": true,
@@ -5856,15 +5857,23 @@
             "type": "test",
             "ref": "tests/test_f76.py::test_ac_2"
           }
+        },
+        {
+          "id": "AC-3",
+          "text": "A factory PR in review whose CI settles red gets F-75's fix round. When the sweep has proved an in-review factory PR current (up to date, re-validated or cached for the current default head) and its CI on that head has settled red (every check finished, at least one failed: F-75's settle rule, never a pending or unresolvable state), it runs F-75's flake guard once per head (re-run the failed Actions jobs, wait again). If the PR is still red, the task takes F-75's CI fix round on that PR: the `in_review → in_progress` fix-round edge, a clone of the PR branch's head, one finding per failing check (name plus the capped, scrubbed, escaped `--log-failed` tail under the untrusted-data heading), L0, L1 and review as usual, a fast-forward leased push through the push fence that updates the same PR, then F-75's CI wait. The round reuses F-75's code in `factory/ci.py` and the orchestrator; it does not copy it. It counts against `max_attempts`. With the budget already spent, no session runs: the task goes `needs_human` on `ci_failed` with the PR converted to draft, as F-75 exhausts today. It acts only when the PR's head is the SHA the factory last pushed or validated. A head moved by anyone else is reported (`not ready: head moved outside the factory`) and never built on. The peak window and the one-open-PR concurrency rule apply as for any run, and at most one sweep fix round starts per run. An F-72 escalation draft PR, a merged PR and a parked task are never touched. Docs: the TASK-CONTRACT and VALIDATOR-SPEC prose that says a red in-review PR waits for the owner is updated. F-75's own spec text stays as built history. Test: an in-review PR red on its head gets one flake re-run, then a fix round whose prompt carries the failing check and its tail, and its push updates the same PR URL. Red then green on the re-run gives no fix round and a `ready` line. Pending or unresolvable gives no action. A spent budget gives `ci_failed` with the PR drafted and no session. A head pushed by someone else gives no fix round and the not-ready line. An escalation draft PR and the peak window give no fix round.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f76.py::test_ac_3"
+          }
         }
       ],
       "attempts": [],
       "links": {},
       "budget": {
-        "size": "S",
+        "size": "M",
         "max_attempts": 3,
-        "max_turns": 150,
-        "wall_clock_min": 120
+        "max_turns": 200,
+        "wall_clock_min": 150
       }
     }
   ]
