@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-10T22:52:41Z",
+  "updated_at": "2026-11-14T08:59:37Z",
   "tasks": [
     {
       "id": "F-00",
@@ -5555,7 +5555,7 @@
       "source": "BUILD-ORDER.md#f-71--pre-spend-contract-checks-and-dependency-policy",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [],
       "risk": [
         "factory_control",
@@ -5608,7 +5608,10 @@
         "max_attempts": 3,
         "max_turns": 200,
         "wall_clock_min": 150
-      }
+      },
+      "acceptance_hash": "99d5ead718f1e701fa34e999c13ae154c9eef2fb6702b49d61cbfbcbe44c7de5",
+      "approved_at": "2026-11-14T08:59:31Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-72",
@@ -5616,7 +5619,7 @@
       "source": "BUILD-ORDER.md#f-72--escalations-keep-the-work-retry-first-and-never-stop-the-batch",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [],
       "risk": [
         "factory_control",
@@ -5676,7 +5679,10 @@
         "max_attempts": 3,
         "max_turns": 200,
         "wall_clock_min": 150
-      }
+      },
+      "acceptance_hash": "6f4ffbedd7f21b811bbfe5e7f7b0e42daf609dfb165d789223b286788dc1bbae",
+      "approved_at": "2026-11-14T08:59:35Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-73",
@@ -5774,7 +5780,7 @@
       "source": "BUILD-ORDER.md#f-75--ci-is-part-of-done-a-red-pr-gets-a-fix-round",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-72"
       ],
@@ -5820,7 +5826,10 @@
         "max_attempts": 3,
         "max_turns": 200,
         "wall_clock_min": 150
-      }
+      },
+      "acceptance_hash": "8adefcb10b6fb6d4814ae41ac71043a58dc355bf6e5bbe34a770580174292a76",
+      "approved_at": "2026-11-14T08:59:36Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-76",
@@ -5828,7 +5837,7 @@
       "source": "BUILD-ORDER.md#f-76--stale-base-re-validation-re-run-once-a-way-back-for-an-open-pr-and-a-fix-round-for-a-pr-that-goes-red-later",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-75"
       ],
@@ -5874,7 +5883,10 @@
         "max_attempts": 3,
         "max_turns": 200,
         "wall_clock_min": 150
-      }
+      },
+      "acceptance_hash": "1eab5e6c451bb0d490c6ddd4762bf21b8128691fbf556022c3bb73fd8898f4c6",
+      "approved_at": "2026-11-14T08:59:37Z",
+      "approved_by": "Anthony"
     }
   ]
 }
