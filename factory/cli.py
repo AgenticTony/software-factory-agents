@@ -160,13 +160,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recover.add_argument(
         "--reset-attempts", action="store_true",
-        help="required for attempts_exhausted and ci_failed: grant a "
-             "fresh attempt budget (history is kept; the budget counts "
-             "only attempts after the reset marker). attempts_exhausted "
-             "re-queues a fresh run. ci_failed (F-77) depends on its PR: "
-             "open — the reset keeps the PR, the task returns to "
-             "in_review and the next loop runs the CI fix round on that "
-             "same PR; closed — a fresh run re-implements from the "
+        help="required for attempts_exhausted, ci_failed and "
+             "scope_change_needed: grant a fresh attempt budget "
+             "(history is kept; the budget counts only attempts after "
+             "the reset marker). attempts_exhausted re-queues a fresh "
+             "run. ci_failed (F-77) and scope_change_needed (F-78) "
+             "depend on their PR: open — the reset keeps the PR, the "
+             "task returns to in_review and the next loop runs the CI "
+             "fix round on that same PR (a scope park only after the "
+             "widened contract is re-approved via `factory approve "
+             "--adopt`); closed — a fresh run re-implements from the "
              "default head; merged or unreadable — refused",
     )
     recover.add_argument(
