@@ -1709,8 +1709,8 @@ def _recover_scope_task(
     if reset_attempts:
         # F-78: the ledger gate FIRST — the widened contract must be
         # owner-approved before anything moves, and before GitHub is
-        # read at all. The state layer cannot see the ledger; this is
-        # its gate, exactly as recover_scope's.
+        # read at all. This is the friendly pre-prompt refusal; the
+        # writer (TaskQueue.recover_attempts) demands the ledger again.
         from factory.contract import contract_hash
         root = factory_root or FACTORY_ROOT_DEFAULT
         ledger = ApprovalLedger.for_project(
