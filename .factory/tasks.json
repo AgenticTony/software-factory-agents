@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-14T14:20:00Z",
+  "updated_at": "2026-11-14T16:20:00Z",
   "tasks": [
     {
       "id": "F-00",
@@ -5947,8 +5947,8 @@
     },
     {
       "id": "F-78",
-      "title": "A scope-changed PR keeps its work: the keep-the-PR reset for scope parks, and the missing `factory adopt`",
-      "source": "BUILD-ORDER.md#f-78--a-scope-changed-pr-keeps-its-work-the-keep-the-pr-reset-for-scope-parks-and-the-missing-factory-adopt",
+      "title": "A scope-changed PR keeps its work: the keep-the-PR reset for scope parks",
+      "source": "BUILD-ORDER.md#f-78--a-scope-changed-pr-keeps-its-work-the-keep-the-pr-reset-for-scope-parks",
       "kind": "build",
       "priority": "P1",
       "status": "draft",
@@ -5974,7 +5974,7 @@
         },
         {
           "id": "AC-2",
-          "text": "`factory adopt <task-id>` exists — shows the current contract and records the owner's approval of exactly that hash into the F-63 ledger; interactive y/N, `--yes` refused, non-draft tasks allowed, queue untouched, idempotent with a say-so.",
+          "text": "The ledger step is today's command: `factory approve --adopt` records the widened hash for a parked task, and the reset's gate accepts exactly what it records (before: refuse naming the command; after: proceed). The drafted \"`factory adopt` exists\" AC was a misdiagnosis — the command exists as `factory approve --adopt` (F-63).",
           "check": {
             "type": "test",
             "ref": "tests/test_f78.py::test_ac_2"
@@ -5996,6 +5996,21 @@
         "max_attempts": 3,
         "max_turns": 150,
         "wall_clock_min": 120
+      },
+      "scope": {
+        "paths": [
+          "factory/state.py",
+          "factory/approve.py",
+          "factory/cli.py",
+          "tests/test_f78.py",
+          "tests/_support/f78.py",
+          "TASK-CONTRACT.md",
+          "BUILD-ORDER.md",
+          ".factory/tasks.json",
+          ".factory/project.yaml",
+          ".factory/BOOTSTRAP.md",
+          "docs/run-loop.md"
+        ]
       }
     }
   ]

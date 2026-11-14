@@ -79,8 +79,8 @@ from factory.state import (
     RunInProgressError,
     TaskQueue,
     attempts_reset_eligible,
-    ci_failed_keep_pr_eligible,
     credential_recovery_eligible,
+    keep_pr_eligible,
     now_iso,
     open_owner_steps,
     recovery_task_eligible,
@@ -821,8 +821,9 @@ def recover_task(
     if scope_recovery_eligible(task):
         return _recover_scope_task(
             queue, task_id, task, evidence=evidence, assume_yes=assume_yes,
-            done_by=done_by, factory_root=factory_root,
-            confirm=confirm, echo=echo,
+            reset_attempts=reset_attempts, done_by=done_by,
+            factory_root=factory_root, pr_state=pr_state,
+            pr_ready=pr_ready, confirm=confirm, echo=echo,
         )
     if not recovery_task_eligible(task):
         raise ApprovalError(
@@ -1450,6 +1451,7 @@ def _recover_attempts_task(
     *,
     evidence: str | None,
     reset_attempts: bool,
+    ledger=None,
     assume_yes: bool,
     done_by: str | None,
     factory_root: Path | None,
@@ -1473,7 +1475,8 @@ def _recover_attempts_task(
     * ``attempts_exhausted`` (no validated PR exists): the fresh-run
       re-queue, ``ready``/``blocked``. GitHub is not read.
     * ``ci_failed`` holding a normal PR link
-      (:func:`factory.state.ci_failed_keep_pr_eligible`): GitHub decides.
+      (:func:`factory.state.keep_pr_eligible` — a ``ci_failed`` (F-77)
+      or ``scope_change_needed`` (F-78) park): GitHub decides.
       **Open** → the PR is kept: ``needs_human → in_review`` with the
       links untouched, so the next sweep runs the CI fix round on that
       same PR under the fresh budget, and the drafted PR is marked ready
@@ -1532,7 +1535,7 @@ def _recover_attempts_task(
     # F-77: only a ci_failed park holding a normal PR link has work to
     # keep — and only GitHub can say whether that PR is still open.
     keep_pr = False
-    if ci_failed_keep_pr_eligible(task):
+    if keep_pr_eligible(task):
         state = _github_says()
         if state == "open":
             keep_pr = True
@@ -1559,7 +1562,7 @@ def _recover_attempts_task(
                     "budget?")
     else:
         outcome = (
-            (f"  PR: {url} (closed)\n" if ci_failed_keep_pr_eligible(task)
+            (f"  PR: {url} (closed)\n" if keep_pr_eligible(task)
              else "")
             + "  recover re-queues the task with a fresh attempt budget: "
             "the next run will re-implement it from the current default "
@@ -1594,7 +1597,8 @@ def _recover_attempts_task(
                         "nothing was written; run the command again"
                     )
                 new_status = queue.recover_attempts(
-                    task_id, evidence, done_by=who, keep_pr=True)
+                    task_id, evidence, done_by=who, keep_pr=True,
+                    ledger=ledger)
         except RunInProgressError as exc:
             raise ApprovalError(
                 f"{task_id}: the run lease is held ({exc}) — another run or "
@@ -1618,7 +1622,8 @@ def _recover_attempts_task(
         else:
             ready_note = "; the PR was marked ready again"
     else:
-        new_status = queue.recover_attempts(task_id, evidence, done_by=who)
+        new_status = queue.recover_attempts(task_id, evidence, done_by=who,
+                                            ledger=ledger)
     marker = (queue.get(task_id).get("attempt_resets") or [{}])[-1]
     kept = (f"the open PR {url} is kept — the sweep's CI fix round "
             f"repairs it in place{ready_note}" if keep_pr
@@ -1657,20 +1662,38 @@ def _recover_scope_task(
     *,
     evidence: str | None,
     assume_yes: bool,
-    done_by: str | None,
-    factory_root: Path | None,
-    confirm: Callable[[str], bool],
-    echo: Callable[[str], None],
+    reset_attempts: bool = False,
+    done_by: str | None = None,
+    factory_root: Path | None = None,
+    pr_state: "Callable[[str], str] | None" = None,
+    pr_ready: "Callable[[str], None] | None" = None,
+    confirm: Callable[[str], bool] = input_confirm,
+    echo: Callable[[str], None] = print,
 ) -> str:
-    """The F-65 scope re-queue: evidence + interactive y/N + the ledger
-    check, through the state layer's dedicated edge
-    (:meth:`TaskQueue.recover_scope`), with the confirmation persisted
-    to the task's progress log like the credential exit. The gate that
-    distinguishes it: the task's CURRENT contract hash (the widened
-    scope included) must already be owner-approved in the F-63 ledger —
-    recover moves nothing the owner has not re-approved (class-2
-    amendment: the spec said "the existing approval path", but no
-    existing path moved a needs_human scope escalation back to ready)."""
+    """The F-65 scope re-queue — and, F-78, the scope park's budget
+    reset: evidence + interactive y/N + the ledger check, through the
+    state layer's dedicated edges (:meth:`TaskQueue.recover_scope` for
+    the re-queue, :meth:`TaskQueue.recover_attempts` for the reset),
+    with the confirmation persisted to the task's progress log like the
+    credential exit. The gate that distinguishes both: the task's
+    CURRENT contract hash (the widened scope included) must already be
+    owner-approved in the F-63 ledger — recover moves nothing the owner
+    has not re-approved (class-2 amendment: the spec said "the existing
+    approval path", but no existing path moved a needs_human scope
+    escalation back to ready).
+
+    ``reset_attempts=False`` re-queues under the re-approved contract
+    (attempts are NOT reset). ``reset_attempts=True`` (F-78) grants the
+    fresh budget the round spent and — where there is published work to
+    keep — keeps it: the ledger gate runs FIRST (an unapproved widened
+    contract refuses naming ``factory approve --adopt``, GitHub never
+    read), then the F-77 reset machinery decides by the PR's state —
+    open → ``needs_human → in_review`` with links untouched and the
+    drafted PR marked ready, so the next sweep's CI fix round repairs
+    the SAME PR under the widened scope; closed → the fresh-run
+    re-queue (with the marker); merged/unreadable → refused, nothing
+    written. A scope park holding no normal PR link takes the
+    fresh-run reset: nothing the sweep may fix in place."""
     if evidence is None or not evidence.strip():
         raise ApprovalError(
             f"{task_id}: scope recovery requires --evidence — what you "
@@ -1683,6 +1706,40 @@ def _recover_scope_task(
             "accepted; widening a contract is a human decision, not a "
             "default"
         )
+    if reset_attempts:
+        # F-78: the ledger gate FIRST — the widened contract must be
+        # owner-approved before anything moves, and before GitHub is
+        # read at all. This is the friendly pre-prompt refusal; the
+        # writer (TaskQueue.recover_attempts) demands the ledger again.
+        from factory.contract import contract_hash
+        root = factory_root or FACTORY_ROOT_DEFAULT
+        ledger = ApprovalLedger.for_project(
+            root, queue.doc.get("project") or "unknown"
+        )
+        chash = contract_hash(task)
+        if not ledger.has_contract(task_id, chash):
+            raise ApprovalError(
+                f"{task_id}: the scope reset needs the CURRENT contract "
+                f"(hash {chash[:12]}…) owner-approved in the ledger first "
+                "— widen the task's scope in the queue, then record the "
+                "re-approval with `factory approve --adopt` (it shows the "
+                "contract and records the new hash; `factory approve` "
+                "refuses non-draft tasks). Nothing was written; GitHub "
+                "was not read."
+            )
+        # …then the F-77 reset machinery, unchanged: its keep-PR gate
+        # (factory.state.keep_pr_eligible) now covers the scope park,
+        # and its echo names the outcome before the y/N. The ledger
+        # rides along: the writer DEMANDS it for a scope park (the
+        # F-65 gate is the state layer's own refusal, not this command's
+        # courtesy) — the check above is only the friendlier, earlier
+        # refusal that names the remedy before any prompt.
+        return _recover_attempts_task(
+            queue, task_id, task, evidence=evidence, reset_attempts=True,
+            assume_yes=assume_yes, done_by=done_by,
+            factory_root=factory_root, pr_state=pr_state,
+            pr_ready=pr_ready, ledger=ledger, confirm=confirm, echo=echo,
+        )
     attempts = task.get("attempts") or []
     scope_now = ", ".join(_scope_paths(task)) or "(none declared)"
     echo(
@@ -1694,9 +1751,10 @@ def _recover_scope_task(
         f"  evidence: {evidence.strip()}\n"
         "  recover re-queues the task under the CURRENT contract — widen "
         "its scope in the queue and record the re-approval first "
-        "(`factory adopt` shows the contract and records the new hash; "
-        "`factory approve` refuses non-draft tasks); a scope the ledger "
-        "does not cover does not move. Attempts are NOT reset."
+        "(`factory approve --adopt` shows the contract and records the "
+        "new hash; `factory approve` refuses non-draft tasks); a scope "
+        "the ledger does not cover does not move. Attempts are NOT "
+        "reset."
     )
     if not confirm(f"Re-queue {task_id} under its re-approved scope?"):
         raise ApprovalDeclined(f"{task_id}: scope recovery declined")

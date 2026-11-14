@@ -313,6 +313,12 @@ paths:
     # fix round, the sweep park's PR) — protected from the day they
     # exist.
     - "tests/test_f77.py"
+    # F-78: same precedent — the scope-park keep-the-PR reset contract
+    # tests judge the protected state/approve modules (the reset
+    # writer's widened gate, the ledger-first scope half, the composed
+    # fix round).
+    - "tests/test_f78.py"
+    - "tests/_support/f78.py"
     # F-71: the dependency policy is judge surface — deps.py decides
     # what a manifest change means, registry.py decides whether a
     # package may be installed, and the generator writes the near-miss

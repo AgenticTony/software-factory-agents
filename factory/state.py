@@ -276,6 +276,26 @@ def credential_recovery_eligible(task: dict) -> bool:
 
 ATTEMPTS_RESET_ESCALATIONS = ("attempts_exhausted", "ci_failed")
 
+# F-78: the parks whose budget reset may KEEP the task's PR (one
+# predicate, two parks — both hold published, reviewed work a reset
+# must not throw away). attempts_exhausted has no validated PR to
+# keep; scope_missing never ran a session or published.
+KEEP_PR_ESCALATIONS = ("ci_failed", "scope_change_needed")
+
+# F-78: the parks the MARKER writer accepts. Wider than
+# ATTEMPTS_RESET_ESCALATIONS on purpose: a scope_change_needed park
+# takes its reset through the SCOPE command half — but the F-65 gate
+# (the owner-ledger approval of the widened contract) is the WRITER's
+# own demand, not the command's courtesy: recover_attempts refuses a
+# scope park without a ledger whose has_contract covers the task's
+# CURRENT hash, exactly as recover_scope does, so no direct caller can
+# bypass it. `attempts_reset_eligible` — the COMMAND dispatch set —
+# stays as it is: a scope park must keep routing to the scope half
+# (which reads GitHub for the keep-PR rule), never straight to the
+# attempts one.
+RESET_WRITER_ESCALATIONS = (
+    "attempts_exhausted", "ci_failed", "scope_change_needed")
+
 # F-72 AC-4: the two escalation classes the owner answers with
 # `factory recover --accept` — both are "the work is fine, the contract's
 # policy question is mine", which is exactly what an escalation draft PR
@@ -368,19 +388,23 @@ def attempts_reset_eligible(task: dict) -> bool:
             and attempts[-1].get("escalation") in ATTEMPTS_RESET_ESCALATIONS)
 
 
-def ci_failed_keep_pr_eligible(task: dict) -> bool:
-    """Whether a budget reset may KEEP this task's PR (F-77).
+def keep_pr_eligible(task: dict) -> bool:
+    """Whether a budget reset may KEEP this task's PR (F-77, F-78).
 
     True only for a ``needs_human`` task whose last attempt escalated
-    ``ci_failed`` and which holds a NORMAL PR link: ``links.pr`` set, no
+    ``ci_failed`` (F-77) or ``scope_change_needed`` (F-78) and which
+    holds a NORMAL PR link: ``links.pr`` set, no
     ``links.escalation_pr`` (that draft is the owner's to accept or
     reject, never the sweep's to fix) and not stamped merged for that
-    URL. Such a task is published, reviewed work parked on a red check;
-    its reset may return it to ``in_review`` so the sweep's CI fix round
-    (F-76) repairs the same PR instead of a fresh run re-implementing
-    from the default head. An ``attempts_exhausted`` task never
-    qualifies, whatever links it holds: it has no validated PR to keep.
-    Whether GitHub still reports the PR open is the COMMAND's read
+    URL. Such a task is published, reviewed work — parked on a red
+    check, or on a fix round that asked for a wider contract — and its
+    reset may return it to ``in_review`` so the sweep's CI fix round
+    (F-76) repairs the same PR under the freshly-approved scope instead
+    of a fresh run re-implementing from the default head. An
+    ``attempts_exhausted`` task never qualifies, whatever links it
+    holds: it has no validated PR to keep; neither does
+    ``scope_missing`` — it never ran a session or published. Whether
+    GitHub still reports the PR open is the COMMAND's read
     (``factory recover --reset-attempts``); this is the state half, the
     one gate of :meth:`TaskQueue.recover_attempts`'s ``keep_pr`` target.
     """
@@ -388,7 +412,7 @@ def ci_failed_keep_pr_eligible(task: dict) -> bool:
     links = task.get("links") or {}
     return (task.get("status") == "needs_human"
             and bool(attempts)
-            and attempts[-1].get("escalation") == "ci_failed"
+            and attempts[-1].get("escalation") in KEEP_PR_ESCALATIONS
             and bool(links.get("pr"))
             and not links.get("escalation_pr")
             and links.get("merged") != links.get("pr"))
@@ -515,8 +539,9 @@ def check_recovery_transition(task: dict, new: str) -> str:
             f"recovery transition {task.get('status')} -> {new} needs a "
             "stale_base/pr_closed escalation and a PR link (F-26; a "
             "credential_added task moves only through "
-            "TaskQueue.recover_credential, and an attempts_exhausted or "
-            "ci_failed task only through TaskQueue.recover_attempts)"
+            "TaskQueue.recover_credential, and an attempts_exhausted, "
+            "ci_failed or scope_change_needed task only through "
+            "TaskQueue.recover_attempts)"
         )
     if (new == "in_review"
             and (task.get("attempts") or [{}])[-1].get("escalation")
@@ -1304,7 +1329,8 @@ class TaskQueue:
 
     def recover_attempts(self, task_id: str, evidence: str, *,
                          done_by: str | None = None,
-                         keep_pr: bool = False) -> str:
+                         keep_pr: bool = False,
+                         ledger=None) -> str:
         """Re-queue an ``attempts_exhausted`` (or, F-75, ``ci_failed``)
         task with a fresh budget: the one writer of that edge, and the
         only writer of ``attempt_resets`` markers.
@@ -1325,20 +1351,34 @@ class TaskQueue:
           task re-queues for a FRESH run — ``blocked`` when a dependency
           is open, else ``ready``, the routing every recovery writer
           uses. The next run re-implements from the default head.
-        * ``keep_pr=True`` (F-77): the task returns to ``in_review``
-          with its links untouched, so the sweep's CI fix round repairs
-          the SAME PR under the fresh budget. Legal only for
-          :func:`ci_failed_keep_pr_eligible` — a ``ci_failed`` park
-          holding a normal PR link; anything else refuses and writes
-          nothing. The caller has read GitHub (the PR is open); this
-          layer cannot, and does not guess.
+        * ``keep_pr=True`` (F-77, F-78): the task returns to
+          ``in_review`` with its links untouched, so the sweep's CI fix
+          round repairs the SAME PR under the fresh budget (for a scope
+          park, under the widened, re-approved scope). Legal only for
+          :func:`keep_pr_eligible` — a ``ci_failed`` (F-77) or
+          ``scope_change_needed`` (F-78) park holding a normal PR link;
+          anything else refuses and writes nothing. The caller has read
+          GitHub (the PR is open); this layer cannot, and does not
+          guess. The F-65 ledger gate for a scope park, by contrast, is
+          THIS method's own demand (see ``ledger`` below) — never the
+          command's alone.
 
         Args:
-            task_id: Task parked on ``attempts_exhausted``/``ci_failed``.
+            task_id: Task parked on ``attempts_exhausted``/``ci_failed``
+                /``scope_change_needed`` (the scope park arrives through
+                the scope command half's ledger gate).
             evidence: What the owner checked; must not be blank.
             done_by: Who granted the reset; recorded in the marker.
             keep_pr: Take the ``in_review`` target (F-77) instead of the
                 fresh-run re-queue.
+            ledger: REQUIRED for a ``scope_change_needed`` park, ignored
+                for the others: the F-63 owner ledger (duck-typed —
+                anything with ``has_contract(task_id, contract_hash)``);
+                a scope park's reset refuses unless that ledger covers
+                the task's CURRENT (widened) whole-contract hash, so no
+                direct caller can spend a budget on a contract the owner
+                has not re-approved (F-78 review finding — the gate
+                lives here, exactly as recover_scope's).
 
         Returns:
             The new status: ``ready``, ``blocked`` or ``in_review``.
@@ -1346,28 +1386,52 @@ class TaskQueue:
         Raises:
             StateError: Unknown task, or blank evidence.
             TransitionError: The task isn't parked on
-                ``attempts_exhausted``/``ci_failed`` (including via the
-                generic transition, which never moves one), or
-                ``keep_pr`` was asked for a task that is not a
-                ``ci_failed`` park holding a normal PR link.
+                ``attempts_exhausted``/``ci_failed``/``scope_change_needed``
+                (including via the generic transition, which never moves
+                one); ``keep_pr`` was asked for a task that is not a
+                ``ci_failed``/``scope_change_needed`` park holding a
+                normal PR link; or a ``scope_change_needed`` park's
+                ledger is missing or does not cover the task's current
+                (widened) contract hash.
             ContractError: If the resulting queue wouldn't validate.
             ConcurrentWriteError: If another writer changed the file.
         """
         if not (evidence or "").strip():
             raise StateError(f"{task_id}: attempt reset requires evidence")
         task = self.get(task_id)
-        if not attempts_reset_eligible(task):
+        parked_on = (task.get("attempts") or [{}])[-1].get("escalation")
+        if not (task.get("status") == "needs_human"
+                and parked_on in RESET_WRITER_ESCALATIONS):
             raise TransitionError(
                 f"{task_id}: attempt reset needs a needs_human task whose "
                 "last attempt escalated attempts_exhausted (or ci_failed, "
-                "F-75)"
+                "F-75; or scope_change_needed, F-78)"
             )
-        if keep_pr and not ci_failed_keep_pr_eligible(task):
+        if parked_on == "scope_change_needed":
+            # F-78 review finding: the F-65 gate is THIS layer's demand,
+            # not only the command's — a widened contract the owner has
+            # not re-approved moves nothing, whoever calls. The ledger is
+            # passed in (duck-typed: needs ``has_contract(task_id,
+            # contract_hash(task))``, as ApprovalLedger provides) because
+            # the state layer owns no I/O of its own; recover_scope takes
+            # the same shape.
+            if ledger is None or not ledger.has_contract(
+                    task_id, contract_hash(task)):
+                raise TransitionError(
+                    f"{task_id}: a scope_change_needed reset demands the "
+                    "owner-ledger approval of the task's CURRENT (widened) "
+                    "contract — pass the ledger and record the "
+                    "re-approval first (`factory approve --adopt`); a "
+                    "scope the ledger does not cover does not move, "
+                    "whatever calls this writer"
+                )
+        if keep_pr and not keep_pr_eligible(task):
             raise TransitionError(
                 f"{task_id}: a reset that keeps the PR needs a needs_human "
-                "task whose last attempt escalated ci_failed and which "
-                "holds a normal PR link (no escalation draft, not merged) "
-                "— every other reset re-queues a fresh run (F-77)"
+                "task whose last attempt escalated ci_failed (F-77) or "
+                "scope_change_needed (F-78) and which holds a normal PR "
+                "link (no escalation draft, not merged) — every other "
+                "reset re-queues a fresh run"
             )
         slice_id = task["attempts"][-1].get("slice_id") or task_id
         if keep_pr:
