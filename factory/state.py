@@ -368,6 +368,32 @@ def attempts_reset_eligible(task: dict) -> bool:
             and attempts[-1].get("escalation") in ATTEMPTS_RESET_ESCALATIONS)
 
 
+def ci_failed_keep_pr_eligible(task: dict) -> bool:
+    """Whether a budget reset may KEEP this task's PR (F-77).
+
+    True only for a ``needs_human`` task whose last attempt escalated
+    ``ci_failed`` and which holds a NORMAL PR link: ``links.pr`` set, no
+    ``links.escalation_pr`` (that draft is the owner's to accept or
+    reject, never the sweep's to fix) and not stamped merged for that
+    URL. Such a task is published, reviewed work parked on a red check;
+    its reset may return it to ``in_review`` so the sweep's CI fix round
+    (F-76) repairs the same PR instead of a fresh run re-implementing
+    from the default head. An ``attempts_exhausted`` task never
+    qualifies, whatever links it holds: it has no validated PR to keep.
+    Whether GitHub still reports the PR open is the COMMAND's read
+    (``factory recover --reset-attempts``); this is the state half, the
+    one gate of :meth:`TaskQueue.recover_attempts`'s ``keep_pr`` target.
+    """
+    attempts = task.get("attempts") or []
+    links = task.get("links") or {}
+    return (task.get("status") == "needs_human"
+            and bool(attempts)
+            and attempts[-1].get("escalation") == "ci_failed"
+            and bool(links.get("pr"))
+            and not links.get("escalation_pr")
+            and links.get("merged") != links.get("pr"))
+
+
 def attempt_budget_floor(task: dict, slice_id: str) -> int:
     """The position in ``task['attempts']`` the slice's budget counts from.
 
@@ -489,8 +515,8 @@ def check_recovery_transition(task: dict, new: str) -> str:
             f"recovery transition {task.get('status')} -> {new} needs a "
             "stale_base/pr_closed escalation and a PR link (F-26; a "
             "credential_added task moves only through "
-            "TaskQueue.recover_credential, and an attempts_exhausted task "
-            "only through TaskQueue.recover_attempts)"
+            "TaskQueue.recover_credential, and an attempts_exhausted or "
+            "ci_failed task only through TaskQueue.recover_attempts)"
         )
     if (new == "in_review"
             and (task.get("attempts") or [{}])[-1].get("escalation")
@@ -1277,35 +1303,53 @@ class TaskQueue:
         return "in_review"
 
     def recover_attempts(self, task_id: str, evidence: str, *,
-                         done_by: str | None = None) -> str:
-        """Re-queue an ``attempts_exhausted`` task with a fresh budget:
-        the one writer of that edge, and the only writer of
-        ``attempt_resets`` markers.
+                         done_by: str | None = None,
+                         keep_pr: bool = False) -> str:
+        """Re-queue an ``attempts_exhausted`` (or, F-75, ``ci_failed``)
+        task with a fresh budget: the one writer of that edge, and the
+        only writer of ``attempt_resets`` markers.
 
         Like the credential exit, the gate lives HERE, not in the command:
-        the generic :meth:`transition` refuses an attempts_exhausted task,
-        so no other writer can move it or spend a budget the owner never
-        granted. Evidence is demanded again at this layer. History is
-        never deleted — the marker records how many attempts existed
-        (``prior_attempts``), and :func:`attempt_budget_used` counts only
-        attempts at or after that position, so the fresh budget starts at
-        zero while every old attempt record stays in the log and in the
-        F-11 measures. Routing matches every recovery writer: ``blocked``
-        when a dependency is open, else ``ready``.
+        the generic :meth:`transition` refuses an attempts_exhausted or
+        ci_failed task, so no other writer can move it or spend a budget
+        the owner never granted. Evidence is demanded again at this
+        layer. History is never deleted — the marker records how many
+        attempts existed (``prior_attempts``), and
+        :func:`attempt_budget_used` counts only attempts at or after that
+        position, so the fresh budget starts at zero while every old
+        attempt record stays in the log and in the F-11 measures.
+
+        Two targets, one marker:
+
+        * ``keep_pr=False`` (the default, every reset before F-77): the
+          task re-queues for a FRESH run — ``blocked`` when a dependency
+          is open, else ``ready``, the routing every recovery writer
+          uses. The next run re-implements from the default head.
+        * ``keep_pr=True`` (F-77): the task returns to ``in_review``
+          with its links untouched, so the sweep's CI fix round repairs
+          the SAME PR under the fresh budget. Legal only for
+          :func:`ci_failed_keep_pr_eligible` — a ``ci_failed`` park
+          holding a normal PR link; anything else refuses and writes
+          nothing. The caller has read GitHub (the PR is open); this
+          layer cannot, and does not guess.
 
         Args:
-            task_id: Task parked on an ``attempts_exhausted`` escalation.
+            task_id: Task parked on ``attempts_exhausted``/``ci_failed``.
             evidence: What the owner checked; must not be blank.
             done_by: Who granted the reset; recorded in the marker.
+            keep_pr: Take the ``in_review`` target (F-77) instead of the
+                fresh-run re-queue.
 
         Returns:
-            The new status: ``ready`` or ``blocked``.
+            The new status: ``ready``, ``blocked`` or ``in_review``.
 
         Raises:
             StateError: Unknown task, or blank evidence.
             TransitionError: The task isn't parked on
-                ``attempts_exhausted`` (including via the generic
-                transition, which never moves one).
+                ``attempts_exhausted``/``ci_failed`` (including via the
+                generic transition, which never moves one), or
+                ``keep_pr`` was asked for a task that is not a
+                ``ci_failed`` park holding a normal PR link.
             ContractError: If the resulting queue wouldn't validate.
             ConcurrentWriteError: If another writer changed the file.
         """
@@ -1318,13 +1362,24 @@ class TaskQueue:
                 "last attempt escalated attempts_exhausted (or ci_failed, "
                 "F-75)"
             )
+        if keep_pr and not ci_failed_keep_pr_eligible(task):
+            raise TransitionError(
+                f"{task_id}: a reset that keeps the PR needs a needs_human "
+                "task whose last attempt escalated ci_failed and which "
+                "holds a normal PR link (no escalation draft, not merged) "
+                "— every other reset re-queues a fresh run (F-77)"
+            )
         slice_id = task["attempts"][-1].get("slice_id") or task_id
-        new_status = (
-            "blocked" if unmet_dependencies(task, self.doc.get("tasks", []))
-            else "ready"
-        )
+        if keep_pr:
+            new_status = "in_review"
+        else:
+            new_status = (
+                "blocked"
+                if unmet_dependencies(task, self.doc.get("tasks", []))
+                else "ready"
+            )
         reason = RECOVERY_TRANSITIONS.get((_status_of(task), new_status))
-        assert reason is not None  # needs_human → ready/blocked is in the table
+        assert reason is not None  # every target is in the recovery table
         _check_kind_rules(task, _status_of(task), new_status)
         _check_slice_rules(task, new_status)
         _check_owner_step_rules(task, new_status)

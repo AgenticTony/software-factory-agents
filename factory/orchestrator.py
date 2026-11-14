@@ -375,8 +375,9 @@ class LoopResult:
 
     ``parked``: the ``needs_human`` results of this loop, in park order —
     one escalation per entry, each carrying ``task_id``, ``escalation``
-    and ``pr`` (the escalation draft PR's URL, or None when the class
-    keeps no work). The caller prints one line per entry and treats a
+    and ``pr`` (the task's PR: the escalation draft PR's URL, or — F-77 —
+    the normal PR a sweep park is about; None when the task holds no PR
+    link). The caller prints one line per entry and treats a
     non-empty list as exit 1: a script must never read "parked" as "all
     done".
     """
@@ -2316,11 +2317,17 @@ def _sweep_escalation(
         task_id,
     )
     queue.transition(task_id, "needs_human")
+    # F-77 AC-3: a sweep park names the task's PR — every sweep
+    # escalation (stale_base, pr_closed, ci_failed) is ABOUT a PR the
+    # task holds, and `factory loop` printed "no PR" beside one that
+    # exists. Read from the queue's own link, never from GitHub; None
+    # only when the task holds no PR link.
+    pr_url = (queue.get(task_id).get("links") or {}).get("pr") or None
     # reports may be None on this escalation path (pre-existing shape;
     # consumers on escalated results treat it as falsy) — the cast
     # preserves today's exact value (F-51/A-7).
     return RunResult(
-        "needs_human", task_id, escalation=escalation,
+        "needs_human", task_id, escalation=escalation, pr=pr_url,
         reports=cast("dict", reports),
     )
 

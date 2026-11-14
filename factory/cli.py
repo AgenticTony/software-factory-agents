@@ -137,15 +137,17 @@ def build_parser() -> argparse.ArgumentParser:
     recover.add_argument(
         "task_id",
         help="task id to recover (stale_base/pr_closed, "
-             "credential_added with --evidence, attempts_exhausted "
-             "with --evidence and --reset-attempts, a scope_missing/"
+             "credential_added with --evidence, attempts_exhausted or "
+             "ci_failed with --evidence and --reset-attempts, a "
+             "scope_missing/"
              "scope_change_needed escalation with --evidence after the "
              "widened contract is re-approved, or — F-72 — an "
              "escalation draft PR answered with --accept/--reject)")
     recover.add_argument(
         "--yes", action="store_true",
         help="non-interactive confirmation (never allowed for "
-             "credential_added, attempts_exhausted, a scope escalation "
+             "credential_added, attempts_exhausted, ci_failed, a scope "
+             "escalation "
              "or an escalation-PR accept/reject)",
     )
     recover.add_argument(
@@ -158,9 +160,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recover.add_argument(
         "--reset-attempts", action="store_true",
-        help="required for attempts_exhausted: grant a fresh attempt "
-             "budget (history is kept; the budget counts only attempts "
-             "after the reset marker)",
+        help="required for attempts_exhausted and ci_failed: grant a "
+             "fresh attempt budget (history is kept; the budget counts "
+             "only attempts after the reset marker). attempts_exhausted "
+             "re-queues a fresh run. ci_failed (F-77) depends on its PR: "
+             "open — the reset keeps the PR, the task returns to "
+             "in_review and the next loop runs the CI fix round on that "
+             "same PR; closed — a fresh run re-implements from the "
+             "default head; merged or unreadable — refused",
     )
     recover.add_argument(
         "--accept", action="store_true",
@@ -439,7 +446,11 @@ def _run_recover(args: argparse.Namespace) -> int:
             factory_root=(Path(args.factory_root) if args.factory_root
                           else None),
         )
-        if status == "in_review" and args.revalidate:
+        if status == "in_review" and args.reset_attempts:
+            print(f"{args.task_id}: needs_human -> in_review "
+                  "(fresh attempt budget; PR kept — the next `factory "
+                  "loop` runs the CI fix round on it)")
+        elif status == "in_review" and args.revalidate:
             print(f"{args.task_id}: needs_human -> in_review "
                   "(stale_base re-validated on the PR's current head; "
                   "the sweep reports it ready or not from here)")
@@ -836,6 +847,10 @@ def _run_extra(result) -> str:
     # F-75: a pr_opened whose CI window ended unsettled carries its
     # note ("CI pending" / "no CI reported").
     detail = result.pr or result.escalation or ""
+    if result.outcome == "needs_human" and result.pr and result.escalation:
+        # F-77 AC-3: a park that holds a PR prints the reason AND the
+        # PR, as the loop's parked line does — never one hiding the other.
+        detail = f"{result.escalation} — {result.pr}"
     if getattr(result, "note", None):
         detail = f"{detail} — {result.note}".strip(" —")
     return detail
@@ -881,8 +896,10 @@ def _run_orchestrator(args: argparse.Namespace) -> int:
             for task_id in result.unledgered:
                 print(f"    unledgered (not acted on): {task_id}")
         # F-72 AC-5: one line per task parked during the loop — id,
-        # reason, and the escalation draft PR (or "no PR"). A parked
-        # batch is NOT a clean finish: the exit code below says so.
+        # reason, and the task's PR: the escalation draft PR, or (F-77)
+        # the normal PR a sweep park is about; "no PR" only when the
+        # task holds no PR link. A parked batch is NOT a clean finish:
+        # the exit code below says so.
         for result in loop.parked:
             where = result.pr or "no PR"
             print(f"  parked: {result.task_id} "

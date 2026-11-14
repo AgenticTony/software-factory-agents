@@ -5887,6 +5887,60 @@
       "acceptance_hash": "1eab5e6c451bb0d490c6ddd4762bf21b8128691fbf556022c3bb73fd8898f4c6",
       "approved_at": "2026-11-14T08:59:37Z",
       "approved_by": "Anthony"
+    },
+    {
+      "id": "F-77",
+      "title": "A ci_failed PR gets more budget without losing its work",
+      "source": "BUILD-ORDER.md#f-77--a-ci_failed-pr-gets-more-budget-without-losing-its-work",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-76"
+      ],
+      "risk": [
+        "factory_control",
+        "external_service"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "A `ci_failed` budget reset keeps an open PR. `factory recover <task-id> --reset-attempts --evidence \"…\"` on a task parked `ci_failed` reads the PR's state from GitHub. Open: the task moves `needs_human → in_review` (not `ready`) with the same `attempt_resets` marker the reset writes today, so the attempt budget counts from zero; `links` (`pr`, `branch`, `pushed_head`, `revalidated`, `ci_rerun_heads`) are untouched; the drafted PR is marked ready again, and a failure of that gh call after the state write is reported loudly without failing the command. Closed: today's behaviour (`ready`, or `blocked` on an open dependency; a fresh run re-implements). Merged, or a state gh cannot answer: refused with the reason named, nothing written. An `attempts_exhausted` task is unchanged. The gate lives in the state layer, in the one writer of the marker: only a `needs_human` task whose last attempt escalated `ci_failed` and which holds a normal `links.pr` (no `links.escalation_pr`) can take the `in_review` target, and the generic transition still refuses it. Evidence, the interactive y/N and the `--yes` refusal stay as they are; the echo before the y/N says which outcome will happen (keep the PR and fix it in place, or re-implement from the default head); the keep-the-PR move takes the run lease; the progress log gains the `recovered` entry (escalation `ci_failed`, the target status, the PR URL).",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f77.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "The next sweep runs the fix round on that PR. A task parked `ci_failed` with a spent budget, an open red PR, `links.pushed_head` equal to the remote head and that head already in `links.ci_rerun_heads`, once recovered per AC-1, gets F-75's CI fix round from the next run's sweep on the same PR URL, its prompt carrying the failing check; the head is not re-run a second time; and when the fresh budget is spent too with CI still red, the task parks `ci_failed` again with the PR drafted. The edge composes with F-75/F-76's machinery; no fix-round logic is forked.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f77.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "The parked line names the PR. `factory loop`'s `parked:` line prints the task's PR for a sweep park too (`ci_failed`, `stale_base`, `pr_closed`): the normal `links.pr`, or the escalation draft PR as today. It prints \"no PR\" only when the task holds neither link. The PR is carried on the run's result where it is built, so `factory run` and `factory loop` agree, and GitHub is not re-read for it.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f77.py::test_ac_3"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 150,
+        "wall_clock_min": 120
+      }
     }
   ]
 }
