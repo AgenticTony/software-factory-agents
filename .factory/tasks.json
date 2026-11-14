@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-14T08:59:37Z",
+  "updated_at": "2026-11-14T12:05:00Z",
   "tasks": [
     {
       "id": "F-00",
@@ -5894,7 +5894,7 @@
       "source": "BUILD-ORDER.md#f-77--a-ci_failed-pr-gets-more-budget-without-losing-its-work",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-76"
       ],
@@ -5940,7 +5940,10 @@
         "max_attempts": 3,
         "max_turns": 150,
         "wall_clock_min": 120
-      }
+      },
+      "acceptance_hash": "7ea7942779bee7bf3cc70443c8f3c36b1f021d3e675ee615c827688597d50d48",
+      "approved_at": "2026-11-14T12:05:00Z",
+      "approved_by": "Anthony"
     }
   ]
 }
