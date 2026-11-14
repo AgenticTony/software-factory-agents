@@ -300,6 +300,13 @@ paths:
     # config modules and the schema — protected from the day they exist.
     - "tests/test_f75.py"
     - "tests/_support/f75.py"
+    # F-76: same precedent — the stale-base re-run/revalidate/sweep
+    # fix-round contract tests judge the protected orchestrator/state/
+    # approve/ci/publish modules and the schema (the narrowed recovery
+    # edge, the dedicated writers, the head guard, the persisted
+    # once-per-head set) — protected from the day they exist.
+    - "tests/test_f76.py"
+    - "tests/_support/f76.py"
     # F-71: the dependency policy is judge surface — deps.py decides
     # what a manifest change means, registry.py decides whether a
     # package may be installed, and the generator writes the near-miss

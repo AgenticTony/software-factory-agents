@@ -391,12 +391,15 @@ def test_ac_1(tmp_path: Path, monkeypatch):
         "the _sweep_stale_prs call in run_once must run under queue.idle_lease()"
     )
     # AC-1's writer sweep as a pin: create_run's only call sites in the
-    # orchestrator are the sweep (leased), _run_task (inside begin_run)
-    # and — F-72 — the accept round's two clones, which sit inside the
+    # orchestrator are the sweep (leased), _run_task (inside begin_run),
+    # — F-72 — the accept round's two clones, which sit inside the
     # leased body the recover_accept_round wrapper calls under
-    # queue.idle_lease(); the importer's call sits inside its own
+    # queue.idle_lease(), and — F-76 — the sweep's shared re-validation
+    # (the one fresh clean clone per pass, inside the sweep's lease) plus
+    # the `recover --revalidate` command's scratch clone (inside the
+    # command's own idle_lease); the importer's call sits inside its own
     # idle_lease.
-    assert src.count("create_run(") == 6, (
+    assert src.count("create_run(") == 7, (
         "create_run gained or lost a call site: every writer under runs/ "
         "must hold the run lease (sweep under idle_lease, _run_task under "
         "begin_run, the F-72 accept round under idle_lease)"

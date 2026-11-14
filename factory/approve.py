@@ -76,6 +76,7 @@ from factory.publish import PublishError, PushRefused
 from factory.runs import FACTORY_ROOT_DEFAULT
 from factory.state import (
     ELIGIBLE_KINDS,
+    RunInProgressError,
     TaskQueue,
     attempts_reset_eligible,
     credential_recovery_eligible,
@@ -662,6 +663,8 @@ def recover_task(
     reset_attempts: bool = False,
     accept: bool = False,
     reject: bool = False,
+    revalidate: bool = False,
+    head: str | None = None,
     done_by: str | None = None,
     factory_root: Path | None = None,
     pr_state: Callable[[str], str] | None = None,
@@ -669,6 +672,8 @@ def recover_task(
     pr_ready: "Callable[[str], None] | None" = None,
     pr_close: "Callable[[str], None] | None" = None,
     session_runner: Callable | None = None,
+    srt_bin_path: Path | None = None,
+    gate_timeout_sec: int = 600,
     confirm: Callable[[str], bool] = input_confirm,
     echo: Callable[[str], None] = print,
 ) -> str:
@@ -763,6 +768,25 @@ def recover_task(
         ContractError: If the resulting queue wouldn't validate.
     """
     task = queue.get(task_id)  # StateError (a ContractError) if unknown
+    if head is not None and not revalidate:
+        raise ApprovalError(
+            f"{task_id}: --head names the head an in_review --revalidate "
+            "vouch is for — it combines with nothing else"
+        )
+    if revalidate and (accept or reject or reset_attempts
+                       or evidence is not None):
+        raise ApprovalError(
+            f"{task_id}: --revalidate answers a stale_base park on its "
+            "own — combine it with none of --accept, --reject, "
+            "--reset-attempts or --evidence"
+        )
+    if revalidate:
+        return _recover_revalidate_task(
+            queue, task_id, task, done_by=done_by, head=head,
+            factory_root=factory_root, pr_state=pr_state,
+            session_runner=session_runner, srt_bin_path=srt_bin_path,
+            gate_timeout_sec=gate_timeout_sec, echo=echo,
+        )
     if accept or reject:
         return _recover_escalation_pr(
             queue, task_id, task, accept=accept, reject=reject,
@@ -831,6 +855,311 @@ def recover_task(
     )
     queue.transition(task_id, new_status)  # the gated edge (state enforces)
     return new_status
+
+
+def _recover_revalidate_task(
+    queue: TaskQueue,
+    task_id: str,
+    task: dict,
+    *,
+    done_by: str | None,
+    head: str | None = None,
+    factory_root: Path | None = None,
+    pr_state: Callable[[str], str] | None,
+    session_runner: Callable | None,
+    srt_bin_path: Path | None,
+    gate_timeout_sec: int,
+    echo: Callable[[str], None],
+) -> str:
+    """F-76 AC-2: the owner's re-validate word for a parked stale_base PR.
+
+    Eligible only for a ``needs_human`` task whose last attempt
+    escalated ``stale_base`` and which holds a PR link GitHub reports
+    **open** — a closed PR was the rejection (the sweep's close edge
+    owns it), a merged one the sweep's merged writer, any other
+    escalation keeps its own exit, and a gh that cannot answer fails
+    closed. Refusals write NOTHING. On the owner's word the command
+    re-validates the PR's CURRENT remote head against the current
+    remote default head through the sweep's OWN code path (the shared
+    :func:`factory.orchestrator.revalidate_stale_pr` — the one re-run
+    included, never a copy), under the run lease like every queue
+    writer. A pass needs no confirmation prompt: the passing
+    re-validation IS the evidence — the task moves
+    ``needs_human → in_review`` through the dedicated
+    :meth:`TaskQueue.recover_revalidated` writer (the generic
+    transition refuses a stale_base task), stamping exactly the pair
+    that passed. A fail keeps the task parked with a NEW stored report
+    and refuses naming the failing step. No model session runs and no
+    attempt is spent: the re-validation is session-less L0/L1, and
+    ``session_runner`` is accepted only so a caller can prove it is
+    never called.
+    """
+    from factory.approvals import require_profile_approval
+    from factory.contract import contract_hash, load_profile
+    from factory.orchestrator import revalidate_stale_pr
+    from factory.publish import PublishError as _PublishError
+
+    factory_root = factory_root or FACTORY_ROOT_DEFAULT
+    attempts = task.get("attempts") or []
+    escalation = attempts[-1].get("escalation") if attempts else None
+    if task.get("status") == "in_review":
+        # R2-1 + R3-1: the in_review VOUCH — the way back every guard
+        # refusal line names. No gates run (the owner's word on a head
+        # they NAME is the vouch; the fix round that may build on the
+        # vouched head runs the full gate stack itself) — which is
+        # exactly why the head must be named: the vouch covers the head
+        # the owner judged, never whatever the remote happens to hold
+        # when the command runs.
+        return _vouch_revalidate_head(
+            queue, task_id, task, done_by=done_by, head=head,
+            factory_root=factory_root, pr_state=pr_state, echo=echo)
+    if head is not None:
+        raise ApprovalError(
+            f"{task_id}: --head belongs to the in_review head vouch — "
+            "the stale_base re-validation judges the head it reads "
+            "itself and names no SHA"
+        )
+    if (task.get("status") != "needs_human" or escalation != "stale_base"
+            or not (task.get("links") or {}).get("pr")):
+        raise ApprovalError(
+            f"{task_id}: --revalidate answers a stale_base park — or, for "
+            "an in_review PR whose head the sweep reported moved or "
+            "unrecorded, vouches for the current head. Everything else "
+            "keeps its own exit; a pr_closed task exits through the "
+            "sweep's re-open or merge signal."
+        )
+    url = task["links"]["pr"]
+    try:
+        state = (pr_state or gh_pr_state)(url)
+    except _PublishError:
+        state = None  # gh failed: fail closed, never guessed
+    if state != "open":
+        shown = state if state is not None else "unreachable (gh failed)"
+        raise ApprovalError(
+            f"{task_id}: --revalidate needs GitHub to report the PR open — "
+            f"it reports {shown}. A closed stale_base PR was your "
+            "rejection (the sweep queues the fix round on its own); a "
+            "merged one is the sweep's merged recovery; nothing is "
+            "guessed when gh cannot answer."
+        )
+    # F-63: the re-validation runs the project's gates, which is acting
+    # on the task — its current contract needs an owner approval, and
+    # the profile's security-relevant content an approval on record
+    # (the recover_accept_round precedent).
+    ledger = ApprovalLedger.for_project(
+        factory_root, queue.doc.get("project") or "unknown")
+    chash = contract_hash(task)
+    if not ledger.has_contract(task_id, chash):
+        raise ApprovalError(
+            f"{task_id}: the current contract (hash {chash[:12]}) has no "
+            "owner approval in the ledger — a re-validation runs gates, "
+            "which is acting on the task; re-approve (`factory adopt`) "
+            "first"
+        )
+    profile_path = Path(queue.path).parent / "project.yaml"
+    profile = load_profile(profile_path)
+    require_profile_approval(profile, factory_root, origin=str(profile_path))
+    who = done_by or default_approver()
+    echo(
+        f"{task_id}: {task.get('title')}\n"
+        f"  escalation: {escalation}\n"
+        f"  PR: {url} (open)\n"
+        "  --revalidate merges the PR's current remote head onto the "
+        "current remote default head and re-runs L0 and L1 (one re-run "
+        "on a fresh clone if the first pass fails a command); a pass "
+        "moves the task back to in_review with the pair stamped — no "
+        "prompt: the passing re-validation is the evidence."
+    )
+    try:
+        with queue.idle_lease():
+            rv = revalidate_stale_pr(
+                queue, task_id, profile, factory_root=factory_root,
+                srt_bin_path=srt_bin_path,
+                gate_timeout_sec=gate_timeout_sec, ledger=ledger)
+            if rv.note is not None:
+                raise ApprovalError(
+                    f"{task_id}: --revalidate failed — {rv.note}; "
+                    f"the report is stored at {rv.report_path} and the "
+                    "task stays needs_human (its PR stays open; close it "
+                    "to queue a fix round, or fix the branch and "
+                    "revalidate again)"
+                )
+            queue.recover_revalidated(
+                task_id, pr_sha=rv.pair[0], default_sha=rv.pair[1])
+    except RunInProgressError as exc:
+        raise ApprovalError(
+            f"{task_id}: the run lease is held ({exc}) — another run or "
+            "housekeeping pass owns the queue right now; retry once it "
+            "finishes. Nothing was written."
+        ) from exc
+    try:
+        ProgressLog.for_task(
+            factory_root, queue.doc.get("project") or "unknown", task_id,
+        ).append({
+            "outcome": "recovered",
+            "escalation": escalation,
+            "done_by": who,
+            "recovered_at": now_iso(),
+            "note": (
+                f"stale_base re-validated by the owner's word: the PR's "
+                f"current head {rv.pair[0][:12]} merged onto the default "
+                f"head {rv.pair[1][:12]} passed L0+L1 "
+                f"({rv.report_path.name}); {task_id} → in_review"
+                + (" — failed once, passed on re-run (first run: "
+                   + "; ".join(rv.flaked) + ")" if rv.flaked else "")
+            ),
+        })
+    except ProgressLogError as exc:
+        raise ApprovalError(
+            f"{task_id}: moved to in_review, but the progress log could "
+            f"not be written — the recovery is NOT durably recorded: {exc}"
+        ) from exc
+    return "in_review"
+
+
+def _vouch_revalidate_head(
+    queue: TaskQueue,
+    task_id: str,
+    task: dict,
+    *,
+    done_by: str | None,
+    head: str | None,
+    factory_root: Path | None,
+    pr_state: Callable[[str], str] | None,
+    echo: Callable[[str], None],
+) -> str:
+    """R2-1: the owner's head vouch for an in_review PR (F-76).
+
+    The sweep's CI fix round builds only on a head the factory pushed
+    (``links.pushed_head``) or the owner vouched for; its refusal lines
+    name ``factory recover --revalidate`` as the way back, so the
+    command accepts the task the line was printed for: an ``in_review``
+    task holding an open NORMAL PR whose head moved or was never
+    recorded. No gates run — the vouch is the owner's word on that
+    exact head (a gate-red head is the shape the line names; the fix
+    round that may build on it runs the full gate stack itself). The
+    head is read from the REMOTE twice — it must not move between the
+    reads; a moved head refuses with nothing written. Refused too,
+    writing nothing: an escalation draft PR, a merged PR, any PR state
+    gh cannot answer, or a contract without an owner approval (the
+    vouch unblocks a round that will run gates — acting).
+    """
+    from factory.approvals import ApprovalLedger, require_profile_approval
+    from factory.contract import contract_hash, load_profile
+    from factory.orchestrator import _ls_remote_heads
+    from factory.publish import PublishError as _PublishError
+
+    factory_root = factory_root or FACTORY_ROOT_DEFAULT
+    links = task.get("links") or {}
+    url = links.get("pr")
+    if (not url or links.get("escalation_pr")
+            or links.get("merged") == url):
+        raise ApprovalError(
+            f"{task_id}: a head vouch needs an in_review task holding an "
+            "open normal PR (no escalation draft, not merged) — answer an "
+            "escalation draft PR with --accept/--reject, and let the sweep "
+            "read a merge."
+        )
+    try:
+        state = (pr_state or gh_pr_state)(url)
+    except _PublishError:
+        state = None  # gh failed: fail closed, never guessed
+    if state != "open":
+        shown = state if state is not None else "unreachable (gh failed)"
+        raise ApprovalError(
+            f"{task_id}: a head vouch needs GitHub to report the PR open — "
+            f"it reports {shown}. Nothing is guessed when gh cannot answer."
+        )
+    ledger = ApprovalLedger.for_project(
+        factory_root, queue.doc.get("project") or "unknown")
+    chash = contract_hash(task)
+    if not ledger.has_contract(task_id, chash):
+        raise ApprovalError(
+            f"{task_id}: the current contract (hash {chash[:12]}) has no "
+            "owner approval in the ledger — a vouch unblocks a round that "
+            "runs gates, which is acting on the task; re-approve "
+            "(`factory adopt`) first"
+        )
+    profile_path = Path(queue.path).parent / "project.yaml"
+    profile = load_profile(profile_path)
+    require_profile_approval(profile, factory_root, origin=str(profile_path))
+    who = done_by or default_approver()
+    branch = links.get("branch")
+    if not branch:
+        raise ApprovalError(
+            f"{task_id}: a head vouch needs the task's PR branch link "
+            "(links.branch) — the queue holds no branch to read the head "
+            "from"
+        )
+    import re as _re
+
+    if head is None or not _re.fullmatch(r"[0-9a-f]{12,40}", head):
+        current = _ls_remote_heads(profile["repo"]["remote"],
+                                   (branch,)).get(branch, "")
+        raise ApprovalError(
+            f"{task_id}: an in_review head vouch must NAME the head you "
+            f"judged — run: factory recover {task_id} --revalidate "
+            f"--head {current or '<the PR head you saw>'} (the full SHA, "
+            "or an unambiguous >=12-char prefix). Nothing was written."
+        )
+    echo(
+        f"{task_id}: {task.get('title')}\n"
+        f"  PR: {url} (open, in_review)\n"
+        f"  vouching for head {head}\n"
+        "  --revalidate vouches for exactly the head you NAMED (R3-1): "
+        "the sweep's CI fix round may then build on that head. No gates "
+        "run — your word on the head you saw is the vouch; the round "
+        "itself runs the full gate stack before anything is pushed."
+    )
+    from factory.state import RunInProgressError as _RunInProgressError
+    try:
+        with queue.idle_lease():
+            first = _ls_remote_heads(profile["repo"]["remote"],
+                                     (branch,)).get(branch, "")
+            second = _ls_remote_heads(profile["repo"]["remote"],
+                                      (branch,)).get(branch, "")
+            if not first or not second or first != second:
+                shown = (first or "nothing", second or "nothing")
+                raise ApprovalError(
+                    f"{task_id}: the PR head moved under the vouch "
+                    f"(read {shown[0][:12]}, then {shown[1][:12]}) — "
+                    "nothing was written; re-read the PR and vouch again"
+                )
+            for read in (first, second):
+                if not read.startswith(head):
+                    raise ApprovalError(
+                        f"{task_id}: the vouch names {head[:12]}, not the "
+                        f"head the remote holds ({read[:12]}) — nothing "
+                        "was written; re-read the PR and vouch for the "
+                        "head you see"
+                    )
+            queue.vouch_pushed_head(task_id, pr_sha=second)
+    except _RunInProgressError as exc:
+        raise ApprovalError(
+            f"{task_id}: the run lease is held ({exc}) — another run or "
+            "housekeeping pass owns the queue right now; retry once it "
+            "finishes. Nothing was written."
+        ) from exc
+    try:
+        ProgressLog.for_task(
+            factory_root, queue.doc.get("project") or "unknown", task_id,
+        ).append({
+            "outcome": "recovered",
+            "done_by": who,
+            "recovered_at": now_iso(),
+            "note": (
+                f"owner vouched for the PR's current head {second[:12]} "
+                f"({url}): the sweep's CI fix round may build on exactly "
+                "that head; no gates ran — the round's own gates are the "
+                "net"
+            ),
+        })
+    except ProgressLogError as exc:
+        raise ApprovalError(
+            f"{task_id}: the vouch landed but the progress log could not "
+            f"be written — it is NOT durably recorded: {exc}"
+        ) from exc
+    return "in_review"
 
 
 def _recover_escalation_pr(

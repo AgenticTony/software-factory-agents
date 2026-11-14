@@ -470,6 +470,15 @@ def check_recovery_transition(task: dict, new: str) -> str:
     (review round on #74: a gate that lived only in the command left
     every other ``transition`` caller able to move a credential task).
 
+    F-76 narrows the ``needs_human → in_review`` pair: it is the
+    RE-OPEN signal for a ``pr_closed`` task (the sweep reads it from
+    GitHub) and nothing else. A ``stale_base`` task never takes it
+    generically — its ``in_review`` exits are the dedicated writers
+    (:meth:`TaskQueue.recover_revalidated` for an open PR whose current
+    head re-validated clean, :meth:`TaskQueue.recover_pr_merged` for a
+    PR GitHub merged), so no generic caller can walk a parked task back
+    into review without either GitHub's word or a passing re-validation.
+
     Raises:
         TransitionError: If the edge isn't a recovery edge, or the task
             isn't a stale_base/pr_closed escalation holding a PR link.
@@ -482,6 +491,17 @@ def check_recovery_transition(task: dict, new: str) -> str:
             "credential_added task moves only through "
             "TaskQueue.recover_credential, and an attempts_exhausted task "
             "only through TaskQueue.recover_attempts)"
+        )
+    if (new == "in_review"
+            and (task.get("attempts") or [{}])[-1].get("escalation")
+            != "pr_closed"):
+        raise TransitionError(
+            f"recovery transition {task.get('status')} -> in_review is the "
+            "re-open signal for a pr_closed task (F-26); a stale_base task "
+            "returns to in_review only through TaskQueue."
+            "recover_revalidated (an open PR whose current head "
+            "re-validated clean — `factory recover --revalidate`, F-76) or "
+            "TaskQueue.recover_pr_merged (GitHub reports the PR merged)"
         )
     return reason
 
@@ -1094,6 +1114,168 @@ class TaskQueue:
         self.save()
         return new_status
 
+    def recover_revalidated(self, task_id: str, *, pr_sha: str,
+                            default_sha: str) -> str:
+        """Return a parked ``stale_base`` task to ``in_review``: the one
+        writer of F-76's re-validate edge, beside the F-26 re-open edge
+        it narrows (same status pair, different gate — the
+        :meth:`recover_credential` precedent: the command cannot be the
+        only gate, and the generic :meth:`transition` refuses a
+        ``stale_base`` task, so no other writer can move it).
+
+        The gate lives HERE: the task must be parked on a ``stale_base``
+        escalation holding a PR link (:func:`recovery_task_eligible`
+        plus the escalation check — a ``pr_closed`` task's in_review
+        exit is the sweep's re-open signal, not this), and the PASSING
+        pair it is handed is the pair the caller proved: the move
+        stamps exactly ``links.revalidated = {pr: pr_sha, default:
+        default_sha}``, so the next sweep tick treats that pair as
+        cached — the stamp IS the record of what was proven. No attempt
+        is spent and no session runs (the re-validation is session-less
+        L0/L1); the task returns to ``in_review``, where the F-75 CI
+        ready rule reports it like any in-review PR.
+
+        Args:
+            task_id: Task parked on a ``stale_base`` escalation.
+            pr_sha: The PR head SHA the passing re-validation judged
+                (the caller read it from the remote — never the queue).
+            default_sha: The default head SHA it was merged onto.
+
+        Returns:
+            ``"in_review"``.
+
+        Raises:
+            StateError: Unknown task.
+            TransitionError: The task isn't parked on ``stale_base``
+                holding a PR link (including via the generic
+                transition, which never moves one).
+            ContractError: If the resulting queue wouldn't validate.
+            ConcurrentWriteError: If another writer changed the file.
+        """
+        task = self.get(task_id)
+        attempts = task.get("attempts") or []
+        eligible = (
+            recovery_task_eligible(task)
+            and attempts[-1].get("escalation") == "stale_base"
+        )
+        if not eligible:
+            raise TransitionError(
+                f"{task_id}: re-validate recovery needs a needs_human task "
+                "whose last attempt escalated stale_base and which holds a "
+                "PR link — a pr_closed task exits through re-open or merge "
+                "(the sweep), and every other escalation keeps its own exit"
+            )
+        reason = RECOVERY_TRANSITIONS.get((_status_of(task), "in_review"))
+        assert reason is not None  # the pair is in the recovery table
+        _check_kind_rules(task, _status_of(task), "in_review")
+        _check_slice_rules(task, "in_review")
+        _check_owner_step_rules(task, "in_review")
+        task["status"] = "in_review"
+        # R1-B1: pushed_head records the owner's vouch — the sweep's CI
+        # fix round may build on exactly this head if its CI goes red.
+        task["links"] = {**(task.get("links") or {}),
+                         "revalidated": {"pr": pr_sha, "default": default_sha},
+                         "pushed_head": pr_sha}
+        self.save()
+        return "in_review"
+
+    def vouch_pushed_head(self, task_id: str, *, pr_sha: str) -> str:
+        """The owner's vouch for an in_review PR's CURRENT head (R2-1,
+        F-76): the one writer of ``links.pushed_head`` for a task that
+        is not being published right now.
+
+        The sweep's CI fix round builds only on a head the factory
+        pushed or the owner vouched for; every guard refusal line names
+        this command as the way back, so the command must ACCEPT the
+        task the line was printed for — an ``in_review`` task holding an
+        open normal PR whose head moved (a hand fix, GitHub's Update
+        branch) or was never recorded (a pre-F-76 PR). The gate lives
+        HERE like every dedicated writer: ``in_review`` + a normal PR
+        link (never an escalation draft — that PR is the owner's to
+        accept/reject — and never a merged one), and the SHA it is
+        handed is the one the CALLER read from the remote twice (it
+        must not have moved between the reads; a moved head refuses
+        before this is called, writing nothing). No gates run here: the
+        vouch is the owner's word on that exact head — the fix round
+        that may build on it runs the full gate stack itself. The
+        sweep never calls this (its only caller is the recover
+        command); ``links.revalidated`` is NOT stamped — the vouch
+        proves nothing about the pair, only the head.
+
+        Returns:
+            ``"in_review"`` (the status is unchanged; only the links
+            move).
+
+        Raises:
+            StateError: Unknown task.
+            TransitionError: The task is not ``in_review`` holding a
+                normal, unmerged PR link.
+            ContractError: If the resulting queue wouldn't validate.
+            ConcurrentWriteError: If another writer changed the file.
+        """
+        task = self.get(task_id)
+        links = task.get("links") or {}
+        if (task.get("status") != "in_review" or not links.get("pr")
+                or links.get("escalation_pr")
+                or links.get("merged") == links.get("pr")):
+            raise TransitionError(
+                f"{task_id}: a head vouch needs an in_review task holding "
+                "an open normal PR (no escalation draft, not merged) — "
+                "everything else keeps its own exit"
+            )
+        task["links"] = {**links, "pushed_head": pr_sha}
+        self.save()
+        return "in_review"
+
+    def recover_pr_merged(self, task_id: str, *, merged_url: str) -> str:
+        """Return an escalated task to ``in_review`` because GitHub
+        reports its PR MERGED: the one writer of that edge for a
+        ``stale_base`` task (F-26's remedy — you resolved the conflict
+        on GitHub and merged; F-76 narrowed the generic
+        ``needs_human → in_review`` recovery edge to the pr_closed
+        re-open signal, so the merged shape needs its own writer). A
+        ``pr_closed`` task's merged PR takes the same writer — one shape
+        for one GitHub signal.
+
+        The method stamps ``links.merged`` (terminal for exactly this
+        PR URL) and moves the task to ``in_review``, where a
+        deploy-target profile waits for the F-14 deploy gate and a
+        no-deploy profile's close pass finishes it in the same run.
+
+        Args:
+            task_id: Task parked on a stale_base/pr_closed escalation.
+            merged_url: The PR URL GitHub reported merged — must equal
+                the task's ``links.pr`` (a different URL is not this
+                task's PR; refuse rather than stamp a foreign merge).
+
+        Returns:
+            ``"in_review"``.
+
+        Raises:
+            StateError: Unknown task.
+            TransitionError: The task isn't recovery-eligible holding
+                this exact PR link.
+            ContractError: If the resulting queue wouldn't validate.
+            ConcurrentWriteError: If another writer changed the file.
+        """
+        task = self.get(task_id)
+        if (not recovery_task_eligible(task)
+                or task["links"].get("pr") != merged_url):
+            raise TransitionError(
+                f"{task_id}: merged-PR recovery needs a needs_human task "
+                "whose last attempt escalated stale_base/pr_closed and "
+                f"whose links.pr is exactly {merged_url}"
+            )
+        reason = RECOVERY_TRANSITIONS.get((_status_of(task), "in_review"))
+        assert reason is not None  # the pair is in the recovery table
+        _check_kind_rules(task, _status_of(task), "in_review")
+        _check_slice_rules(task, "in_review")
+        _check_owner_step_rules(task, "in_review")
+        task["status"] = "in_review"
+        task["links"] = {**(task.get("links") or {}), "merged": merged_url}
+        self.save()
+        return "in_review"
+
     def recover_attempts(self, task_id: str, evidence: str, *,
                          done_by: str | None = None) -> str:
         """Re-queue an ``attempts_exhausted`` task with a fresh budget:
@@ -1602,8 +1784,20 @@ class TaskQueue:
             reclaimed: list[str] = []
             for task in self.doc.get("tasks", []):
                 if task.get("status") == "in_progress":
-                    check_transition("in_progress", "ready")
-                    task["status"] = "ready"
+                    # R1-B2 (F-76): an abandoned fix round holding a PR
+                    # link returns to in_review, not ready — ready would
+                    # wedge the queue behind its own open PR (the sweep
+                    # scans in_review only; the concurrency count reads
+                    # the open PR). No gh call here: the next sweep reads
+                    # GitHub's truth (open → owned again; closed →
+                    # pr_closed, one recover word; merged → the merged
+                    # recovery).
+                    _links = task.get("links") or {}
+                    target = ("in_review" if _links.get("pr")
+                              and not _links.get("escalation_pr")
+                              else "ready")
+                    check_transition("in_progress", target)
+                    task["status"] = target
                     reclaimed.append(task.get("id"))
             if reclaimed:
                 self.save()

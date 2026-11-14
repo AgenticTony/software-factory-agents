@@ -304,13 +304,23 @@
             },
             "revalidated": {
               "type": "object",
-              "description": "F-26 stale-base cache: the (pr branch sha, default head sha) pair this PR was last re-validated against. An unchanged pair is not re-run; written by the sweep on every pass.",
+              "description": "F-26 stale-base cache: the (pr branch sha, default head sha) pair this PR was last re-validated against. An unchanged pair is not re-run; written by the sweep on every pass, and by `factory recover --revalidate` on its pass (F-76) — which also moves the parked task back to in_review.",
               "additionalProperties": false,
               "required": ["pr", "default"],
               "properties": {
                 "pr": { "type": "string" },
                 "default": { "type": "string" }
               }
+            },
+            "pushed_head": {
+              "type": "string",
+              "description": "F-76: the head SHA the factory itself last pushed to links.branch (the validated publish or F-75's leased CI-fix update), or that the owner vouched for on that exact head (`factory recover --revalidate`, the accept release). The sweep's CI fix round builds ONLY on this head — the sweep's own up-to-date/re-validated stamps never write it, so a foreign push to the PR branch (a hand fix, GitHub's Update branch) reads 'head moved outside the factory' and gets no round until the owner vouches."
+            },
+            "ci_rerun_heads": {
+              "type": "array",
+              "items": { "type": "string" },
+              "maxItems": 8,
+              "description": "F-76: PR head SHAs whose failed CI runs the sweep already re-ran once (the flake guard — once per head, across runs, so a red head that keeps failing is never re-run twice). The sweep keeps at most the last 8."
             }
           }
         }
