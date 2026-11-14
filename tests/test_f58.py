@@ -222,7 +222,8 @@ def _ci(state: str, checks=(("test-ubuntu-24.04 (3.11)", "success"),),
         detail: str = ""):
     """A CIState-shaped fake (SimpleNamespace: the orchestrator reads
     .state/.checks/.detail only)."""
-    return SimpleNamespace(state=state, checks=tuple(checks), detail=detail)
+    return SimpleNamespace(state=state, checks=tuple(checks),
+                           detail=detail, summaries=())
 
 
 class CIRecorder:
@@ -617,10 +618,31 @@ def test_ac_5(tmp_path: Path):
         pending.run(ci_state=CIRecorder(default=_ci("none")))
 
     # --- a red or pending PR is never reported ready ---
+    # F-76 re-seat: a red PR the sweep proved current no longer stops at
+    # a not-ready line — the sweep starts F-75's fix round on it. With
+    # the budget spent (one pass attempt of max_attempts=1, appended the
+    # queue's way) the round cannot run: the task parks ci_failed, the
+    # PR kept (draft conversion is the real gh seam here — the fake URL
+    # refuses, and the note names it), session-less. The ready rule this
+    # arm pins is unchanged: a red PR is never reported ready.
     pr_env = Env(tmp_path / "pr", tasks=[_task()], unavailable=True)
     branch_sha = pr_env.push_branch("factory/t-1")
     pr_env.force_in_review(branch="factory/t-1")
     default_sha = _git(pr_env.remote, "rev-parse", "refs/heads/main")
+    q = TaskQueue(pr_env.queue_path)
+    q.get("T-1")["budget"]["max_attempts"] = 1
+    q.append_attempt("T-1", {
+        "run_id": "20261113T000000Z-f58f58",
+        "slice_id": "T-1",
+        "started": "2026-11-13T00:00:00Z",
+        "ended": "2026-11-13T00:00:00Z",
+        "outcome": "pass",
+        "rounds": 1, "turns": 2,
+        "input_tokens": 1, "output_tokens": 1,
+        "prompt_versions": {}, "skills": [],
+        "pr": "https://github.com/fixture/fixture/pull/9",
+    })
+    q.save()
 
     red = CIRecorder({
         default_sha: _ci("success"),
@@ -631,14 +653,25 @@ def test_ac_5(tmp_path: Path):
     assert result.not_ready_prs, "the refusal to call it ready is visible"
     assert any("live-network" in line and "failed" in line
                for line in result.not_ready_prs), result.not_ready_prs
-    assert pr_env.task()["status"] == "in_review"
+    # F-76 R1-B1 re-seat: this fixture's PR is hand-linked (no recorded
+    # factory push), so the CI fix round fails CLOSED on the missing
+    # record — visible in the not-ready lines, the task untouched
+    # (the budget-spent park is unreachable without a recorded head).
+    task = pr_env.task()
+    assert task["status"] == "in_review"
+    assert any("no recorded factory push" in line
+               for line in result.not_ready_prs), result.not_ready_prs
 
-    # Re-run-then-green: the same PR, checks now green → ready.
+    # Checks now green → ready (a fresh PR the same shape).
+    pr1b = Env(tmp_path / "pr1b", tasks=[_task()], unavailable=True)
+    b1b = pr1b.push_branch("factory/t-1")
+    pr1b.force_in_review(branch="factory/t-1")
+    d1b = _git(pr1b.remote, "rev-parse", "refs/heads/main")
     green = CIRecorder({
-        default_sha: _ci("success"),
-        branch_sha: _ci("success", checks=(("live-network", "success"),)),
+        d1b: _ci("success"),
+        b1b: _ci("success", checks=(("live-network", "success"),)),
     })
-    result = pr_env.run(ci_state=green)
+    result = pr1b.run(ci_state=green)
     assert result.not_ready_prs == []
     assert any("factory/t-1" in line or "pull/9" in line
                for line in result.ready_prs), result.ready_prs

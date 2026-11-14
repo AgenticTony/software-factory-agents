@@ -106,7 +106,13 @@ from factory.l2 import (
     parse_verifier_vote,
     settle_review_verdict,
 )
-from factory.mergeorder import admission, gh_branch_protection, gh_ci_state, gh_pr_state
+from factory.mergeorder import (
+    CIState,
+    admission,
+    gh_branch_protection,
+    gh_ci_state,
+    gh_pr_state,
+)
 from factory.prbody import PRBodyError, build_pr_body, check_pr_body, fence
 from factory.progress import ProgressLog
 from factory.prompts import (
@@ -161,6 +167,7 @@ from factory.session import (
 )
 from factory.state import (
     ELIGIBLE_KINDS,
+    Pick,
     RunInProgressError,
     TaskQueue,
     attempt_budget_used,
@@ -1747,19 +1754,49 @@ def run_once(
     # instead of racing. Nothing inside the sweep re-takes the lease (the
     # queue's writes serialise on their own lock), and the sweep's dirs
     # are cleaned up in its own finally blocks before the lease releases.
+    ci_fix: list = []
     with queue.idle_lease():
         stale = _sweep_stale_prs(
             queue, profile, factory_root=factory_root,
             srt_bin_path=srt_bin_path, gate_timeout_sec=gate_timeout_sec,
             states=states, recovery=recovery, ready=ready,
             ci_state=ci_for_sweep, not_ready=not_ready, config=config,
-            ledger=ledger,
+            ledger=ledger, now=now, ci_fix=ci_fix,
         )
     if stale is not None:
         stale.ready_prs = ready
         stale.not_ready_prs = not_ready
         stale.unledgered = unledgered
         return stale
+    # F-76 AC-3: the sweep may hand back ONE fix round for an in-review
+    # PR whose CI settled red. It runs in THIS run, as this run's work —
+    # the PR is already open and red; nothing else may take the slot.
+    # Two cheap re-guards first (the sweep's CI read could have taken a
+    # whole wait window): the peak window (never start a round inside
+    # it) and the head (the remote branch must still hold exactly the
+    # head the sweep proved current).
+    fix: CIFixSeed | None = ci_fix[0] if ci_fix else None
+    if fix is not None and in_peak_window(now(), config.peak_window):
+        not_ready.append(f"{fix.pr_url}: not ready: the peak window "
+                         "stopped the CI fix round (CI still red)")
+        fix = None
+    if fix is not None:
+        fix_heads = _ls_remote_heads(
+            (profile.get("repo") or {}).get("remote", ""), (fix.branch,))
+        if fix_heads.get(fix.branch) != fix.head_sha:
+            not_ready.append(
+                f"{fix.pr_url}: not ready: head moved outside the factory "
+                f"(the sweep validated {fix.head_sha[:12]}; the remote now "
+                f"holds {(fix_heads.get(fix.branch) or 'nothing')[:12]})")
+            fix = None
+    if fix is not None:
+        fix_task = queue.get(fix.task_id)
+        fix_slice = None
+        for slice_ in fix_task.get("slices") or []:
+            if slice_.get("id") == _slice_id_of(fix_task):
+                fix_slice = slice_
+                break
+        pick = Pick(task=fix_task, slice=fix_slice)
     if pick is None:
         return RunResult("idle", ready_prs=ready, not_ready_prs=not_ready,
                          unledgered=unledgered)
@@ -1776,11 +1813,17 @@ def run_once(
     # open — the limit fails closed (round-3 finding 2) and the wait
     # names the unresolvable link (round-4 finding 3); the count's extra
     # links are resolved only now that a task is picked.
+    # F-76 exception, exactly one shape: a SWEEP-STARTED CI fix round
+    # updates its own PR (never opens one — F-75's update push), so its
+    # own PR is excluded from the count; every OTHER open PR still
+    # counts, and the round waits on them like any run.
     pending = [url for url in _pr_urls(queue, _PR_STATES_STATUSES,
                                        skip_merged=True)
                if url not in states]
     states.update(_resolve_pr_states(pending, pr_state))
-    open_urls, unresolved_urls = _count_open_prs(queue, states)
+    open_urls, unresolved_urls = _count_open_prs(
+        queue, states,
+        exclude_pr=None if fix is None else {fix.pr_url})
     limit = (profile.get("repo") or {}).get("concurrency", 1)
     if len(open_urls) + len(unresolved_urls) >= limit:
         return RunResult("concurrency_wait", task_id=task_id,
@@ -1816,7 +1859,7 @@ def run_once(
     with queue.begin_run(task_id, ledger=ledger):
         try:
             result = (_finish_unrecorded_publish(queue, task_id, pick.slice)
-                      or _run_task(ctx, pick.slice))
+                      or _run_task(ctx, pick.slice, ci_fix=fix))
             result.ready_prs = ready
             result.not_ready_prs = not_ready
             result.unledgered = unledgered
@@ -1830,7 +1873,12 @@ def run_once(
             with contextlib.suppress(Exception):
                 fresh = TaskQueue(queue_path)
                 if fresh.get(task_id).get("status") == "in_progress":
-                    fresh.transition(task_id, "ready")
+                    # R1-B2: a fix round on an already-open PR returns
+                    # to in_review — ready would wedge the queue behind
+                    # its own open PR (the sweep scans in_review only).
+                    fresh.transition(
+                        task_id,
+                        _abort_requeue_status(fresh.get(task_id)))
             raise
 
 
@@ -2028,7 +2076,10 @@ def _resolve_pr_states(urls: list[str], pr_state: Callable) -> dict:
     return states
 
 
-def _count_open_prs(queue: TaskQueue, states: dict) -> tuple[list[str], list[str]]:
+def _count_open_prs(
+    queue: TaskQueue, states: dict, *,
+    exclude_pr: "frozenset[str] | set[str] | None" = None,
+) -> tuple[list[str], list[str]]:
     """(open PR URLs, unresolvable PR URLs) per the run's resolved states.
 
     Statuses whose PR can still be open: ``in_review`` (awaiting merge),
@@ -2057,6 +2108,11 @@ def _count_open_prs(queue: TaskQueue, states: dict) -> tuple[list[str], list[str
             continue
         url = links.get("pr")
         if not url or url in open_urls or url in unresolved_urls:
+            continue
+        if exclude_pr and url in exclude_pr:
+            # F-76: a sweep-started CI fix round's own PR — it UPDATES
+            # that PR (F-75's update push, never a second PR), so it
+            # holds no slot against itself.
             continue
         if _is_merged(links):
             continue  # stamped terminal (round-6 finding 2): not open
@@ -2137,7 +2193,8 @@ def _refuse_over_red_ci(profile: dict, ci_state: Callable) -> None:
 
 
 def _pr_ready_or_not(ci_state: Callable | None, remote: str, pr_url: str,
-                     sha: str, ready: list, not_ready: list, line: str) -> None:
+                     sha: str, ready: list, not_ready: list,
+                     line: str) -> "CIState | None":
     """F-58 AC-5 / F-75 AC-3: report one open PR ready ONLY on green CI.
 
     The sweep's last word on every PR it proved up to date or
@@ -2149,16 +2206,20 @@ def _pr_ready_or_not(ci_state: Callable | None, remote: str, pr_url: str,
     one as ``not ready: CI pending`` (unresolvable is never guessed
     green), a checkless one with its own line — visible, never silent,
     and never "ready".
+
+    Returns the CIState the line was built from (None when ``ci_state``
+    is None) — F-76: the sweep reads it to decide whether the PR's CI
+    has settled red and a fix round should start.
     """
     if ci_state is None:
         ready.append(line)
-        return
+        return None
     try:
         state = ci_state(remote, sha)
     except PublishError as exc:
         not_ready.append(f"{pr_url}: not ready: CI pending "
                          f"(state unresolvable: {exc})"[:300])
-        return
+        return None
     if state.state == "success":
         ready.append(line)
     elif state.state == "failed":
@@ -2174,6 +2235,7 @@ def _pr_ready_or_not(ci_state: Callable | None, remote: str, pr_url: str,
         not_ready.append(
             f"{pr_url}: not ready: CI pending (state unresolvable: "
             f"{state.detail[:200]})")
+    return state
 
 
 def _ls_remote_heads(remote: str, refs: tuple[str, ...]) -> dict[str, str]:
@@ -2350,6 +2412,340 @@ def _close_merged_tasks(
     return closed
 
 
+@dataclass(frozen=True)
+class Revalidation:
+    """One stale-base re-validation's outcome (F-76).
+
+    The ONE code path both writers share — the sweep (F-26) and
+    ``factory recover --revalidate`` (F-76): a copy would be a review
+    finding. ``note`` None means the merged tree passed (a re-run that
+    passed included); ``flaked`` carries the first run's failing
+    finding texts when a re-run turned a failure into a pass (the
+    progress entry names them so a flaky test stays visible);
+    ``failed_twice`` marks a re-run that also failed.
+    """
+
+    pair: tuple[str, str]
+    run_id: str
+    report_path: Path
+    reports: dict
+    note: str | None
+    flaked: tuple[str, ...] = ()
+    failed_twice: bool = False
+
+
+def _revalidate_gate_pass(
+    queue: TaskQueue, profile: dict, task_id: str, *,
+    work: RunDir, merged_sha: str, pr_sha: str, default_sha: str,
+    branch: str, factory_root: Path, srt_bin_path: Path | None,
+    gate_timeout_sec: int, ledger: "ApprovalLedger | None",
+) -> "tuple[str | None, Any, Any]":
+    """One L0/L1 pass over the merged tree, on a FRESH clean clone.
+
+    Returns ``(note, l0, l1)`` — ``note`` None when every gate passed
+    (escalations all owner-waived). The clone, its venv and its sandbox
+    settings are created here and cleaned up here: nothing about one
+    pass is visible to the next (the F-76 re-run rule).
+    """
+    project = profile["name"]
+    clean = create_run(project, work.root, factory_root=factory_root,
+                       ref=merged_sha)
+    try:
+        _gate_settings(profile, clean, factory_root)
+        # F-47: the sweep owns no attempt trace; an escapee here opens
+        # this re-validation's own trace file — the store `factory
+        # status` counts from — only when it fires.
+        runner = sandboxed_runner(
+            clean.root, clean.settings_path,
+            srt_bin_path=srt_bin_path,
+            on_escapee=_sweep_trace_sink(
+                factory_root, project, work.run_id, task_id, profile=profile),
+        )
+        live = queue.get(task_id)
+        l0 = run_l0(profile, clean.root, default_sha, merged_sha,
+                    task=live, runner=runner, timeout_sec=gate_timeout_sec)
+        # R1-F5: an escalation class the owner already ACCEPTED on this
+        # exact PR head (recover --accept, the ledger waiver keyed to
+        # task, class, PR head SHA and contract) is dropped here — the
+        # PR head is unchanged when only the base moved, so the SHA key
+        # still fits. Any new commit on the branch voids the waiver.
+        def _waived(escalation: str) -> bool:
+            return ledger is not None and ledger.has_escalation_waiver(
+                task_id, escalation, pr_sha,
+                contract_hash_value=contract_hash(live),
+            )
+
+        unwaived = [e for e in l0.escalations if not _waived(e)]
+        l1 = None
+        if l0.verdict == "pass" and not unwaived:
+            l1 = run_l1(profile, clean.root, default_sha, merged_sha,
+                        task=live, runner=runner,
+                        timeout_sec=gate_timeout_sec)
+        if l0.verdict != "pass":
+            note: str | None = (
+                f"L0 failed on {branch} merged onto {default_sha[:12]}")
+        elif unwaived:
+            note = ("L0 escalations on the merged tree: "
+                    + ", ".join(unwaived))
+        elif l1 is None or l1.verdict != "pass":
+            note = f"L1 failed on {branch} merged onto {default_sha[:12]}"
+        else:
+            note = None  # every escalation was owner-accepted, L0/L1 pass
+        return note, l0, l1
+    finally:
+        cleanup_run(clean)
+
+
+# R1-F3: the finding ids born from a COMMAND's non-zero exit (or its
+# timeout) — the only classes a re-run can plausibly flip. L0:
+# command_failed / command_timeout / new_error are all emitted inside
+# run_l0's command loop, from an exit code or a timed-out runner. L1:
+# every verdict-fail id except contract_ambiguous rides a pytest run
+# (test_not_green = the branch run failed, contract_not_collected = the
+# run collected nothing, test_proves_nothing = the base run stayed
+# green, command_timeout); contract_ambiguous is a malformed contract
+# check — deterministic, never re-run. Every OTHER L0 id
+# (protected_path_touched, test_deleted, baseline_invalid, attribution,
+# scope, sentinel findings) is deterministic: a re-run cannot change it,
+# and new ids added later default to the deterministic (park) side.
+_REVALIDATE_COMMAND_IDS = {
+    "L0": frozenset({"command_failed", "command_timeout", "new_error"}),
+    "L1": frozenset({"command_timeout", "contract_not_collected",
+                     "test_not_green", "test_proves_nothing"}),
+}
+
+
+def _revalidate_command_failure(l0, l1) -> bool:
+    """Whether a failed pass failed a COMMAND (F-76's re-run trigger).
+
+    R1-F3: an L0/L1 verdict ``fail`` alone is NOT enough — L0's verdict
+    is fail for ANY finding, and attribution, sentinel, protected-path,
+    test_deleted and baseline findings are deterministic (a re-run
+    cannot flip them; re-running would only delay the park). The
+    trigger fires only when EVERY failing finding on the failed layer
+    is command-derived (see :data:`_REVALIDATE_COMMAND_IDS`); a merge
+    conflict and unwaived L0 escalations (riding a PASS verdict) never
+    re-run either.
+    """
+    if l0 is not None and l0.verdict != "pass":
+        if not all(f.id in _REVALIDATE_COMMAND_IDS["L0"]
+                   for f in l0.findings):
+            return False
+        if l1 is not None and l1.verdict != "pass":
+            return all(f.id in _REVALIDATE_COMMAND_IDS["L1"]
+                       for f in l1.findings)
+        return True
+    if l1 is not None and l1.verdict != "pass":
+        return all(f.id in _REVALIDATE_COMMAND_IDS["L1"] for f in l1.findings)
+    return False
+
+
+def revalidate_pr_base(
+    queue: TaskQueue, profile: dict, task_id: str, *,
+    work: RunDir, pr_sha: str, default_sha: str, branch: str,
+    factory_root: Path, srt_bin_path: Path | None,
+    gate_timeout_sec: int, ledger: "ApprovalLedger | None" = None,
+) -> Revalidation:
+    """Re-validate a PR merged onto a new default head (F-26, F-76).
+
+    Merges ``pr_sha`` onto ``default_sha`` in the scratch clone
+    ``work`` (which must already hold both), reads conflicts from the
+    index, and — when the merge is clean — runs L0 (with the ledger's
+    escalation waivers) and L1 on a fresh clean clone of the merged
+    SHA. F-76: a first pass that failed a COMMAND re-runs ONCE on
+    ANOTHER fresh clone of the same merged SHA (never the first run's
+    clone, venv or temp files), so a flaky command cannot park a good
+    PR and a real failure cannot be run green. The stored
+    ``<run-id>-revalidate.json`` keeps the deciding run under today's
+    top-level ``L0``/``L1``/``L2`` keys (existing readers keep working)
+    and, when a re-run happened, the first run under ``first_run``.
+
+    The caller owns every queue write: on ``note`` None it stamps
+    ``links.revalidated`` with ``pair``; on a note it escalates (the
+    sweep) or refuses (``--revalidate``). Nothing here writes the queue.
+
+    Raises:
+        RunError: The merge failed with no unmerged paths
+            (infrastructure, not the PR), or timed out.
+    """
+    project = profile["name"]
+    default_branch = profile["repo"]["default_branch"]
+    reports_dir = (factory_root / "reports" / project_component(project)
+                   / re.sub(r"[^\w.-]", "_", task_id))
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    report_path = reports_dir / f"{work.run_id}-revalidate.json"
+    pair = (pr_sha, default_sha)
+
+    report_secrets = run_secrets(profile)
+
+    def done(reports: dict, note: str | None, flaked: tuple = (),
+             failed_twice: bool = False) -> Revalidation:
+        # R2-2: the stored report crosses the egress seam (the F-75
+        # ci_store precedent — redact before any record): command
+        # output and session-derived file names ride the L0/L1 finding
+        # dicts, and the report is owner evidence either way. Structure
+        # kept; only run secrets redact.
+        scrubbed = scrub_session_value(reports, report_secrets)
+        report_path.write_text(
+            json.dumps(scrubbed, indent=2, ensure_ascii=False) + "\n")
+        return Revalidation(pair=pair, run_id=work.run_id,
+                            report_path=report_path, reports=scrubbed,
+                            note=note, flaked=flaked,
+                            failed_twice=failed_twice)
+
+    # Stale: merge the PR onto the new base; a conflict is itself a
+    # re-validation failure (the merge a human would attempt). LC_ALL=C
+    # (deterministic note text), prompts disabled as defense in depth;
+    # conflicts are read from the index, not git's messages (round-2
+    # finding 2). F-45: the shared remote_call wrapper with the merge's
+    # own (local) timeout.
+    hardened_git(work.root, "checkout", "-q", "--detach", pr_sha)
+    try:
+        merge = remote_call(
+            ["git", *GIT_HARDENING, "-C", str(work.root), *_IDENTITY,
+             "merge", "--no-edit", default_sha],
+            env_extra={"LC_ALL": "C", "LANG": "C", **GIT_NET_ENV},
+            timeout_sec=_MERGE_TIMEOUT_SEC,
+            what=f"git merge of {branch} onto "
+                 f"{default_branch}@{default_sha[:12]}",
+        )
+    except RemoteCallTimeout as exc:
+        # Round-4 finding 5 + round-5 finding 5: a timeout is a clean
+        # RunError (exit 2, message), never a traceback — and this
+        # merge is local, so the message names the local pathology.
+        raise RunError(
+            f"git merge of {branch} onto "
+            f"{default_branch}@{default_sha[:12]} timed out after "
+            f"{_MERGE_TIMEOUT_SEC}s — a local merge (both commits "
+            "were already fetched): pathological merge or disk "
+            "problem, not the network"
+        ) from exc
+    if merge.returncode != 0:
+        conflicts = _conflict_paths(work.root)
+        if not conflicts:
+            raise RunError(
+                f"git merge of {branch} onto {default_branch}@"
+                f"{default_sha[:12]} failed with no unmerged paths "
+                f"(infrastructure, not the PR): "
+                f"{(merge.stdout + merge.stderr).strip()[:300]}"
+            )
+        return done(
+            {"L0": None, "L1": None, "L2": None},
+            note=(
+                f"merge conflict: {branch} does not merge onto "
+                f"{default_branch}@{default_sha[:12]} (conflicts in: "
+                f"{', '.join(conflicts)}; git: "
+                f"{merge.stdout.strip()[:200]})"
+            ),
+        )
+    merged_sha = _git_out(work.root, "rev-parse", "--verify", "HEAD")
+    note, l0, l1 = _revalidate_gate_pass(
+        queue, profile, task_id, work=work, merged_sha=merged_sha,
+        pr_sha=pr_sha, default_sha=default_sha, branch=branch,
+        factory_root=factory_root, srt_bin_path=srt_bin_path,
+        gate_timeout_sec=gate_timeout_sec, ledger=ledger)
+    if note is None or not _revalidate_command_failure(l0, l1):
+        return done(
+            {"L0": l0.to_dict() if l0 else None,
+             "L1": l1.to_dict() if l1 else None,
+             "L2": None},
+            note=note,
+        )
+    # F-76: the first pass failed a command — exactly one re-run, on a
+    # FRESH clean clone of the same merged SHA. Only a second failure
+    # parks; a pass is a pass, with the flaked findings named.
+    note2, l0b, l1b = _revalidate_gate_pass(
+        queue, profile, task_id, work=work, merged_sha=merged_sha,
+        pr_sha=pr_sha, default_sha=default_sha, branch=branch,
+        factory_root=factory_root, srt_bin_path=srt_bin_path,
+        gate_timeout_sec=gate_timeout_sec, ledger=ledger)
+    flaked: tuple[str, ...] = ()
+    if note2 is None:
+        # R1-F4 + R2-2: the first run's failing findings — text AND the
+        # session-derived file:line — ride the egress seam before they
+        # reach any progress note (the assembled line, scrubbed,
+        # escaped, capped, backticks neutralised), and the stored report
+        # is scrubbed at done() (run secrets redacted, structure kept —
+        # no current consumer reads it back into a prompt or PR body;
+        # the publish path's PR-body projection scrubs again anyway).
+        secrets = run_secrets(profile)
+
+        def flaked_line(f) -> str:
+            # R2-2: the session controls the FILE field too (new_error
+            # parses it from command output) — assemble id + file:line +
+            # text FIRST, then the whole line crosses the seam once,
+            # then the cap, then the backtick neutraliser (a triple
+            # backtick inside a progress entry can break the fenced
+            # JSON the log renders into later prompts).
+            where = f"{f.file}:{f.line}" if f.file else "unknown location"
+            text = (f.text.splitlines()[0] if f.text else "")
+            line = f"{f.id} at {where}: {text}"
+            line = escape_approval_text(
+                scrub_session_text(line, secrets))[:200]
+            return line.replace("`", "'")
+
+        first = [flaked_line(f) for f in l0.findings]
+        if l1 is not None:
+            first += [flaked_line(f) for f in l1.findings]
+        flaked = tuple(first[:5])
+    return done(
+        {"L0": l0b.to_dict() if l0b else None,
+         "L1": l1b.to_dict() if l1b else None,
+         "L2": None,
+         "first_run": {"L0": l0.to_dict() if l0 else None,
+                       "L1": l1.to_dict() if l1 else None}},
+        note=(None if note2 is None
+              else note2 + " — failed twice (a fresh-clone re-run "
+              "also failed)"),
+        flaked=flaked,
+        failed_twice=note2 is not None,
+    )
+
+
+def revalidate_stale_pr(
+    queue: TaskQueue, task_id: str, profile: dict, *,
+    factory_root: Path, srt_bin_path: Path | None = None,
+    gate_timeout_sec: int = 600,
+    ledger: "ApprovalLedger | None" = None,
+) -> Revalidation:
+    """Re-validate a parked stale_base PR's CURRENT head (F-76 AC-2).
+
+    The owner's word behind ``factory recover <task-id> --revalidate``:
+    both heads are read from the REMOTE (never trusted from the queue —
+    a hand fix on the PR branch or a merged main is judged as it sits),
+    then the ONE shared re-validation (:func:`revalidate_pr_base`) runs:
+    merge onto the current default head, L0/L1 on a fresh clean clone,
+    and its one re-run. Session-less; no attempt; nothing written to
+    the queue — the caller owns the move (the dedicated
+    :meth:`TaskQueue.recover_revalidated` writer) on a pass and the
+    refusal on a fail. The caller holds the run lease.
+
+    Raises:
+        RunError: The remote (or the PR branch on it) can't be fetched.
+    """
+    repo_cfg = profile["repo"]
+    project = profile["name"]
+    source = Path(repo_cfg["path"]).expanduser()
+    branch = (queue.get(task_id).get("links") or {}).get("branch")
+    if not branch:
+        raise RunError(
+            f"{task_id}: the parked task names no PR branch to re-validate"
+        )
+    work = create_run(project, source, factory_root=factory_root,
+                      ref=repo_cfg["default_branch"])
+    try:
+        default_sha = _fetch_sha(work.root, repo_cfg["remote"],
+                                 repo_cfg["default_branch"])
+        pr_sha = _fetch_sha(work.root, repo_cfg["remote"], branch)
+        return revalidate_pr_base(
+            queue, profile, task_id, work=work, pr_sha=pr_sha,
+            default_sha=default_sha, branch=branch,
+            factory_root=factory_root, srt_bin_path=srt_bin_path,
+            gate_timeout_sec=gate_timeout_sec, ledger=ledger)
+    finally:
+        cleanup_run(work)
+
+
 def _sweep_stale_prs(
     queue: TaskQueue, profile: dict, *, factory_root: Path,
     srt_bin_path: Path | None, gate_timeout_sec: int, states: dict,
@@ -2357,6 +2753,8 @@ def _sweep_stale_prs(
     ci_state: Callable | None = None, not_ready: list[str] | None = None,
     config: FactoryConfig | None = None,
     ledger: "ApprovalLedger | None" = None,
+    now: Callable[[], datetime] | None = None,
+    ci_fix: list | None = None,
 ) -> RunResult | None:
     """F-26 AC-3: bring every open factory PR's readiness up to date.
 
@@ -2406,9 +2804,19 @@ def _sweep_stale_prs(
     (real branch protection) keeps today's behaviour, with zero CI
     calls.
 
+    F-76 adds two moves on top: a re-validation that fails a command
+    re-runs once on a fresh clean clone before parking (only a second
+    failure escalates — the pilot's flaky run must not park a good PR),
+    and an in-review PR whose CI has settled red on a proved-current
+    head starts F-75's fix round (the flake re-run, the head guard, the
+    peak window and the budget all checked; at most one per run).
+
     Returns:
-        A ``needs_human`` result when a stale PR failed re-validation, or
-        None (all open PRs up to date, or none open).
+        A ``needs_human`` result when a stale PR failed re-validation
+        (twice) or a red PR's budget was spent (``ci_failed``), or None
+        (all open PRs up to date, or none open). A fix-round request,
+        when one qualifies, rides the ``ci_fix`` out-param — it does
+        not end the sweep.
 
     Raises:
         RunError: The remote (or the PR branch on it) can't be fetched.
@@ -2417,6 +2825,11 @@ def _sweep_stale_prs(
     project = profile["name"]
     source = Path(repo_cfg["path"]).expanduser()
     default_branch = repo_cfg["default_branch"]
+    now = now or (lambda: datetime.now(timezone.utc))
+    # F-76: at most one sweep fix round per run — the first red
+    # in-review PR that qualifies fills this and later candidates only
+    # report their lines.
+    fix_flag = [False]
     # F-63 AC-1: the sweep ACTS on tasks (recovery edges from GitHub's
     # PR state, stale-base re-validation, merged closes) — every acted-on
     # task needs a ledger match for its current contract. Unledgered ones
@@ -2445,12 +2858,23 @@ def _sweep_stale_prs(
             # unmerged slices stays in_review for its next slice. The
             # note claims only the recovery: whatever the close pass
             # then does, its own "closed" entry is the record.
-            new_status = "in_review"
-            task["links"]["merged"] = task["links"]["pr"]
-            note = (f"GitHub shows {task['links']['pr']} merged: "
-                    f"{escalation} recovery — back to in_review"
-                    + ("" if _no_deploy_target(profile)
-                       else " for the F-14 deploy gate"))
+            # F-76: the move goes through TaskQueue.recover_pr_merged —
+            # the dedicated writer — because the generic recovery edge
+            # narrowed to the pr_closed re-open signal (a stale_base
+            # task never takes needs_human → in_review generically; its
+            # in_review exits are the GitHub-merged and the
+            # passing-re-validation writers).
+            queue.recover_pr_merged(task["id"], merged_url=task["links"]["pr"])
+            _progress_best_effort(
+                ProgressLog.for_task(factory_root, project, task["id"]),
+                {"run_id": new_run_id(), "outcome": "recovered",
+                 "note": (f"GitHub shows {task['links']['pr']} merged: "
+                          f"{escalation} recovery — back to in_review"
+                          + ("" if _no_deploy_target(profile)
+                             else " for the F-14 deploy gate"))},
+                task["id"],
+            )
+            continue
         elif state == "open" and escalation == "pr_closed":
             new_status = "in_review"
             note = (f"GitHub shows {task['links']['pr']} open again: "
@@ -2534,12 +2958,19 @@ def _sweep_stale_prs(
                 and heads.get(default_branch) == cached["default"]):
             # F-58 AC-5: cached up-to-date is necessary, not sufficient —
             # CI state changes without the SHAs moving (a re-run), so the
-            # CI gate runs on every tick, cached or not.
-            _pr_ready_or_not(
-                ci_state, repo_cfg["remote"], links["pr"], cached["pr"],
-                ready, not_ready if not_ready is not None else [],
-                f"{links['pr']} against {default_branch}@{cached['default'][:12]}",
+            # CI gate runs on every tick, cached or not (and F-76's fix
+            # round with it — an unchanged pair whose CI settled red is
+            # exactly the shape the fix round exists for).
+            result = _sweep_pr_ready_or_ci_fix(
+                queue, profile, task, ci_state=ci_state,
+                head=cached["pr"], default_sha=cached["default"],
+                config=config, ready=ready,
+                not_ready=not_ready if not_ready is not None else [],
+                factory_root=factory_root, now=now,
+                ci_fix=ci_fix, fix_flag=fix_flag,
             )
+            if result is not None:
+                return result
             continue  # cached pair unchanged on the remote: nothing to redo
         work = create_run(project, source, factory_root=factory_root,
                           ref=default_branch)
@@ -2555,164 +2986,293 @@ def _sweep_stale_prs(
                                                 "default": default_sha}:
                     links["revalidated"] = {"pr": pr_sha, "default": default_sha}
                     queue.save()
-                _pr_ready_or_not(
-                    ci_state, repo_cfg["remote"], links["pr"], pr_sha,
-                    ready, not_ready if not_ready is not None else [],
-                    f"{links['pr']} against {default_branch}@{default_sha[:12]}",
+                result = _sweep_pr_ready_or_ci_fix(
+                    queue, profile, task, ci_state=ci_state,
+                    head=pr_sha, default_sha=default_sha, config=config,
+                    ready=ready, not_ready=not_ready if not_ready is not None
+                    else [], factory_root=factory_root, now=now,
+                    ci_fix=ci_fix, fix_flag=fix_flag,
                 )
+                if result is not None:
+                    return result
                 continue  # the PR branch already contains the default head
             if links.get("revalidated") == {"pr": pr_sha, "default": default_sha}:
-                _pr_ready_or_not(
-                    ci_state, repo_cfg["remote"], links["pr"], pr_sha,
-                    ready, not_ready if not_ready is not None else [],
-                    f"{links['pr']} against {default_branch}@{default_sha[:12]}",
+                result = _sweep_pr_ready_or_ci_fix(
+                    queue, profile, task, ci_state=ci_state,
+                    head=pr_sha, default_sha=default_sha, config=config,
+                    ready=ready, not_ready=not_ready if not_ready is not None
+                    else [], factory_root=factory_root, now=now,
+                    ci_fix=ci_fix, fix_flag=fix_flag,
                 )
+                if result is not None:
+                    return result
                 continue  # already re-validated against exactly this base
 
-            # Stale: merge the PR onto the new base; a conflict is itself
-            # a re-validation failure (the merge a human would attempt).
-            hardened_git(work.root, "checkout", "-q", "--detach", pr_sha)
-            try:
-                # LC_ALL=C (deterministic note text), prompts disabled as
-                # defense in depth: the scratch clone is blobless, and an
-                # unexpectedly missing blob would trigger a lazy fetch
-                # from the local source — prompt-free keeps even that
-                # path safe. Conflicts are read from the index, not from
-                # git's localized messages (round-2 finding 2); any
-                # other failure is infrastructure, not the PR. F-45: the
-                # call runs through the shared remote_call wrapper with
-                # the merge's own (local) timeout.
-                merge = remote_call(
-                    ["git", *GIT_HARDENING, "-C", str(work.root), *_IDENTITY,
-                     "merge", "--no-edit", default_sha],
-                    env_extra={"LC_ALL": "C", "LANG": "C", **GIT_NET_ENV},
-                    timeout_sec=_MERGE_TIMEOUT_SEC,
-                    what=f"git merge of {branch} onto "
-                         f"{default_branch}@{default_sha[:12]}",
-                )
-            except RemoteCallTimeout as exc:
-                # Round-4 finding 5 + round-5 finding 5: a timeout is a
-                # clean RunError (exit 2, message), never a traceback —
-                # and this merge is local, so the message names the local
-                # pathology, not credentials or the network.
-                raise RunError(
-                    f"git merge of {branch} onto "
-                    f"{default_branch}@{default_sha[:12]} timed out after "
-                    f"{_MERGE_TIMEOUT_SEC}s — a local merge (both commits "
-                    "were already fetched): pathological merge or disk "
-                    "problem, not the network"
-                ) from exc
-            reports: dict = {"L0": None, "L1": None, "L2": None}
-            note: str | None = None
-            merged_sha: str | None = None
-            if merge.returncode != 0:
-                conflicts = _conflict_paths(work.root)
-                if not conflicts:
-                    raise RunError(
-                        f"git merge of {branch} onto {default_branch}@"
-                        f"{default_sha[:12]} failed with no unmerged paths "
-                        f"(infrastructure, not the PR): "
-                        f"{(merge.stdout + merge.stderr).strip()[:300]}"
-                    )
-                note = (
-                    f"merge conflict: {branch} does not merge onto "
-                    f"{default_branch}@{default_sha[:12]} (conflicts in: "
-                    f"{', '.join(conflicts)}; git: "
-                    f"{merge.stdout.strip()[:200]})"
-                )
-            else:
-                merged_sha = _git_out(work.root, "rev-parse", "--verify", "HEAD")
-                clean = create_run(project, work.root, factory_root=factory_root,
-                                   ref=merged_sha)
-                try:
-                    _gate_settings(profile, clean, factory_root)
-                    # F-47: the sweep owns no attempt trace; an escapee
-                    # here opens this re-validation's own trace file
-                    # (trace/<project>/<work run id>.jsonl) — the store
-                    # `factory status` counts from — only when it fires.
-                    runner = sandboxed_runner(
-                        clean.root, clean.settings_path,
-                        srt_bin_path=srt_bin_path,
-                        on_escapee=_sweep_trace_sink(
-                            factory_root, project, work.run_id, task_id,
-                            profile=profile),
-                    )
-                    live = queue.get(task_id)
-                    l0 = run_l0(profile, clean.root, default_sha, merged_sha,
-                                task=live, runner=runner, timeout_sec=gate_timeout_sec)
-                    reports["L0"] = l0.to_dict()
-                    # R1-F5: an escalation class the owner already
-                    # ACCEPTED on this exact PR head (recover --accept,
-                    # the ledger waiver keyed to task, class, PR head SHA
-                    # and contract) is dropped here — the PR head is
-                    # unchanged when only the base moved, so the SHA key
-                    # still fits, and the accepted class must not bounce
-                    # the task to stale_base on the first unrelated
-                    # merge. Any new commit on the branch voids the
-                    # waiver (the SHA no longer matches) and the class
-                    # stands again.
-                    def _waived(escalation: str) -> bool:
-                        return ledger is not None and ledger.has_escalation_waiver(
-                            task_id, escalation, pr_sha,
-                            contract_hash_value=contract_hash(live),
-                        )
-
-                    unwaived = [e for e in l0.escalations if not _waived(e)]
-                    l1 = None
-                    if l0.verdict == "pass" and not unwaived:
-                        l1 = run_l1(profile, clean.root, default_sha, merged_sha,
-                                    task=live, runner=runner,
-                                    timeout_sec=gate_timeout_sec)
-                        reports["L1"] = l1.to_dict()
-                    if l0.verdict != "pass":
-                        note = f"L0 failed on {branch} merged onto {default_sha[:12]}"
-                    elif unwaived:
-                        note = ("L0 escalations on the merged tree: "
-                                + ", ".join(unwaived))
-                    elif l1 is None or l1.verdict != "pass":
-                        note = f"L1 failed on {branch} merged onto {default_sha[:12]}"
-                    # else: every escalation was owner-accepted (waived)
-                    # and L0/L1 passed — note stays None (a clean pass).
-                finally:
-                    cleanup_run(clean)
-
-            reports_dir = (factory_root / "reports"
-                           / project_component(project)
-                           / re.sub(r"[^\w.-]", "_", task_id))
-            reports_dir.mkdir(parents=True, exist_ok=True)
-            report_path = reports_dir / f"{work.run_id}-revalidate.json"
-            report_path.write_text(
-                json.dumps(reports, indent=2, ensure_ascii=False) + "\n")
-
-            if note is not None:
+            # Stale: the ONE shared re-validation (F-76) — merge onto the
+            # new base, gates on a fresh clean clone, and, when the first
+            # pass failed a command, one re-run on ANOTHER fresh clone.
+            rv = revalidate_pr_base(
+                queue, profile, task_id, work=work, pr_sha=pr_sha,
+                default_sha=default_sha, branch=branch,
+                factory_root=factory_root, srt_bin_path=srt_bin_path,
+                gate_timeout_sec=gate_timeout_sec, ledger=ledger)
+            if rv.note is not None:
                 return _sweep_escalation(
                     queue, factory_root, profile, task_id,
-                    escalation="stale_base", note=note, run_id=work.run_id,
-                    report_path=report_path, reports=reports, config=config,
+                    escalation="stale_base", note=rv.note, run_id=rv.run_id,
+                    report_path=rv.report_path, reports=rv.reports,
+                    config=config,
                 )
             # Pass: no attempt (no session ran, no budget spent); the
             # readiness record is the log entry plus the stored report,
             # and links.revalidated caches the pair so an unchanged base
-            # is not re-paid on every later run.
+            # is not re-paid on every later run. F-76: a pass that
+            # needed its re-run names the flaked findings — a flaky test
+            # stays visible.
+            note = (f"stale-base re-validation: L0+L1 pass on {branch} "
+                    f"merged onto {default_branch}@{default_sha[:12]} "
+                    f"({rv.report_path.name})")
+            if rv.flaked:
+                note += (" — failed once, passed on re-run (first run: "
+                         + "; ".join(rv.flaked) + ")")
             queue.get(task_id)["links"]["revalidated"] = {
-                "pr": pr_sha, "default": default_sha}
+                "pr": rv.pair[0], "default": rv.pair[1]}
             queue.save()
             _progress_best_effort(
                 ProgressLog.for_task(factory_root, project, task_id),
-                {"run_id": work.run_id, "outcome": "pass",
-                 "note": (f"stale-base re-validation: L0+L1 pass on {branch} "
-                          f"merged onto {default_branch}@{default_sha[:12]} "
-                          f"({report_path.name})")},
+                {"run_id": rv.run_id, "outcome": "pass", "note": note},
                 task_id,
             )
-            _pr_ready_or_not(
-                ci_state, repo_cfg["remote"], links["pr"], pr_sha,
-                ready, not_ready if not_ready is not None else [],
-                f"{links['pr']} against {default_branch}@{default_sha[:12]}",
+            result = _sweep_pr_ready_or_ci_fix(
+                queue, profile, task, ci_state=ci_state,
+                head=rv.pair[0], default_sha=rv.pair[1], config=config,
+                ready=ready, not_ready=not_ready if not_ready is not None
+                else [], factory_root=factory_root, now=now,
+                ci_fix=ci_fix, fix_flag=fix_flag,
             )
+            if result is not None:
+                return result
         finally:
             cleanup_run(work)
     return None
+
+
+@dataclass(frozen=True)
+class CIFixSeed:
+    """What the sweep hands ``_run_task`` to start F-75's CI fix round
+    on an in-review PR whose CI settled red (F-76 AC-3).
+
+    ``head_sha`` is the head the sweep PROVED current (its guard: the
+    remote branch must still hold exactly it when the round starts);
+    ``findings`` are the parent-escaped, fenced CI-finding lines that
+    ride the fix round's implementer prompt; ``rerun_heads`` is the
+    persisted once-per-head set seeded from ``links.ci_rerun_heads``.
+    """
+
+    task_id: str
+    pr_url: str
+    branch: str
+    head_sha: str
+    findings: tuple[str, ...]
+    rerun_heads: frozenset
+
+
+def _sweep_pr_ready_or_ci_fix(
+    queue: TaskQueue, profile: dict, task: dict, *,
+    ci_state: Callable | None, head: str, default_sha: str,
+    config: FactoryConfig | None, ready: list, not_ready: list,
+    factory_root: Path, now: Callable[[], datetime],
+    ci_fix: list | None, fix_flag: list,
+) -> "RunResult | None":
+    """The sweep's ready/not-ready line, then the F-76 fix-round decision.
+
+    One wrapper for every site that proved a PR current (cached,
+    up-to-date, or freshly re-validated): first the F-75 AC-3 line (a PR
+    is ready only on green CI), then — when the answer was a settled
+    ``failed`` — the AC-3 fix-round machinery (``_sweep_ci_fix_round``).
+    """
+    repo_cfg = profile["repo"]
+    default_branch = repo_cfg["default_branch"]
+    url = task["links"]["pr"]
+    state = _pr_ready_or_not(
+        ci_state, repo_cfg["remote"], url, head, ready, not_ready,
+        f"{url} against {default_branch}@{default_sha[:12]}")
+    if state is None or state.state != "failed":
+        return None
+    if ci_fix is None or fix_flag[0]:
+        return None  # no fix-round channel, or this run already started one
+    outcome = _sweep_ci_fix_round(
+        queue, profile, task, head=head, default_sha=default_sha,
+        ci_state=ci_state, config=config, ready=ready,
+        not_ready=not_ready, factory_root=factory_root, now=now)
+    if isinstance(outcome, CIFixSeed):
+        fix_flag[0] = True
+        ci_fix.append(outcome)
+        return None
+    return outcome  # a RunResult (the exhaustion) ends the sweep
+
+
+def _sweep_ci_fix_round(
+    queue: TaskQueue, profile: dict, task: dict, *,
+    head: str, default_sha: str, ci_state: Callable | None,
+    config: FactoryConfig | None, ready: list, not_ready: list,
+    factory_root: Path, now: Callable[[], datetime],
+) -> "RunResult | CIFixSeed | None":
+    """F-76 AC-3: decide a red in-review PR's fix round — or its park.
+
+    Guards, in order: the peak window (a fix round never starts inside
+    it — the not-ready line above stays the report); the head guard
+    (R1-B1: the remote branch must still hold exactly
+    ``links.pushed_head`` — a head the FACTORY pushed (the validated
+    publish, F-75's leased update, the accept release) or the owner
+    vouched for (`recover --revalidate`); the sweep's own
+    up-to-date/re-validated stamps never qualify, so a foreign push or
+    GitHub's Update branch is never built on); then F-75's flake guard
+    through
+    :func:`factory.ci.settle` — one re-run of the failed Actions jobs
+    per head, persisted on ``links.ci_rerun_heads`` so a later run never
+    re-runs the same head twice. Green after the re-run: the ready line,
+    no round. Still red: a spent budget parks the task ``ci_failed``
+    with the PR drafted (F-75's exhaustion, session-less); a remaining
+    budget returns a :class:`CIFixSeed` for ``run_once`` to run through
+    ``_run_task`` — F-75's own round loop, never a copy.
+    """
+    repo_cfg = profile["repo"]
+    config = config if config is not None else FactoryConfig()
+    task_id = task["id"]
+    url = task["links"]["pr"]
+    branch = task["links"]["branch"]
+    if ci_state is None:
+        return None  # no CI reader (direct callers): nothing to judge
+    if in_peak_window(now(), config.peak_window):
+        not_ready.append(f"{url}: not ready: the peak window stopped the "
+                         "CI fix round (CI still red)")
+        return None
+    # R1-B1, the head guard: the ONLY recorded SHA is links.pushed_head
+    # — a head the factory itself pushed (the validated publish, F-75's
+    # leased update, the accept release) or the owner vouched for
+    # (recover --revalidate stamps it on its exact judged head). The
+    # sweep's own up-to-date/re-validated stamps NEVER write it, so a
+    # foreign push to the PR branch (a hand fix, GitHub's Update branch)
+    # reads as moved and gets no round until the owner vouches. A
+    # missing record (a pre-F-76 PR, or a crash between the push and
+    # the links save) fails closed: no round, the line says the way
+    # back. The remote is re-read; the CI-red evidence must also be
+    # about exactly this head.
+    recorded = (task.get("links") or {}).get("pushed_head")
+    if not recorded:
+        not_ready.append(
+            f"{url}: not ready: no recorded factory push for this PR's "
+            f"head — the CI fix round builds only on a head the factory "
+            f"pushed; vouch with `factory recover {task_id} "
+            f"--revalidate --head {head}`")
+        return None
+    if head != recorded:
+        not_ready.append(
+            f"{url}: not ready: head moved outside the factory "
+            f"(the red CI was read on {head[:12]}, not the factory's "
+            f"pushed {recorded[:12]}) — vouch with `factory recover "
+            f"{task_id} --revalidate --head {head}`")
+        return None
+    heads = _ls_remote_heads(repo_cfg["remote"], (branch,))
+    if heads.get(branch) != recorded:
+        not_ready.append(
+            f"{url}: not ready: head moved outside the factory "
+            f"(the factory last pushed {recorded[:12]}; the remote now "
+            f"holds {(heads.get(branch) or 'nothing')[:12]}) — vouch "
+            f"with `factory recover {task_id} --revalidate "
+            f"--head {heads.get(branch) or '<the head you see>'}`")
+        return None
+    # The flake guard, seeded from the persisted once-per-head set.
+    live = queue.get(task_id)
+    rerun_heads = set((live.get("links") or {}).get("ci_rerun_heads") or [])
+    window = config.ci_wait_min
+    settled = ci_settle(
+        repo_cfg["remote"], head, ci_state=ci_state, actions=CIActions(),
+        window_sec=window * 60.0, clock=ci_clock, sleep=ci_sleep,
+        rerun_heads=rerun_heads)
+    # Persist before anything else: a crash after the re-run must never
+    # let a later run re-run the same head (the set only grows; cap at
+    # the last 8 heads — a bound, not a semantics change).
+    new_heads = sorted(rerun_heads)
+    links = queue.get(task_id)["links"]
+    if list(links.get("ci_rerun_heads") or []) != new_heads:
+        links["ci_rerun_heads"] = new_heads[-8:]
+        queue.save()
+    if settled.outcome != "red":
+        if settled.outcome == "green":
+            # The re-run turned it green: the readiness proof the red
+            # not-ready line above was waiting for.
+            ready.append(f"{url} against "
+                         f"{repo_cfg['default_branch']}@{default_sha[:12]}")
+        return None
+    secrets = run_secrets(profile)
+    findings = _ci_finding_lines(settled, secrets)
+    if settled.partial:
+        findings.append(
+            f"- {settled.partial} check(s) were still running when the "
+            "wait window ended — their logs are missing from this "
+            "report; re-run them on GitHub if their failures matter.")
+    names = ", ".join(
+        escape_approval_text(scrub_session_text(f.name, secrets))
+        for f in settled.failing) or "unknown checks"
+    reports_dir = (factory_root / "reports" / project_component(profile["name"])
+                   / re.sub(r"[^\w.-]", "_", task_id))
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    rid = new_run_id()
+    ci_store = reports_dir / f"{rid}-ci.json"
+    ci_store.write_text(
+        json.dumps(scrub_session_value(settled.report or {}, secrets),
+                   indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    budget = live.get("budget") or {}
+    slice_id = _slice_id_of(live)
+    spent = attempt_budget_used(live, slice_id)
+    if spent >= budget.get("max_attempts", 0):
+        note = (
+            f"the PR's CI is red on {head[:12]} and the attempt budget is "
+            f"spent ({spent} of {budget.get('max_attempts', 0)}); failing "
+            f"checks: {names}; the capped failing-log tails are stored at "
+            f"{ci_store}"
+            + (f"; {settled.partial} check(s) were still running when the "
+               "window ended — their logs may be missing"
+               if settled.partial else "")
+        )
+        try:
+            gh_pr_draft(url)
+        except PublishError as exc:
+            note += f" (converting the PR to a draft failed: {exc})"
+        else:
+            note += "; the PR was converted to a draft and stays open"
+        return _sweep_escalation(
+            queue, factory_root, profile, task_id,
+            escalation="ci_failed", note=note, run_id=rid,
+            report_path=ci_store, config=config)
+    return CIFixSeed(task_id=task_id, pr_url=url, branch=branch,
+                     head_sha=recorded, findings=tuple(findings),
+                     rerun_heads=frozenset(rerun_heads))
+
+
+def _abort_requeue_status(task: dict) -> str:
+    """Where an aborted, errored or quota-stopped round re-queues (R1-B2).
+
+    ``in_review`` when the task holds a NORMAL PR link — the round was
+    a fix round on an already-open PR (F-75's in-run round or the
+    sweep's), and re-queueing it ``ready`` would wedge the queue: the
+    open PR holds the one concurrency slot while the sweep only scans
+    ``in_review``, so the red PR would never be re-swept, never fixed
+    and nothing else would run. Back to ``in_review`` the sweep owns it
+    again and the budget bounds the retries to ``ci_failed``. An
+    ESCALATION draft PR (``links.escalation_pr``) is the owner's to
+    answer (--accept/--reject), never the sweep's — it routes as today.
+    No gh call here (a crash handler must not depend on the network):
+    the next sweep reads GitHub's truth — a closed PR escalates
+    ``pr_closed`` (visible, one ``factory recover`` word), a merged one
+    takes the merged recovery. ``ready`` otherwise (a fresh run with no
+    PR, today's behaviour).
+    """
+    links = task.get("links") or {}
+    return "in_review" if links.get("pr") and not links.get("escalation_pr") \
+        else "ready"
 
 
 def _sweep_trace_sink(
@@ -2773,7 +3333,8 @@ def _build_on_remote_default(work: RunDir, remote: str, default_branch: str) -> 
     hardened_git(work.root, "checkout", "-q", "--detach", "FETCH_HEAD")
 
 
-def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
+def _run_task(ctx: _Ctx, slice_: dict | None,
+              ci_fix: CIFixSeed | None = None) -> RunResult:
     profile, queue, task_id = ctx.profile, ctx.queue, ctx.task_id
     project = profile["name"]
     repo_cfg = profile["repo"]
@@ -2949,6 +3510,16 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
     ci_pushed_sha: str | None = None  # the sha the remote branch holds
     ci_rerun_heads: set = set()  # SHAs whose failed runs were re-run once
     ci_fix_findings: list[str] | None = None  # rides the fix round's prompt
+    if ci_fix is not None:
+        # F-76 AC-3: a sweep-started fix round enters with F-75's state
+        # pre-seeded — the PR is open, the proved head is the pushed
+        # SHA, the persisted once-per-head set carries over, and the
+        # first implementer round carries the CI findings. From here on
+        # the round loop is F-75's own, unchanged.
+        ci_pr_url = ci_fix.pr_url
+        ci_pushed_sha = ci_fix.head_sha
+        ci_rerun_heads = set(ci_fix.rerun_heads)
+        ci_fix_findings = list(ci_fix.findings)
     # F-45 AC-4 (m-13): whether this round's finish() already recorded its
     # attempt. The error path below must never append a second attempt for
     # a round whose first one landed (one failure = exactly one attempt);
@@ -2985,11 +3556,44 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                         extra_secrets=egress_secrets)
     try:
         with trace.phase("setup"):
-            _build_on_remote_default(work, repo_cfg["remote"], default_branch)
-            branch = _branch_name(task_id, work.run_id)
-            created = frozenset({branch})
-            hardened_git(work.root, "checkout", "-q", "-b", branch)
-            base_sha = _git_out(work.root, "rev-parse", "--verify", "HEAD^{commit}")
+            if ci_fix is None:
+                _build_on_remote_default(work, repo_cfg["remote"], default_branch)
+                branch = _branch_name(task_id, work.run_id)
+                created = frozenset({branch})
+                hardened_git(work.root, "checkout", "-q", "-b", branch)
+                base_sha = _git_out(work.root, "rev-parse", "--verify",
+                                    "HEAD^{commit}")
+            else:
+                # F-76 AC-3: a sweep-started CI fix round builds on the
+                # PR branch's PROVED head — the same shape as F-75's
+                # in-run round, entered from a fresh process. The remote
+                # default head is fetched (the clone's origin is the
+                # local source and can be stale — _build_on_remote_
+                # default's rule) for the gates' base: the merge-base of
+                # the proved head and the default head (an up-to-date
+                # PR: the default head itself; a re-validated one: the
+                # fork point — the PR's own diff either way). The head
+                # guard already re-read the remote at run_once entry;
+                # the push's LEASE is the last-line guard against a push
+                # that landed since.
+                branch = ci_fix.branch
+                created = frozenset({branch})  # the lease guards it
+                pr_sha = _fetch_sha(work.root, repo_cfg["remote"], branch)
+                if pr_sha != ci_fix.head_sha:
+                    raise RunError(
+                        f"the PR branch {branch!r} no longer holds the "
+                        f"validated head {ci_fix.head_sha[:12]} "
+                        f"(it holds {pr_sha[:12]}) — the CI fix round "
+                        "refuses to build on a head it did not validate; "
+                        "the task returns to the queue and the sweep "
+                        "re-validates the new head"
+                    )
+                default_head = _fetch_sha(work.root, repo_cfg["remote"],
+                                          default_branch)
+                hardened_git(work.root, "checkout", "-q", "-B", branch,
+                             ci_fix.head_sha)
+                base_sha = _git_out(work.root, "merge-base",
+                                    ci_fix.head_sha, default_head)
             reports_dir = (ctx.factory_root / "reports"
                            / project_component(project)
                            / re.sub(r"[^\w.-]", "_", task_id))
@@ -3274,7 +3878,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                 attempt_no, started, "aborted", records, None,
                 escalation="quota_exhausted", note=quota_record.reason,
             )
-            finish(attempt, "ready", [f"1. quota: {quota_record.reason}"])
+            finish(attempt, _abort_requeue_status(queue.get(task_id)),
+                   [f"1. quota: {quota_record.reason}"])
             return RunResult("quota_exhausted", task_id,
                              escalation="quota_exhausted", reports=reports)
 
@@ -3418,7 +4023,9 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                 return RunResult("needs_human", task_id,
                                  escalation=escalation, pr=url)
             if in_peak_window(ctx.now(), ctx.config.peak_window):
-                queue.transition(task_id, "ready")
+                # R1-B2: an open-PR fix round waits in in_review (the
+                # sweep re-enters it off-peak), never ready-with-slot.
+                queue.transition(task_id, _abort_requeue_status(queue.get(task_id)))
                 trace.run_end("aborted")  # no attempt recorded: the run stopped
                 return RunResult("peak_window", task_id)
 
@@ -3478,7 +4085,9 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                     if _is_quota(impl):
                         attempt = attempt_record(attempt_no, started, "aborted", records, None,
                                                  escalation="quota_exhausted", note=impl.reason)
-                        finish(attempt, "ready", [f"1. quota: {impl.reason}"])
+                        finish(attempt,
+                               _abort_requeue_status(queue.get(task_id)),
+                               [f"1. quota: {impl.reason}"])
                         return RunResult("quota_exhausted", task_id, escalation="quota_exhausted")
 
                     # F-65 AC-3: a valid scope request escalates AT ONCE
@@ -4527,7 +5136,14 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                         # the validated PR is a normal factory PR: any
                         # escalation marker from an earlier park clears
                         # (the sweep must re-validate and report it).
-                        new_links = {**old_links, "pr": url, "branch": branch}
+                        # R1-B1: pushed_head records the head THIS run
+                        # pushed (the open push or F-75's leased update)
+                        # — the one SHA the sweep's CI fix round may
+                        # later build on. The sweep's own stamps never
+                        # write it; a crash before this save leaves it
+                        # absent and the fix round refuses (fail closed).
+                        new_links = {**old_links, "pr": url, "branch": branch,
+                                     "pushed_head": cast(str, head_sha)}
                         new_links.pop("escalation_pr", None)
                         task["links"] = new_links
                         if ci_pr_url is None:
@@ -4868,7 +5484,10 @@ def _run_task(ctx: _Ctx, slice_: dict | None) -> RunResult:
                     queue.transition(task_id, "needs_human")
                     return RunResult("needs_human", task_id,
                                      escalation="publish_refused", reports=reports)
-                queue.transition(task_id, "ready")
+                # R1-B2: a fix round on an already-open PR returns to
+                # in_review (the sweep owns the PR again), never ready.
+                queue.transition(
+                    task_id, _abort_requeue_status(queue.get(task_id)))
                 return RunResult("error", task_id,
                                  escalation="orchestrator_error", reports=reports)
     except BaseException as exc:
@@ -5190,6 +5809,9 @@ def _recover_accept_leased(
         push_branch(work.root, repo_cfg["remote"], branch, sha=released,
                     created=frozenset({branch}),
                     default_branch=repo_cfg["default_branch"], lease_sha=sha)
+        # R1-B1: the released head is a factory push — the sweep's CI
+        # fix round may build on it if its CI goes red later.
+        queue.get(task_id)["links"]["pushed_head"] = released
         pr_ready(task["links"]["pr"])
         status = queue.recover_accept(task_id, ledger=ledger, sha=sha,
                                       evidence=evidence, done_by=done_by)

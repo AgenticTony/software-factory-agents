@@ -179,6 +179,29 @@ def build_parser() -> argparse.ArgumentParser:
              "new_dependency/risk_path_touched only; interactive, no --yes",
     )
     recover.add_argument(
+        "--revalidate", action="store_true",
+        help="F-76, two shapes. stale_base park (needs_human): "
+             "re-validates the parked task's PR (GitHub must report it "
+             "open) by merging its CURRENT remote head onto the current "
+             "remote default head and re-running L0+L1 (one re-run on a "
+             "fresh clone if the first pass fails a command); a pass "
+             "moves the task back to in_review with the pair stamped — "
+             "no prompt, the passing re-validation is the evidence; "
+             "combines with no other flag. in_review head vouch (a PR "
+             "the sweep reported moved/unrecorded): requires --head to "
+             "name the head you judged; no gates run — your word on "
+             "that head is the vouch",
+    )
+    recover.add_argument(
+        "--head", default=None, metavar="SHA",
+        help="F-76: with --revalidate on an in_review PR (the head-vouch "
+             "shape): the head you judged and are vouching for — the "
+             "full SHA or an unambiguous >=12-char prefix. The remote "
+             "must hold exactly it when the command runs. Without "
+             "--head the in_review shape refuses and prints the current "
+             "head plus the command to run",
+    )
+    recover.add_argument(
         "--done-by", default=None,
         help="your name for the recovery log entry "
              "(default: git user.name)",
@@ -411,11 +434,16 @@ def _run_recover(args: argparse.Namespace) -> int:
             TaskQueue(args.queue), args.task_id, assume_yes=args.yes,
             evidence=args.evidence, reset_attempts=args.reset_attempts,
             accept=args.accept, reject=args.reject,
+            revalidate=args.revalidate, head=args.head,
             done_by=args.done_by,
             factory_root=(Path(args.factory_root) if args.factory_root
                           else None),
         )
-        if status == "in_review":
+        if status == "in_review" and args.revalidate:
+            print(f"{args.task_id}: needs_human -> in_review "
+                  "(stale_base re-validated on the PR's current head; "
+                  "the sweep reports it ready or not from here)")
+        elif status == "in_review":
             print(f"{args.task_id}: needs_human -> in_review "
                   "(escalation accepted; PR marked ready)")
         elif status == "draft":
