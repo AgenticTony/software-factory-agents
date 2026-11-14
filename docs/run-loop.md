@@ -75,6 +75,7 @@ This takes about 15 minutes and is not a full review. Its sources:
 | 2026-11-12 | wo21 run 3 | **pr_opened** (JFO #163), 2 attempts | 3 (profile re-approve, approve, merge) | 100 (cap) + 31 | 233k in / 53k out / 6.0M cache-read | 31.5 min | implementer committed as the owner; setup burn; sandbox missing fonts led to a skip marker |
 | 2026-11-13 | wo21 run 4 (#163 live test) | needs_human stale_base (F-75 never reached) | 1 (profile re-approve after repo move) | 0 (no session) | 0 model tokens | ~3 min | one flaky test fails stale-base re-validation and parks a passing PR; an open stale_base PR has no retry exit |
 | 2026-11-14 | wo21 run 5 (F-76 live) | needs_human ci_failed, then a stalled recovery | 4 (revalidate, reset-attempts, merge #138, the repair) | 0 (session-less park) | 0 model tokens | ~8 min (sweep) | F-77 existed but was unmerged when needed; recover ran pre-F-77 code |
+| 2026-11-14 | wo21 run 6 (F-77 live) | needs_human scope_change_needed (budget spent 2/2, PR kept) | 2 (reset, merge #139) | 60 + 43 | pending usage | ~29 min | a scope park on an open PR with spent budget has no exit that keeps the work (F-78); `factory adopt` named by the contract but absent from the CLI |
 
 ## Retros
 
@@ -123,6 +124,17 @@ This takes about 15 minutes and is not a full review. Its sources:
 
 ### Session repair (2026-11-14 ~12:00, recorded for the audit trail)
 After #139 merged and main was pulled, wo21 was re-parked by hand (`ready → needs_human`, one field, the factory's own JSON format) — reconstructing the state the 11:08 reset should have found — and the REAL F-77 recover ran against it: `needs_human → in_review`, links untouched, a second reset marker on file, budget 0/2, `gh pr ready` un-drafted #163, progress entry `recovered | ci_failed → in_review`. The hand-edit is visible in `.factory/tasks.json`'s uncommitted diff and named in the reset evidence. The next `factory loop` started the CI fix round on #163 (run 20261114T134530Z-f49bb7) — the retro below covers it.
+
+### Run 2026-11-14 (afternoon): wo21 — F-77's first live keep-the-PR recovery, and the fix round that found the real holes
+- **Goal:** run the CI fix round on #163 under the F-77 reset (the red: `test_ac_2`, the em-dash KNOWN_PHRASE missing from pypdf extraction on Ubuntu fonts).
+- **The recovery worked end to end.** After #139 merged and main was pulled, the task was re-parked by hand (`ready → needs_human`, one field — reconstructing what the 11:08 pre-F-77 reset should have found) and the real F-77 recover ran: `needs_human → in_review`, links untouched, budget 0/2, `gh pr ready` un-drafted #163, honest progress entry. The next loop's sweep started the fix round on the SAME PR — no re-implementation, no second PR.
+- **The round itself:** attempt 1 (60 turns) fixed the font-dependent test; L0 and L1 passed; L2 found what the round was actually for — U-4 `[spec/major]`: the production send path calls `verify_text_layer` without `must_contain`, so a glyph-substituted, ATS-unreadable cover letter PASSES the runtime guard (the reviewer proved it empirically: forced `_resolve_unicode_font` to None → 136 chars of `?`-substituted extraction → the guard passes → dispatch); and U-2: `download_cover_letter`/`download_tailored_cv` build outbound PDFs with NO verification at all. Attempt 2 (43 turns) fixed what the contract covered and requested `backend/app/api/v1/applications.py` — parked `scope_change_needed`, nothing pushed, PR kept (drafted), budget spent 2/2.
+- **What broke in the factory:**
+  1. **A `scope_change_needed` park on an open PR with a spent budget has no exit that keeps the work.** `recover_scope` → `ready` (deadlocks on its own open PR, and the budget is spent anyway); the reset is gated to `attempts_exhausted`/`ci_failed`; closing the PR rejects the round's work. → **Fix as a WO: F-78** (this PR) — the keep-the-PR reset for scope parks.
+  2. **`factory adopt` does not exist.** TASK-CONTRACT's scope exit names it as the ledger step; the CLI never got it — the designed exit was unusable end to end even before the PR/budget problem. F-78 AC-2 builds it.
+  3. The reviewer finding real spec holes in a CI fix round is the loop working: the fix round's diff (a font-tolerant test) gave L2 the lens to check the guarantee, not just the test. No fix needed.
+- **Owner decision (2026-11-14 ~15:15):** park wo21, fix the gap first — wo21 resumes after F-78 lands (widen scope, adopt, reset, loop).
+- **Cost:** turns 60 + 43; token usage pending the run's usage record; ~29 min wall clock.
 
 The target is 2 owner touches per task: approve and merge.
 

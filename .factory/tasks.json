@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-14T12:05:00Z",
+  "updated_at": "2026-11-14T14:20:00Z",
   "tasks": [
     {
       "id": "F-00",
@@ -5944,6 +5944,59 @@
       "acceptance_hash": "7ea7942779bee7bf3cc70443c8f3c36b1f021d3e675ee615c827688597d50d48",
       "approved_at": "2026-11-14T12:05:00Z",
       "approved_by": "Anthony"
+    },
+    {
+      "id": "F-78",
+      "title": "A scope-changed PR keeps its work: the keep-the-PR reset for scope parks, and the missing `factory adopt`",
+      "source": "BUILD-ORDER.md#f-78--a-scope-changed-pr-keeps-its-work-the-keep-the-pr-reset-for-scope-parks-and-the-missing-factory-adopt",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-77"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "A `scope_change_needed` budget reset keeps an open PR: the ledger gate first (widened whole-contract hash owner-approved, else refuse naming the remedy), then GitHub decides — open → `needs_human → in_review` (F-77 shape: marker, links untouched, un-draft, run lease, re-read), closed → fresh-run re-queue, merged/unreadable → refused; `attempts_exhausted` and `scope_missing` never take `in_review`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f78.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "`factory adopt <task-id>` exists — shows the current contract and records the owner's approval of exactly that hash into the F-63 ledger; interactive y/N, `--yes` refused, non-draft tasks allowed, queue untouched, idempotent with a say-so.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f78.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "The next sweep runs the CI fix round on that PR under the widened scope and the reset budget — no re-implementation, the resumed round's L0 accepts the widened path's diff.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f78.py::test_ac_3"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 150,
+        "wall_clock_min": 120
+      }
     }
   ]
 }
