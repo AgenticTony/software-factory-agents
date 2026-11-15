@@ -936,6 +936,12 @@ def _run_orchestrator(args: argparse.Namespace) -> int:
             result = run_once(Path(args.queue), profile_path=args.profile, **kwargs)
             detail = f" {result.task_id}" if result.task_id else ""
             print(f"factory run: {result.outcome}{detail} {_run_extra(result)}".rstrip())
+            # F-82 AC-3: one line under the published PR — the follow-up
+            # draft this run's publish wrote (or replaced). The PR line
+            # above names the round; this names what it left open.
+            if result.followup:
+                print(f"  follow-up drafted: {result.followup[0]} "
+                      f"({result.followup[1]} findings)")
             # F-26 AC-3 (round-7 finding 2): each open PR proven current
             # against the remote default head, so the owner merges only
             # what this run reported ready.
@@ -954,6 +960,10 @@ def _run_orchestrator(args: argparse.Namespace) -> int:
         loop = run_loop(Path(args.queue), profile_path=args.profile, **kwargs)
         for result in loop.results:
             print(f"  {result.task_id or '-'}: {result.outcome} {_run_extra(result)}".rstrip())
+            # F-82 AC-3: the same line under each published PR.
+            if result.followup:
+                print(f"    follow-up drafted: {result.followup[0]} "
+                      f"({result.followup[1]} findings)")
             for line in result.ready_prs:
                 print(f"    ready: {line}")
             for line in result.not_ready_prs:

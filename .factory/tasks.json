@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-15T12:00:00Z",
+  "updated_at": "2026-11-15T11:30:00Z",
   "tasks": [
     {
       "id": "F-00",
@@ -6167,6 +6167,76 @@
           ".factory/project.yaml",
           ".factory/BOOTSTRAP.md",
           "docs/run-loop.md"
+        ]
+      }
+    },
+    {
+      "id": "F-82",
+      "title": "Review findings that do not block are never lost",
+      "source": "docs/next-work-orders.md#f-82--review-findings-that-do-not-block-are-never-lost",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-79"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "A published round whose passing L2 report carries findings adds a section \"Review findings left open\" to the PR body: one line per finding (id, severity, file:line, text), escaped and scrubbed through the same egress seam every other PR text uses, capped, under the body's size limit. A round with none adds nothing. A CI fix round's update refreshes the section to that round's findings.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f82.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "At publish, the parent writes ONE task `<task-id>-followup` to the queue through a dedicated state-layer writer: status draft, kind and source copied, depends_on: [<task-id>], title \"Follow-up: <original title>\", one acceptance criterion per finding with the finding text and a manual check type, scope the files the findings name intersected with the original scope, budget the profile floor. A later round on the same task REPLACES that draft's criteria while it is still draft; once the owner has approved or edited it, the writer never touches it again and says so in the progress log. No findings → no task, and an untouched draft follow-up from an earlier round is removed.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f82.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "factory run and factory loop print one line under the published PR: `follow-up drafted: <id> (<n> findings)`. factory status lists it like any draft.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f82.py::test_ac_3"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 150,
+        "wall_clock_min": 120
+      },
+      "scope": {
+        "paths": [
+          "factory/prbody.py",
+          "factory/publish.py",
+          "factory/state.py",
+          "factory/orchestrator.py",
+          "factory/cli.py",
+          "factory/progress.py",
+          "tests/test_f82.py",
+          "tests/_support/f82.py",
+          "TASK-CONTRACT.md",
+          "BUILD-ORDER.md",
+          ".factory/tasks.json",
+          ".factory/project.yaml",
+          ".factory/BOOTSTRAP.md"
         ]
       }
     }

@@ -93,7 +93,7 @@ from factory.approvals import (
 from factory.ci import CIActions
 from factory.ci import settle as ci_settle
 from factory.config import CONFIG_FILE, FactoryConfig, in_peak_window, load_config
-from factory.contract import contract_hash, load_profile
+from factory.contract import ContractError, budget_floor, contract_hash, load_profile
 from factory.egress import escape_approval_text, scrub_session_text, scrub_session_value
 from factory.gates import CommandResult, diff_name_status, git_rc
 from factory.gates import git as hardened_git
@@ -138,6 +138,7 @@ from factory.publish import (
     gh_pr_close,
     gh_pr_create,
     gh_pr_draft,
+    gh_pr_edit,
     push_branch,
     remote_call,
 )
@@ -168,9 +169,12 @@ from factory.session import (
 )
 from factory.state import (
     ELIGIBLE_KINDS,
+    ConcurrentWriteError,
     Pick,
     RunInProgressError,
+    StateError,
     TaskQueue,
+    TransitionError,
     attempt_budget_used,
     escalation_accept_eligible,
     holds_normal_pr,
@@ -373,6 +377,12 @@ class RunResult:
     # "CI pending" or "no CI reported". None for every other outcome
     # (green and red both resolve; red becomes a fix round or ci_failed).
     note: str | None = None
+    # F-82 AC-3: the follow-up draft this publish wrote (or replaced),
+    # as ``(followup_task_id, findings_carried)`` — printed by run/loop
+    # as one line under the published PR. None when the round carried no
+    # findings, when the writer kept an owner-touched draft, or on every
+    # outcome that never published.
+    followup: "tuple[str, int] | None" = None
 
 
 @dataclass
@@ -679,6 +689,94 @@ def _progress_best_effort(log: ProgressLog, entry: dict, task_id: str) -> None:
         )
 
 
+def _record_publish_followup(queue: TaskQueue, task_id: str, l2, profile: dict,
+                             log: ProgressLog, trace_append, egress_secrets,
+                             run_id: str) -> "tuple[str, int] | None":
+    """F-82 AC-2/AC-3: write the publish's follow-up draft — or remove,
+    or keep, the one an earlier round left — then narrate it in the
+    task's progress log.
+
+    The findings are the round's still-open L2 findings, each string
+    field through the SAME egress escape every queue-bound session text
+    gets (scrub, then visible control escapes — the queue refuses raw
+    controls at load). The writer's memory of what it last wrote is the
+    last ``followup`` entry in the task's own log: the record it named
+    is the only draft a later round may replace, so an owner edit or a
+    foreign task of the same id is kept, never clobbered — and the log
+    entry says which.
+
+    Best-effort by design: the publish is already durable (PR open or
+    updated, attempt recorded, links saved, ``in_review``), and the
+    findings still ride the PR body — a write failure is traced and
+    logged, never an escalation. Returns the RunResult's follow-up
+    field: ``(followup_id, findings)`` when a draft the owner can act
+    on now exists, None otherwise.
+    """
+    def esc(value: str) -> str:
+        return escape_approval_text(
+            scrub_session_text(value, egress_secrets))
+
+    findings: list = []
+    for finding in (l2.findings if l2 is not None else []):
+        if not isinstance(finding, L2Finding):
+            continue
+        entry: dict[str, Any] = {
+            key: esc(value)
+            for key in ("id", "severity", "file", "text")
+            if isinstance(value := getattr(finding, key, None), str) and value
+        }
+        if not entry.get("text"):
+            continue  # nothing carries; the report still holds the raw finding
+        line = getattr(finding, "line", None)
+        if isinstance(line, int):
+            entry["line"] = line
+        findings.append(entry)
+    remembered: "dict | None" = None
+    try:
+        for record in reversed(log.entries()):
+            if (record.get("type") == "followup"
+                    and record.get("action") in ("drafted", "replaced")):
+                candidate = record.get("task")
+                remembered = candidate if isinstance(candidate, dict) else None
+                break
+    except Exception as exc:  # noqa: BLE001 — unreadable memory keeps, never replaces
+        trace_append({"type": "followup_memory_unreadable",
+                      "reason": f"{type(exc).__name__}: {exc}"[:300]})
+    followup_id = f"{task_id}-followup"
+    try:
+        outcome = queue.record_followup(
+            task_id, findings=findings, floor=budget_floor(profile),
+            remembered=remembered)
+    except (StateError, TransitionError, ConcurrentWriteError,
+            ContractError) as exc:
+        trace_append({"type": "followup_write_failed",
+                      "reason": f"{type(exc).__name__}: {exc}"[:300]})
+        _progress_best_effort(
+            log, {"run_id": run_id, "type": "followup",
+                  "action": "write_failed", "id": followup_id,
+                  "findings": len(findings),
+                  "reason": f"{type(exc).__name__}: {exc}"[:300]},
+            task_id)
+        return None
+    if outcome["action"] == "none":
+        # No findings and no follow-up exists: nothing happened, and the
+        # log says nothing (a log line per clean publish would be noise;
+        # every other action — drafted, replaced, removed, kept, failed —
+        # is an event the owner reads).
+        return None
+    entry = {"run_id": run_id, "type": "followup",
+             "action": outcome["action"], "id": outcome["id"],
+             "findings": outcome["count"]}
+    if outcome.get("reason"):
+        entry["reason"] = outcome["reason"][:300]
+    if outcome.get("task") is not None:
+        entry["task"] = outcome["task"]
+    _progress_best_effort(log, entry, task_id)
+    if outcome["action"] in ("drafted", "replaced"):
+        return outcome["id"], outcome["count"]
+    return None
+
+
 def _is_quota(record: SessionRecord) -> bool:
     return record.status != "completed" and bool(_QUOTA.search(record.reason or ""))
 
@@ -805,7 +903,8 @@ def _compact(report: dict | None, tail: int) -> dict | None:
 
 
 def _numbered_findings(reports: dict, extra: list[str],
-                       include_dropped: bool = True) -> list[str]:
+                       include_dropped: bool = True,
+                       secrets: "Sequence[str]" = ()) -> list[str]:
     """The round's numbered finding lines.
 
     ``include_dropped=False`` builds the implementer's fix list: dropped
@@ -816,8 +915,18 @@ def _numbered_findings(reports: dict, extra: list[str],
     a voted-out finding is noise by the review's own record, not work.
     The full list (default) is the round's record: log, PR evidence, the
     human's read.
+
+    F-82's hostile pass found the hole this ``secrets`` parameter closes:
+    these lines are SESSION-derived text (finding texts, verifier and
+    arbiter reasons) landing in the progress log — a durable, owner-read
+    record — so every line passes the egress seam as it is built. The
+    scrub is idempotent, so the fix lists that ride prompts (where the
+    same lines travel again) scrub harmlessly.
     """
-    lines: list[str] = list(extra)
+    def _line(text: str) -> str:
+        return scrub_session_text(text, secrets)
+
+    lines: list[str] = [_line(text) for text in extra]
     # F-41: a round that ran the final review stores its delta review as
     # "L2-delta" (empty findings by then — it passed — but its drops are
     # the record's to keep, exactly like the L2 list).
@@ -827,7 +936,8 @@ def _numbered_findings(reports: dict, extra: list[str],
             where = ""
             if finding.get("file"):
                 where = f" ({finding['file']}:{finding.get('line') or ''})"
-            lines.append(f"[{layer} {finding.get('id')}] {finding.get('text')}{where}")
+            lines.append(_line(
+                f"[{layer} {finding.get('id')}] {finding.get('text')}{where}"))
         if not include_dropped:
             continue
         # Dropped L2 findings ride the record marked, not actionable: the
@@ -835,19 +945,19 @@ def _numbered_findings(reports: dict, extra: list[str],
         # even though the orchestrator ruled it out of scope.
         for entry in report.get("dropped") or []:
             finding = entry.get("finding") or {}
-            lines.append(
+            lines.append(_line(
                 f"[{layer} dropped {finding.get('id')}] {finding.get('text')} "
                 f"({finding.get('file') or 'no file'}; out of scope, no "
                 "missed_earlier — for the record, not to fix)"
-            )
+            ))
         # F-38: the verifier's drops ride the record the same way — the
         # reviewer noise the vote removed, with the reason, never as work.
         for entry in report.get("verifier_dropped") or []:
             finding = entry.get("finding") or {}
-            lines.append(
+            lines.append(_line(
                 f"[{layer} voted out {finding.get('id')}] {finding.get('text')} "
                 f"({entry.get('reason')}) — for the record, not to fix)"
-            )
+            ))
     return [f"{i}. {text}" for i, text in enumerate(lines, start=1)]
 
 
@@ -890,7 +1000,8 @@ def _final_review_field(l2, repeat: bool) -> dict:
 
 
 def _fix_findings(reports: dict, extra: list[str], l2, reviewed: bool,
-                  last_valid_l2: dict | None) -> list[str]:
+                  last_valid_l2: dict | None,
+                  secrets: "Sequence[str]" = ()) -> list[str]:
     """The next round's fix list: actionable findings only.
 
     Dropped findings are excluded (out of scope — fixing their defect
@@ -907,7 +1018,8 @@ def _fix_findings(reports: dict, extra: list[str], l2, reviewed: bool,
     silently replay the older findings as if they had been accepted.
     """
     if reviewed:
-        return _numbered_findings(reports, extra, include_dropped=False)
+        return _numbered_findings(reports, extra, include_dropped=False,
+                                  secrets=secrets)
     if l2 is not None:  # a review ran, but produced no verdict
         extra = [
             "[L2 unreviewed] this round's review produced no verdict — the "
@@ -915,7 +1027,8 @@ def _fix_findings(reports: dict, extra: list[str], l2, reviewed: bool,
             *extra,
         ]
     fix_reports = {**reports, "L2": last_valid_l2}
-    return _numbered_findings(fix_reports, extra, include_dropped=False)
+    return _numbered_findings(fix_reports, extra, include_dropped=False,
+                              secrets=secrets)
 
 
 # The stop's note comes from the classifier's reason, never re-derived
@@ -4138,7 +4251,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                     wipstore.store_findings(
                         ctx.factory_root, project, task_id, work.run_id,
                         _fix_findings(reports, extra_findings, l2, reviewed,
-                                      last_valid_l2))
+                                      last_valid_l2, secrets=egress_secrets))
             entry = {
                 "run_id": attempt["run_id"],
                 "attempt": attempt["rounds"],
@@ -4450,7 +4563,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                 finish(attempt, "needs_human",
                                        _numbered_findings(
                                            reports,
-                                           [f"[L0 escalation] {escalation}"]))
+                                           [f"[L0 escalation] {escalation}"],
+                                           secrets=egress_secrets))
                                 return RunResult("needs_human", task_id,
                                                  escalation=escalation, pr=url,
                                                  reports=reports)
@@ -5118,7 +5232,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                         finish(attempt, "needs_human",
                                _numbered_findings(
                                    reports, [*extra_findings,
-                                             f"[L2 arbiter] {arb_error}"]),
+                                             f"[L2 arbiter] {arb_error}"],
+                                   secrets=egress_secrets),
                                finding_keys=round_keys)
                         return RunResult("needs_human", task_id,
                                          escalation=escalation, pr=url,
@@ -5151,7 +5266,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                _numbered_findings(
                                    reports, [*extra_findings,
                                              f"[L2 arbiter] contract: "
-                                             f"{reason}"]),
+                                             f"{reason}"],
+                                   secrets=egress_secrets),
                                finding_keys=round_keys)
                         return RunResult("needs_human", task_id,
                                          escalation=escalation, pr=url,
@@ -5209,7 +5325,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                             final_exhausted = False
 
                 path = _store(reports_dir, work.run_id, attempt_no, reports)
-                findings = _numbered_findings(reports, extra_findings)
+                findings = _numbered_findings(reports, extra_findings,
+                                               secrets=egress_secrets)
                 passed = all(x is not None and x.verdict == "pass" for x in (l0, l1, l2))
 
                 if passed:
@@ -5331,6 +5448,22 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                         lease_sha=ci_pushed_sha)
                             pushed = True
                             url = ci_pr_url
+                            # F-82 AC-1: a CI fix round's update REFRESHES
+                            # the PR body to this round's — the findings
+                            # section, the evidence, the head it names.
+                            # The leased push above is the substance; a
+                            # failed edit is traced and the publish goes
+                            # on (the old body stays, naming the round
+                            # before — never a park over a display
+                            # refresh while CI runs on the new head).
+                            try:
+                                gh_pr_edit(url, body)
+                            except PublishError as exc:
+                                trace.append({
+                                    "type": "pr_body_refresh_failed",
+                                    "pr": url,
+                                    "reason": str(exc)[:300],
+                                })
                         attempt = attempt_record(attempt_no, started, "pass", records, path,
                                                  pr=url,
                                                  sentinels=list(cast("Any", l0).sentinel_results),
@@ -5383,6 +5516,15 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                             # rewrite above is a no-op (same pr/branch)
                             # but re-saves the queue atomically.
                             queue.transition(task_id, "in_review")
+                        # F-82 AC-2: the publish's follow-up draft — the
+                        # round's still-open findings as ONE draft task,
+                        # written (or replaced/removed/kept) through the
+                        # dedicated state-layer writer. After the
+                        # transitions above: the publish is durable, so
+                        # this is best-effort (see the helper).
+                        followup_out = _record_publish_followup(
+                            queue, task_id, l2, profile, log, trace.append,
+                            egress_secrets, work.run_id)
                         wipstore.discard(ctx.factory_root, project, task_id)
                         # ---- F-75 AC-1/AC-2: CI is part of done ----
                         # The bookkeeping above is durable (attempt,
@@ -5500,7 +5642,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                     return RunResult(
                                         "needs_human", task_id,
                                         escalation="ci_failed", pr=url,
-                                        reports=reports)
+                                        reports=reports,
+                                        followup=followup_out)
                                 # The fix round: same clone (the branch
                                 # holds the pushed head), same branch,
                                 # same PR. The task hops back to
@@ -5516,7 +5659,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                             ci_note = settled.note
                     trace.run_end("published")  # after phase_end: the last line
                     return RunResult("pr_opened", task_id, pr=url,
-                                     reports=reports, note=ci_note)
+                                     reports=reports, note=ci_note,
+                                     followup=followup_out)
 
                 # F-65 AC-3: the SAME out-of-scope path flagged in two
                 # rounds of this run — the implementer had a fix round
@@ -5648,7 +5792,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                 )
                 finish(attempt, None, findings, finding_keys=round_keys)
                 prev_findings = _fix_findings(
-                    reports, extra_findings, l2, reviewed, last_valid_l2)
+                    reports, extra_findings, l2, reviewed, last_valid_l2,
+                    secrets=egress_secrets)
                 task = queue.get(task_id)
             except Exception as exc:
                 # The orchestrator itself failed mid-round (gh after the push,
@@ -5685,7 +5830,9 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                     # double-spend the budget for one failure.
                     attempt = attempt_record(attempt_no, started, "escalated", records,
                                              path, escalation=escalation, note=note)
-                    findings = _numbered_findings(reports, [f"[{escalation}] {note}"])
+                    findings = _numbered_findings(
+                        reports, [f"[{escalation}] {note}"],
+                        secrets=egress_secrets)
                     queue.append_attempt(task_id, attempt)
                     _progress_best_effort(
                         log,

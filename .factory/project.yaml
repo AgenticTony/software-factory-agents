@@ -337,6 +337,12 @@ paths:
     - "tests/test_f80.py"
     - "tests/_support/f80.py"
     - "factory/contractreview.py"
+    # F-82: the follow-up contract tests judge the protected
+    # state/orchestrator/prbody/publish/progress modules (the follow-up
+    # writer and its untouched rule, the PR section's fence and caps,
+    # the fix-round body refresh) — the same precedent as F-79's.
+    - "tests/test_f82.py"
+    - "tests/_support/f82.py"
     # F-71: the dependency policy is judge surface — deps.py decides
     # what a manifest change means, registry.py decides whether a
     # package may be installed, and the generator writes the near-miss

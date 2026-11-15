@@ -1224,9 +1224,14 @@ def test_review9(tmp_path, monkeypatch):
     })
     result = env.run(_Seats(huge_review))
     assert result.outcome == "needs_human", result  # body over size: refused
-    # Scrubbed ONCE each, whatever the shrink loop did: one notes call,
-    # one call per report key — never once per iteration.
-    assert counts["text"] == 1, counts
+    # Scrubbed ONCE per input, whatever the shrink loop did — never once
+    # per iteration. AMENDED BY F-82: the count now includes the channels
+    # F-82 added (each numbered finding line the record logs, and — on a
+    # publish — each follow-up criterion field), still one call per
+    # input: here 1 notes + 1 publish-path finding line + 2 error-path
+    # lines. A per-iteration re-scrub would triple the numbered-line
+    # counts (the loop walks three tails).
+    assert counts["text"] == 4, counts
     assert counts["value"] == 3, counts  # L0, L1, L2 — the report keys
 
     # And the publishable path is unchanged: the scrubbed body still
@@ -1237,7 +1242,10 @@ def test_review9(tmp_path, monkeypatch):
     env2 = _Env(tmp_path / "second")
     result = env2.run(_Seats(_review_with_finding()))
     assert result.outcome == "pr_opened", result
-    assert counts["text"] == 1 and counts["value"] == 3, counts
+    # AMENDED BY F-82 with the follow-up channels: 1 notes + 1 numbered
+    # finding line + 4 follow-up criterion fields (id, severity, file,
+    # text) — still one per input, iteration-independent.
+    assert counts["text"] == 6 and counts["value"] == 3, counts
     (pr,) = env2.prs
     assert SEAT_TOKEN not in pr.body and "[redacted]" in pr.body
 

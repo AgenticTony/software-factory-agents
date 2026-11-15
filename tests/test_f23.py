@@ -521,7 +521,10 @@ def test_review8_a_pass_round_does_not_log_finding_keys(tmp_path: Path):
         ),
     )
     assert env.run(seats).outcome == "pr_opened"
-    last = env.log().entries()[-1]
+    # AMENDED BY F-82: a passing round whose review left findings open
+    # also appends its follow-up entry (type "followup", no outcome) —
+    # the pass entry is the last OUTCOME entry.
+    last = [e for e in env.log().entries() if "outcome" in e][-1]
     assert last["outcome"] == "pass"
     assert "finding_keys" not in last  # red before: the pass logged keys
     # Fail rounds still log them — that is what seeds the next run.
