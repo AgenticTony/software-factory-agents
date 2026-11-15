@@ -1207,6 +1207,7 @@ def build_options(
     bypass_denials: BypassDenials | None = None,
     propose_collector: Any = None,
     scope_collector: Any = None,
+    resume: str | None = None,
 ) -> ClaudeAgentOptions:
     """Build the per-seat ClaudeAgentOptions (WO F-06 options list).
 
@@ -1249,6 +1250,14 @@ def build_options(
     stamps onto the record. ``None`` still denies — the hook makes its
     own state — but only the count that rides a record reaches the
     attempt accounting.
+
+    ``resume`` (F-85): a session id to CONTINUE — the SDK's resume loads
+    the named session's transcript and appends the new prompt as the next
+    turn of the SAME session (``fork_session`` stays False, so the id is
+    kept, never forked). The one use is the repair turn a seat whose
+    verdict failed to parse gets; it needs the session's transcript to
+    still be in ``$HOME`` — the caller reuses the seat's own settings
+    path so the scratch HOME matches. None is every ordinary session.
     """
     seat_config = _seat(seat)
     # F-59: the resolver's literal env when the caller resolved a
@@ -1327,6 +1336,11 @@ def build_options(
         options.cli_path = str(Path(cli_path).expanduser().resolve())
     if model is not None:
         options.model = model
+    if resume is not None:
+        # F-85: continue the SAME session (never fork) — the transcript
+        # the CLI loads is what makes the repair turn cheap.
+        options.resume = resume
+        options.fork_session = False
     return options
 
 
@@ -1904,6 +1918,7 @@ async def run_session(
     toolkit: dict | None = None,
     propose_collector: Any = None,
     scope_collector: Any = None,
+    resume: str | None = None,
 ) -> SessionRecord:
     """Run one seat's session and return what it recorded.
 
@@ -1970,6 +1985,11 @@ async def run_session(
             alone); its requests ride the record out as
             ``scope_requests`` on every exit path. ``Any``-typed for
             the same cycle reason.
+        resume: F-85 — a session id to CONTINUE (see
+            :func:`build_options`): the ONE repair turn a seat whose
+            verdict failed to parse gets, appending to the same
+            conversation instead of a fresh session. None is every
+            ordinary session.
 
     Returns:
         The record: ``completed`` / ``failed`` (with reason) / ``aborted``
@@ -2019,6 +2039,7 @@ async def run_session(
         bypass_denials=bypass_denials,
         propose_collector=propose_collector,
         scope_collector=scope_collector,
+        resume=resume,
     )
 
     def _carry(record: SessionRecord) -> SessionRecord:
@@ -2344,6 +2365,7 @@ def run_session_sandboxed(
     propose: dict | None = None,
     deny_read: "Sequence[Path]" = (),
     scratch_files: "Mapping[str, str] | None" = None,
+    resume: str | None = None,
 ) -> SessionRecord:
     """Run one session with the whole runner process inside the F-05 sandbox.
 
@@ -2408,6 +2430,13 @@ def run_session_sandboxed(
             staged file could ride that seat's diff — refused. The
             scratch is cleaned with the run; names must be bare
             filenames (no path), or the session refuses to start.
+        resume: F-85 — a session id to CONTINUE (the repair turn a seat
+            whose verdict failed to parse gets). The session's
+            transcript must still be in the scratch HOME this call
+            resolves: a fan-out seat's repair passes that seat's own
+            settings path (see :func:`fanout_seat_settings`); a
+            single-session seat (the verifier) reuses the run's own.
+            None is every ordinary session.
 
     Returns:
         The session's record (any status — completed/failed/aborted are
@@ -2512,6 +2541,7 @@ def run_session_sandboxed(
             read_only=review_guard, writable_roots=reviewer_writable,
             run_id=run_id, task_id=task_id, trace_sink=trace_sink,
             toolkit=toolkit, propose=propose, deny_read=deny_read,
+            resume=resume,
         )
     finally:
         try:
@@ -2593,6 +2623,40 @@ def _derive_settings_path(
     )
 
 
+def run_settings_base(run_dir: Path, factory_root: Path | None) -> Path:
+    """The run's base settings path (``<sandbox>/<project>-<run-id>.json``)
+    — the name every fan-out sibling and the verifier's own scratch hang
+    off. F-85: the orchestrator derives it to resume a seat's repair
+    turn in that seat's own HOME; it is the same derivation
+    :func:`run_session_sandboxed` makes, in one place so the two can
+    never drift."""
+    _, settings = _derive_settings_path(Path(run_dir), factory_root, None)
+    return settings
+
+
+def fanout_seat_settings(base: Path, seat: str, ordinal: int) -> Path:
+    """The per-session settings path the fan-out derives for a seat's
+    ``ordinal``-th session of its type (``<base>-r1.json``, ``-v1.json``,
+    …) — the ONE derivation both :func:`_fanout_sandboxed` and the
+    orchestrator's F-85 repair use, so a repair call reuses exactly the
+    settings whose ``-scratch`` HOME holds that seat's transcript."""
+    prefix = "r" if seat == "reviewer" else "v"
+    return Path(base).with_name(f"{Path(base).name}-{prefix}{ordinal}.json")
+
+
+def sweep_fanout_scratch(base: Path) -> None:
+    """Remove every kept fan-out scratch dir under ``base`` (F-85).
+
+    A fan-out asked to ``keep_scratch`` leaves each seat's HOME alive so
+    the parent can resume a repair turn in it; once the round has parsed
+    every verdict (and run every repair it will), the caller sweeps them
+    here — restoring the F-38 teardown contract in the normal flow. The
+    crash backstop is unchanged: ``cleanup_run`` globs the same prefix.
+    """
+    for path in Path(base).parent.glob(f"{Path(base).name}-*-scratch"):
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def run_sessions_parallel(
     specs: "Sequence[tuple[str, str]]",
     run_dir: Path,
@@ -2601,6 +2665,7 @@ def run_sessions_parallel(
     runner: "Callable[..., SessionRecord] | None" = None,
     factory_root: Path | None = None,
     settings_path: Path | None = None,
+    keep_scratch: bool = False,
     **session_kwargs,
 ) -> list[SessionRecord]:
     """Run the review fan-out: N independent sessions over one diff (F-38).
@@ -2622,7 +2687,12 @@ def run_sessions_parallel(
     the seat's ordinal — review finding 1: no shared HOME, TMPDIR,
     CLAUDE_CODE_TMPDIR or cwd slug, so no session can read or rewrite
     another's state, and nothing inside the readable clone is writable),
-    and the fan-out removes them all on exit.
+    and the fan-out removes them all on exit — EXCEPT the scratch roots
+    when ``keep_scratch`` is set: F-85's repair turn resumes a seat in
+    its own HOME (the transcript lives there), so the parent that will
+    parse the verdicts asks to keep them and sweeps them itself (see
+    :func:`sweep_fanout_scratch`; ``cleanup_run`` stays the crash
+    backstop).
 
     With any other runner (the orchestrator's test stubs), the seats are
     called with the same signature through the same thread pool — the
@@ -2637,6 +2707,9 @@ def run_sessions_parallel(
         runner: The seat runner; default :func:`run_session_sandboxed`.
         factory_root / settings_path: The base srt settings location (the
             same derivation as run_session_sandboxed when omitted).
+        keep_scratch: Leave each seat's scratch root on disk for the
+            caller (F-85 repair resume); the caller sweeps (see above).
+            Ignored by non-sandboxed runners.
         **session_kwargs: Everything each session takes (max_turns,
             timeout_min, protected, system_prompt, …) — handed to the
             runner unchanged.
@@ -2662,6 +2735,7 @@ def run_sessions_parallel(
         return _fanout_sandboxed(
             specs, run_dir, profile,
             factory_root=factory_root, settings_path=settings_path,
+            keep_scratch=keep_scratch,
             **session_kwargs,
         )
     # A test (or alternative) runner: same signature, same concurrency,
@@ -2684,6 +2758,7 @@ def _fanout_sandboxed(
     *,
     factory_root: Path | None = None,
     settings_path: Path | None = None,
+    keep_scratch: bool = False,
     **session_kwargs,
 ) -> list[SessionRecord]:
     """The real-runner fan-out: one shared guard, per-session settings and
@@ -2697,7 +2772,9 @@ def _fanout_sandboxed(
     that session's staged dir). Only the guard (baseline + workspace check
     spanning every session) and the scratch naming are the fan-out's own.
     Per-session artifacts (settings, staged runner, staged toolkit,
-    scratch) are removed on every exit path; ``cleanup_run``'s sweep
+    scratch) are removed on every exit path — the scratch root alone is
+    kept when ``keep_scratch`` asks (F-85's repair resume; see the
+    ``run_sessions_parallel`` docstring); ``cleanup_run``'s sweep
     remains the crash backstop for all of them.
 
     F-59: no token is pre-resolved here. Every seat resolves its own
@@ -2722,8 +2799,7 @@ def _fanout_sandboxed(
     per_scratch: list[tuple[Path, Path]] = []
     for seat, _ in specs:
         counts[seat] = counts.get(seat, 0) + 1
-        suffix = ("r" if seat == "reviewer" else "v") + str(counts[seat])
-        settings = base.with_name(f"{base.name}-{suffix}.json")
+        settings = fanout_seat_settings(base, seat, counts[seat])
         per_session.append(settings)
         per_scratch.append(
             _scratch_dirs(settings.with_name(settings.name + "-scratch"))
@@ -2769,7 +2845,13 @@ def _fanout_sandboxed(
                               ignore_errors=True)  # F-22 sibling
                 shutil.rmtree(settings.with_name(settings.name + "-record"),
                               ignore_errors=True)  # F-56 sibling
-                shutil.rmtree(home.parent, ignore_errors=True)
+                if not keep_scratch:
+                    shutil.rmtree(home.parent, ignore_errors=True)
+                # F-85 keep_scratch: the seat's scratch root — its HOME,
+                # holding the session transcript a repair turn resumes —
+                # stays for the caller, which sweeps it (see
+                # sweep_fanout_scratch) once the round's verdicts are
+                # parsed; cleanup_run's glob remains the crash backstop.
     return [record for record in records if record is not None]
 
 
@@ -2800,6 +2882,7 @@ def _run_prepared(
     toolkit: dict | None = None,
     propose: dict | None = None,
     deny_read: "Sequence[Path]" = (),
+    resume: str | None = None,
 ) -> SessionRecord:
     """Stage the runner, write settings, run the sandboxed entry and parse
     its record — the ONE per-session prepare/run/parse step every sandboxed
@@ -2890,6 +2973,9 @@ def _run_prepared(
             {
                 "seat": seat,
                 "prompt": prompt,
+                # F-85: a session id to CONTINUE (the repair turn) —
+                # None is every ordinary session.
+                "resume": resume,
                 "cwd": str(run_dir),
                 "max_turns": max_turns,
                 "timeout_min": timeout_min,
@@ -3410,6 +3496,7 @@ def _main(argv: list[str] | None = None) -> int:
                 protected=spec.get("protected") or (),
                 model=spec.get("model"),
                 system_prompt=spec.get("system_prompt"),
+                resume=spec.get("resume"),
                 cli_path=Path(spec["cli_path"]) if spec.get("cli_path") else None,
                 run_id=spec.get("run_id"),
                 task_id=spec.get("task_id"),

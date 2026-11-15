@@ -737,6 +737,128 @@ def parse_reviews_with_retry(
     return reports, retries
 
 
+# The innermost ``{...}`` spans of a text: a finding object (or a vote
+# object) never nests another object, so one regex reaches every one of
+# them even when the object AROUND them does not parse (F-85's best-effort
+# extraction works on exactly that text).
+_INNERMOST_OBJECT = re.compile(r"\{[^{}]*\}")
+
+# F-85's evidence shape is the trailing comma ("Illegal trailing comma
+# before end of object", runs 140cfb/f49bb7): structural commas dropped
+# before a closing brace/bracket turn most such text into JSON a MINER
+# can read. The STRICT parser never sees the tolerated text — only the
+# extraction does, and its output is marks to compare, never a verdict.
+_TRAILING_COMMA = re.compile(r",\s*([}\]])")
+
+
+def _tolerated_candidates(text: str) -> "list[Any]":
+    """Every dict that survives trailing-comma tolerance and parses — the
+    whole text first (a pure-JSON reply), then each balanced span, last
+    first like :func:`_extract_json`'s candidate order."""
+    tolerated = _TRAILING_COMMA.sub(r"\1", text)
+    candidates: list[Any] = []
+    for raw in [tolerated, *_balanced_objects(tolerated)]:
+        try:
+            value = json.loads(
+                raw, object_pairs_hook=_no_duplicate_keys)
+        except (json.JSONDecodeError, _DuplicateKey, ValueError):
+            continue
+        if isinstance(value, dict):
+            candidates.append(value)
+    return candidates
+
+
+def extract_verdict_marks(text: str) -> "tuple[set[tuple[str, str]], str | None]":
+    """Best-effort ``(id, severity)`` marks and declared verdict from text
+    that FAILED verdict parsing (F-85 AC-2).
+
+    The verdict parser stays exactly as strict — this never accepts
+    anything. It exists so the parent can prove a repair turn did not
+    SHRINK the review it was told only to re-emit: every finding mark the
+    malformed text carried must still be present in the repaired
+    verdict, and a declared verdict the text extractably stated must not
+    have flipped. Mined from the tolerated text's parsed objects first
+    (correct pairing even when a finding's own text quotes JSON), then —
+    for shapes no candidate parses (truncation) — from innermost objects
+    carrying both keys.
+
+    Returns:
+        ``(marks, declared)`` — the ``(id, severity)`` pairs found (the
+        severity canonicalised the parser's way; empty when the text
+        held none), and the declared verdict when every value the text
+        states agrees on ``pass``/``fail`` (``None`` when absent or
+        conflicting — nothing comparable). Prose returns ``({}, None)``.
+    """
+    marks: set[tuple[str, str]] = set()
+    declared: set[str] = set()
+    for data in _tolerated_candidates(text):
+        value = data.get("verdict")
+        if isinstance(value, str):
+            declared.add(value.strip().lower())
+        findings = data.get("findings")
+        if isinstance(findings, list):
+            for item in findings:
+                if not isinstance(item, dict):
+                    continue
+                finding_id = item.get("id")
+                severity = item.get("severity")
+                if (isinstance(finding_id, str)
+                        and isinstance(severity, str)):
+                    marks.add((finding_id, severity.strip().lower()))
+    if not marks:
+        # Truncation-class fallback: pair the keys where both appear in
+        # one innermost object. A finding whose text quotes JSON is not
+        # innermost and is missed here — best effort, and the missed
+        # constraint can only come from a shape the miner cannot read.
+        for match in _INNERMOST_OBJECT.finditer(text):
+            block = match.group(0)
+            id_match = re.search(r'"id"\s*:\s*"([^"]*)"', block)
+            severity_match = re.search(r'"severity"\s*:\s*"([^"]*)"', block)
+            if id_match is None or severity_match is None:
+                continue
+            marks.add((id_match.group(1),
+                       severity_match.group(1).strip().lower()))
+    if not declared:
+        declared = {
+            value.strip().lower()
+            for value in re.findall(r'"verdict"\s*:\s*"([^"]*)"', text)
+        }
+    stated = declared.pop() if len(declared) == 1 else None
+    return marks, (stated if stated in ("pass", "fail") else None)
+
+
+def extract_vote_marks(text: str) -> dict[str, bool]:
+    """Best-effort ``{id: keep}`` marks from text that FAILED vote parsing
+    (F-85 AC-2 over the verifier's vote — the same rule
+    :func:`extract_verdict_marks` applies to verdicts, never a parse).
+
+    Returns:
+        The id → keep mapping mined from the tolerated text's parsed
+        vote objects (then, for truncation-class shapes, from innermost
+        objects carrying both keys). Empty when the text held none —
+        nothing comparable, so a repaired vote that parses is accepted
+        on its own.
+    """
+    marks: dict[str, bool] = {}
+    for data in _tolerated_candidates(text):
+        votes = data.get("votes")
+        if not isinstance(votes, list):
+            continue
+        for item in votes:
+            if (isinstance(item, dict) and isinstance(item.get("id"), str)
+                    and isinstance(item.get("keep"), bool)):
+                marks[item["id"]] = item["keep"]
+    if not marks:
+        for match in _INNERMOST_OBJECT.finditer(text):
+            block = match.group(0)
+            id_match = re.search(r'"id"\s*:\s*"([^"]*)"', block)
+            keep_match = re.search(r'"keep"\s*:\s*(true|false)\b', block)
+            if id_match is None or keep_match is None:
+                continue
+            marks[id_match.group(1)] = keep_match.group(1) == "true"
+    return marks
+
+
 def apply_convergence(
     report: L2Report,
     prior: dict[str, str | None],

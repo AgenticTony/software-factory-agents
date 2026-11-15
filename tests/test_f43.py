@@ -521,6 +521,16 @@ _EGRESS_MODULES = {
             "apply_vote", "apply_convergence", "final_review_verdict",
             "parse_reviews_with_retry", "parse_verifier_vote",
             "parse_arbiter_rulings", "_review_drops", "_esc",
+            # F-85 (amended 2026-11-15): the repair turn's parse-and-
+            # compare path — parse_verdict over the REPAIRED session's
+            # result (the reviewer-verdict twin of parse_verifier_vote),
+            # _repair_verdict_usable/_repair_vote_usable (pure set
+            # comparisons over the parsed marks, returning bools), and
+            # _collect_vote (the closure wrapping parse_verifier_vote;
+            # its vote flows into the same guarded reports channel any
+            # verifier vote does).
+            "parse_verdict", "_repair_verdict_usable",
+            "_repair_vote_usable", "_collect_vote",
             # Prompt builders: session text riding INTO a session's prompt
             # is the review flow itself (ingress), not egress.
             "_implementer_prompt", "_reviewer_prompt", "_verifier_prompt",
