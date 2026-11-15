@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-14T19:00:00Z",
+  "updated_at": "2026-11-15T08:26:25Z",
   "tasks": [
     {
       "id": "F-00",
@@ -5951,7 +5951,7 @@
       "source": "BUILD-ORDER.md#f-78--a-scope-changed-pr-keeps-its-work-the-keep-the-pr-reset-for-scope-parks",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-77"
       ],
@@ -6011,7 +6011,10 @@
           ".factory/BOOTSTRAP.md",
           "docs/run-loop.md"
         ]
-      }
+      },
+      "acceptance_hash": "e74075cdd55c5af907f1f04d49c1fc5840fb66580b074aa83f5526dc82fbd337",
+      "approved_at": "2026-11-15T08:26:24Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-79",
@@ -6019,7 +6022,7 @@
       "source": "BUILD-ORDER.md#f-79--fix-round-work-survives-and-any-pr-park-resumes",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-78"
       ],
@@ -6085,7 +6088,10 @@
           ".factory/BOOTSTRAP.md",
           "docs/run-loop.md"
         ]
-      }
+      },
+      "acceptance_hash": "04f8adea4abb28764fb4c8c0abbdb08b1c533aa77449445dcd706e9b1c2ba94b",
+      "approved_at": "2026-11-15T08:26:25Z",
+      "approved_by": "Anthony"
     }
   ]
 }
