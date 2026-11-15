@@ -807,3 +807,45 @@ def gh_pr_close(pr_url: str, *, gh_bin: Path | str | None = None) -> None:
         raise PublishError(
             f"gh pr close failed for {pr_url}: {proc.stderr.strip()[:300]}"
         )
+
+
+def gh_pr_edit(pr_url: str, body: str, *, gh_bin: Path | str | None = None) -> None:
+    """Replace a PR's body (``gh pr edit --body-file``) — F-82 AC-1: a
+    CI fix round's leased update refreshes the body to that round's
+    findings, so the PR never carries the round-before's story over a
+    head it no longer holds.
+
+    The body travels through a temp file outside every clone, exactly
+    as :func:`gh_pr_create` carries it (argv limits, ``ps``).
+
+    Raises:
+        PublishError: gh is missing or the call failed. The caller
+            treats a failed refresh as best-effort (the branch update is
+            the substance; the old body stays and the trace names the
+            failure) — never as a reason to park a task whose CI is
+            already running on the new head.
+    """
+    gh = str(gh_bin) if gh_bin else shutil.which("gh")
+    if not gh:
+        raise PublishError(
+            "cannot edit the PR body: gh is not installed (F-82)"
+        )
+    # The same backstop gh_pr_create runs (the title is not edited, so
+    # only the body's free text is judged): a fence the body built
+    # cannot have lost between the push and the edit, but the seam is
+    # cheap and independent by design.
+    check_pr_text("", body)
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as fh:
+        fh.write(body)
+        body_path = Path(fh.name)
+    try:
+        proc = remote_call(
+            [gh, "pr", "edit", pr_url, "--body-file", str(body_path)],
+            env_extra=GH_NET_ENV, what=f"gh pr edit body ({pr_url})",
+        )
+    finally:
+        body_path.unlink(missing_ok=True)
+    if proc.returncode != 0:
+        raise PublishError(
+            f"gh pr edit failed for {pr_url}: {proc.stderr.strip()[:300]}"
+        )

@@ -185,6 +185,11 @@ class ProgressLog:
         owner telemetry for `factory status` (F-11) and the F-19 review,
         not fresh-session context — a vent says what friction the last
         sessions hit, which the round entries already summarise better.
+        F-82 follow-up entries (``type: "followup"``) do not render
+        either: they are the follow-up writer's MEMORY (the exact draft
+        it wrote, embedded so a later round can tell untouched from
+        owner-edited), and the findings a session must act on already
+        reach it as that round's findings to fix.
 
         Args:
             omit_last_findings: Drop the newest entry's findings field.
@@ -192,6 +197,7 @@ class ProgressLog:
         entries = [
             record for record in self.entries()
             if record.get("kind") != "vent"
+            and record.get("type") != "followup"
         ]
         if not entries:
             return ""

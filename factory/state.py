@@ -56,8 +56,11 @@ from factory.contract import (
     canonical_json,
     contract_hash,
     load_tasks,
+    scope_pattern_error,
     validate_queue,
 )
+from factory.gates import scope_matches
+from factory.prbody import open_finding_line
 
 # All task statuses. MIRRORS the schema's status enum
 # (factory/data/schema/tasks.schema.json $defs/status); keep both in sync.
@@ -1157,6 +1160,59 @@ def _lease_busy_message(queue_path: Path, holder_line: str) -> str:
     )
 
 
+def _build_followup(task: dict, findings: list, floor: dict) -> dict:
+    """The follow-up draft :meth:`TaskQueue.record_followup` writes —
+    pure shape, no queue access, so the writer's decisions and the
+    record it must recognise on a later round are the SAME function's
+    output (the untouched test is equality against this).
+
+    ``findings`` are the round's still-open L2 findings as clean dicts
+    (``id``/``severity``/``file``/``line``/``text``), each string
+    already through the egress escape — the criterion text reuses the
+    PR body's one-line rendering so the owner reads one shape
+    everywhere. ``floor`` is the profile's budget floor.
+    """
+    original_paths = (
+        (task.get("scope") or {}).get("paths")
+        if isinstance(task.get("scope"), dict) else None
+    ) or []
+    scope_paths: list[str] = []
+    for finding in findings:
+        file = finding.get("file") if isinstance(finding, dict) else None
+        if (not isinstance(file, str) or not file or file in scope_paths
+                or scope_pattern_error(file) is not None
+                or not scope_matches(file, original_paths)):
+            # A file the finding names outside the original scope never
+            # enters the follow-up's scope (it stays a criterion); a
+            # malformed name (absolute, climbing, classes) is dropped
+            # rather than poisoning the queue's load-time scope check.
+            continue
+        scope_paths.append(file)
+    followup: dict = {
+        "id": f"{task['id']}-followup",
+        "title": f"Follow-up: {task.get('title', '')}",
+        "source": task.get("source", ""),
+        "kind": task.get("kind", "build"),
+        "priority": task.get("priority", "P2"),
+        "status": "draft",
+        "depends_on": [task["id"]],
+        "risk": list(task.get("risk") or []),
+        "gates": {"spec_approval": True, "merge": "human", "deploy": "human"},
+        "acceptance": [
+            {"id": f"AC-{index}", "text": open_finding_line(finding),
+             "check": {"type": "manual"}}
+            for index, finding in enumerate(findings, start=1)
+        ],
+        "budget": {"size": "S", "max_attempts": 1,
+                   "max_turns": floor["max_turns"],
+                   "wall_clock_min": floor["wall_clock_min"]},
+        "attempts": [],
+    }
+    if scope_paths:
+        followup["scope"] = {"paths": sorted(scope_paths)}
+    return followup
+
+
 class TaskQueue:
     """The orchestrator's handle on a ``tasks.json`` — its only writer.
 
@@ -1280,6 +1336,116 @@ class TaskQueue:
         _drop_wip(task)
         self.save()
         return wip
+
+    def record_followup(self, task_id: str, *, findings: list,
+                        floor: dict, remembered: "dict | None") -> dict:
+        """F-82 AC-2: the one writer of a publish's follow-up draft.
+
+        Called by the publish path with the round's still-open L2
+        findings (each string field ALREADY through the egress escape —
+        the queue refuses control characters at load), the profile's
+        budget floor, and the follow-up record the factory last wrote
+        (from the task's progress log; None when the log names none).
+        Writes ONE ``<task_id>-followup`` task — status ``draft``,
+        ``kind``/``source``/``priority``/``risk`` copied from the
+        original, ``depends_on: [task_id]``, title "Follow-up: …", one
+        acceptance criterion per finding with a ``manual`` check, budget
+        at the floor, scope the finding files intersected with the
+        original scope (omitted when the intersection is empty — the
+        owner completes it at approval).
+
+        A later publish REPLACES the draft while it is still exactly
+        what the factory wrote (``remembered``); once the owner has
+        approved it (status no longer ``draft``) or edited it (record no
+        longer the remembered one), the writer never touches it again.
+        No findings → no task, and an untouched draft from an earlier
+        round is REMOVED (a draft holds no attempts, so the append-only
+        rule allows it).
+
+        Returns:
+            ``{"action": drafted | replaced | removed | kept | none,
+               "id": the follow-up id, "reason": why (kept/none only),
+               "task": the record written (drafted/replaced only),
+               "count": findings carried}``.
+
+        Raises:
+            StateError: Unknown original task.
+            TransitionError: The original is not ``in_review`` — the
+                writer runs at publish, nowhere else.
+            ContractError: The resulting queue would not validate.
+            ConcurrentWriteError: Another writer changed the file.
+        """
+        task = self.get(task_id)
+        if task.get("status") != "in_review":
+            raise TransitionError(
+                f"{task_id}: a follow-up draft is written only for a "
+                f"task whose round just published (status is "
+                f"{task.get('status')!r}, not 'in_review')"
+            )
+        followup_id = f"{task_id}-followup"
+        existing = next(
+            (t for t in self.doc.get("tasks", [])
+             if isinstance(t, dict) and t.get("id") == followup_id),
+            None,
+        )
+        if not findings:
+            if existing is None:
+                return {"action": "none", "id": followup_id,
+                        "reason": "no findings and no follow-up exists",
+                        "task": None, "count": 0}
+            if existing.get("status") != "draft":
+                return {"action": "kept", "id": followup_id,
+                        "reason": (
+                            f"{followup_id} is no longer draft "
+                            f"(status {existing.get('status')!r}) — the "
+                            "owner approved it; a round with no findings "
+                            "never removes an approved follow-up"),
+                        "task": None, "count": 0}
+            if remembered is None or existing != remembered:
+                return {"action": "kept", "id": followup_id,
+                        "reason": (
+                            f"{followup_id} no longer holds exactly what "
+                            "the factory wrote — the owner edited it; a "
+                            "round with no findings never removes an "
+                            "edited follow-up"),
+                        "task": None, "count": 0}
+            self.doc["tasks"] = [
+                t for t in self.doc.get("tasks", [])
+                if not (isinstance(t, dict) and t.get("id") == followup_id)
+            ]
+            self.save()
+            return {"action": "removed", "id": followup_id,
+                    "reason": "the round published with no findings open",
+                    "task": None, "count": 0}
+        built = _build_followup(task, findings, floor)
+        if existing is None:
+            self.doc.setdefault("tasks", []).append(built)
+            self.save()
+            return {"action": "drafted", "id": followup_id, "reason": None,
+                    "task": built, "count": len(findings)}
+        if existing.get("status") != "draft":
+            return {"action": "kept", "id": followup_id,
+                    "reason": (
+                        f"{followup_id} is no longer draft (status "
+                        f"{existing.get('status')!r}) — the owner "
+                        "approved it; the writer never touches it again"),
+                    "task": None, "count": 0}
+        if remembered is None or existing != remembered:
+            return {"action": "kept", "id": followup_id,
+                    "reason": (
+                        f"{followup_id} no longer holds exactly what the "
+                        "factory wrote — the owner edited it (or the "
+                        "task is foreign: the factory has no record of "
+                        "writing it); the writer never touches it again"),
+                    "task": None, "count": 0}
+        self.doc["tasks"] = [
+            built if (isinstance(t, dict) and t.get("id") == followup_id)
+            else t
+            for t in self.doc.get("tasks", [])
+        ]
+        self.save()
+        return {"action": "replaced", "id": followup_id, "reason": None,
+                "task": built, "count": len(findings)}
 
     def recover_credential(self, task_id: str, evidence: str, *,
                            keep_pr: bool = False,

@@ -8,6 +8,10 @@ validator facts, never from the agent's own account:
 * **Evidence** — per contract test ref: red on base (with L1's
   ``red_reason``) and green on head, read from the L1 report's command
   results.
+* **Review findings left open** (F-82, optional) — one fenced line per
+  finding a PASSING L2 still carried: the non-blocking findings that
+  ride the merge, with the draft follow-up task that carries them
+  named. A round with none adds the section not at all.
 * **Sentinels** — every sentinel L0 ran on the diff, pass or fail (F-25),
   as a table read from the L0 report's ``sentinel_results``.
 * **Merge Danger** — **Door** (``one-way`` when the task carries any of
@@ -42,6 +46,19 @@ REQUIRED_SECTIONS = (
     "Validator report",
     "How to revert",
 )
+
+# F-82: the section a passing round with still-open findings adds to the
+# PR body (optional — a round with none adds nothing, so it is not in
+# REQUIRED_SECTIONS; check_pr_body never demands it and the fence below
+# is what keeps it from ever being forged into a second heading).
+OPEN_FINDINGS_SECTION = "Review findings left open"
+# The render caps for that section: at most this many finding lines and
+# this many characters of section body (GitHub's whole-body limit is
+# 65,536; the caps keep the section's contribution bounded whatever the
+# review carried — the omitted count is stated, never silent, and the
+# follow-up task carries every finding).
+OPEN_FINDINGS_MAX_LINES = 50
+OPEN_FINDINGS_MAX_CHARS = 6000
 
 # Data that leaked, money that moved, a schema that migrated, a deploy that
 # shipped, a call an external service acted on: reverting the code recalls
@@ -268,7 +285,21 @@ def build_pr_body(
         "Validator report": _validator_section(reports),
         "How to revert": how_to_revert(task, profile, extra_flags),
     }
-    body = "\n\n".join(f"## {name}\n\n{sections[name]}" for name in REQUIRED_SECTIONS)
+    # F-82: the still-open findings ride directly under the evidence —
+    # decision-relevant in front of the merger, before the danger
+    # section; a round with none adds the section not at all (it is
+    # optional, so check_pr_body never demands it).
+    open_findings = build_open_findings_section(reports, task["id"])
+    ordered = [
+        ("Summary", sections["Summary"]),
+        ("Evidence", sections["Evidence"]),
+    ]
+    if open_findings is not None:
+        ordered.append((OPEN_FINDINGS_SECTION, open_findings))
+    ordered += [
+        (name, sections[name]) for name in REQUIRED_SECTIONS[2:]
+    ]
+    body = "\n\n".join(f"## {name}\n\n{content}" for name, content in ordered)
     return body + "\n\n---\nOpened by the software factory. A human reviews and merges.\n"
 
 
@@ -352,6 +383,75 @@ def _flat(value) -> str:
     included) collapse to single spaces, so each dropped finding renders
     as a single readable list line inside the fence that holds it."""
     return " ".join(str(value or "").split())
+
+
+def open_finding_line(finding: dict) -> str:
+    """One still-open finding as one line — ``id [severity] file:line:
+    text`` — the shape both the PR section and the follow-up task's
+    acceptance criteria render (F-82). Missing parts drop out; every
+    part is flattened, so the line cannot wrap or forge structure.
+
+    The finding dict is session-derived text: callers pass it through
+    the egress seam first (the PR body renders the scrubbed report; the
+    follow-up task's criteria render the scrubbed AND escaped form the
+    queue demands).
+    """
+    where = _flat(finding.get("file"))
+    line = finding.get("line")
+    if isinstance(line, int) and where:
+        where = f"{where}:{line}"
+    head = " ".join(
+        part for part in (
+            _flat(finding.get("id")),
+            f"[{_flat(finding.get('severity'))}]"
+            if finding.get("severity") else "",
+            f"{where}:" if where else "",
+        ) if part
+    )
+    return f"{head} {_flat(finding.get('text'))}".strip()
+
+
+def build_open_findings_section(reports: dict, task_id: str) -> "str | None":
+    """F-82 AC-1: the "Review findings left open" section — one line per
+    finding the passing L2 still carries, fenced, capped, naming the
+    follow-up task that carries them.
+
+    Read from the (already egress-scrubbed) report projection the body
+    builds from; ``None`` when the round's L2 carries no finding (the
+    body then adds nothing). ``L2-delta`` is deliberately not read: the
+    final review owns the open set at a pass.
+    """
+    l2 = reports.get("L2")
+    findings = (l2 or {}).get("findings") if isinstance(l2, dict) else None
+    findings = [f for f in findings or [] if isinstance(f, dict)]
+    if not findings:
+        return None
+    lines: list[str] = []
+    used = 0
+    for finding in findings[:OPEN_FINDINGS_MAX_LINES]:
+        rendered = f"- {open_finding_line(finding)}"
+        if len(rendered) > 1000:
+            # A monster text truncates rather than refuses the publish:
+            # the whole finding rides the Validator report and the
+            # follow-up criterion, both uncapped.
+            rendered = rendered[:1000] + " …"
+        if used + len(rendered) > OPEN_FINDINGS_MAX_CHARS and lines:
+            break
+        lines.append(rendered)
+        used += len(rendered) + 1
+    omitted = len(findings) - len(lines)
+    if omitted > 0:
+        lines.append(
+            f"- … and {omitted} more finding(s) not shown here — every "
+            "one is a criterion of the follow-up task and rides the "
+            "Validator report below")
+    intro = (
+        f"**The review passed with {len(findings)} finding(s) still "
+        "open** — none blocking. One draft follow-up task "
+        f"`{task_id}-followup` carries them (nothing was approved "
+        "automatically; approve the task to schedule the work):"
+    )
+    return intro + "\n\n" + fence("\n".join(lines), "text")
 
 
 def check_pr_body(body: str) -> None:
