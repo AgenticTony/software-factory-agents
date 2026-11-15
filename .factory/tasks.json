@@ -6326,6 +6326,71 @@
           ".factory/BOOTSTRAP.md"
         ]
       }
+    },
+    {
+      "id": "F-85",
+      "title": "A reviewer's malformed verdict gets one repair turn, not a new session",
+      "source": "BUILD-ORDER.md#f-85--a-reviewers-malformed-verdict-gets-one-repair-turn-not-a-new-session",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-83"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "When a reviewer or verifier session completes and its output fails verdict parsing, the parent sends ONE follow-up turn to the SAME session: the parse error, the required schema, and 're-emit the verdict only; do not change any finding'. If the re-emitted verdict parses, it is used and the trace records `reviewer_repair`. If it does not, today's full retry runs, counted against today's retry budget. If the SDK path cannot continue a finished session, report that as a spec hole instead of emulating it with a new session.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f85.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "The repair turn cannot change the review: the parent compares the finding ids and severities present in the unparseable text (best effort, by the ids it can extract) with the repaired verdict and falls back to the full retry when the set shrank. The parser itself is untouched: no lenient mode.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f85.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "The repair turn's tokens and turn count are recorded in the attempt's usage (per seat, F-83's shape if it has landed; today's shape otherwise).",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f85.py::test_ac_3"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 80,
+        "wall_clock_min": 60
+      },
+      "scope": {
+        "paths": [
+          "factory/orchestrator.py",
+          "factory/session.py",
+          "factory/l2.py",
+          "tests/test_f85.py",
+          "BUILD-ORDER.md",
+          ".factory/tasks.json",
+          ".factory/project.yaml",
+          ".factory/BOOTSTRAP.md"
+        ]
+      }
     }
   ]
 }

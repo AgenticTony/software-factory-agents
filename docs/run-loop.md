@@ -190,6 +190,7 @@ The target is 2 owner touches per task: approve and merge.
 
 ## Known gaps carried forward (fix only if a run hits them)
 - The clone has no virtualenv and no git identity before the session (F-73 AC-2, shelved). wo21 run 1 burned turns on it.
+- ~~A malformed verdict re-ran the whole reviewer session~~ (F-85, from the 140cfb/f49bb7 `reviewer_retry` traces): a completed seat whose verdict or vote fails to parse gets ONE repair turn on the SAME session (the SDK's resume) before today's full re-run — the parse error, the schema, "re-emit the verdict only; do not change any finding". The parsers stay exactly as strict; a repair that shrinks what the malformed text carried falls back to the re-run.
 - ~~A failed session records no token usage~~ (F-74 AC-1's usage half, taken over by F-83): a session the SDK ends with a delivered result message keeps its turns/usage/cost whatever the outcome; a session that died before any result (wall clock, a transport error) still records none — its usage renders unknown, never 0.
 - A retry gets only the failure line, not the previous attempt's work (F-73 AC-3, shelved) — fixed for fix rounds on an open PR by F-79 (the kept commit plus that round's review findings); a fresh run's later attempts still get only the progress log.
 - Local queue state lives in the repo's `.factory/tasks.json`, so a contract PR forces the owner to discard local state before pulling (step 3). This is new from this prep and becomes a WO only if it bites again.

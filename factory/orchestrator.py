@@ -101,9 +101,12 @@ from factory.l0 import run_l0
 from factory.l1 import run_l1
 from factory.l2 import (
     L2Finding,
+    extract_verdict_marks,
+    extract_vote_marks,
     merge_reviews,
     parse_arbiter_rulings,
     parse_reviews_with_retry,
+    parse_verdict,
     parse_verifier_vote,
     settle_review_verdict,
 )
@@ -162,10 +165,13 @@ from factory.sandbox import (
 )
 from factory.session import (
     SessionRecord,
+    fanout_seat_settings,
     parse_scope_requests,
     probe_session_interpreter,
     run_session_sandboxed,
     run_sessions_parallel,
+    run_settings_base,
+    sweep_fanout_scratch,
 )
 from factory.state import (
     ELIGIBLE_KINDS,
@@ -261,6 +267,13 @@ ARBITER_TURN_CAP = 20
 # (never a remainder, never a number a session record funds); used by
 # factory.contractreview, which runs the seat outside any task run.
 CONTRACT_REVIEWER_TURN_CAP = 20
+# F-85 AC-1: the repair turn's fixed parent-side turn cap. A repair
+# resumes the SAME session (the SDK's resume) with one instruction —
+# re-emit the verdict/vote you just produced, correctly formatted. That
+# is a single assistant turn; the cap leaves slack for a tool call the
+# seat makes on the way, and a repair that needs MORE than this is not
+# a formatting slip — today's full re-run decides it.
+REPAIR_TURN_CAP = 4
 
 # F-64 AC-1: the wall-clock minutes reserved for the review/verify fan-out.
 # The implementer's timeout is wall_clock_min minus this reserve, so a
@@ -1393,6 +1406,136 @@ def _verifier_prompt(task: dict, diff: str, union: list, delta: str | None = Non
         "",
     ]
     return "\n".join(parts)
+
+
+def _repair_reviewer_prompt(parse_error: str) -> str:
+    """F-85 AC-1: the ONE follow-up turn a reviewer seat whose verdict
+    failed to parse gets, sent to the SAME session (SDK resume — the
+    seat keeps its context; it does not re-read the diff). The parse
+    error verbatim, the required schema (the reviewer prompt's own
+    verdict protocol), and the instruction that bounds what a repair may
+    do. The parse itself is never weakened."""
+    return "\n".join([
+        "Your previous reply was not a valid verdict, so it could not be "
+        "used:",
+        "",
+        parse_error,
+        "",
+        "Emit the verdict again as exactly one JSON object and nothing "
+        "else that could be mistaken for one:",
+        "",
+        "```json",
+        "{",
+        '  "verdict": "pass or fail",',
+        '  "findings": [',
+        "    {",
+        '      "id": "R-1",',
+        '      "axis": "spec or standards",',
+        '      "severity": "blocking, major, minor or note",',
+        '      "file": "path/from/the/diff",',
+        '      "line": 12,',
+        '      "text": "what is wrong, with the evidence",',
+        '      "missed_earlier": "only on fix rounds: why round one '
+        'missed a finding outside the delta"',
+        "    }",
+        "  ]",
+        "}",
+        "```",
+        "",
+        "Re-emit the verdict only; do not change any finding.",
+    ])
+
+
+def _repair_verifier_prompt(parse_error: str) -> str:
+    """F-85 AC-1 over the verifier's vote — the same ONE follow-up turn
+    :func:`_repair_reviewer_prompt` gives a reviewer, with the vote
+    protocol's schema."""
+    return "\n".join([
+        "Your previous reply was not a valid vote, so it could not be "
+        "used:",
+        "",
+        parse_error,
+        "",
+        "Emit the vote again as exactly one JSON object and nothing else "
+        "that could be mistaken for one:",
+        "",
+        "```json",
+        "{",
+        '  "votes": [',
+        "    {",
+        '      "id": "U-1",',
+        '      "keep": true,',
+        '      "reason": "what you checked that confirms it",',
+        '      "tag": "important, nit or pre-existing"',
+        "    },",
+        "    {",
+        '      "id": "U-2",',
+        '      "keep": false,',
+        '      "reason": "which drop case, and the evidence"',
+        "    }",
+        "  ]",
+        "}",
+        "```",
+        "",
+        "Re-emit the vote only; do not change any vote.",
+    ])
+
+
+def _repair_verdict_usable(
+    original_text: str, report: "Any",
+) -> "tuple[bool, bool]":
+    """F-85 AC-2: whether a PARSED repaired verdict may replace the seat's
+    malformed one — ``(usable, shrunk)``.
+
+    The repair was told "re-emit the verdict only; do not change any
+    finding", so the parent compares what the malformed text best-effort
+    carried (:func:`factory.l2.extract_verdict_marks` — the parser itself
+    is untouched) with what the repair now says: every ``(id, severity)``
+    mark must survive (a dropped or re-rated finding — a blocking finding
+    softened, a blocker gone — is a SHRINK), and a declared verdict the
+    text extractably stated must not have flipped (fail -> pass is the
+    hostile direction; pass -> fail disobeyed the same instruction). A
+    text that carried nothing comparable (prose, or a verdict object too
+    broken to mine) imposes no constraint: the repair's verdict is the
+    seat's first parseable one, judged by the strict parser alone."""
+    marks, declared = extract_verdict_marks(original_text)
+    repaired = {
+        (finding.id, finding.severity)
+        for finding in report.findings
+        if isinstance(finding, L2Finding)
+    }
+    shrunk = bool(marks - repaired) or (
+        declared is not None and report.declared is not None
+        and declared != report.declared
+    )
+    return (not shrunk, shrunk)
+
+
+def _repair_vote_usable(original_text: str, outcome: "Any") -> bool:
+    """F-85 AC-2 over the verifier's vote: every ``(id, keep)`` mark the
+    malformed vote best-effort carried must be unchanged in the repaired
+    outcome (:func:`factory.l2.extract_vote_marks`; the vote parser is
+    untouched). A flip either way disobeyed "do not change any vote": a
+    keep that became a drop silences a finding, a drop that became a
+    keep un-drops one the verifier had evidence against. A vote that
+    carried nothing comparable constrains nothing."""
+    marks = extract_vote_marks(original_text)
+    kept = {
+        finding.id
+        for finding in outcome.kept
+        if isinstance(finding, L2Finding)
+    }
+    dropped = {
+        entry.get("finding", {}).get("id")
+        for entry in outcome.dropped
+        if isinstance(entry, dict)
+    }
+    for finding_id, keep in marks.items():
+        if keep and finding_id not in kept:
+            return False
+        if not keep and finding_id not in dropped:
+            return False
+    return True
 
 
 def _arbiter_prompt(task: dict, diff: str, findings: list) -> str:
@@ -4140,6 +4283,98 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                     f"original escalation was {escalation}: {note}"
                 )
 
+        def _repair_review_seat(seat_no, session, parse_error, spend):
+            """F-85 AC-1: ONE follow-up turn on the SAME session that
+            produced an unparseable verdict — the SDK's resume (same
+            session id, same transcript: the seat keeps its context and
+            re-emits, it does not re-read the diff), carrying the parse
+            error, the verdict schema and "re-emit the verdict only; do
+            not change any finding".
+
+            Only a COMPLETED session with a resumable id qualifies — a
+            dead session has nothing to repair, and the full re-run is
+            the only recovery. The turn runs at the fixed
+            :data:`REPAIR_TURN_CAP` inside the same wall-clock fit a
+            re-run would get (recomputed; a window that cannot fit a
+            repair cannot fit the re-run either, and the re-run names
+            the refusal).
+
+            Returns the repair's record when it is the seat's verdict
+            (parsed and, per AC-2, not a shrink of what the malformed
+            text carried — :func:`_repair_verdict_usable`), OR when it
+            died on quota (the caller aborts on it like any recovery
+            record); ``None`` when no repair ran or it fell back — then
+            today's full re-run decides. A repair turn can never fail
+            the round by itself: a raising runner is traced and treated
+            as a fallback."""
+            nonlocal session_seconds
+            if session.status != "completed" or not session.session_id:
+                return None
+            fit = _retry_budget(budget, session_seconds)
+            if fit.refusal is not None:
+                return None  # no window for any recovery; the re-run names it
+            # The seat's OWN settings: the repair must resume in the HOME
+            # that holds the session's transcript — the fan-out seat's
+            # scratch the orchestrator asked it to keep.
+            seat_settings = fanout_seat_settings(
+                run_settings_base(clean.root, ctx.factory_root),
+                "reviewer", seat_no)
+            t0 = time.monotonic()
+            try:
+                record = ctx.session_runner(
+                    "reviewer", _repair_reviewer_prompt(parse_error),
+                    clean.root, profile,
+                    factory_root=ctx.factory_root,
+                    settings_path=seat_settings,
+                    resume=session.session_id,
+                    max_turns=REPAIR_TURN_CAP, timeout_min=fit.wall,
+                    protected=protected, system_prompt=reviewer_system,
+                    srt_bin_path=ctx.srt_bin_path,
+                    run_id=work.run_id, task_id=task_id,
+                    trace_sink=trace.append, toolkit=toolkit_reviewer,
+                )
+            except Exception as exc:  # noqa: BLE001 — never fails the round
+                trace.append({
+                    "type": "reviewer_repair", "seat": "reviewer",
+                    "seat_no": seat_no, "status": "error",
+                    "reason": f"{type(exc).__name__}: {exc}"[:300],
+                    "original_status": session.status,
+                    "original_reason": parse_error,
+                    "outcome": "fell_back",
+                })
+                return None
+            session_seconds += time.monotonic() - t0
+            records.append(record)
+            spend.add(record)
+            _log_vents(log, record, "reviewer", work.run_id, task_id,
+                       egress_secrets)
+            trace.session_end(record, "reviewer")
+            if _is_quota(record):
+                trace.append({
+                    "type": "reviewer_repair", "seat": "reviewer",
+                    "seat_no": seat_no, "status": record.status,
+                    "reason": record.reason,
+                    "original_status": session.status,
+                    "original_reason": parse_error, "outcome": "quota",
+                })
+                return record
+            usable, shrunk = False, False
+            if record.status == "completed":
+                report = parse_verdict(record.result)
+                if report.parse_error is None:
+                    usable, shrunk = _repair_verdict_usable(
+                        session.result or "", report)
+            trace.append({
+                "type": "reviewer_repair", "seat": "reviewer",
+                "seat_no": seat_no, "status": record.status,
+                "reason": record.reason,
+                "original_status": session.status,
+                "original_reason": parse_error,
+                "outcome": "used" if usable else "fell_back",
+                "shrunk": shrunk,
+            })
+            return record if usable else None
+
         def _rerun_review_seat(prompt, spend, retry_records, outcomes,
                                seat_no, session, parse_error):
             """ONE retry of one reviewer seat whose verdict failed to
@@ -4148,16 +4383,29 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
             drives it and decides whether the retry's verdict is used; a
             still-invalid retry keeps the fail-closed union FAIL.
 
+            F-85 (2026-11-15, runs 140cfb/f49bb7): a COMPLETED seat gets
+            ONE repair turn on its own session first
+            (:func:`_repair_review_seat`) — a formatting slip costs one
+            turn, not a 13-turn re-run. The repair IS the returned
+            record when usable (or quota-dead: the caller aborts); a
+            repair that falls back changes nothing here — the full
+            re-run below runs exactly as before, counted against the
+            same one-retry-per-seat budget.
+
             Budget-fitted (round 3; F-64 fixed-cap): the re-run runs at
             the parent-granted :data:`REVIEWER_TURN_CAP` and is REFUSED
             — ``None``, counted as no retry — only when the wall clock
             (:func:`_retry_budget`, recomputed from parent-measured
-            time) cannot fit one; the refusal's budget is named in
-            ``outcomes`` for the seat's note. A re-run that dies on
-            quota is not a refusal: its record lands in
-            ``retry_records`` (and the caller aborts the attempt exactly
-            like the fan-out's own quota branch — one shared path,
-            :func:`_quota_exhausted` below).
+            time, and shrunk by any repair that ran) cannot fit one; the
+            refusal's budget is named in ``outcomes`` for the seat's
+            note. A re-run that dies on quota is not a refusal: its
+            record lands in ``retry_records`` (and the caller aborts the
+            attempt exactly like the fan-out's own quota branch — one
+            shared path, :func:`_quota_exhausted` below). The re-run's
+            fan-out runs under its OWN settings base (``-retry<n>``):
+            the seats' originals are kept alive for repairs, and a
+            re-run must never run inside the HOME of the session whose
+            verdict it is re-producing.
 
             The retry's session is recorded like any reviewer seat —
             records, spend, vents, trace — plus its own
@@ -4165,15 +4413,27 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
             seat number and the original failure (the attempt record is
             schema-locked, so the trace is the retry's ledger)."""
             nonlocal session_seconds
+            repair = _repair_review_seat(seat_no, session, parse_error,
+                                         spend)
+            if repair is not None:
+                # The repair's verdict is the seat's — or it died on
+                # quota and the caller aborts on this record. Its usage
+                # already rode records/spend (AC-3).
+                retry_records.append(repair)
+                outcomes[seat_no] = {"repair": repair}
+                return repair
             fit = _retry_budget(budget, session_seconds)
             if fit.refusal is not None:
                 outcomes[seat_no] = {"refused": fit.refusal}
                 return None
             retry_turns, retry_wall = fit.turns, fit.wall
+            base = run_settings_base(clean.root, ctx.factory_root)
             t0 = time.monotonic()
             record = run_sessions_parallel(
                 [("reviewer", prompt)], clean.root, profile,
                 runner=ctx.session_runner, factory_root=ctx.factory_root,
+                settings_path=base.with_name(
+                    base.name + f"-retry{seat_no}"),
                 max_turns=retry_turns, timeout_min=retry_wall,
                 protected=protected, system_prompt=reviewer_system,
                 srt_bin_path=ctx.srt_bin_path,
@@ -4267,6 +4527,91 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                 extra_findings.append(
                     f"[L2 {label} seat {seat_no}] {original}; {reran}")
             return verdicts, None
+
+        def _collect_vote(session, findings, spend):
+            """F-85 AC-1 for the verifier seat: parse the vote, and when
+            the session COMPLETED but the vote failed to parse, ONE
+            follow-up turn on the SAME session (the SDK's resume — the
+            verifier keeps the diff it already read) carrying the parse
+            error, the vote schema and "re-emit the vote only; do not
+            change any vote".
+
+            A repaired vote that parses and changes no ``(id, keep)``
+            mark the malformed text carried (:func:`_repair_vote_usable`)
+            IS the vote; anything else — prose, a dead repair session, a
+            changed vote, no wall clock left, no resumable id — is
+            today's outcome exactly: an invalid vote drops nothing, and
+            :attr:`L2Report.verifier_error` names why. There is no
+            verifier re-run to fall back to (there never was one).
+
+            Returns ``(vote, repair_record)`` — the repair's record only
+            when it died on quota, so the caller aborts the attempt on
+            it exactly like the verifier's own quota branch."""
+            nonlocal session_seconds
+            vote = parse_verifier_vote(
+                session.result if session.status == "completed"
+                else None, findings)
+            error = vote.error
+            if (error is None or session.status != "completed"
+                    or not session.session_id):
+                return vote, None
+            remaining = budget["wall_clock_min"] - session_seconds / 60.0
+            if remaining <= 0:
+                return vote, None
+            t0 = time.monotonic()
+            try:
+                record = ctx.session_runner(
+                    "verifier", _repair_verifier_prompt(error),
+                    clean.root, profile,
+                    factory_root=ctx.factory_root,
+                    resume=session.session_id,
+                    max_turns=REPAIR_TURN_CAP, timeout_min=remaining,
+                    protected=protected, system_prompt=verifier_system,
+                    srt_bin_path=ctx.srt_bin_path,
+                    run_id=work.run_id, task_id=task_id,
+                    trace_sink=trace.append, toolkit=toolkit_reviewer,
+                )
+            except Exception as exc:  # noqa: BLE001 — never fails the round
+                trace.append({
+                    "type": "reviewer_repair", "seat": "verifier",
+                    "seat_no": 1, "status": "error",
+                    "reason": f"{type(exc).__name__}: {exc}"[:300],
+                    "original_status": session.status,
+                    "original_reason": error, "outcome": "fell_back",
+                })
+                return vote, None
+            session_seconds += time.monotonic() - t0
+            records.append(record)
+            spend.add(record)
+            _log_vents(log, record, "verifier", work.run_id, task_id,
+                       egress_secrets)
+            trace.session_end(record, "verifier")
+            if _is_quota(record):
+                trace.append({
+                    "type": "reviewer_repair", "seat": "verifier",
+                    "seat_no": 1, "status": record.status,
+                    "reason": record.reason,
+                    "original_status": session.status,
+                    "original_reason": error, "outcome": "quota",
+                })
+                return vote, record
+            usable = False
+            if record.status == "completed":
+                repaired = parse_verifier_vote(record.result, findings)
+                if repaired.error is None:
+                    usable = _repair_vote_usable(session.result or "",
+                                                 repaired)
+                    if usable:
+                        vote = repaired
+            trace.append({
+                "type": "reviewer_repair", "seat": "verifier",
+                "seat_no": 1, "status": record.status,
+                "reason": record.reason,
+                "original_status": session.status,
+                "original_reason": error,
+                "outcome": "used" if usable else "fell_back",
+            })
+            return vote, None
 
         # F-30: the attempt every trace event of this round is stamped with,
         # and the attempt outcome mapped to --follow's terminal marker.
@@ -4758,6 +5103,11 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                     run_id=work.run_id, task_id=task_id,
                                     trace_sink=trace.append,  # F-30
                                     toolkit=toolkit_reviewer,  # F-22: narrowed
+                                    # F-85: the seats' scratch HOMEs stay
+                                    # until this round's verdicts are
+                                    # parsed (a repair turn resumes a seat
+                                    # in its own HOME); swept below.
+                                    keep_scratch=True,
                                 )
                                 session_seconds += time.monotonic() - t0
                                 records.extend(reviews)
@@ -4782,6 +5132,12 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                     "reviewer")
                                 if quota_result is not None:
                                     return quota_result
+                                # F-85: every verdict is parsed and every
+                                # repair this round will run has run — the
+                                # seats' transcripts are spent.
+                                sweep_fanout_scratch(
+                                    run_settings_base(clean.root,
+                                                      ctx.factory_root))
                                 union = merge_reviews(verdicts)
                                 vote = None
                                 if union.parse_error is None and union.findings:
@@ -4873,12 +5229,16 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                             f"{verifier.reason} — nothing was "
                                             "dropped; every finding stands"
                                         )
-                                    vote = parse_verifier_vote(
-                                        verifier.result
-                                        if verifier.status == "completed"
-                                        else None,
-                                        union.findings,
-                                    )
+                                    # F-85: a completed verifier whose vote
+                                    # failed to parse gets ONE repair turn
+                                    # on its own session before the
+                                    # invalid-vote fallback.
+                                    vote, verifier_repair = _collect_vote(
+                                        verifier, union.findings,
+                                        review_spend)
+                                    if verifier_repair is not None:
+                                        return _quota_exhausted(
+                                            verifier_repair)
                                 # F-48 (M-3): the post-review chain — union,
                                 # vote, convergence — is ONE shared function
                                 # (factory.l2.settle_review_verdict), so the
@@ -5028,6 +5388,9 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                     run_id=work.run_id, task_id=task_id,
                                     trace_sink=trace.append,  # F-30
                                     toolkit=toolkit_reviewer,  # F-22: narrowed
+                                    # F-85: kept for this review's repair
+                                    # turns, swept below.
+                                    keep_scratch=True,
                                 )
                                 session_seconds += time.monotonic() - t0
                                 records.extend(final_reviews)
@@ -5046,6 +5409,11 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                     "final-review")
                                 if quota_result is not None:
                                     return quota_result
+                                # F-85: this review's repairs are done —
+                                # sweep the seats' transcripts.
+                                sweep_fanout_scratch(
+                                    run_settings_base(clean.root,
+                                                      ctx.factory_root))
                                 union = merge_reviews(verdicts)
                                 vote = None
                                 if union.parse_error is None and union.findings:
@@ -5129,12 +5497,13 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                             f"{verifier.reason} — nothing was "
                                             "dropped; every finding stands"
                                         )
-                                    vote = parse_verifier_vote(
-                                        verifier.result
-                                        if verifier.status == "completed"
-                                        else None,
-                                        union.findings,
-                                    )
+                                    # F-85: one repair turn for a malformed
+                                    # vote, before the invalid-vote fallback.
+                                    vote, verifier_repair = _collect_vote(
+                                        verifier, union.findings, final_spend)
+                                    if verifier_repair is not None:
+                                        return _quota_exhausted(
+                                            verifier_repair)
                                 # AC-2: the F-23 delta rules do not apply —
                                 # the full diff is the scope, nothing is out
                                 # of it and no missed_earlier is owed — so
@@ -6186,8 +6555,8 @@ def _recover_accept_leased(
                     f"{sha[:12]}"
                 )
             # The review, as a normal full-diff round: the fan-out, one
-            # parse retry per seat, the verifier over findings, the ONE
-            # shared settle chain.
+            # repair turn then one parse retry per seat (F-85), the
+            # verifier over findings, the ONE shared settle chain.
             protected = list((profile.get("paths") or {}).get("protected") or [])
             reviewer_system = assemble_reviewer_prompt(profile)
             verifier_system = assemble_verifier_prompt(profile)
@@ -6195,11 +6564,55 @@ def _recover_accept_leased(
             diff = hardened_git(clean.root, "diff", "--no-color",
                                 "--no-ext-diff", f"{base}...{sha}")
             prompt = _review_prompt(live, diff, l0.to_dict(), l1.to_dict())
+            accept_base = run_settings_base(clean.root, factory_root)
+
+            def repair(seat_no, session, parse_error):
+                """F-85 on the accept path: the same ONE repair turn
+                :func:`_run_task` gives a seat whose verdict failed to
+                parse. No trace lives here (none of this path's sessions
+                are traced today); the repair is observable through what
+                it changes — the verdict used, or the re-run that
+                follows."""
+                if session.status != "completed" or not session.session_id:
+                    return None
+                try:
+                    record = runner(
+                        "reviewer", _repair_reviewer_prompt(parse_error),
+                        clean.root, profile,
+                        factory_root=factory_root,
+                        settings_path=fanout_seat_settings(
+                            accept_base, "reviewer", seat_no),
+                        resume=session.session_id,
+                        max_turns=REPAIR_TURN_CAP, timeout_min=60.0,
+                        protected=protected,
+                        system_prompt=reviewer_system,
+                        srt_bin_path=srt_bin_path,
+                        run_id=work.run_id, task_id=task_id,
+                        toolkit=toolkit_reviewer,
+                    )
+                except Exception:  # noqa: BLE001 — the re-run is the fallback
+                    return None
+                if _is_quota(record):
+                    return record  # parse_reviews_with_retry stops on it
+                if record.status != "completed":
+                    return None
+                report = parse_verdict(record.result)
+                if report.parse_error is not None:
+                    return None
+                usable, _ = _repair_verdict_usable(session.result or "",
+                                                   report)
+                return record if usable else None
 
             def rerun(seat_no, session, parse_error):
+                record = repair(seat_no, session, parse_error)
+                if record is not None:
+                    return record
+                base_settings = accept_base.with_name(
+                    accept_base.name + f"-retry{seat_no}")
                 record = run_sessions_parallel(
                     [("reviewer", prompt)], clean.root, profile,
                     runner=runner, factory_root=factory_root,
+                    settings_path=base_settings,
                     max_turns=REVIEWER_TURN_CAP,
                     timeout_min=60.0, protected=protected,
                     system_prompt=reviewer_system, srt_bin_path=srt_bin_path,
@@ -6216,8 +6629,10 @@ def _recover_accept_leased(
                 srt_bin_path=srt_bin_path, run_id=work.run_id,
                 task_id=task_id,
                 toolkit=toolkit_reviewer,
+                keep_scratch=True,  # F-85: repairs resume in-seat
             )
             verdicts, _ = parse_reviews_with_retry(reviews, rerun, stop=_is_quota)
+            sweep_fanout_scratch(accept_base)  # F-85: repairs are done
             union = merge_reviews(verdicts)
             vote = None
             if union.parse_error is None and union.findings:
@@ -6234,6 +6649,36 @@ def _recover_accept_leased(
                     verifier.result if verifier.status == "completed" else None,
                     union.findings,
                 )
+                # F-85: a malformed vote from a completed verifier gets
+                # its ONE repair turn here too — no trace on this path,
+                # the same as every other session it runs.
+                if (vote.error is not None
+                        and verifier.status == "completed"
+                        and verifier.session_id):
+                    try:
+                        repaired = runner(
+                            "verifier", _repair_verifier_prompt(vote.error),
+                            clean.root, profile,
+                            factory_root=factory_root,
+                            resume=verifier.session_id,
+                            max_turns=REPAIR_TURN_CAP, timeout_min=30.0,
+                            protected=protected,
+                            system_prompt=verifier_system,
+                            srt_bin_path=srt_bin_path,
+                            run_id=work.run_id, task_id=task_id,
+                            toolkit=toolkit_reviewer,
+                        )
+                    except Exception:  # noqa: BLE001 — keep today's outcome
+                        repaired = None
+                    if (repaired is not None
+                            and repaired.status == "completed"
+                            and not _is_quota(repaired)):
+                        candidate = parse_verifier_vote(
+                            repaired.result, union.findings)
+                        if (candidate.error is None
+                                and _repair_vote_usable(
+                                    verifier.result or "", candidate)):
+                            vote = candidate
             l2 = settle_review_verdict(
                 union, {}, frozenset(), delta_mode=False, vote=vote,
                 reviewers=config.reviewers, final=True,

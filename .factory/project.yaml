@@ -349,6 +349,11 @@ paths:
     # not-ready line) — the same precedent as F-79's.
     - "tests/test_f83.py"
     - "tests/_support/f83.py"
+    # F-85: the repair-turn contract tests judge the protected
+    # orchestrator/session/l2 modules (one resume turn before the
+    # re-run, no shrink, the repair's usage on the attempt) — the same
+    # precedent as F-79/F-83's.
+    - "tests/test_f85.py"
     # F-71: the dependency policy is judge surface — deps.py decides
     # what a manifest change means, registry.py decides whether a
     # package may be installed, and the generator writes the near-miss

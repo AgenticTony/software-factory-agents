@@ -850,6 +850,16 @@ Acceptance:
 
 After it merges: the next run's attempt records and `factory status <task>` speak the honest numbers; the wo21 rows stay pre-F-83 shape (old records load unchanged) and are re-read through the per-seat lens only in new runs.
 
+### F-85 — A reviewer's malformed verdict gets one repair turn, not a new session
+Found by the run loop on 2026-11-15 (runs `20261114T184258Z-140cfb` and `20261114T134530Z-f49bb7`, trace event `reviewer_retry`): a trailing comma in a reviewer's verdict voided the parse and the WHOLE reviewer session was re-run — 13 turns, about $0.34, for a formatting slip. The parse stays exactly as strict; the recovery gets cheaper: ONE follow-up turn on the SAME session (the SDK's resume — same session id, same transcript), carrying the parse error, the required schema and "re-emit the verdict only; do not change any finding".
+
+Acceptance:
+- AC-1 One repair turn, then today's retry. When a reviewer or verifier session completes and its output fails verdict parsing, the parent sends ONE follow-up turn to the SAME session (resume; a completed session with no resumable id, or a dead session, goes straight to today's recovery). The turn runs at a tight fixed cap (`REPAIR_TURN_CAP`) inside the same wall-clock fit a re-run would get, and its trace event is `reviewer_repair` (outcome `used`/`fell_back`/`quota`). If the re-emitted verdict parses, it is the seat's; if it does not, today's full re-run runs, counted against today's one-retry-per-seat budget. A repair that dies on quota aborts the attempt exactly like a quota'd re-run. The verifier gets the same turn before its invalid-vote fallback (there is no verifier re-run today either).
+- AC-2 The repair cannot change the review. The parent best-effort extracts the `(id, severity)` marks and the declared verdict from the unparseable text (`factory.l2.extract_verdict_marks`) and the `(id, keep)` marks from an unparseable vote (`extract_vote_marks`), and falls back to today's recovery when the set shrank (a dropped or re-rated finding, a keep that became a drop) or the declared verdict flipped. Nothing comparable extracted imposes no constraint. The parsers themselves are untouched: no lenient mode.
+- AC-3 The repair's cost is recorded. The repair turn's tokens, turns and cost ride the attempt's usage like any session (per seat, F-83's shape): `turns_by_seat`, `token_usage`, `provider_usage`, `cost_usd`, and the `session_end` trace row.
+
+After it merges: the fan-out keeps each seat's scratch HOME until its round's verdicts are parsed (a repair resumes in the seat's own HOME), sweeps it after; a re-run's fan-out runs under its own `-retry<n>` settings base so it never runs inside the HOME of the session whose verdict it re-produces. The eval's review path is unchanged (its scripted seats carry no session ids, so no repair ever fires there).
+
 ## Phase 1c — First outside project
 
 ### F-13 — Onboard JobFinderOS (pilot)
