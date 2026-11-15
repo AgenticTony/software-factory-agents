@@ -328,6 +328,15 @@ paths:
     - "tests/test_f79.py"
     - "tests/_support/f79.py"
     - "factory/wip.py"
+    # F-80: same precedent — the contract-review tests judge the
+    # protected session/provider/l2/approve modules and the profile
+    # schema (the seat's sandbox contract, the strict parse, the store
+    # path rule, what approval shows). contractreview.py decides what
+    # the owner sees at the approval prompt and what reaches a
+    # reviewer's prompt: judge surface from the day it exists.
+    - "tests/test_f80.py"
+    - "tests/_support/f80.py"
+    - "factory/contractreview.py"
     # F-71: the dependency policy is judge surface — deps.py decides
     # what a manifest change means, registry.py decides whether a
     # package may be installed, and the generator writes the near-miss

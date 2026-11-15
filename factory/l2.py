@@ -124,6 +124,7 @@ import re
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, ClassVar, NamedTuple, Sequence, cast
 
+from factory.egress import strip_control_sequences
 from factory.gates import Finding, GateReport
 
 VALID_AXES = ("spec", "standards")
@@ -1179,6 +1180,179 @@ def parse_arbiter_rulings(output: Any, finding_ids: Sequence[str]) -> ArbiterOut
             "must be ruled"
         )
     return ArbiterOutcome(rulings=rulings, error=None)
+
+
+# F-80 AC-1: the contract review's protocol. The enums are the whole
+# vocabulary — a lens or severity outside them fails the review.
+CONTRACT_REVIEW_LENSES = ("purpose", "testability", "scope", "ambiguity",
+                          "budget")
+CONTRACT_REVIEW_SEVERITIES = ("blocker", "major", "minor")
+CONTRACT_REVIEW_FINDING_KEYS = ("id", "lens", "severity", "text",
+                                "criterion", "suggested_change")
+# Bounds, never semantics: a review past them is not a review the owner
+# can read at an approval prompt.
+CONTRACT_REVIEW_MAX_FINDINGS = 40
+CONTRACT_REVIEW_MAX_TEXT = 2000
+_CONTRACT_FINDING_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,31}")
+# ONE enclosing fence around the whole output is the only wrapping
+# accepted (models fence JSON by habit); anything outside it is prose.
+_WHOLE_FENCE = re.compile(r"```(?:json)?[^\S\n]*\n(.*)\n[^\S\n]*```", re.DOTALL)
+
+
+class ContractReviewOutcome(NamedTuple):
+    """A contract review's findings (F-80 AC-1). ``error`` is set iff the
+    output was not a valid review, in which case ``findings`` is empty."""
+
+    findings: list
+    error: str | None
+
+
+def validate_contract_findings(
+    data: Any, criterion_ids: Sequence[str]
+) -> ContractReviewOutcome:
+    """Validate a decoded contract-review object (F-80 AC-1).
+
+    The shape is exactly ``{"findings": [{id, lens, severity, text,
+    criterion, suggested_change}]}``: no other key at either level, every
+    finding key present. ``lens`` and ``severity`` come from the two
+    enums; ``id`` is a short token, unique in the review; ``text`` is
+    non-empty; ``criterion`` is null or one of ``criterion_ids`` (a
+    finding about a criterion the contract does not have is unverifiable);
+    ``suggested_change`` is null or non-empty text. A string carrying a
+    terminal control sequence, a duplicate finding (same lens, criterion
+    and text) or a bound exceeded fails too. Every violation fails the
+    WHOLE review — the one rule the session's parse and the stored
+    file's re-read at approval share.
+
+    Args:
+        data: The decoded JSON value.
+        criterion_ids: The contract's acceptance ids.
+
+    Returns:
+        The :class:`ContractReviewOutcome`; strings are stripped.
+    """
+
+    def invalid(reason: str) -> ContractReviewOutcome:
+        return ContractReviewOutcome(findings=[], error=reason)
+
+    def text_error(value: Any, what: str) -> str | None:
+        if not isinstance(value, str) or not value.strip():
+            return f"{what} must be non-empty text"
+        if len(value.strip()) > CONTRACT_REVIEW_MAX_TEXT:
+            return (f"{what} is longer than {CONTRACT_REVIEW_MAX_TEXT} "
+                    "characters")
+        if strip_control_sequences(value) != value:
+            return f"{what} carries a terminal control sequence"
+        return None
+
+    if not isinstance(data, dict):
+        return invalid("the review must be one JSON object")
+    if set(data) != {"findings"}:
+        return invalid(
+            "the review object must hold exactly the key 'findings' (got "
+            f"{sorted(map(str, data))!r})")
+    items = data["findings"]
+    if not isinstance(items, list):
+        return invalid("'findings' must be a list")
+    if len(items) > CONTRACT_REVIEW_MAX_FINDINGS:
+        return invalid(
+            f"{len(items)} findings is over the bound of "
+            f"{CONTRACT_REVIEW_MAX_FINDINGS}")
+    known = set(criterion_ids)
+    seen_ids: set[str] = set()
+    seen_content: set[tuple] = set()
+    findings: list[dict] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            return invalid(f"finding {index} is not an object")
+        if set(item) != set(CONTRACT_REVIEW_FINDING_KEYS):
+            return invalid(
+                f"finding {index} must hold exactly the keys "
+                f"{list(CONTRACT_REVIEW_FINDING_KEYS)} (got "
+                f"{sorted(map(str, item))!r})")
+        fid = item["id"]
+        if not isinstance(fid, str) or not _CONTRACT_FINDING_ID_RE.fullmatch(fid):
+            return invalid(f"finding {index} has an invalid id: {fid!r:.80}")
+        if fid in seen_ids:
+            return invalid(f"two findings share the id {fid!r}")
+        seen_ids.add(fid)
+        lens = item["lens"]
+        if not isinstance(lens, str) or lens not in CONTRACT_REVIEW_LENSES:
+            return invalid(
+                f"finding {fid!r}: lens is not one of "
+                f"{list(CONTRACT_REVIEW_LENSES)}: {lens!r:.80}")
+        severity = item["severity"]
+        if not isinstance(severity, str) \
+                or severity not in CONTRACT_REVIEW_SEVERITIES:
+            return invalid(
+                f"finding {fid!r}: severity is not one of "
+                f"{list(CONTRACT_REVIEW_SEVERITIES)}: {severity!r:.80}")
+        error = text_error(item["text"], f"finding {fid!r}: text")
+        if error:
+            return invalid(error)
+        criterion = item["criterion"]
+        if criterion is not None and (
+                not isinstance(criterion, str) or criterion not in known):
+            return invalid(
+                f"finding {fid!r}: criterion {criterion!r:.80} is neither "
+                f"null nor one of the contract's {sorted(known)!r}")
+        change = item["suggested_change"]
+        if change is not None:
+            error = text_error(change, f"finding {fid!r}: suggested_change")
+            if error:
+                return invalid(error)
+        content = (lens, criterion, " ".join(item["text"].split()).casefold())
+        if content in seen_content:
+            return invalid(
+                f"finding {fid!r} repeats an earlier finding (same lens, "
+                "criterion and text)")
+        seen_content.add(content)
+        findings.append({
+            "id": fid, "lens": lens, "severity": severity,
+            "text": item["text"].strip(), "criterion": criterion,
+            "suggested_change": change.strip() if change is not None else None,
+        })
+    return ContractReviewOutcome(findings=findings, error=None)
+
+
+def parse_contract_review(
+    output: Any, criterion_ids: Sequence[str]
+) -> ContractReviewOutcome:
+    """Parse a contract-reviewer session's output, strictly (F-80 AC-1).
+
+    The arbiter ruling parse's shape, one notch stricter on purpose: the
+    reviewed contract has no approval yet, and what this returns is put
+    in front of the owner at the approval prompt. The WHOLE output must
+    be ONE JSON object — optionally inside one enclosing code fence, and
+    nothing else: prose before or after it, a second object, a second
+    fence or a duplicated key each fail the review (there is no
+    candidate search and no last-wins here — a session that says two
+    things said nothing). The object is then held to
+    :func:`validate_contract_findings`.
+
+    Args:
+        output: The session's result text (or None / non-text when the
+            session failed — same treatment).
+        criterion_ids: The contract's acceptance ids.
+
+    Returns:
+        The :class:`ContractReviewOutcome`. On ``error``, no findings.
+    """
+    if not isinstance(output, str):
+        return ContractReviewOutcome(findings=[], error=(
+            f"the session produced no review text ({type(output).__name__})"))
+    text = output.strip()
+    fenced = _WHOLE_FENCE.fullmatch(text)
+    if fenced is not None:
+        text = fenced.group(1).strip()
+    try:
+        data = json.loads(text, object_pairs_hook=_no_duplicate_keys)
+    except (json.JSONDecodeError, _DuplicateKey, ValueError,
+            RecursionError) as exc:
+        return ContractReviewOutcome(findings=[], error=(
+            "the output is not exactly one JSON object (prose, a second "
+            f"object or a repeated key fails the review): {str(exc):.200}"))
+    return validate_contract_findings(data, criterion_ids)
 
 
 def parse_verifier_vote(output: Any, findings: Sequence[L2Finding]) -> VerifierOutcome:

@@ -41,6 +41,18 @@ the public internet) are deselected by the main CI job and run in the named
 `live-network` job instead. CI (`.github/workflows/ci.yml`) runs the same
 steps plus the `typecheck` (pyright) and `wheel` install jobs.
 
+## Operating: review a contract before you approve it (F-80)
+
+`factory review-contract <task-id>` runs one read-only model session that
+reads a task's contract and the document its `source` names (as committed
+on the default branch) and reports findings under five lenses — purpose,
+testability, scope, ambiguity, budget. A valid review is stored under
+`<factory-root>/contract-reviews/`, keyed by the contract hash, and
+`factory approve <task-id>` shows it above the y/N, blockers first. It is
+advice: nothing blocks on it and nothing is edited for you; any change to
+the contract makes the stored review stale. It spends one session, so run
+it outside the peak window (TASK-CONTRACT §3).
+
 ## Operating: the monthly validator eval (F-16)
 
 The validator is measured, not assumed. `factory eval` seeds the known

@@ -92,11 +92,17 @@ PROVIDER_KINDS = ("zai", "anthropic", "bedrock", "vertex",
 # owner may override it with ``seat_providers.arbiter`` under the same
 # providers_allowed rule as every seat (an F-63 security group, so the
 # override re-approval-gates the profile).
-SEAT_ROLES = ("implementer", "reviewer", "verifier", "importer", "arbiter")
+# F-80 adds ``contract_reviewer`` — the pre-approval contract review seat
+# — on exactly the arbiter's terms: no model of its own, the reviewer's
+# provider and model by default, ``seat_providers.contract_reviewer`` as
+# the owner's override (same providers_allowed rule, same F-63 group).
+SEAT_ROLES = ("implementer", "reviewer", "verifier", "importer", "arbiter",
+              "contract_reviewer")
 
 # Seats whose default resolution is ANOTHER seat's: the arbiter runs the
-# reviewer's provider and model unless the owner overrode it (F-72 AC-2).
-SEAT_DEFAULTS = {"arbiter": "reviewer"}
+# reviewer's provider and model unless the owner overrode it (F-72 AC-2);
+# so does the contract reviewer (F-80 AC-1).
+SEAT_DEFAULTS = {"arbiter": "reviewer", "contract_reviewer": "reviewer"}
 
 # One keychain item per kind: ``factory-<kind>``. ``factory-zai`` is the
 # production item DESIGN D2 named, unchanged (keychain_service("zai") is
@@ -362,7 +368,8 @@ def resolve_provider(profile: Mapping[str, Any],
             region = override.get("region")
             base_url = override.get("base_url")
         elif seat in SEAT_DEFAULTS:
-            # F-72 AC-2: an un-overridden arbiter IS the reviewer's seat —
+            # F-72 AC-2: an un-overridden arbiter IS the reviewer's seat
+            # (F-80: the contract reviewer likewise) —
             # the reviewer's provider override (if any) and the reviewer's
             # model. The owner's pending decision is the override hook;
             # the default picks nothing new.

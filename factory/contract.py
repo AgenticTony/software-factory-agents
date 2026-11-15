@@ -140,6 +140,27 @@ def contract_hash(task: dict) -> str:
     Returns:
         Hex SHA-256 digest.
     """
+    canonical = json.dumps(contract_view(task), sort_keys=True,
+                           separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def contract_view(task: dict) -> dict:
+    """The task's CONTRACT — exactly the content :func:`contract_hash`
+    covers: the task minus :data:`CONTRACT_HASH_EXCLUDED_FIELDS` and each
+    owner step's :data:`OWNER_STEP_HASH_EXCLUDED_FIELDS`.
+
+    The one definition of "the contract" both the hash and the F-80
+    contract review read: what the reviewer is shown is what the owner's
+    approval will cover, never the task's lifecycle or history (status,
+    attempts, links, approval stamps).
+
+    Args:
+        task: The task record.
+
+    Returns:
+        A new dict (the task is not mutated; nested values are shared).
+    """
     trimmed = {
         key: value for key, value in task.items()
         if key not in CONTRACT_HASH_EXCLUDED_FIELDS
@@ -155,9 +176,7 @@ def contract_hash(task: dict) -> str:
             steps.append(step)
     if steps or "owner_steps" in trimmed:
         trimmed["owner_steps"] = steps
-    canonical = json.dumps(trimmed, sort_keys=True, separators=(",", ":"),
-                           ensure_ascii=False)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return trimmed
 
 
 def _field(task: dict, key: str) -> Any:

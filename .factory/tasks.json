@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-15T08:26:25Z",
+  "updated_at": "2026-11-15T12:00:00Z",
   "tasks": [
     {
       "id": "F-00",
@@ -6092,6 +6092,83 @@
       "acceptance_hash": "04f8adea4abb28764fb4c8c0abbdb08b1c533aa77449445dcd706e9b1c2ba94b",
       "approved_at": "2026-11-15T08:26:25Z",
       "approved_by": "Anthony"
+    },
+    {
+      "id": "F-80",
+      "title": "A fresh-context review of the contract before the owner approves it",
+      "source": "BUILD-ORDER.md#f-80--a-fresh-context-review-of-the-contract-before-the-owner-approves-it",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-79"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "The command: `factory review-contract <task-id>` runs ONE session on a new read-only seat `contract_reviewer` (the verifier's exact sandbox contract: no edit tools, the workspace-integrity guard; provider and model through the one resolver, the reviewer's by default, `seat_providers.contract_reviewer` as the owner's override — F-59's providers_allowed rule and F-63's re-approval unchanged) under a fixed parent-side turn cap of 20 beside the arbiter's. Its prompt holds exactly: the contract (the content `contract_hash` covers); the source document the task's `source` names, read by the parent from the session's clone of the remote default branch (so only tracked content can reach a prompt), capped, narrowed to the `#heading` section when one is named, fenced under an untrusted heading; the profile's risk and protected globs; and the clone's tracked file list (paths only, capped). Never progress logs, attempt history, other tasks or earlier reviews. The parent parses the output strictly: the whole output is one JSON object `{findings: [{id, lens, severity, text, criterion|null, suggested_change|null}]}` (one enclosing code fence tolerated, nothing else), `lens` in `purpose | testability | scope | ambiguity | budget`, `severity` in `blocker | major | minor`; an unknown or missing key, a wrong enum, a duplicate id, finding or JSON key, an unknown criterion, a terminal control sequence, a bound exceeded, or any text outside the object fails the WHOLE review — nothing stored, non-zero exit. A valid review is stored atomically at `<factory_root>/contract-reviews/<project>/<task>/<contract-hash>.json` with the provider record and the session-reported usage; the path builder refuses (never sanitises) a task id or project that is not a safe component. The queue file is byte-identical before and after. The session runs under the queue's run lease, refuses inside the peak window, requires the profile's owner approval, and works on `draft` and every later status. A source path that is absolute, carries `..`, resolves outside the clone (a symlink out of it included) or is missing refuses before any session.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f80.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "The five lenses are in the prompt, specific, and pinned by test. Purpose: if every criterion passes, is the stated purpose achieved — name one concrete way it could fail while all criteria pass. Testability: each criterion has a check that can fail; one that cannot distinguish done from not done is a finding. Scope: files the work plausibly needs that `scope.paths` omits (the reviewer may read the clone), and scope paths matching a risk glob the contract's `risk` does not declare. Ambiguity: wording two implementers would build differently. Budget: turns/attempts implausible for the size. The prompt forbids proposing new features. The lens block sits after the untrusted material, in the parent's own section.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f80.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "The owner sees it at approval: `factory approve <task-id>` shows, before the y/N, the stored review for the task's CURRENT contract hash: counts, then every finding, blockers first, each value escaped with the function approval text uses. No review for the current hash: one line saying so and naming the command — not a refusal. A review of a different hash only: one line calling it stale, its findings not shown. A store file that is not a valid review of this contract (its recorded project, task or hash differ, or its findings fail the session-output validator) is one line and not shown. `--yes` is unchanged, and nothing about the review changes what approval refuses, asks or records.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f80.py::test_ac_3"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 150,
+        "wall_clock_min": 120
+      },
+      "scope": {
+        "paths": [
+          "factory/contractreview.py",
+          "factory/l2.py",
+          "factory/contract.py",
+          "factory/session.py",
+          "factory/provider.py",
+          "factory/orchestrator.py",
+          "factory/approve.py",
+          "factory/cli.py",
+          "factory/data/schema/project.schema.json",
+          "tests/test_f80.py",
+          "tests/_support/f80.py",
+          "TASK-CONTRACT.md",
+          "VALIDATOR-SPEC.md",
+          "BUILD-ORDER.md",
+          "README.md",
+          "CLAUDE.md",
+          ".factory/tasks.json",
+          ".factory/project.yaml",
+          ".factory/BOOTSTRAP.md",
+          "docs/run-loop.md"
+        ]
+      }
     }
   ]
 }

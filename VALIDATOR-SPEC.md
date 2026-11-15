@@ -20,6 +20,10 @@ Each layer catches what the others can't. L0–L3 run before a PR opens; L4 runs
 | **L3 Holdout scenarios** | Orchestrator, local/preview build | Test creds only | Agent optimising for the visible tests instead of the intent |
 | **L4 Live verification** | Orchestrator, after deploy | Yes (keychain) | "Merged ≠ live"; drift between repo and production |
 
+### Before L0 — the contract review (F-80, advisory)
+
+The layers below prove a change against its contract; none of them asks whether the contract is right. `factory review-contract <task-id>` is the one model-judged check that runs BEFORE approval and before any spend on the work: a single read-only `contract_reviewer` session reads the contract and its source document through five fixed lenses (purpose, testability, scope, ambiguity, budget) and the parent stores its strictly-parsed findings keyed by the contract hash. It is not a layer and not a gate — `factory approve` shows the findings for the current hash and the owner decides; a missing, stale or blocker-carrying review refuses nothing. Its trust rules are the judge seats' own: read-only sandbox plus the workspace-integrity guard, untrusted text fenced as data, the output accepted only as one exact object, every shown value escaped (TASK-CONTRACT §3, "Contract review before approval").
+
 ### L0 — Deterministic gates (no model involved)
 
 Run from `project.yaml` on a **fresh clone of the slice's branch**, not the worker's own checkout:

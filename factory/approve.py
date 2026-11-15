@@ -54,6 +54,7 @@ from factory.contract import (
     budget_floor,
     load_profile,
 )
+from factory.contractreview import approval_lines as contract_review_lines
 from factory.egress import escape_approval_text
 from factory.gates import (
     GateError,
@@ -634,6 +635,13 @@ def approve_task(
             "packages (F-71)"
         )
     echo(render_contract(task, warnings=warnings))
+    # F-80 AC-3: the stored contract review for THIS contract hash, in
+    # view before the y/N — blockers first, every value escaped. Advice
+    # only: no review, a stale one or a blocker changes nothing about
+    # what approval refuses, asks or records (--yes included).
+    echo("\n".join(contract_review_lines(
+        factory_root or FACTORY_ROOT_DEFAULT,
+        queue.doc.get("project") or "unknown", task)))
     if not assume_yes and not confirm(f"Approve {task_id}?"):
         raise ApprovalDeclined(f"{task_id}: approval declined")
     _freeze_contract(task, approved_by)
