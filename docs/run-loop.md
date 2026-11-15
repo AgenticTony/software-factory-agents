@@ -79,6 +79,7 @@ This takes about 15 minutes and is not a full review. Its sources:
 | 2026-11-14 | wo21 run 6 (F-77 live) | needs_human scope_change_needed (budget spent 2/2, PR kept) | 2 (reset, merge #139) | 60 + 43 | pending usage | ~29 min | a scope park on an open PR with spent budget has no exit that keeps the work (F-78); `factory adopt` named by the contract but absent from the CLI |
 | 2026-11-14 | F-78 build (session) | branch held for review | 2 (approve F-78, merge pending) | — (session build, not a factory run) | — | — | **finding: the SFA profile declares `repo.branch_protection: unavailable` on a PUBLIC repo whose owner has ADMIN — a false declaration (the schema allows it only for plan-limit-403 private repos); `factory loop` on this repo correctly refused to build.** Owner deciding protection separately; F-78 built session-style on a branch instead |
 | 2026-11-14 | wo21 run 7 (F-78 live) | **pr_opened**: fix round passed L0, L1 and review and pushed to #163; the PR's own tests went green | 3 (adopt, reset, loop) plus 2 unrelated (merge JobFinderOS #165, merge #163) | 92 | 227k in / 61k out / 4.0M cache-read | 26 min | the loop prints a stale pre-round `not ready` line; a `main`-side advisory reddens every PR and a re-run reuses the stale merge commit |
+| 2026-11-15 | wo22 run 1 (first run after F-79, F-80, F-82) | **pr_opened** (JobFinderOS #166), 2 attempts, CI green on the first wait | 3 (contract review, approve, loop) plus the merge | 53 (failed lint) + 23 | 230k in / 41k out / 3.6M cache-read; $2.65 nominal | 28 min | a lint error cost a whole attempt; a reviewer's malformed JSON cost a whole session again (F-85); contract review does not converge between runs |
 
 ## Retros
 
@@ -160,6 +161,31 @@ The target is 2 owner touches per task: approve and merge.
   2. **A red caused by `main` looks the same as a red caused by the task.** With budget left, the next sweep would have started a paid fix round for an advisory the task did not introduce. The factory has no check for "this check also fails on the default branch". Watch for a second case before building anything.
   3. **A re-run cannot see a fix that landed on the default branch.** F-75's flake guard re-runs the failed job, which reuses the old merge commit. That is right for flakes and useless for a `main`-side fix. Same watch item as 2.
 - **Fix as a WO?** No new one from this run. F-79 (kept fix-round work, one resume rule) was already in build and covers what the afternoon run lost. Items 2 and 3 wait for a second occurrence.
+
+
+### Run 2026-11-15: wo22-apply-link-recovery, pr_opened in one run (JobFinderOS #166)
+- **Goal:** the second task through the factory, and the first run with the contract review (F-80), kept fix-round work (F-79) and follow-up drafting (F-82) in place.
+- **Before the run: two contract reviews.**
+  - The first (`factory review-contract`, 11 turns, 2 minutes, 34k input and 5.8k output tokens) returned 5 findings, 4 major: an undeclared `privacy` risk path, a scope gap (the API schema file was missing, so every criterion could pass while the user saw nothing), two behaviours merged into one criterion, and an ambiguous re-probe rule. All five were applied to the contract.
+  - The second, on the edited contract (11 turns, 2.7 minutes), returned 6 more, 3 major. One of them is against an edit made in response to the first review: AC-2 now excludes a twin that has only an email address, and the source design counts such a twin as usable. The owner approved with these open.
+- **The run** (`20261115T151556Z-94d58c`, 28 minutes):
+  - Attempt 1: 53 implementer turns, failed L0 on lint. One unused import in the task's own test file (`F401`).
+  - Attempt 2: 23 implementer turns, then 8 reviewer and 6 verifier turns. L0, L1 and review passed. It published #166: 488 added lines across 5 files, including an Alembic migration and the schema file the first contract review added to scope.
+  - CI settled green on the first wait (8 polls). No fix round, no park, no recovery command.
+- **Escalated:** none.
+- **Owner touches:** 3 for the task (contract review, approve, loop), plus the merge. The second contract review was a fourth, optional one.
+- **Cost:** 230k input, 41k output and 3.6M cache-read tokens; $2.65 at the trace's nominal rates. The attempt records carry no per-seat turns or cost because the run used the pre-F-83 code: the factory checkout was deliberately not updated while a loop was running.
+- **What worked:**
+  1. **The contract review changed the outcome.** The schema file it added to scope is in the diff. wo21 parked on exactly that kind of gap.
+  2. **F-82 drafted the follow-up.** Three minor findings left open by review became `wo22-apply-link-recovery-followup`. One deserves more than "minor": the twin lookup loads the whole job-postings table on every call.
+  3. **F-79 was not needed:** the round published, so no work was kept.
+- **What broke in the factory:**
+  1. **A lint error cost a whole attempt.** 53 turns were spent, the gate failed on one unused import, and the next attempt started over. Candidate fix: the session runs the profile's lint command before it finishes, or a lint-only failure gets a short fix round in the same clone instead of a new attempt.
+  2. **A reviewer's malformed verdict cost a whole session again** (trailing comma, same as the wo21 runs). F-85 is the fix and is in build.
+  3. **Contract review does not converge.** A fresh review of an improved contract found six new things. The useful rule is one review, apply what matters, then the owner decides. A second review is worth it only after a large rewrite.
+  4. **An edit made to satisfy a review can contradict the source document.** The reviewer offered two options for email-only twins; the more cautious one was written into the contract without checking it against the design. Edits made from review findings need the same check against the source that the original contract got.
+  5. **Updating the factory under a running loop is unsafe,** and nothing prevents it. The installed command runs from the main checkout. Watch item: a guard, or a separate install.
+- **Fix as a WO?** One new candidate, small: lint before finish (item 1). Items 3 and 4 are practice, recorded here. Item 5 waits for a second occurrence.
 
 
 ## Known gaps carried forward (fix only if a run hits them)
