@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-15T11:30:00Z",
+  "updated_at": "2026-11-15T13:19:42Z",
   "tasks": [
     {
       "id": "F-00",
@@ -6099,7 +6099,7 @@
       "source": "BUILD-ORDER.md#f-80--a-fresh-context-review-of-the-contract-before-the-owner-approves-it",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-79"
       ],
@@ -6168,7 +6168,10 @@
           ".factory/BOOTSTRAP.md",
           "docs/run-loop.md"
         ]
-      }
+      },
+      "acceptance_hash": "d2545ddf344bf5ee64a1cfd882e6c7bddb9263925db40f0e645553de8ef8f84b",
+      "approved_at": "2026-11-15T13:19:40Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-82",
@@ -6176,7 +6179,7 @@
       "source": "docs/next-work-orders.md#f-82--review-findings-that-do-not-block-are-never-lost",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-79"
       ],
@@ -6238,7 +6241,10 @@
           ".factory/project.yaml",
           ".factory/BOOTSTRAP.md"
         ]
-      }
+      },
+      "acceptance_hash": "b1f759161cb9ebe74d61891414974470b099ea3273d64b91b9aa8b53d8182d2f",
+      "approved_at": "2026-11-15T13:19:42Z",
+      "approved_by": "Anthony"
     }
   ]
 }
