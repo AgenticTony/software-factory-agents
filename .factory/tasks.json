@@ -6245,6 +6245,87 @@
       "acceptance_hash": "b1f759161cb9ebe74d61891414974470b099ea3273d64b91b9aa8b53d8182d2f",
       "approved_at": "2026-11-15T13:19:42Z",
       "approved_by": "Anthony"
+    },
+    {
+      "id": "F-83",
+      "title": "Run numbers and loop lines say what happened",
+      "source": "BUILD-ORDER.md#f-83--run-numbers-and-loop-lines-say-what-happened",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-82"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "Each attempt records `turns_by_seat` (`implementer`, `reviewer`, `verifier`, `arbiter`, …) beside `turns`, and `turns` is the IMPLEMENTER's count: the number `max_turns` bounds. Old records without the field still load. The PR body's attempt line and `factory status` show the implementer's turns against the cap.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f83.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "An attempt that fails, escalates, aborts or crashes after at least one session ended records `token_usage`, `provider_usage` and a `cost_usd` total from the sessions that did run. `model` in `provider_usage` is the seat's resolved model, never `?`. `factory status <task>` prints a per-attempt and a per-task total.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f83.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "`factory.ci.settle` returns `red` when the last completed read was red (after the one re-run), `pending` only when checks were still running or unreadable at the window's end. The run note, the loop line and the trace agree. This must not change WHEN a fix round starts: read how the in-run round decides today, keep that decision, and report if the two cannot both hold.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f83.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "A `not ready` line is printed only for the head the PR holds when the run ends: a sweep line about a head the same run then replaced is dropped (or re-read), never printed beside the new head's line.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f83.py::test_ac_4"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 150,
+        "wall_clock_min": 120
+      },
+      "scope": {
+        "paths": [
+          "factory/orchestrator.py",
+          "factory/session.py",
+          "factory/ci.py",
+          "factory/prbody.py",
+          "factory/status.py",
+          "factory/cli.py",
+          "factory/data/schema/tasks.schema.json",
+          "tests/test_f83.py",
+          "tests/_support/f83.py",
+          "TASK-CONTRACT.md",
+          "VALIDATOR-SPEC.md",
+          "BUILD-ORDER.md",
+          "docs/run-loop.md",
+          ".factory/tasks.json",
+          ".factory/project.yaml",
+          ".factory/BOOTSTRAP.md"
+        ]
+      }
     }
   ]
 }

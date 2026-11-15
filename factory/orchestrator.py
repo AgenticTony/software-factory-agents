@@ -816,19 +816,33 @@ def _attempt_provider_usage(records, primary: dict) -> "list[dict]":
     PARENT-STAMPED provider (the spec's record the F-59 transport
     stamps — never a field the session can influence in a real run); a
     record with none (stub seats, pre-F-59 records) attributes to the
-    attempt's primary provider. Telemetry only, like the totals."""
+    attempt's primary provider. Telemetry only, like the totals.
+
+    F-83 AC-2: the model is the seat's RESOLVED model, never ``?`` —
+    the parent-stamped block's own, else (a profile that names none,
+    whose seat ran the CLI default) the session's REPORTED model,
+    validated like every record field; a record with no block takes the
+    primary's, else its own report. A self project with no provider
+    block ran every 2026-11-14 row under the bogus ``?`` glyph. A
+    record that reports nothing at all groups under ``unknown`` — the
+    honest name for a session that ended before any result (a bare
+    record), never a fake model."""
     groups: "dict[tuple[str, str], dict]" = {}
     order: "list[tuple[str, str]]" = []
     for record in records or []:
         if record is None:
             continue
         block = getattr(record, "provider", None)
+        reported = getattr(record, "model", None)
         if isinstance(block, dict) and block.get("kind"):
             kind = str(block["kind"])
-            model = str(block.get("model") or "?")
+            # Never the primary's model here: the block names ANOTHER
+            # provider (a seat override), and one provider's model name
+            # under another's kind would misprice the row.
+            model = str(block.get("model") or reported or "unknown")
         else:
             kind = str(primary.get("kind"))
-            model = str(primary.get("model") or "?")
+            model = str(primary.get("model") or reported or "unknown")
         key = (kind, model)
         if key not in groups:
             groups[key] = {name: 0 for name in
@@ -857,6 +871,45 @@ def _session_turns(record) -> int:
     if isinstance(turns, bool) or not isinstance(turns, int) or turns < 0:
         return 0
     return turns
+
+
+def _turns_by_seat(records) -> "dict[str, int]":
+    """F-83 AC-1: an attempt's turns grouped by seat name, first-seen
+    order — reviewer re-runs sum into their seat, and a session that
+    ended before any result (a bare record, or a forged count) renders
+    0 for its seat, exactly the ``_session_turns`` rule. Telemetry only:
+    ``turns`` (the implementer's count, the number ``max_turns`` bounds)
+    reads the same map, and no budget ever does."""
+    by_seat: dict[str, int] = {}
+    for record in records or []:
+        if record is None:
+            continue
+        seat = getattr(record, "seat", None)
+        if not isinstance(seat, str) or not seat:
+            continue  # the record boundary refuses such a seat anyway
+        by_seat[seat] = by_seat.get(seat, 0) + _session_turns(record)
+    return by_seat
+
+
+def _attempt_cost(records) -> "float | None":
+    """F-83 AC-2: the attempt's session-REPORTED cost total. Every
+    record must carry a validated non-negative number — one session
+    whose cost is unknown (a bare record, a forged value) makes the
+    total unknown (None), never a partial sum presented as the whole
+    (the R1-6 rule the token columns follow). ``round(…, 6)`` only
+    sheds float noise, never a cent."""
+    costs: list[float] = []
+    for record in records or []:
+        if record is None:
+            continue
+        value = getattr(record, "total_cost_usd", None)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or value < 0:
+            return None  # one unknown poisons the whole total
+        costs.append(value)
+    if not costs:
+        return None
+    return round(sum(costs), 6)
 
 
 class RetryFit(NamedTuple):
@@ -1716,6 +1769,12 @@ class _Ctx:
     # F-75: the CI reader seam the publish-path wait and the ready rule
     # share (run_once's ``ci_state`` — one reader, never a second).
     ci_state: Callable = gh_ci_state
+    # F-83 AC-4: the sweep's not-ready lines for THIS run (run_once's
+    # own list, passed by reference). The update push prunes the lines
+    # about the PR whose head it replaces, so a line about a head the
+    # run then replaced is never printed beside the new head's. None
+    # for direct _run_task callers (no sweep ran, nothing to prune).
+    not_ready: "list[str] | None" = None
 
 
 def run_once(
@@ -2003,7 +2062,7 @@ def run_once(
         session_runner=session_runner or run_session_sandboxed,
         open_pr=open_pr or gh_pr_create, config=config, now=now,
         srt_bin_path=srt_bin_path, gate_timeout_sec=gate_timeout_sec,
-        ci_state=ci_state,
+        ci_state=ci_state, not_ready=not_ready,
     )
     with queue.begin_run(task_id, ledger=ledger):
         try:
@@ -3861,6 +3920,12 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
             reports_dir.mkdir(parents=True, exist_ok=True)
 
         def attempt_record(attempt_no, started, outcome, records, report_path, **extra):
+            # F-83 AC-1: per-seat turns, and ``turns`` is the
+            # IMPLEMENTER's count — the number budget.max_turns bounds.
+            # The wo21 140cfb pass recorded 92 (60 implementer + 29
+            # reviewers + 3 verifier) against an 80-turn implementer
+            # budget and looked nearly spent; per-seat sums end that.
+            turns_by_seat = _turns_by_seat(records)
             record = {
                 "run_id": work.run_id,
                 "slice_id": slice_id,
@@ -3872,7 +3937,9 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                 # importer's way (_session_turns: a forged non-int,
                 # negative or bool count renders as nothing, never raw) —
                 # never budget arithmetic; caps are the parent's.
-                "turns": sum(_session_turns(r) for r in records),
+                # F-83 AC-1: the implementer's alone (see turns_by_seat).
+                "turns": turns_by_seat.get("implementer", 0),
+                "turns_by_seat": turns_by_seat,
                 "input_tokens": sum(_tokens(r, "input_tokens") for r in records),
                 "output_tokens": sum(_tokens(r, "output_tokens") for r in records),
                 "prompt_versions": dict(versions),
@@ -3905,6 +3972,11 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
             # implementer's kind+model.
             record["provider_usage"] = _attempt_provider_usage(
                 records, provider_record)
+            # F-83 AC-2: the sessions' cost total — unknown (absent)
+            # when any session reported none, whatever the outcome; a
+            # session-less attempt (records=[]) records no cost at all.
+            if records:
+                record["cost_usd"] = _attempt_cost(records)
             models = [f"{r.seat}={r.model}" for r in records if r and r.model]
             if models:
                 record["model"] = " ".join(models)
@@ -5376,6 +5448,12 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                 extra_flags=cast("Any", l0).risk_flags_added,
                                 implementer_notes=scrubbed_notes,
                                 attempt=attempt_no,
+                                # F-83 AC-1: the implementer's turns —
+                                # the number budget.max_turns bounds —
+                                # against the cap, never the all-seat
+                                # sum that misreported wo21's round.
+                                implementer_turns=_turns_by_seat(
+                                    records).get("implementer"),
                             )
                             if len(body) <= _PR_BODY_LIMIT:
                                 break
@@ -5448,6 +5526,31 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                         lease_sha=ci_pushed_sha)
                             pushed = True
                             url = ci_pr_url
+                            # F-83 AC-4: the head this push replaced is
+                            # gone — the sweep's not-ready lines about
+                            # THAT head (its CI read of the old head,
+                            # taken before this round started) are no
+                            # longer true and must never print beside
+                            # the new head's publish. The run's own
+                            # lines (this settle, the ci findings) and
+                            # the NEXT sweep speak for the new head;
+                            # lines about PRs this run never touched
+                            # stay, whatever they say.
+                            if ctx.not_ready is not None:
+                                prefix = f"{url}: "
+                                stale_lines = [line for line in ctx.not_ready
+                                               if line.startswith(prefix)]
+                                if stale_lines:
+                                    ctx.not_ready[:] = [
+                                        line for line in ctx.not_ready
+                                        if not line.startswith(prefix)]
+                                    trace.append({
+                                        "type": "not_ready_dropped",
+                                        "pr": url,
+                                        "dropped": len(stale_lines),
+                                        "reason": "the run replaced the "
+                                                  "head the line read",
+                                    })
                             # F-82 AC-1: a CI fix round's update REFRESHES
                             # the PR body to this round's — the findings
                             # section, the evidence, the head it names.

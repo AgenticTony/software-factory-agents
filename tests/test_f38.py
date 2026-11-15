@@ -406,15 +406,20 @@ def test_ac_5(tmp_path: Path, monkeypatch):
     # decision 2026-11-09, option D): every seat runs at its FIXED
     # parent-granted cap — reviewers at REVIEWER_TURN_CAP, the verifier
     # at VERIFIER_TURN_CAP — whatever the implementer's record claimed
-    # (3 turns here). The attempt's recorded turns stay the sum over ALL
-    # sessions, session-REPORTED telemetry only.
+    # (3 turns here). The attempt's recorded turns were the sum over
+    # ALL sessions until F-83 (2026-11-15): `turns` is the
+    # IMPLEMENTER's count — the number max_turns bounds — with
+    # `turns_by_seat` carrying each seat's, session-REPORTED telemetry
+    # only (amended in place).
     from factory.orchestrator import REVIEWER_TURN_CAP, VERIFIER_TURN_CAP
 
     assert {kw["max_turns"] for kw in seats.kwargs("reviewer")} == {
         REVIEWER_TURN_CAP
     }
     assert seats.kwargs("verifier")[0]["max_turns"] == VERIFIER_TURN_CAP
-    assert attempt["turns"] == 3 + 2 + 2 + 1  # impl + reviewer x2 + verifier
+    assert attempt["turns"] == 3  # the implementer's alone (F-83)
+    assert attempt["turns_by_seat"] == {  # impl + reviewer x2 + verifier
+        "implementer": 3, "reviewer": 2 + 2, "verifier": 1}
 
     # And inside the wall-clock budget: the verifier inherits the remaining
     # time after the reviewers, and never starts once it is spent.
@@ -1070,8 +1075,13 @@ def test_review3_turn_caps_are_fixed_not_remainder(tmp_path: Path):
     }
     assert seats.kwargs("verifier")[0]["max_turns"] == VERIFIER_TURN_CAP
     attempt = env.task()["attempts"][-1]
-    assert attempt["turns"] == 3 + 2 * (REVIEWER_TURN_CAP // 2) + (
-        VERIFIER_TURN_CAP // 2)  # impl + reviewer echoes + verifier echo
+    # F-83 (2026-11-15, amended in place): `turns` is the implementer's
+    # count; the per-seat echo sums ride `turns_by_seat`.
+    assert attempt["turns"] == 3  # the implementer's echo alone
+    assert attempt["turns_by_seat"] == {
+        "implementer": 3,
+        "reviewer": 2 * (REVIEWER_TURN_CAP // 2),
+        "verifier": VERIFIER_TURN_CAP // 2}
 
     # The pre-F-64 refusal cases are gone: an implementer that "spent" 19
     # of the 20 turns, and reviewers claiming their full caps, still get

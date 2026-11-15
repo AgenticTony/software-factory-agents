@@ -81,7 +81,13 @@
         "ended": { "type": "string", "format": "date-time" },
         "outcome": { "enum": ["pass", "fail", "escalated", "aborted"] },
         "rounds": { "type": "integer", "minimum": 0 },
-        "turns": { "type": "integer", "minimum": 0 },
+        "turns": { "type": "integer", "minimum": 0, "description": "F-83: the IMPLEMENTER's turns — the number budget.max_turns bounds (records before F-83 summed every seat, which misreported the implementer's spend)." },
+        "turns_by_seat": {
+          "type": "object",
+          "description": "F-83 AC-1: the attempt's turns grouped by seat name (implementer, reviewer, verifier, arbiter, …), session-reported telemetry validated the _session_turns way; reviewer re-runs sum into their seat. Absent on every attempt recorded before F-83.",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        },
+        "cost_usd": { "type": ["number", "null"], "minimum": 0, "description": "F-83 AC-2: the attempt's session-reported cost total. Null (unknown) when any session that ran reported no cost — never a partial sum; absent when no session ran." },
         "input_tokens": { "type": "integer", "minimum": 0 },
         "output_tokens": { "type": "integer", "minimum": 0 },
         "provider": {

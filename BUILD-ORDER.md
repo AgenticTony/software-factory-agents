@@ -839,6 +839,16 @@ Acceptance:
 - AC-3 The loop tells the owner. `factory run` and `factory loop` print one line under the published PR: `follow-up drafted: <id> (<n> findings)`. `factory status` lists it like any draft.
 
 After it merges: the first run of any task whose review leaves findings open drafts its follow-up; the wo21 findings (U-2 above all) become a JobFinderOS follow-up task the next time a round on wo21 publishes — or by hand if wo21 is closed first.
+### F-83 — Run numbers and loop lines say what happened
+Found by the run loop on 2026-11-14 (wo21/JobFinderOS, traces in `~/factory/trace/jobfinderos/`). Four misreports: (1) the published attempt recorded `turns: 92` where the implementer used 60 — the budget is the implementer's, so the record made it look nearly spent; (2) the 60-turn failed attempt of run `20261114T134530Z-f49bb7` recorded `token_usage: null` although its `session_end` events carried tokens and cost (the verifier's error `ResultMessage` was discarded when the SDK raised after it — F-74 AC-1's usage half); (3) run `20261114T184258Z-140cfb` settled `pending` with detail "first wait: failed; re-ran 1 failed run(s) once; second wait: failed" and the loop printed `CI pending` for a PR that was red after its re-run; (4) under the run that published, the loop printed `not ready: … CI red` — the sweep's read of the OLD head, printed after the round had replaced it.
+
+Acceptance:
+- AC-1 Turns per seat. Each attempt records `turns_by_seat` (`implementer`, `reviewer`, `verifier`, `arbiter`, …) beside `turns`, and `turns` is the IMPLEMENTER's count: the number `max_turns` bounds. Old records without the field still load. The PR body's attempt line and `factory status` show the implementer's turns against the cap.
+- AC-2 Every session's usage is recorded, whatever the outcome. An attempt that fails, escalates, aborts or crashes after at least one session ended records `token_usage`, `provider_usage` and a `cost_usd` total from the sessions that did run. `model` in `provider_usage` is the seat's resolved model, never `?`. `factory status <task>` prints a per-attempt and a per-task total.
+- AC-3 A CI wait that ended red says red. `factory.ci.settle` returns `red` when the last completed read was red (after the one re-run), `pending` only when checks were still running or unreadable at the window's end. The run note, the loop line and the trace agree. This must not change WHEN a fix round starts: read how the in-run round decides today, keep that decision, and report if the two cannot both hold.
+- AC-4 No stale line. A `not ready` line is printed only for the head the PR holds when the run ends: a sweep line about a head the same run then replaced is dropped (or re-read), never printed beside the new head's line.
+
+After it merges: the next run's attempt records and `factory status <task>` speak the honest numbers; the wo21 rows stay pre-F-83 shape (old records load unchanged) and are re-read through the per-seat lens only in new runs.
 
 ## Phase 1c — First outside project
 
