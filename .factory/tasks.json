@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-15T13:19:42Z",
+  "updated_at": "2026-11-15T18:33:14Z",
   "tasks": [
     {
       "id": "F-00",
@@ -6252,7 +6252,7 @@
       "source": "BUILD-ORDER.md#f-83--run-numbers-and-loop-lines-say-what-happened",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-82"
       ],
@@ -6325,7 +6325,10 @@
           ".factory/project.yaml",
           ".factory/BOOTSTRAP.md"
         ]
-      }
+      },
+      "acceptance_hash": "53e465e9a2ea75e2deaa86cf22afb207e4380dc895cda36b2a694c67232f63b9",
+      "approved_at": "2026-11-15T18:33:13Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-85",
@@ -6333,7 +6336,7 @@
       "source": "BUILD-ORDER.md#f-85--a-reviewers-malformed-verdict-gets-one-repair-turn-not-a-new-session",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-83"
       ],
@@ -6390,7 +6393,10 @@
           ".factory/project.yaml",
           ".factory/BOOTSTRAP.md"
         ]
-      }
+      },
+      "acceptance_hash": "73991f84e912756c8ad7ad77019c17731181df11c3b2440ce455810952bf9471",
+      "approved_at": "2026-11-15T18:33:14Z",
+      "approved_by": "Anthony"
     }
   ]
 }
