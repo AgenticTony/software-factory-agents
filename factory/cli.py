@@ -24,6 +24,7 @@ from factory.approve import (
 )
 from factory.config import CONFIG_FILE, ConfigError, load_config
 from factory.contract import ContractError, load_profile, load_tasks, read_file
+from factory.contractreview import finding_lines, review_contract
 from factory.dashboard import DEFAULT_PORT, make_server
 from factory.eval import DEFAULT_REPEATS, EvalError, run_on_demand_eval
 from factory.gates import GateError
@@ -131,6 +132,26 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument(
         "--approved-by", default=None, help="approver name (default: git user.name)"
     )
+
+    review = sub.add_parser(
+        "review-contract",
+        help="one fresh-context, read-only session reviews a task's "
+             "contract and source document before you approve it (F-80): "
+             "findings by lens (purpose, testability, scope, ambiguity, "
+             "budget) are stored under the factory root, keyed by the "
+             "contract hash, and shown by `factory approve`. Advice only "
+             "— it never blocks, edits or approves; drives one model "
+             "session, never inside the peak window")
+    review.add_argument("task_id", help="task id whose contract to review")
+    review.add_argument("--queue", default=".factory/tasks.json",
+                        help="queue file (default: %(default)s)")
+    review.add_argument("--profile", default=None,
+                        help="project.yaml path (default: next to the queue)")
+    review.add_argument("--factory-root", default=None,
+                        help="factory root (default: ~/factory)")
+    review.add_argument("--config", default=None,
+                        help="factory config (default: "
+                             "<factory-root>/config.yaml)")
 
     recover = sub.add_parser(
         "recover", help="queue a fix round for a parked F-26 escalation")
@@ -440,6 +461,36 @@ def _run_approve(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("factory approve: interrupted", file=sys.stderr)
         return 130
+
+
+def _run_review_contract(args: argparse.Namespace) -> int:
+    """Dispatch ``review-contract`` (F-80 AC-1). 0 with the stored
+    review's path and findings; 1 on any refusal or an invalid review
+    (nothing stored), never a traceback."""
+    try:
+        root = (Path(args.factory_root) if args.factory_root
+                else FACTORY_ROOT_DEFAULT)
+        stored = review_contract(
+            Path(args.queue), args.task_id, factory_root=root,
+            profile_path=args.profile,
+            config=load_config(args.config) if args.config else None,
+        )
+    except _RUN_ERRORS as exc:
+        print(f"factory review-contract: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("factory review-contract: interrupted", file=sys.stderr)
+        return 130
+    lines = finding_lines(stored.review["findings"], indent="  ")
+    print(f"{args.task_id}: contract review stored — "
+          f"{len(stored.review['findings'])} finding(s), "
+          f"contract hash {stored.review['contract_hash'][:12]}")
+    for line in lines:
+        print(line)
+    print(f"stored: {stored.path}")
+    print(f"`factory approve {args.task_id}` shows it while the contract "
+          "is unchanged.")
+    return 0
 
 
 def _run_recover(args: argparse.Namespace) -> int:
@@ -967,6 +1018,8 @@ def main(argv: list | None = None) -> int:
         return _run_approve(args)
     if args.command == "recover":
         return _run_recover(args)
+    if args.command == "review-contract":
+        return _run_review_contract(args)
     if args.command in ("run", "loop"):
         return _run_orchestrator(args)
     if args.command == "tick":

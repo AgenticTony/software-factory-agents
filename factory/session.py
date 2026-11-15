@@ -606,7 +606,24 @@ SEATS: dict[str, SeatConfig] = {
         disallowed_tools=("Write", "Edit", "NotebookEdit"),
         permission_mode="bypassPermissions",
     ),
+    "contract_reviewer": SeatConfig(
+        name="contract_reviewer",
+        allowed_tools=(VENT_QUALIFIED_NAME,),
+        # F-80 AC-1: the contract reviewer reads a contract and the repo
+        # BEFORE the owner approves — the verifier's exact read-only
+        # contract (no edit tools, the integrity guard in
+        # run_session_sandboxed). It reports findings; a seat that could
+        # write its clone could plant the evidence its own findings cite.
+        disallowed_tools=("Write", "Edit", "NotebookEdit"),
+        permission_mode="bypassPermissions",
+    ),
 }
+
+# The guard seats: a read-only sandbox plus the workspace-integrity
+# guard (run_session_sandboxed). Every judge seat is one — the reviewer,
+# the verifier (F-38), the arbiter (F-72) and the contract reviewer
+# (F-80).
+GUARD_SEATS = ("reviewer", "verifier", "arbiter", "contract_reviewer")
 
 
 def _seat(seat: str) -> SeatConfig:
@@ -2425,12 +2442,13 @@ def run_session_sandboxed(
 
     # Reviewer integrity (owner review rounds 2 and 4): the reviewer — and,
     # since F-38, the verifier, which judges the reviewers' findings, and
-    # since F-72 the arbiter, which rules on repeated findings — gets a
+    # since F-72 the arbiter, which rules on repeated findings, and since
+    # F-80 the contract reviewer — gets a
     # read-only sandbox and a workspace guard (branch, HEAD, tree,
     # refs, ignored files; see _GitState). The scratch links exist
     # BEFORE the baseline so their (untracked) presence can never look
     # like a mutation between the two snapshots.
-    review_guard = seat in ("reviewer", "verifier", "arbiter")
+    review_guard = seat in GUARD_SEATS
     reviewer_writable: tuple[Path, ...] = ()
     baseline: _GitState | None = None
     record: SessionRecord | None = None

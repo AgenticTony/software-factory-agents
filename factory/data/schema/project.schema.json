@@ -121,8 +121,8 @@
     },
     "seat_providers": {
       "type": "object",
-      "description": "Seat role -> provider override (F-59 AC-5). Every kind must come from providers_allowed; the override's host joins only that seat's sandbox egress, never the implementer's. F-72: the arbiter seat may be overridden here; without an override it resolves to the reviewer's provider and model.",
-      "propertyNames": { "enum": ["implementer", "reviewer", "verifier", "importer", "arbiter"] },
+      "description": "Seat role -> provider override (F-59 AC-5). Every kind must come from providers_allowed; the override's host joins only that seat's sandbox egress, never the implementer's. F-72: the arbiter seat may be overridden here; without an override it resolves to the reviewer's provider and model. F-80: the contract_reviewer seat (the pre-approval contract review) on the same terms.",
+      "propertyNames": { "enum": ["implementer", "reviewer", "verifier", "importer", "arbiter", "contract_reviewer"] },
       "additionalProperties": { "$ref": "#/$defs/seatProviderBlock" }
     },
     "repo": {

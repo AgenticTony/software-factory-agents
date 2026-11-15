@@ -251,6 +251,12 @@ VERIFIER_TURN_CAP = 10
 # arbiter reads a contract, a diff and a handful of findings — the
 # reviewer's own workload minus the fan-out.
 ARBITER_TURN_CAP = 20
+# F-80 AC-1: the contract reviewer's fixed parent-side turn cap — the
+# pre-approval review reads one contract, its source document and as
+# much of the clone as the scope lens needs. Granted like the arbiter's
+# (never a remainder, never a number a session record funds); used by
+# factory.contractreview, which runs the seat outside any task run.
+CONTRACT_REVIEWER_TURN_CAP = 20
 
 # F-64 AC-1: the wall-clock minutes reserved for the review/verify fan-out.
 # The implementer's timeout is wall_clock_min minus this reserve, so a
@@ -276,6 +282,9 @@ assert VERIFIER_TURN_CAP >= _REVIEW_TURN_FLOOR, (
     "a verifier cap below the turn floor is not a vote (F-38 finding 3)")
 assert ARBITER_TURN_CAP >= _REVIEW_TURN_FLOOR, (
     "an arbiter cap below the turn floor is not a ruling (F-38 finding 3)")
+assert CONTRACT_REVIEWER_TURN_CAP >= _REVIEW_TURN_FLOOR, (
+    "a contract-reviewer cap below the turn floor is not a review "
+    "(F-38 finding 3)")
 
 # F-72 AC-1: the guarded escalation classes that RETRY before they
 # escalate — a fixable slip (one revert) becomes an L0 FAIL finding for

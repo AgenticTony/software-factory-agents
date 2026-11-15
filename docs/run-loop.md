@@ -34,6 +34,7 @@ The `factory` command runs from the main checkout of this repo (the miniconda ed
    ```
 
 5. Approve wo21. This is interactive, and `--yes` is refused because the contract declares a dependency.
+   - Optional, before the first run of any new or changed contract (F-80): `factory review-contract <task-id>` outside the peak window — one read-only session reads the contract and its source document; `factory approve` then shows its findings (blockers first) above the y/N. Advice only.
 
    ```bash
    cd ~/Desktop/JobFinderOS && factory approve wo21-pdf-text-layer-verification
