@@ -231,6 +231,7 @@ def build_pr_body(
     extra_flags=(),
     implementer_notes: str | None = None,
     attempt: int,
+    implementer_turns: int | None = None,
 ) -> str:
     """Assemble the full PR body from validator facts.
 
@@ -245,14 +246,26 @@ def build_pr_body(
         implementer_notes: The implementer's own account — rendered fenced,
             below the computed values, never as evidence.
         attempt: The attempt number that passed.
+        implementer_turns: F-83 AC-1 — the round's implementer turns (the
+            number ``budget.max_turns`` bounds), shown against the cap on
+            the attempt line. None (a pre-F-83 caller) keeps the line
+            without the turns clause.
     """
     budget = task.get("budget") or {}
+    attempt_line = f"- Attempt {attempt} of {budget.get('max_attempts', '?')}"
+    if implementer_turns is not None:
+        # The implementer's turns alone — never the all-seat sum, which
+        # made wo21's passing round read "92 of 80" against a budget
+        # only the implementer spends.
+        attempt_line += (f"; implementer turns {implementer_turns}"
+                         f" of {budget.get('max_turns', '?')}")
+    attempt_line += "; L0, L1 and L2 passed"
     summary = [
         f"Task **{task['id']}** — {task.get('title', '')}".rstrip(),
         "",
         f"- Branch `{branch}` → `{(profile.get('repo') or {}).get('default_branch', 'main')}`",
         f"- Base `{base_sha[:12]}`, head `{head_sha[:12]}`",
-        f"- Attempt {attempt} of {budget.get('max_attempts', '?')}; L0, L1 and L2 passed",
+        attempt_line,
         f"- Source: `{task.get('source', '')}`",
         "",
         "Changed files:",

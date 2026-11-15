@@ -343,6 +343,12 @@ paths:
     # the fix-round body refresh) — the same precedent as F-79's.
     - "tests/test_f82.py"
     - "tests/_support/f82.py"
+    # F-83: the run-numbers contract tests judge the protected
+    # orchestrator/session/ci/prbody/status modules (the per-seat turns,
+    # the usage whatever the outcome, the honest CI verdict, the stale
+    # not-ready line) — the same precedent as F-79's.
+    - "tests/test_f83.py"
+    - "tests/_support/f83.py"
     # F-71: the dependency policy is judge surface — deps.py decides
     # what a manifest change means, registry.py decides whether a
     # package may be installed, and the generator writes the near-miss

@@ -52,7 +52,7 @@ from factory.runs import (
 from factory.sandbox import SandboxError
 from factory.session import SessionConfigError
 from factory.state import TaskQueue, run_lease_held
-from factory.status import StatusError, render_status
+from factory.status import StatusError, render_status, render_task_status
 from factory.tick import TickError, tick_steps
 from factory.toolkit import ToolkitError
 from factory.trace import TraceError, read_trace, trace_path
@@ -361,7 +361,15 @@ def build_parser() -> argparse.ArgumentParser:
         cmd.add_argument("--config", default=None,
                          help="factory config (default: <factory-root>/config.yaml)")
 
-    status = sub.add_parser("status", help="daily summary and metrics (F-11)")
+    status = sub.add_parser(
+        "status",
+        help="daily summary and metrics (F-11); with a task id, that "
+             "task's attempts and spend (F-83)")
+    status.add_argument(
+        "task_id", nargs="?", default=None,
+        help="one task's page: per-attempt turns/usage/cost and the "
+             "task total (F-83)",
+    )
     status.add_argument(
         "--queue", default=".factory/tasks.json",
         help="queue file (default: %(default)s)",
@@ -619,10 +627,17 @@ def _run_dashboard(args: argparse.Namespace) -> int:
 
 def _run_status(args: argparse.Namespace) -> int:
     """Dispatch the status subcommand (F-11). It reads only; an unreadable
-    queue exits 1 with a message, never a traceback."""
+    queue exits 1 with a message, never a traceback. A task id (F-83)
+    renders that task's page instead of the project's."""
     try:
         queue = load_tasks(args.queue)
         root = Path(args.factory_root) if args.factory_root else FACTORY_ROOT_DEFAULT
+        if args.task_id:
+            # F-83 AC-2: the per-task page — attempts, turns against the
+            # cap, usage and cost, per attempt and in total.
+            print(render_task_status(queue, args.task_id,
+                                     project=queue["project"]))
+            return 0
         print(render_status(queue, project=queue["project"], factory_root=root,
                             repo=Path(args.repo)))
         return 0

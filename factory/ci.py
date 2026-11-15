@@ -15,7 +15,10 @@ counts), and hands the orchestrator one verdict:
 * **green** — the run ends ``pr_opened`` as today;
 * **pending / none at the window** — ``pr_opened`` with the note
   ``CI pending`` / ``no CI reported`` (an ``unresolvable`` answer is
-  pending, never green — the F-45 rule);
+  pending, never green — the F-45 rule); pending means checks were
+  still running or unreadable at the window's end — a FAILED read at
+  the window is red, whatever the re-run's observation state (F-83
+  AC-3);
 * **red** — a fix round on the same branch and PR, carrying one finding
   per failing check: its name and the capped tail of its failing log
   (``gh run view --log-failed``) or, for a check no Actions run backs,
@@ -161,9 +164,11 @@ def _wait(remote: str, sha: str, *, ci_state: Callable, window_sec: float,
     seen non-completed since the re-run was issued. The check-runs API
     (``filter=latest``) can keep answering the OLD failed attempt until
     GitHub registers the new one, so an immediate poll can read a stale
-    failure and void the flake guard; a stale failure that is never
-    observed within the window ends the wait PENDING (``settled``
-    False), never red.
+    failure and void the flake guard. That gate is MID-WINDOW only: at
+    the window's end a failed read is the evidence of record and
+    settles red (F-83 AC-3 — a re-run that completes red between polls
+    is never observed, and the old rule printed "CI pending" for a PR
+    that was red after its re-run).
 
     A :class:`PublishError` from the FIRST poll (gh missing, a
     non-GitHub remote) ends the wait at once as pending: those
@@ -196,10 +201,21 @@ def _wait(remote: str, sha: str, *, ci_state: Callable, window_sec: float,
             # R1-F2: a stale pre-re-run failure — not evidence. Keep
             # polling; the re-run must be observed before red counts.
         if clock() >= deadline:
-            if state.state == "failed" and (observed or not require_observation):
+            if state.state == "failed":
                 # R1-F1: failed plus siblings still running at the window
                 # is red — PARTIAL: the failing checks stand, their logs
                 # may be missing (the run never completed).
+                # F-83 AC-3: a failed read at the window's end is RED
+                # whether or not the re-run was ever OBSERVED. The
+                # observation gate stays a MID-WINDOW rule (below): a
+                # stale pre-re-run failure must not settle red before the
+                # re-run had its chance. But at the window there is no
+                # chance left to wait for, and the last completed read —
+                # old attempt or new — is the evidence of record. Run
+                # 20261114T184258Z-140cfb's re-run completed red BETWEEN
+                # polls, so no poll ever saw a non-completed check and
+                # the old code answered "CI pending" for a PR that was
+                # red after its re-run.
                 return state, None, polls, True
             note = "no CI reported" if state.state == "none" else "CI pending"
             if sink is not None:
@@ -337,11 +353,12 @@ def settle(remote: str, sha: str, *, ci_state: Callable,
                         elapsed_sec=clock() - started, polls=polls,
                         reran=True)
                 if not settled2:
-                    # The window ended without the re-run ever being
-                    # observed (a stale pre-re-run failure, or checks
-                    # still running): NOT a red verdict — the note rides
-                    # pr_opened and the ready rule (F-58, extended by
-                    # F-75 AC-3) decides readiness later.
+                    # The window ended with checks still running or no
+                    # answer at all — never a failed read (F-83 AC-3
+                    # made a window-end failure settle red in _wait), so
+                    # this is pending/none: the note rides pr_opened and
+                    # the ready rule (F-58, extended by F-75 AC-3)
+                    # decides readiness later.
                     return CISettled(
                         outcome="none" if state.state == "none" else "pending",
                         note=note, detail=detail,

@@ -902,3 +902,145 @@ def render_status(
     # were already seam-scrubbed at the flush; this covers anything else
     # that reaches the page.
     return strip_control_sequences("\n".join(lines))
+
+
+def render_task_status(
+    queue: dict, task_id: str, *, project: str
+) -> str:
+    """``factory status <task>`` (F-83): one task's honest numbers.
+
+    Per attempt: the implementer's turns against the budget cap (the
+    number ``max_turns`` bounds — F-83 AC-1), the per-seat turn spread
+    (``turns_by_seat``), the validated token columns and the cost total
+    (AC-2). Then one task total, column by column, under the R1-6 rule:
+    any unknown count keeps the total unknown, never a partial sum.
+    Attempts recorded before F-83 have no ``turns_by_seat`` and their
+    ``turns`` summed every seat — the row says so instead of presenting
+    the all-seat sum as the implementer's.
+
+    Args:
+        queue: The parsed, validated queue document.
+        task_id: The task to render.
+        project: The project name (page header).
+
+    Raises:
+        KeyError: No task with that id in the queue.
+
+    Returns:
+        The markdown page. Read-only.
+    """
+    task = next(
+        (t for t in queue.get("tasks") or [] if t.get("id") == task_id), None
+    )
+    if task is None:
+        raise KeyError(f"no task {task_id!r} in this queue")
+    budget = task.get("budget") or {}
+    cap = budget.get("max_turns")
+    cap_text = str(cap) if isinstance(cap, int) else "?"
+    lines = [
+        f"# factory status — {project} — task {task_id}",
+        "",
+        f"- title: {task.get('title', '')}",
+        f"- status: {task.get('status', '?')}",
+        f"- budget: {budget.get('max_attempts', '?')} attempts / "
+        f"{cap_text} turns / {budget.get('wall_clock_min', '?')} min",
+    ]
+    links = task.get("links") or {}
+    if links.get("pr"):
+        lines.append(f"- PR: {links['pr']}")
+
+    def turns_cell(attempt: dict) -> str:
+        turns = attempt.get("turns")
+        if not isinstance(turns, int) or isinstance(turns, bool):
+            turns_text = "?"
+        else:
+            turns_text = str(turns)
+        cell = f"{turns_text} of {cap_text}"
+        if "turns_by_seat" not in attempt and turns:
+            cell += " (pre-F-83: all seats)"
+        return cell
+
+    def usage_cell(usage: dict | None, name: str) -> str:
+        if not isinstance(usage, dict):
+            return "—"
+        return _fmt_millions(usage.get(name))
+
+    def cost_cell(attempt: dict) -> str:
+        if "cost_usd" not in attempt:
+            return "—"  # not recorded: no session ran, or pre-F-83
+        cost = attempt.get("cost_usd")
+        if cost is None or isinstance(cost, bool) \
+                or not isinstance(cost, (int, float)):
+            return "unknown"  # recorded unknown, never a partial sum
+        return f"${cost:.2f}"
+
+    attempts = task.get("attempts") or []
+    lines += ["", "## Attempts", ""]
+    if not attempts:
+        lines.append("- none recorded")
+    else:
+        lines.append(
+            "| run | outcome | impl turns | seats (turns) "
+            "| in | cache read | out | cost |"
+        )
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for attempt in attempts:
+            outcome = str(attempt.get("outcome", "?"))
+            if attempt.get("escalation"):
+                outcome += f" ({attempt['escalation']})"
+            by_seat = attempt.get("turns_by_seat")
+            seats = ", ".join(f"{seat} {turns}" for seat, turns in
+                              (by_seat or {}).items()) or "—"
+            lines.append(
+                f"| {attempt.get('run_id', '?')} | {outcome} "
+                f"| {turns_cell(attempt)} | {seats} "
+                f"| {usage_cell(attempt.get('token_usage'), 'input')} "
+                f"| {usage_cell(attempt.get('token_usage'), 'cache_read')} "
+                f"| {usage_cell(attempt.get('token_usage'), 'output')} "
+                f"| {cost_cell(attempt)} |"
+            )
+
+    # -- Task total (R1-6: unknown poisons, never a partial sum) --------
+    columns: dict[str, list] = {name: [] for name in _USAGE_FIELDS}
+    costs: list = []
+    cost_poisoned = False
+    for attempt in attempts:
+        usage = attempt.get("token_usage")
+        if isinstance(usage, dict):
+            for name in _USAGE_FIELDS:
+                columns[name].append(usage.get(name))
+        if "cost_usd" in attempt:
+            cost = attempt.get("cost_usd")
+            if cost is None or isinstance(cost, bool) \
+                    or not isinstance(cost, (int, float)):
+                cost_poisoned = True  # recorded unknown poisons the total
+            else:
+                costs.append(cost)
+    lines += ["", "## Task total", ""]
+    if not attempts:
+        lines.append("- no attempts recorded")
+    else:
+        parts = [
+            f"{len(attempts)} attempt(s)"
+            + (f", {sum(1 for a in attempts if a.get('outcome') == 'escalated')}"
+               " escalated" if any(a.get("outcome") == "escalated"
+                                   for a in attempts) else ""),
+        ]
+        for name in ("input", "output"):
+            parts.append(f"{name} {_fmt_millions(_column(columns[name]))}")
+        if cost_poisoned:
+            parts.append("cost unknown")
+        elif costs:
+            parts.append(f"cost ${sum(costs):.2f}")
+        else:
+            parts.append("cost —")
+        lines.append("- " + "; ".join(parts))
+        lines.append(
+            "- unknown counts keep a total unknown, never a partial sum; "
+            "attempts without a usage block (no session ran) contribute "
+            "nothing"
+        )
+    lines.append("")
+    # F-43 (m-16): the rendered page is terminal-executed as well as
+    # read — strip at the render seam, like the project page.
+    return strip_control_sequences("\n".join(lines))

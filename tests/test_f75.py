@@ -724,8 +724,17 @@ def test_ac_3(tmp_path: Path, monkeypatch):
 
     # (5) the AC-1 pending case, caught later: the run ends pr_opened
     # with "CI pending", the CI then goes red, and the NEXT run refuses
-    # to report the PR ready, naming the check.
-    env = Env75(tmp_path / "went-red")
+    # to report the PR ready. Amended in place twice: F-76 (2026-11-13)
+    # made that next run START the CI fix round on the proved head
+    # instead of leaving the PR for the owner, and F-83 (2026-11-15)
+    # drops the sweep's not-ready line about the OLD head the moment
+    # that round publishes the new one — this arm pinned the stale line
+    # until then. The red still never reads ready; with the budget
+    # spent (no round, no replaced head) the line stays and names the
+    # check.
+    env = Env75(tmp_path / "went-red", tasks=[_task(
+        budget={"size": "S", "max_attempts": 1, "max_turns": 20,
+                "wall_clock_min": 30})])
     _seams(monkeypatch, env)
     ci = CI(default=ci_state("pending",
                              checks=((CHECK_NAME, "in_progress"),)))
@@ -741,6 +750,33 @@ def test_ac_3(tmp_path: Path, monkeypatch):
                                          checks=((CHECK_NAME, "failure"),))})
     result = env.run(Seats(), ci_state=ci,
                      config=FactoryConfig(ci_wait_min=0))
+    # the budget is spent: no round ran, the head stands, and the PR is
+    # not ready — the line stays and names the check (AC-3's letter).
+    assert result.outcome == "needs_human", result
+    assert result.escalation == "ci_failed", result
     assert result.ready_prs == [], result.ready_prs
     assert any("CI red" in line and CHECK_NAME in line
                for line in result.not_ready_prs), result.not_ready_prs
+
+    # with budget left, the F-76 round replaces the head and the stale
+    # line about the old one is dropped (F-83 AC-4; test_f83 pins the
+    # two-PR shape) — never printed beside the new head's publish.
+    env = Env75(tmp_path / "went-red-fixed")
+    _seams(monkeypatch, env, Actions(failed_default=[FAILED_RUN],
+                                     logs={101: LOG_TAIL}))
+    ci = CI(default=ci_state("pending",
+                             checks=((CHECK_NAME, "in_progress"),)))
+    result = env.run(Seats(impl_files=[{}, {"impl.py": IMPL_FIXED}]),
+                     ci_state=ci, config=FactoryConfig(ci_wait_min=1))
+    assert result.outcome == "pr_opened" and result.note == "CI pending"
+    branch = env.task()["links"]["branch"]
+    branch_sha = env.remote_branch_sha(branch)
+    ci = CI(by_sha={branch_sha: [RED, RED, PENDING, RED]}, default=GREEN)
+    result = env.run(Seats(impl_files=[{}, {"impl.py": IMPL_FIXED}]),
+                     ci_state=ci, config=FactoryConfig(ci_wait_min=5))
+    assert result.outcome == "pr_opened", result
+    assert result.ready_prs == [], result.ready_prs
+    assert not any("CI red" in line for line in result.not_ready_prs), \
+        result.not_ready_prs
+    assert env.remote_branch_sha(branch) != branch_sha, \
+        "the fix round replaced the head the line read"

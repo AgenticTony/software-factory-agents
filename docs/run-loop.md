@@ -62,7 +62,7 @@ This takes about 15 minutes and is not a full review. Its sources:
 - Turns: implementer <n>/<max> per attempt; where they went (setup, exploration, the change, fixes)
 - Escalated: <class or none> — why — was it the task's fault, the contract's, or the factory's?
 - Owner touches: <count> — each one named (approve, recover, merge, a manual fix)
-- Cost: tokens/usage per seat (implementer, reviewers, verifier, arbiter); wall clock
+- Cost: tokens/usage per seat (implementer, reviewers, verifier, arbiter); wall clock — `factory status <task-id>` prints each attempt's turns against the cap and the per-attempt/per-task usage and cost totals (F-83)
 - What broke in the factory: <one line each, or none>
 - Fix as a WO? <yes/no per item; one review round unless it's security/push/sandbox>
 ```
@@ -164,6 +164,6 @@ The target is 2 owner touches per task: approve and merge.
 
 ## Known gaps carried forward (fix only if a run hits them)
 - The clone has no virtualenv and no git identity before the session (F-73 AC-2, shelved). wo21 run 1 burned turns on it.
-- A failed session records no token usage (F-73 AC-1, shelved).
+- ~~A failed session records no token usage~~ (F-74 AC-1's usage half, taken over by F-83): a session the SDK ends with a delivered result message keeps its turns/usage/cost whatever the outcome; a session that died before any result (wall clock, a transport error) still records none — its usage renders unknown, never 0.
 - A retry gets only the failure line, not the previous attempt's work (F-73 AC-3, shelved) — fixed for fix rounds on an open PR by F-79 (the kept commit plus that round's review findings); a fresh run's later attempts still get only the progress log.
 - Local queue state lives in the repo's `.factory/tasks.json`, so a contract PR forces the owner to discard local state before pulling (step 3). This is new from this prep and becomes a WO only if it bites again.

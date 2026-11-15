@@ -2132,11 +2132,35 @@ async def run_session(
                     duration_ms=int((time.monotonic() - started) * 1000),
                 ))
             except ClaudeSDKError as exc:
+                # F-83 AC-2 (F-74 AC-1's usage half, taken over): the
+                # SDK can RAISE after the stream already delivered its
+                # ResultMessage — ``ResultError`` on error_max_turns,
+                # error_during_execution, an API error result — and the
+                # wo21 run 20261114T134530Z-f49bb7 lost a 60-turn
+                # verifier session's turns, model, usage and cost to
+                # exactly this path. The delivered message is the
+                # evidence: build the record FROM it (status failed, the
+                # message's own reason beside the raise's type), keeping
+                # every telemetry field a completed session carries. A
+                # raise with NO message delivered keeps today's bare
+                # record — its usage renders unknown downstream, never
+                # 0 (the F-64 telemetry rule).
+                duration = int((time.monotonic() - started) * 1000)
+                if result_message is not None:
+                    record = _record_from(result_message, seat, duration)
+                    if record.status != "failed":
+                        record.status = "failed"
+                        record.reason = f"{type(exc).__name__} after result"
+                    else:
+                        record.reason = (
+                            f"{record.reason} "
+                            f"(then {type(exc).__name__})")[:200]
+                    return _carry(record)
                 return _carry(SessionRecord(
                     seat=seat,
                     status="failed",
                     reason=f"{type(exc).__name__}: {exc}",
-                    duration_ms=int((time.monotonic() - started) * 1000),
+                    duration_ms=duration,
                 ))
             finally:
                 # Every exit path closes the stream (review round 2): the
