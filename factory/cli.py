@@ -138,7 +138,8 @@ def build_parser() -> argparse.ArgumentParser:
         "task_id",
         help="task id to recover (stale_base/pr_closed, "
              "credential_added with --evidence, attempts_exhausted or "
-             "ci_failed with --evidence and --reset-attempts, a "
+             "ci_failed — or, F-79, ANY park holding a normal open PR — "
+             "with --evidence and --reset-attempts, a "
              "scope_missing/"
              "scope_change_needed escalation with --evidence after the "
              "widened contract is re-approved, or — F-72 — an "
@@ -160,17 +161,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recover.add_argument(
         "--reset-attempts", action="store_true",
-        help="required for attempts_exhausted, ci_failed and "
-             "scope_change_needed: grant a fresh attempt budget "
-             "(history is kept; the budget counts only attempts after "
-             "the reset marker). attempts_exhausted re-queues a fresh "
-             "run. ci_failed (F-77) and scope_change_needed (F-78) "
-             "depend on their PR: open — the reset keeps the PR, the "
-             "task returns to in_review and the next loop runs the CI "
-             "fix round on that same PR (a scope park only after the "
-             "widened contract is re-approved via `factory approve "
-             "--adopt`); closed — a fresh run re-implements from the "
-             "default head; merged or unreadable — refused",
+        help="grant a fresh attempt budget (history is kept; the "
+             "budget counts only attempts after the reset marker). "
+             "Required for attempts_exhausted, ci_failed and "
+             "scope_change_needed, and — F-79 — the one resume command "
+             "for ANY park that holds a normal PR link: GitHub reports "
+             "the PR open — the reset keeps it, the task returns to "
+             "in_review and the next loop runs the fix round on that "
+             "same PR, starting from the last fix round's kept work "
+             "when there is some (a scope park only after the widened "
+             "contract is re-approved via `factory approve --adopt`); "
+             "closed — a fresh run re-implements from the default "
+             "head; merged or unreadable — refused. A park holding no "
+             "normal PR link re-queues a fresh run. Never for "
+             "stale_base (use --revalidate), pr_closed or "
+             "credential_added (its --evidence exit only)",
     )
     recover.add_argument(
         "--accept", action="store_true",
@@ -457,9 +462,15 @@ def _run_recover(args: argparse.Namespace) -> int:
             print(f"{args.task_id}: needs_human -> in_review "
                   "(stale_base re-validated on the PR's current head; "
                   "the sweep reports it ready or not from here)")
-        elif status == "in_review":
+        elif status == "in_review" and args.accept:
             print(f"{args.task_id}: needs_human -> in_review "
                   "(escalation accepted; PR marked ready)")
+        elif status == "in_review":
+            # F-79: the credential evidence exit on a task whose PR is
+            # still open — the PR is kept, no budget granted.
+            print(f"{args.task_id}: needs_human -> in_review "
+                  "(PR kept — the sweep owns it again; attempts not "
+                  "reset)")
         elif status == "draft":
             print(f"{args.task_id}: needs_human -> draft "
                   "(escalation rejected; contract re-approval required)")

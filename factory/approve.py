@@ -80,6 +80,7 @@ from factory.state import (
     TaskQueue,
     attempts_reset_eligible,
     credential_recovery_eligible,
+    holds_normal_pr,
     keep_pr_eligible,
     now_iso,
     open_owner_steps,
@@ -719,8 +720,18 @@ def recover_task(
     → the PR is kept, the task returns ``needs_human → in_review`` with
     its links untouched and the next sweep runs the CI fix round on that
     same PR; **closed** → the fresh-run re-queue (``ready``/``blocked``);
-    **merged** or unreadable → refused, nothing written. An
-    ``attempts_exhausted`` reset always re-queues a fresh run.
+    **merged** or unreadable → refused, nothing written. F-79 makes
+    that the ONE resume rule: the same reset keeps the PR for ANY park
+    holding a normal PR link GitHub reports open (``attempts_exhausted``,
+    ``review_not_converging``, ``budget_exhausted``, ``sentinel_failed``,
+    ``protected_path_touched``, ``orchestrator_error``, …). Classes with
+    their own gate keep it, first: ``scope_change_needed`` (the ledger),
+    ``stale_base`` (``--revalidate``; ``--reset-attempts`` refuses
+    there), ``credential_added`` (its evidence exit only — which, like
+    the plain scope re-queue, now reads GitHub when the task holds a
+    normal PR link, because no task may land ``ready`` under its own
+    open PR). An escalation draft PR stays with ``--accept``/``--reject``.
+    A park holding no normal PR link re-queues a fresh run as before.
 
     Refused — :class:`ApprovalError`, nothing written — when the task
     isn't parked on a recoverable escalation (the same gates the
@@ -806,9 +817,21 @@ def recover_task(
             confirm=confirm, echo=echo,
         )
     if credential_recovery_eligible(task):
+        if reset_attempts:
+            # F-79 AC-2: never through the reset — the credential park's
+            # own gate (a human looked at the finding) is its only exit,
+            # and it grants no budget.
+            raise ApprovalError(
+                f"{task_id}: --reset-attempts never applies to a "
+                "credential_added park — its evidence exit only: run "
+                f"`factory recover {task_id} --evidence \"<what you "
+                "checked>\"` (no budget is granted; when the task holds "
+                "an open PR that exit keeps it). Nothing was written."
+            )
         return _recover_credential_task(
             queue, task_id, task, evidence=evidence, assume_yes=assume_yes,
             done_by=done_by, factory_root=factory_root,
+            pr_state=pr_state, pr_ready=pr_ready,
             confirm=confirm, echo=echo,
         )
     if attempts_reset_eligible(task):
@@ -825,16 +848,47 @@ def recover_task(
             factory_root=factory_root, pr_state=pr_state,
             pr_ready=pr_ready, confirm=confirm, echo=echo,
         )
+    if keep_pr_eligible(task):
+        # F-79 AC-2: ONE resume rule — any other park holding a normal
+        # PR link (review_not_converging, budget_exhausted,
+        # sentinel_failed, protected_path_touched, orchestrator_error,
+        # …) takes the same budget reset, and GitHub's word on the PR
+        # decides where it lands (open: the PR is kept).
+        return _recover_attempts_task(
+            queue, task_id, task, evidence=evidence,
+            reset_attempts=reset_attempts, assume_yes=assume_yes,
+            done_by=done_by, factory_root=factory_root,
+            pr_state=pr_state, pr_ready=pr_ready,
+            confirm=confirm, echo=echo,
+        )
     if not recovery_task_eligible(task):
         raise ApprovalError(
-            f"{task_id}: not recoverable — only a stale_base/pr_closed "
+            f"{task_id}: not recoverable — a park holding a normal PR link "
+            "resumes with --evidence and --reset-attempts (the PR is kept "
+            "while GitHub reports it open); a stale_base/pr_closed "
             "escalation holding a PR link, a credential_added escalation "
             "with --evidence, or an attempts_exhausted/ci_failed "
             "escalation with --evidence and --reset-attempts, can take "
-            "the fix-round edge. "
+            "the fix-round edge; an escalation DRAFT PR is answered with "
+            "--accept or --reject (new_dependency/risk_path_touched). "
             "Re-open the PR on GitHub (the sweep returns it to in_review), "
             "confirm the credential finding, grant a fresh attempt budget, "
             "or change the contract and re-approve."
+        )
+    if reset_attempts:
+        # F-79 AC-2: the two sweep parks keep their own gate. Neither
+        # spent a budget (they are session-less), and a reset must not
+        # walk a stale_base PR past the re-validation it failed.
+        parked_on = (task.get("attempts") or [{}])[-1].get("escalation")
+        raise ApprovalError(
+            f"{task_id}: --reset-attempts does not apply to a {parked_on} "
+            "park — it is session-less and spent no budget, and its exit "
+            "is its own: a stale_base task whose PR is open returns to "
+            "in_review only through a PASSING re-validation (`factory "
+            f"recover {task_id} --revalidate`); a pr_closed task returns "
+            "when you re-open the PR on GitHub; closing the PR and running "
+            f"`factory recover {task_id}` queues a fresh run. Nothing was "
+            "written."
         )
     url = task["links"]["pr"]
     state: str | None
@@ -867,6 +921,7 @@ def recover_task(
         else "ready"
     )
     queue.transition(task_id, new_status)  # the gated edge (state enforces)
+    _discard_wip(queue, factory_root, task_id)  # F-79: a fresh run
     return new_status
 
 
@@ -1370,6 +1425,15 @@ def _recover_escalation_pr(
     return new_status
 
 
+def _github_pr_state(pr_state, url: str) -> "str | None":
+    """GitHub's word on a PR, or None when gh cannot answer (fail
+    closed — never guessed)."""
+    try:
+        return (pr_state or gh_pr_state)(url)
+    except PublishError:
+        return None
+
+
 def _recover_credential_task(
     queue: TaskQueue,
     task_id: str,
@@ -1379,6 +1443,8 @@ def _recover_credential_task(
     assume_yes: bool,
     done_by: str | None,
     factory_root: Path | None,
+    pr_state: "Callable[[str], str] | None" = None,
+    pr_ready: "Callable[[str], None] | None" = None,
     confirm: Callable[[str], bool],
     echo: Callable[[str], None],
 ) -> str:
@@ -1389,7 +1455,18 @@ def _recover_credential_task(
     Session-less, no attempt reset (the remaining budget is the owner's
     call, made with the finding named in ``evidence``). Refuses before
     any write on a missing or empty evidence, on ``--yes`` (the
-    confirmation IS the gate), and on a declined prompt."""
+    confirmation IS the gate), and on a declined prompt.
+
+    F-79 AC-2 — a credential park that holds a normal PR link (a fix
+    round on an open PR tripped the sentinel; the PR still holds the
+    last validated head, and nothing new was pushed) follows the one PR
+    rule, because a ``ready`` task holding its own open PR waits on it
+    forever: GitHub reports the PR **open** → the PR is kept, the task
+    returns ``needs_human → in_review`` (run lease, state re-read under
+    it, the drafted PR marked ready) and the sweep owns it again;
+    **closed** → today's fresh-run re-queue; **merged** or unreadable →
+    refused, nothing written. Never a budget reset: the credential exit
+    grants no attempts on either target."""
     # Same refusal as `(evidence or "").strip()`, written so the type
     # narrows to str for every use below (F-51/A-7: narrowing, no
     # behaviour change — None and whitespace-only both stop here).
@@ -1406,18 +1483,84 @@ def _recover_credential_task(
             "the finding"
         )
     attempts = task.get("attempts") or []
+    url: str = (task.get("links") or {}).get("pr") or ""
+    keep_pr = pr_closed = False
+    if holds_normal_pr(task):
+        state = _github_pr_state(pr_state, url)
+        if state == "open":
+            keep_pr = True
+        elif state == "closed":
+            pr_closed = True
+        else:
+            shown = state if state is not None else "unreachable (gh failed)"
+            raise ApprovalError(
+                f"{task_id}: the task holds the PR {url} and GitHub reports "
+                f"it {shown} — the credential exit needs it open (the PR is "
+                "kept) or closed (a fresh run); a merged PR is the sweep's "
+                "merged recovery and nothing is guessed when gh cannot "
+                "answer. Nothing was written."
+            )
+    if keep_pr:
+        outcome = (
+            f"  PR: {url} (open)\n"
+            f"  recover keeps PR {url}: the task returns to in_review and "
+            "the sweep owns the PR again (its CI fix round runs on it "
+            "under the REMAINING budget); attempts are NOT reset."
+        )
+    else:
+        outcome = (
+            (f"  PR: {url} (closed)\n" if pr_closed else "")
+            + "  recover re-queues the task on a fresh run (the old run "
+            "branch is discarded); attempts are NOT reset."
+        )
     echo(
         f"{task_id}: {task.get('title')}\n"
         f"  escalation: {attempts[-1].get('escalation')} "
         "(nothing was pushed; the finding is local to the run branch)\n"
         f"  evidence: {evidence.strip()}\n"
-        "  recover re-queues the task on a fresh run (the old run branch "
-        "is discarded); attempts are NOT reset."
+        + outcome
     )
     if not confirm(f"Re-queue {task_id} (credential confirmed handled)?"):
         raise ApprovalDeclined(f"{task_id}: credential recovery declined")
-    new_status = queue.recover_credential(task_id, evidence)
+    ready_note = ""
+    if keep_pr:
+        try:
+            with queue.idle_lease():
+                state = _github_pr_state(pr_state, url)
+                if state != "open":
+                    shown = (state if state is not None
+                             else "unreachable (gh failed)")
+                    raise ApprovalError(
+                        f"{task_id}: the PR {url} was open when you were "
+                        f"asked, but GitHub now reports it {shown} — "
+                        "nothing was written; run the command again"
+                    )
+                new_status = queue.recover_credential(
+                    task_id, evidence, keep_pr=True)
+        except RunInProgressError as exc:
+            raise ApprovalError(
+                f"{task_id}: the run lease is held ({exc}) — another run or "
+                "housekeeping pass owns the queue right now; retry once it "
+                "finishes. Nothing was written."
+            ) from exc
+        try:
+            (pr_ready or gh_pr_ready)(url)
+        except PublishError as exc:
+            ready_note = (f"; marking the PR ready FAILED ({exc}) — it is "
+                          "still a draft")
+            echo(
+                f"WARNING: {task_id} moved to in_review, but marking {url} "
+                f"ready failed — the PR is still a draft: {exc}. Mark it "
+                f"ready yourself (`gh pr ready {url}`)."
+            )
+        else:
+            ready_note = "; the PR was marked ready again"
+    else:
+        new_status = queue.recover_credential(
+            task_id, evidence, pr_closed=pr_closed)
+        _discard_wip(queue, factory_root, task_id)
     who = done_by or default_approver()
+    kept = (f" — the open PR {url} is kept{ready_note}" if keep_pr else "")
     # The audit trail: the state has moved, so a log failure is loud —
     # the operator must know the one durable record of the confirmation
     # is missing, not discover it in an incident review.
@@ -1433,7 +1576,7 @@ def _recover_credential_task(
             "done_by": who,
             "recovered_at": now_iso(),
             "note": f"credential_added re-queued ({new_status}) by "
-                    f"{who}: {evidence.strip()}",
+                    f"{who}{kept}: {evidence.strip()}",
         })
     except ProgressLogError as exc:
         raise ApprovalError(
@@ -1442,6 +1585,16 @@ def _recover_credential_task(
         ) from exc
     assert entry.get("outcome") == "recovered"
     return new_status
+
+
+def _discard_wip(queue: TaskQueue, factory_root: "Path | None",
+                 task_id: str) -> None:
+    """F-79: a fresh-run re-queue dropped the task's ``links.wip`` (the
+    writer's own save); these are the kept files that went with it."""
+    from factory import wip as wipstore
+
+    wipstore.discard(factory_root or FACTORY_ROOT_DEFAULT,
+                     queue.doc.get("project") or "unknown", task_id)
 
 
 def _recover_attempts_task(
@@ -1470,13 +1623,16 @@ def _recover_attempts_task(
     on a missing or empty evidence, on a missing --reset-attempts (with
     the reason), on ``--yes``, and on a declined prompt.
 
-    F-77 — where the task lands depends on what there is to keep:
+    F-77, one rule since F-79 — where the task lands depends on what
+    there is to keep:
 
-    * ``attempts_exhausted`` (no validated PR exists): the fresh-run
+    * a park holding NO normal PR link (a fresh run's
+      ``attempts_exhausted``, an escalation draft PR): the fresh-run
       re-queue, ``ready``/``blocked``. GitHub is not read.
-    * ``ci_failed`` holding a normal PR link
-      (:func:`factory.state.keep_pr_eligible` — a ``ci_failed`` (F-77)
-      or ``scope_change_needed`` (F-78) park): GitHub decides.
+    * ANY park holding a normal PR link
+      (:func:`factory.state.keep_pr_eligible` — every class but
+      ``credential_added``/``stale_base``/``pr_closed``, which never
+      reach this half's keep target): GitHub decides.
       **Open** → the PR is kept: ``needs_human → in_review`` with the
       links untouched, so the next sweep runs the CI fix round on that
       same PR under the fresh budget, and the drafted PR is marked ready
@@ -1485,8 +1641,10 @@ def _recover_attempts_task(
       a state gh cannot answer → refused, nothing written: a merged PR
       belongs to the sweep's merged edge, and an unknown state is never
       guessed.
-    * ``ci_failed`` holding an escalation draft PR or no PR link: the
-      fresh-run re-queue (nothing the sweep may fix in place).
+
+    The fresh-run target passes GitHub's "closed" on to the writer
+    (``pr_closed=True``) — the writer refuses to re-queue a PR-holding
+    task without it — and removes the task's kept fix-round files.
 
     The echo before the y/N names which of the two outcomes will happen.
     The keep-PR move runs under the run lease (it hands a PR to the
@@ -1524,25 +1682,25 @@ def _recover_attempts_task(
             "decision, not a default"
         )
     url: str = (task.get("links") or {}).get("pr") or ""
-    read_state = pr_state or gh_pr_state
 
     def _github_says() -> str | None:
-        try:
-            return read_state(url)
-        except PublishError:
-            return None  # gh failed: fail closed, never guessed
+        return _github_pr_state(pr_state, url)
 
-    # F-77: only a ci_failed park holding a normal PR link has work to
-    # keep — and only GitHub can say whether that PR is still open.
-    keep_pr = False
+    # F-77/F-78, one rule since F-79: ANY park holding a normal PR link
+    # has published work to keep — and only GitHub can say whether that
+    # PR is still open. The writer demands the word either way: it never
+    # re-queues a task that holds a normal PR link on a guess.
+    keep_pr = pr_closed = False
     if keep_pr_eligible(task):
         state = _github_says()
         if state == "open":
             keep_pr = True
-        elif state != "closed":
+        elif state == "closed":
+            pr_closed = True
+        else:
             shown = state if state is not None else "unreachable (gh failed)"
             raise ApprovalError(
-                f"{task_id}: the ci_failed reset needs GitHub to report the "
+                f"{task_id}: the {escalation} reset needs GitHub to report the "
                 f"PR {url} open (the PR is kept and fixed in place) or "
                 f"closed (a fresh run re-implements) — it reports {shown}. "
                 "A merged PR is the sweep's merged recovery, not a reset; "
@@ -1562,8 +1720,7 @@ def _recover_attempts_task(
                     "budget?")
     else:
         outcome = (
-            (f"  PR: {url} (closed)\n" if keep_pr_eligible(task)
-             else "")
+            (f"  PR: {url} (closed)\n" if pr_closed else "")
             + "  recover re-queues the task with a fresh attempt budget: "
             "the next run will re-implement it from the current default "
             "head on a fresh branch (no existing PR is reused)."
@@ -1623,7 +1780,9 @@ def _recover_attempts_task(
             ready_note = "; the PR was marked ready again"
     else:
         new_status = queue.recover_attempts(task_id, evidence, done_by=who,
+                                            pr_closed=pr_closed,
                                             ledger=ledger)
+        _discard_wip(queue, factory_root, task_id)
     marker = (queue.get(task_id).get("attempt_resets") or [{}])[-1]
     kept = (f"the open PR {url} is kept — the sweep's CI fix round "
             f"repairs it in place{ready_note}" if keep_pr
@@ -1741,6 +1900,33 @@ def _recover_scope_task(
             pr_ready=pr_ready, ledger=ledger, confirm=confirm, echo=echo,
         )
     attempts = task.get("attempts") or []
+    # F-79 AC-2: this exit only ever re-queues a FRESH run — a scope
+    # park that holds a normal PR link takes it only once GitHub
+    # reports the PR closed. An open PR is kept through the budget
+    # reset instead (never re-queued under itself).
+    pr_closed = False
+    if holds_normal_pr(task):
+        url = (task.get("links") or {}).get("pr") or ""
+        state = _github_pr_state(pr_state, url)
+        if state == "open":
+            raise ApprovalError(
+                f"{task_id}: the task holds the open PR {url} — the plain "
+                "scope re-queue would land it ready under its own open PR, "
+                "where it waits forever. Keep the PR instead: `factory "
+                f"recover {task_id} --evidence \"…\" --reset-attempts` "
+                "(the task returns to in_review and the sweep's fix round "
+                "repairs that PR under the re-approved scope), or close "
+                "the PR for a fresh run. Nothing was written."
+            )
+        if state != "closed":
+            shown = state if state is not None else "unreachable (gh failed)"
+            raise ApprovalError(
+                f"{task_id}: the task holds the PR {url} and GitHub reports "
+                f"it {shown} — the scope re-queue needs it closed (a merged "
+                "PR is the sweep's merged recovery; nothing is guessed when "
+                "gh cannot answer). Nothing was written."
+            )
+        pr_closed = True
     scope_now = ", ".join(_scope_paths(task)) or "(none declared)"
     echo(
         f"{task_id}: {task.get('title')}\n"
@@ -1764,8 +1950,10 @@ def _recover_scope_task(
         root, queue.doc.get("project") or "unknown"
     )
     new_status = queue.recover_scope(
-        task_id, ledger=ledger, evidence=evidence.strip(), done_by=who
+        task_id, ledger=ledger, evidence=evidence.strip(), done_by=who,
+        pr_closed=pr_closed,
     )
+    _discard_wip(queue, factory_root, task_id)
     # The audit trail: the state has moved, so a log failure is loud —
     # same posture as the credential and attempts exits.
     try:

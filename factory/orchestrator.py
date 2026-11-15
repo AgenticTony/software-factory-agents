@@ -84,6 +84,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Sequence, cast
 
+from factory import wip as wipstore
 from factory.approvals import (
     ApprovalLedger,
     ApprovalLedgerError,
@@ -172,6 +173,8 @@ from factory.state import (
     TaskQueue,
     attempt_budget_used,
     escalation_accept_eligible,
+    holds_normal_pr,
+    merged_recovery_eligible,
     now_iso,
     open_owner_steps,
     recovery_task_eligible,
@@ -953,7 +956,8 @@ def _ci_finding_lines(settled, secrets: "tuple[str, ...]") -> list[str]:
 def _implementer_prompt(task: dict, slice_: dict | None, branch: str, history: str,
                         attempt: int, max_attempts: int,
                         fix_findings: list[str] | None = None,
-                        ci_findings: list[str] | None = None) -> str:
+                        ci_findings: list[str] | None = None,
+                        kept: dict | None = None) -> str:
     contract = {
         "acceptance": task.get("acceptance", []),
         "out_of_scope": task.get("out_of_scope", []),
@@ -997,6 +1001,28 @@ def _implementer_prompt(task: dict, slice_: dict | None, branch: str, history: s
         "",
         f"This is attempt {attempt} of {max_attempts}.",
     ]
+    if kept:
+        # F-79: this round starts from work an earlier fix round on this
+        # PR already got through L0 and L1 — the parent kept it locally
+        # and seeded this clone with it. The section is parent-built
+        # (the sha and run id are the queue's own record).
+        parts += [
+            "",
+            "## Continuing kept work",
+            "",
+            f"You are continuing kept work, not starting over. An earlier fix "
+            f"round on this PR (run `{kept['run_id']}`) produced a change "
+            "that passed L0 and L1 and then did not publish (its review "
+            "failed, or the round escalated). The orchestrator kept that "
+            f"change as commit `{kept['sha'][:12]}` and this branch already "
+            f"holds it on top of the PR's pushed head: `git show "
+            f"{kept['sha'][:12]}` shows what is already done. Build on it — "
+            "do not redo it and do not revert it unless a finding below "
+            "requires that."
+            + (" That round's review findings are the findings to fix below."
+               if fix_findings else
+               " No review findings were recorded for that round."),
+        ]
     if fix_findings:
         parts += [
             "",
@@ -2054,7 +2080,77 @@ def _recovery_tasks(queue: TaskQueue) -> list[dict]:
     recovery edges on its own.
     """
     return [task for task in queue.doc.get("tasks", [])
-            if recovery_task_eligible(task)]
+            if recovery_task_eligible(task) or merged_recovery_eligible(task)]
+
+
+def _forget_wip(queue: TaskQueue, factory_root: Path, project: str,
+                task_id: str) -> None:
+    """F-79: drop a task's kept fix-round work — the link first (the
+    record), then the files. Idempotent; a task holding none is a no-op
+    on the queue, and leftover files no link names are removed too."""
+    queue.clear_wip(task_id)
+    wipstore.discard(factory_root, project, task_id)
+
+
+def _resume_kept_work(
+    queue: TaskQueue, task_id: str, work: RunDir, branch: str,
+    pushed_sha: str, factory_root: Path, project: str, log: ProgressLog,
+) -> "dict | None":
+    """F-79 AC-1: seed a sweep-started fix round's clone from the kept
+    commit — when, and only when, it is still the continuation of the
+    head the round builds on.
+
+    ``pushed_sha`` is the head the caller just fetched from the remote
+    branch and proved equal to the sweep's validated head. The WIP is
+    used only if its recorded parent is exactly that SHA AND exactly
+    ``links.pushed_head``, and the bundle yields exactly the recorded
+    commit with that one parent (:func:`factory.wip.restore`). Anything
+    else: the WIP is ignored, cleared, and the progress entry says why —
+    the round builds on the pushed head as it always did.
+
+    Returns:
+        ``{"sha", "run_id", "findings"}`` when the clone now holds the
+        kept commit as the branch head, else None.
+    """
+    links = queue.get(task_id).get("links") or {}
+    kept = links.get("wip")
+    if not kept:
+        return None
+    shown = str(kept.get("sha") or "")[:12]
+    why = None
+    if kept.get("parent") != pushed_sha or links.get("pushed_head") != pushed_sha:
+        why = (f"its parent {str(kept.get('parent') or '')[:12]} is no "
+               f"longer the PR's pushed head ({pushed_sha[:12]})")
+    else:
+        try:
+            sha = wipstore.restore(work.root, factory_root=factory_root,
+                                   project=project, task_id=task_id, wip=kept)
+            hardened_git(work.root, "checkout", "-q", "-B", branch, sha)
+        except Exception as exc:  # noqa: BLE001 — WipError / git: ignore the WIP
+            why = f"{type(exc).__name__}: {exc}"[:300]
+    if why is not None:
+        _forget_wip(queue, factory_root, project, task_id)
+        _progress_best_effort(
+            log,
+            {"run_id": work.run_id, "outcome": "wip_ignored",
+             "note": (f"kept fix-round work {shown} (run "
+                      f"{kept.get('run_id')}) was ignored and cleared: {why} "
+                      "— this round builds on the pushed head")},
+            task_id,
+        )
+        return None
+    findings = wipstore.load_findings(
+        factory_root, project, task_id, str(kept.get("run_id")))
+    _progress_best_effort(
+        log,
+        {"run_id": work.run_id, "outcome": "wip_resumed",
+         "note": (f"this round continues kept fix-round work {shown} (run "
+                  f"{kept.get('run_id')}; passed L0 and L1) on the pushed "
+                  f"head {pushed_sha[:12]}")},
+        task_id,
+    )
+    return {"sha": kept["sha"], "run_id": str(kept.get("run_id")),
+            "findings": findings}
 
 
 def _resolve_pr_states(urls: list[str], pr_state: Callable) -> dict:
@@ -2850,7 +2946,12 @@ def _sweep_stale_prs(
     recovery = [task for task in recovery if _approved(task)]
     for task in recovery:
         state = states.get(task["links"]["pr"])
-        escalation = task["attempts"][-1].get("escalation")
+        escalation = (task.get("attempts") or [{}])[-1].get("escalation")
+        if state != "merged" and not recovery_task_eligible(task):
+            # F-79 AC-3: every park holding a normal PR link is read
+            # for the MERGED signal only; the re-open and rejection
+            # edges below stay stale_base/pr_closed's (F-26).
+            continue
         if state == "merged":
             # Round-5 finding 4 + round-6 findings 1+2: you resolved the
             # conflict on GitHub and merged — the task returns to
@@ -2871,7 +2972,11 @@ def _sweep_stale_prs(
             # task never takes needs_human → in_review generically; its
             # in_review exits are the GitHub-merged and the
             # passing-re-validation writers).
+            # F-79 AC-3: the same edge for ANY park holding a normal PR
+            # link — a hand-merged PR ends the park whatever it was — and
+            # the writer drops any kept fix-round work with the move.
             queue.recover_pr_merged(task["id"], merged_url=task["links"]["pr"])
+            wipstore.discard(factory_root, project, task["id"])
             _progress_best_effort(
                 ProgressLog.for_task(factory_root, project, task["id"]),
                 {"run_id": new_run_id(), "outcome": "recovered",
@@ -2900,6 +3005,10 @@ def _sweep_stale_prs(
         else:
             continue  # no owner action to read
         queue.transition(task["id"], new_status)
+        if new_status != "in_review":
+            # F-79: a fresh-run re-queue resumes nothing (the writer
+            # dropped the link; these are the files).
+            wipstore.discard(factory_root, project, task["id"])
         _progress_best_effort(
             ProgressLog.for_task(factory_root, project, task["id"]),
             {"run_id": new_run_id(), "outcome": "recovered", "note": note},
@@ -2935,7 +3044,9 @@ def _sweep_stale_prs(
             # gate, except on a no-deploy profile, where the close pass
             # takes it to done/awaiting_owner in this same run.
             links["merged"] = links["pr"]
+            links.pop("wip", None)  # F-79: merged — nothing to resume
             queue.save()
+            wipstore.discard(factory_root, project, task_id)
             _close_merged_tasks(queue, profile, factory_root, ledger=ledger)
             continue
         if state == "closed":
@@ -2943,7 +3054,9 @@ def _sweep_stale_prs(
             # task instead of stranding it silently in in_review. The
             # run id is a real generated one (round-3 finding 4): no
             # session ran, but audit joins by run_id must not collide
-            # across tasks or escalations.
+            # across tasks or escalations. F-79: a closed PR has
+            # nothing left to resume — any kept work goes with it.
+            _forget_wip(queue, factory_root, project, task_id)
             return _sweep_escalation(
                 queue, factory_root, profile, task_id,
                 escalation="pr_closed",
@@ -3517,6 +3630,13 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
     ci_pushed_sha: str | None = None  # the sha the remote branch holds
     ci_rerun_heads: set = set()  # SHAs whose failed runs were re-run once
     ci_fix_findings: list[str] | None = None  # rides the fix round's prompt
+    # F-79 AC-1: kept fix-round work. ``kept`` is what THIS run was
+    # seeded from (a sweep-started round whose task held a valid WIP);
+    # it rides the first implementer prompt only. ``round_wip`` is the
+    # commit THIS round kept (set when its change passed L0 and L1 on an
+    # open PR), so the round's end can store its fix list beside it.
+    kept: dict | None = None
+    round_wip: str | None = None
     if ci_fix is not None:
         # F-76 AC-3: a sweep-started fix round enters with F-75's state
         # pre-seeded — the PR is open, the proved head is the pushed
@@ -3601,6 +3721,18 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                              ci_fix.head_sha)
                 base_sha = _git_out(work.root, "merge-base",
                                     ci_fix.head_sha, default_head)
+                # F-79 AC-1: the round continues work an earlier fix
+                # round on this PR already got through L0 and L1 — when
+                # the kept commit is still exactly one commit on the
+                # head just fetched and proved. The base is unchanged,
+                # so L0, L1, review and the push fence judge the WHOLE
+                # range, kept commit included; the leased fast-forward
+                # still starts from the pushed head.
+                kept = _resume_kept_work(
+                    queue, task_id, work, branch, ci_fix.head_sha,
+                    ctx.factory_root, project, log)
+                if kept is not None and kept["findings"]:
+                    prev_findings = list(kept["findings"])
             reports_dir = (ctx.factory_root / "reports"
                            / project_component(project)
                            / re.sub(r"[^\w.-]", "_", task_id))
@@ -3956,8 +4088,48 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
             pushed)."""
             return escape_approval_text(scrub_session_text(text, egress_secrets))
 
+        def _keep_wip(head: str) -> None:
+            """F-79 AC-1: this round's change passed L0 and L1 on a task
+            that holds its open PR — keep it LOCALLY before anything
+            else can end the round (a failed review, an escalation, the
+            peak window, quota, a crash). One parent-built commit on the
+            pushed head, bundled under the factory root, then recorded
+            on the task; never pushed. Keeping is best-effort: a failure
+            is traced and the round goes on exactly as before."""
+            nonlocal round_wip
+            live = queue.get(task_id)
+            if (ci_pr_url is None or ci_pushed_sha is None
+                    or not holds_normal_pr(live)
+                    or (live.get("links") or {}).get("pushed_head")
+                    != ci_pushed_sha):
+                return  # not a fix round on a PR the factory pushed
+            try:
+                sha = wipstore.preserve(
+                    work.root, factory_root=ctx.factory_root,
+                    project=project, task_id=task_id, run_id=work.run_id,
+                    head=head, parent=ci_pushed_sha, identity=_IDENTITY)
+                queue.record_wip(task_id, sha=sha, parent=ci_pushed_sha,
+                                 run_id=work.run_id)
+            except Exception as exc:  # noqa: BLE001 — never fails the round
+                trace.append({"type": "wip_not_kept",
+                              "reason": f"{type(exc).__name__}: {exc}"[:300]})
+                return
+            round_wip = sha
+            trace.append({"type": "wip_kept", "sha": sha,
+                          "parent": ci_pushed_sha})
+
         def finish(attempt, status, findings, finding_keys=None, **result):
             nonlocal round_attempt_landed
+            if round_wip is not None:
+                # F-79: the round kept its change and is ending without
+                # publishing — its fix list (what the next in-run round
+                # would be handed) rides beside the kept commit for the
+                # round that resumes it.
+                with contextlib.suppress(Exception):
+                    wipstore.store_findings(
+                        ctx.factory_root, project, task_id, work.run_id,
+                        _fix_findings(reports, extra_findings, l2, reviewed,
+                                      last_valid_l2))
             entry = {
                 "run_id": attempt["run_id"],
                 "attempt": attempt["rounds"],
@@ -4041,6 +4213,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
             round_no += 1
             round_attempt_landed = False
             guard_repeated = False  # R1-F2: per-round escalation state
+            round_wip = None  # F-79: what this round kept, if anything
             records: list = []
             reports: dict = {"L0": None, "L1": None, "L2": None}
             extra_findings: list[str] = []
@@ -4066,7 +4239,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                         task, slice_, branch,
                         log.render(omit_last_findings=prev_findings is not None),
                         attempt_no, max_attempts, fix_findings=prev_findings,
-                        ci_findings=ci_fix_findings)
+                        ci_findings=ci_fix_findings,
+                        kept=kept if round_no == 1 else None)
                     t0 = time.monotonic()
                     impl = ctx.session_runner(
                         "implementer", prompt, work.root, profile,
@@ -4277,6 +4451,11 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                             runner=runner, timeout_sec=ctx.gate_timeout_sec)
                                 reports["L1"] = l1.to_dict()
                                 trace.gate_checks(reports["L1"])  # F-30 AC-3
+                            if l1.verdict == "pass":
+                                # F-79 AC-1: validated — kept before the
+                                # review (or anything else) can end the
+                                # round without a publish.
+                                _keep_wip(head_sha)
                         # A round that owes a final-review repeat (F-41 AC-3)
                         # skips its regular review entirely: the repeat is
                         # the round's review, over the full diff.
@@ -4291,17 +4470,26 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                     # fault) and the next session is told the change
                                     # existed and was discarded with the run.
                                     path = _store(reports_dir, work.run_id, attempt_no, reports)
+                                    # F-79: a fix round's validated change
+                                    # is KEPT (round_wip), and the task
+                                    # returns to in_review — never ready
+                                    # under its own open PR.
+                                    fate = (
+                                        "kept for the next fix round on this PR"
+                                        if round_wip is not None
+                                        else "discarded with the run")
                                     attempt = attempt_record(
                                         attempt_no, started, "aborted", records, path,
                                         note=f"peak window before the L2 review; the change "
                                              f"(head {head_sha[:12]}, passed L0 and L1) was "
-                                             f"discarded with the run",
+                                             f"{fate}",
                                     )
-                                    finish(attempt, "ready", [
+                                    finish(attempt, _abort_requeue_status(
+                                        queue.get(task_id)), [
                                         f"1. peak window stopped attempt {attempt_no} before "
                                         f"the L2 review: its change (head {head_sha[:12]}) had "
-                                        f"passed L0 and L1 and was discarded with the run — "
-                                        f"redo it",
+                                        f"passed L0 and L1 and was {fate}"
+                                        + ("" if round_wip is not None else " — redo it"),
                                     ])
                                     return RunResult("peak_window", task_id, reports=reports)
                                 remaining_review = budget["wall_clock_min"] - session_seconds / 60.0
@@ -4474,7 +4662,9 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                             None, escalation="quota_exhausted",
                                             note=verifier.reason,
                                         )
-                                        finish(attempt, "ready",
+                                        finish(attempt,
+                                               _abort_requeue_status(
+                                                   queue.get(task_id)),
                                                [f"1. quota: {verifier.reason}"])
                                         return RunResult(
                                             "quota_exhausted", task_id,
@@ -4561,20 +4751,27 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                     # was discarded with the run.
                                     path = _store(reports_dir, work.run_id,
                                                   attempt_no, reports)
+                                    fate = (
+                                        "kept for the next fix round on this PR"
+                                        if round_wip is not None
+                                        else "discarded with the run")
                                     attempt = attempt_record(
                                         attempt_no, started, "aborted", records,
                                         path,
                                         note=(f"peak window before the final review; "
                                               f"the change (head {head_sha[:12]}, "
                                               f"passed L0, L1 and the delta review) "
-                                              f"was discarded with the run"),
+                                              f"was {fate}"),
                                     )
-                                    finish(attempt, "ready", [
+                                    finish(attempt, _abort_requeue_status(
+                                        queue.get(task_id)), [
                                         f"1. peak window stopped attempt "
                                         f"{attempt_no} before the final review: its "
                                         f"change (head {head_sha[:12]}) had passed "
                                         f"L0, L1 and the delta review and was "
-                                        f"discarded with the run — redo it",
+                                        f"{fate}"
+                                        + ("" if round_wip is not None
+                                           else " — redo it"),
                                     ])
                                     return RunResult("peak_window", task_id,
                                                      reports=reports)
@@ -4721,7 +4918,9 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                             None, escalation="quota_exhausted",
                                             note=verifier.reason,
                                         )
-                                        finish(attempt, "ready",
+                                        finish(attempt,
+                                               _abort_requeue_status(
+                                                   queue.get(task_id)),
                                                [f"1. quota: {verifier.reason}"])
                                         return RunResult(
                                             "quota_exhausted", task_id,
@@ -5152,6 +5351,11 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                         new_links = {**old_links, "pr": url, "branch": branch,
                                      "pushed_head": cast(str, head_sha)}
                         new_links.pop("escalation_pr", None)
+                        # F-79: the kept work is published (it is in
+                        # this very range) — the record goes with the
+                        # same save, the files right after.
+                        new_links.pop("wip", None)
+                        round_wip = None
                         task["links"] = new_links
                         if ci_pr_url is None:
                             queue.transition(task_id, "in_review")
@@ -5170,6 +5374,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                             # rewrite above is a no-op (same pr/branch)
                             # but re-saves the queue atomically.
                             queue.transition(task_id, "in_review")
+                        wipstore.discard(ctx.factory_root, project, task_id)
                         # ---- F-75 AC-1/AC-2: CI is part of done ----
                         # The bookkeeping above is durable (attempt,
                         # links, in_review): a crash from here leaves the
@@ -5488,6 +5693,13 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                     return RunResult("needs_human", task_id,
                                      escalation="pr_create_failed", reports=reports)
                 if deterministic:
+                    # F-79: the push fence or the PR-body gate refused
+                    # this range, and retrying cannot change that — kept
+                    # work is IN the range, so resuming from it would
+                    # meet the same refusal forever. It goes (and with
+                    # it whatever the fence objected to, off the disk).
+                    with contextlib.suppress(Exception):
+                        _forget_wip(queue, ctx.factory_root, project, task_id)
                     queue.transition(task_id, "needs_human")
                     return RunResult("needs_human", task_id,
                                      escalation="publish_refused", reports=reports)

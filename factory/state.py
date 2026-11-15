@@ -276,11 +276,18 @@ def credential_recovery_eligible(task: dict) -> bool:
 
 ATTEMPTS_RESET_ESCALATIONS = ("attempts_exhausted", "ci_failed")
 
-# F-78: the parks whose budget reset may KEEP the task's PR (one
-# predicate, two parks — both hold published, reviewed work a reset
-# must not throw away). attempts_exhausted has no validated PR to
-# keep; scope_missing never ran a session or published.
-KEEP_PR_ESCALATIONS = ("ci_failed", "scope_change_needed")
+# F-79: ONE resume rule replaces the per-class list (F-77 ci_failed,
+# F-78 scope_change_needed). ANY park holding a normal PR link may be
+# resumed on that PR — except the classes below, which keep their own
+# exit and never take the keep-the-PR budget reset:
+#   * credential_added — its evidence exit only (recover_credential,
+#     which follows the same PR rule; no budget is granted with it);
+#   * stale_base — session-less, it spent no budget to reset; its gate
+#     is a PASSING re-validation (recover_revalidated), which a reset
+#     must not bypass;
+#   * pr_closed — the PR is closed by definition; re-open it (the sweep
+#     returns it to in_review) or take the fix-round word.
+KEEP_PR_NEVER_ESCALATIONS = ("credential_added", "stale_base", "pr_closed")
 
 # F-78: the parks the MARKER writer accepts. Wider than
 # ATTEMPTS_RESET_ESCALATIONS on purpose: a scope_change_needed park
@@ -295,6 +302,34 @@ KEEP_PR_ESCALATIONS = ("ci_failed", "scope_change_needed")
 # attempts one.
 RESET_WRITER_ESCALATIONS = (
     "attempts_exhausted", "ci_failed", "scope_change_needed")
+
+
+def holds_normal_pr(task: dict) -> bool:
+    """Whether the task holds a NORMAL PR link (F-79): ``links.pr`` set,
+    no ``links.escalation_pr`` (that draft is the owner's to accept or
+    reject) and not stamped merged for that URL. Whether GitHub still
+    reports it open is never this layer's knowledge — the state layer
+    reads no network; a caller that did read it says so (``keep_pr`` /
+    ``pr_closed`` on the recovery writers)."""
+    links = task.get("links") or {}
+    return (bool(links.get("pr"))
+            and not links.get("escalation_pr")
+            and links.get("merged") != links.get("pr"))
+
+
+def merged_recovery_eligible(task: dict) -> bool:
+    """Whether the sweep's merged edge may move this task (F-79 AC-3):
+    ANY ``needs_human`` task holding a normal PR link — when GitHub
+    reports that PR merged, the park is over whatever class it was
+    (:meth:`TaskQueue.recover_pr_merged`). A park is a task whose last
+    attempt escalated — the shape every escalation writes; a
+    ``needs_human`` task with no escalated attempt on record is not
+    read (the sibling predicates' ``bool(attempts)`` rule)."""
+    attempts = task.get("attempts") or []
+    return (task.get("status") == "needs_human"
+            and bool(attempts)
+            and bool(attempts[-1].get("escalation"))
+            and holds_normal_pr(task))
 
 # F-72 AC-4: the two escalation classes the owner answers with
 # `factory recover --accept` — both are "the work is fine, the contract's
@@ -389,33 +424,85 @@ def attempts_reset_eligible(task: dict) -> bool:
 
 
 def keep_pr_eligible(task: dict) -> bool:
-    """Whether a budget reset may KEEP this task's PR (F-77, F-78).
+    """Whether a recovery may KEEP this task's PR (F-77, F-78; F-79
+    made it one rule).
 
-    True only for a ``needs_human`` task whose last attempt escalated
-    ``ci_failed`` (F-77) or ``scope_change_needed`` (F-78) and which
-    holds a NORMAL PR link: ``links.pr`` set, no
-    ``links.escalation_pr`` (that draft is the owner's to accept or
-    reject, never the sweep's to fix) and not stamped merged for that
-    URL. Such a task is published, reviewed work — parked on a red
-    check, or on a fix round that asked for a wider contract — and its
-    reset may return it to ``in_review`` so the sweep's CI fix round
-    (F-76) repairs the same PR under the freshly-approved scope instead
-    of a fresh run re-implementing from the default head. An
-    ``attempts_exhausted`` task never qualifies, whatever links it
-    holds: it has no validated PR to keep; neither does
-    ``scope_missing`` — it never ran a session or published. Whether
-    GitHub still reports the PR open is the COMMAND's read
-    (``factory recover --reset-attempts``); this is the state half, the
-    one gate of :meth:`TaskQueue.recover_attempts`'s ``keep_pr`` target.
+    True for a ``needs_human`` task that holds a NORMAL PR link
+    (:func:`holds_normal_pr`) whatever it escalated on — published,
+    reviewed work parked on a red check, a wider-scope request, a spent
+    budget, a non-converging review, a guard hit or an orchestrator
+    error — EXCEPT the classes in :data:`KEEP_PR_NEVER_ESCALATIONS`
+    (``credential_added``: its evidence exit only; ``stale_base``: its
+    re-validation gate; ``pr_closed``: the PR is closed). Such a task
+    may return to ``in_review`` so the sweep's CI fix round (F-76)
+    repairs the same PR instead of a fresh run re-implementing from the
+    default head. Whether GitHub still reports the PR open is the
+    COMMAND's read (``factory recover --reset-attempts``); this is the
+    state half, the one gate of :meth:`TaskQueue.recover_attempts`'s
+    ``keep_pr`` target.
     """
     attempts = task.get("attempts") or []
-    links = task.get("links") or {}
     return (task.get("status") == "needs_human"
             and bool(attempts)
-            and attempts[-1].get("escalation") in KEEP_PR_ESCALATIONS
-            and bool(links.get("pr"))
-            and not links.get("escalation_pr")
-            and links.get("merged") != links.get("pr"))
+            and attempts[-1].get("escalation") not in KEEP_PR_NEVER_ESCALATIONS
+            and holds_normal_pr(task))
+
+
+def _requeue_target(task: dict, tasks: list, *, keep_pr: bool,
+                    pr_closed: bool, what: str) -> str:
+    """Where a recovery writer lands a parked task (F-79 AC-2) — ONE
+    rule for every writer that leaves ``needs_human`` on the owner's
+    word, so no task ever lands ``ready`` holding a normal open PR.
+
+    A task holding a normal PR link (:func:`holds_normal_pr`) must be
+    told what GitHub reports for it, because this layer cannot read it:
+
+    * ``keep_pr`` (the caller read **open**) → ``in_review``: the PR is
+      kept and the sweep owns it again;
+    * ``pr_closed`` (the caller read **closed**) → the fresh-run
+      re-queue, ``ready`` (``blocked`` on an open dependency);
+    * neither → refused. A ``ready`` task holding its own open PR waits
+      on the one-open-PR rule forever (F-26), so the writer never
+      guesses.
+
+    A task holding no normal PR link takes the fresh-run re-queue, and
+    refuses ``keep_pr`` (there is no PR to keep).
+
+    Raises:
+        TransitionError: per above; nothing is written.
+    """
+    task_id = task.get("id")
+    if keep_pr and pr_closed:
+        raise TransitionError(
+            f"{task_id}: {what} was told the PR is both open (keep_pr) and "
+            "closed (pr_closed) — say one")
+    if holds_normal_pr(task):
+        if keep_pr:
+            return "in_review"
+        if not pr_closed:
+            raise TransitionError(
+                f"{task_id}: {what} refuses to re-queue a task that holds a "
+                f"normal PR link ({(task.get('links') or {}).get('pr')}) "
+                "without GitHub's word on it — a ready task holding its own "
+                "open PR waits on it forever. Say what GitHub reports: "
+                "keep_pr=True (open: the PR is kept, the task returns to "
+                "in_review) or pr_closed=True (closed: a fresh run "
+                "re-implements). `factory recover` reads it for you")
+    elif keep_pr:
+        raise TransitionError(
+            f"{task_id}: {what} can keep the PR only for a task that holds "
+            "a normal PR link (no escalation draft, not merged) — every "
+            "other recovery re-queues a fresh run")
+    return "blocked" if unmet_dependencies(task, tasks) else "ready"
+
+
+def _drop_wip(task: dict) -> None:
+    """Forget the task's kept fix-round work (F-79): a fresh run starts
+    from the default head, and a merged or closed PR has nothing left
+    to resume. Only the link — the files are the orchestrator's."""
+    links = task.get("links")
+    if isinstance(links, dict) and "wip" in links:
+        task["links"] = {k: v for k, v in links.items() if k != "wip"}
 
 
 def attempt_budget_floor(task: dict, slice_id: str) -> int:
@@ -770,6 +857,35 @@ def _atomic_write_json(path: Path, doc: dict) -> None:
         raise
 
 
+def atomic_install(tmp: Path, path: Path) -> None:
+    """Move an already-written temp file into place atomically — the
+    non-JSON sibling of :func:`_atomic_write_json` (F-79: a git bundle
+    git itself wrote). Same durability order: the file is fsynced, then
+    renamed, then the parent directory is fsynced. ``tmp`` must live in
+    ``path``'s directory. This module stays the only one that renames
+    (F-45 AC-6, I-3).
+
+    Raises:
+        OSError: If fsyncing or renaming fails; ``tmp`` is removed and
+            the destination is intact up to a failed rename.
+    """
+    try:
+        fd = os.open(tmp, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 def _check_attempts_append_only(old_doc: dict, new_doc: dict) -> None:
     """Refuse any change to ``attempts``/``attempt_resets`` other than
     appending (§2).
@@ -1114,9 +1230,60 @@ class TaskQueue:
         _check_slice_rules(task, new_status)
         _check_owner_step_rules(task, new_status)
         task["status"] = new_status
+        if new_status in ("ready", "blocked", "draft"):
+            _drop_wip(task)  # F-79: a fresh run resumes nothing
         self.save()
 
-    def recover_credential(self, task_id: str, evidence: str) -> str:
+    def record_wip(self, task_id: str, *, sha: str, parent: str,
+                   run_id: str) -> None:
+        """Record a fix round's kept work (F-79 AC-1): the ONE writer
+        of ``links.wip``.
+
+        The gate lives here, like every dedicated writer: the task must
+        be ``in_progress`` (a round is running under the run lease —
+        the only moment validated-but-unpublished work exists), hold a
+        normal PR link, and ``parent`` must be exactly
+        ``links.pushed_head`` — the head the factory pushed, the only
+        one a fix round may build on (F-76). The record is the WIP
+        commit's sha, that parent and the run id; the next fix round
+        restores it only while the parent is still the pushed head.
+
+        Raises:
+            StateError: Unknown task.
+            TransitionError: The task is not an in-progress fix round
+                on a normal PR whose pushed head is ``parent``.
+            ContractError: The record would not validate (a malformed
+                sha or run id).
+        """
+        task = self.get(task_id)
+        links = task.get("links") or {}
+        if (task.get("status") != "in_progress" or not holds_normal_pr(task)
+                or links.get("pushed_head") != parent):
+            raise TransitionError(
+                f"{task_id}: kept fix-round work is recorded only for an "
+                "in_progress task holding a normal PR link whose "
+                "links.pushed_head is exactly the kept commit's parent"
+            )
+        task["links"] = {**links, "wip": {"sha": sha, "parent": parent,
+                                           "run_id": run_id}}
+        self.save()
+
+    def clear_wip(self, task_id: str) -> "dict | None":
+        """Forget the task's kept fix-round work; returns the record
+        that was cleared (None when there was none — nothing written).
+        Clearing is always legal: the WIP is an optimisation, and every
+        gate runs on whatever the next round builds."""
+        task = self.get(task_id)
+        wip = (task.get("links") or {}).get("wip")
+        if wip is None:
+            return None
+        _drop_wip(task)
+        self.save()
+        return wip
+
+    def recover_credential(self, task_id: str, evidence: str, *,
+                           keep_pr: bool = False,
+                           pr_closed: bool = False) -> str:
         """Re-queue a ``credential_added`` task: the one writer of the
         ``needs_human → ready/blocked`` edge for that escalation.
 
@@ -1152,16 +1319,21 @@ class TaskQueue:
                 f"{task_id}: credential recovery needs a needs_human task "
                 "whose last attempt escalated credential_added"
             )
-        new_status = (
-            "blocked" if unmet_dependencies(task, self.doc.get("tasks", []))
-            else "ready"
-        )
+        # F-79 AC-2: a credential park holding a normal PR link (a fix
+        # round's diff tripped the sentinel; the PR still holds the last
+        # validated head) follows the one PR rule — never ready while
+        # the PR is open.
+        new_status = _requeue_target(
+            task, self.doc.get("tasks", []), keep_pr=keep_pr,
+            pr_closed=pr_closed, what="credential recovery")
         reason = RECOVERY_TRANSITIONS.get((_status_of(task), new_status))
-        assert reason is not None  # needs_human → ready/blocked is in the table
+        assert reason is not None  # every target is in the recovery table
         _check_kind_rules(task, _status_of(task), new_status)
         _check_slice_rules(task, new_status)
         _check_owner_step_rules(task, new_status)
         task["status"] = new_status
+        if new_status != "in_review":
+            _drop_wip(task)
         self.save()
         return new_status
 
@@ -1280,8 +1452,12 @@ class TaskQueue:
 
     def recover_pr_merged(self, task_id: str, *, merged_url: str) -> str:
         """Return an escalated task to ``in_review`` because GitHub
-        reports its PR MERGED: the one writer of that edge for a
-        ``stale_base`` task (F-26's remedy — you resolved the conflict
+        reports its PR MERGED: the one writer of that edge — since F-79
+        for ANY ``needs_human`` task holding a normal PR link
+        (:func:`merged_recovery_eligible`; a hand-merged PR ends the
+        park whatever it was, and any kept fix-round work is dropped
+        with the move), originally for a ``stale_base`` task (F-26's
+        remedy — you resolved the conflict
         on GitHub and merged; F-76 narrowed the generic
         ``needs_human → in_review`` recovery edge to the pr_closed
         re-open signal, so the merged shape needs its own writer). A
@@ -1294,7 +1470,7 @@ class TaskQueue:
         no-deploy profile's close pass finishes it in the same run.
 
         Args:
-            task_id: Task parked on a stale_base/pr_closed escalation.
+            task_id: Task parked holding a normal PR link.
             merged_url: The PR URL GitHub reported merged — must equal
                 the task's ``links.pr`` (a different URL is not this
                 task's PR; refuse rather than stamp a foreign merge).
@@ -1310,11 +1486,11 @@ class TaskQueue:
             ConcurrentWriteError: If another writer changed the file.
         """
         task = self.get(task_id)
-        if (not recovery_task_eligible(task)
+        if (not merged_recovery_eligible(task)
                 or task["links"].get("pr") != merged_url):
             raise TransitionError(
                 f"{task_id}: merged-PR recovery needs a needs_human task "
-                "whose last attempt escalated stale_base/pr_closed and "
+                "holding a normal PR link (no escalation draft) "
                 f"whose links.pr is exactly {merged_url}"
             )
         reason = RECOVERY_TRANSITIONS.get((_status_of(task), "in_review"))
@@ -1324,12 +1500,14 @@ class TaskQueue:
         _check_owner_step_rules(task, "in_review")
         task["status"] = "in_review"
         task["links"] = {**(task.get("links") or {}), "merged": merged_url}
+        _drop_wip(task)  # F-79: merged — nothing is left to resume
         self.save()
         return "in_review"
 
     def recover_attempts(self, task_id: str, evidence: str, *,
                          done_by: str | None = None,
                          keep_pr: bool = False,
+                         pr_closed: bool = False,
                          ledger=None) -> str:
         """Re-queue an ``attempts_exhausted`` (or, F-75, ``ci_failed``)
         task with a fresh budget: the one writer of that edge, and the
@@ -1351,15 +1529,20 @@ class TaskQueue:
           task re-queues for a FRESH run — ``blocked`` when a dependency
           is open, else ``ready``, the routing every recovery writer
           uses. The next run re-implements from the default head.
-        * ``keep_pr=True`` (F-77, F-78): the task returns to
-          ``in_review`` with its links untouched, so the sweep's CI fix
-          round repairs the SAME PR under the fresh budget (for a scope
-          park, under the widened, re-approved scope). Legal only for
-          :func:`keep_pr_eligible` — a ``ci_failed`` (F-77) or
-          ``scope_change_needed`` (F-78) park holding a normal PR link;
-          anything else refuses and writes nothing. The caller has read
-          GitHub (the PR is open); this layer cannot, and does not
-          guess. The F-65 ledger gate for a scope park, by contrast, is
+        * ``keep_pr=True`` (F-77, F-78; one rule since F-79): the task
+          returns to ``in_review`` with its links untouched, so the
+          sweep's CI fix round repairs the SAME PR under the fresh
+          budget (for a scope park, under the widened, re-approved
+          scope). Legal only for :func:`keep_pr_eligible` — ANY park
+          holding a normal PR link except ``credential_added``,
+          ``stale_base`` and ``pr_closed`` (their own exits); anything
+          else refuses and writes nothing. The caller has read GitHub
+          (the PR is open); this layer cannot, and does not guess.
+        * F-79: a task holding a normal PR link is NEVER re-queued on a
+          guess — the fresh-run target demands ``pr_closed=True`` (the
+          caller read GitHub reporting the PR closed); neither word
+          refuses (:func:`_requeue_target`). A fresh-run re-queue drops
+          ``links.wip``. The F-65 ledger gate for a scope park, by contrast, is
           THIS method's own demand (see ``ledger`` below) — never the
           command's alone.
 
@@ -1371,6 +1554,9 @@ class TaskQueue:
             done_by: Who granted the reset; recorded in the marker.
             keep_pr: Take the ``in_review`` target (F-77) instead of the
                 fresh-run re-queue.
+            pr_closed: The caller read GitHub reporting the task's PR
+                closed — required for the fresh-run re-queue of a task
+                that holds a normal PR link (F-79).
             ledger: REQUIRED for a ``scope_change_needed`` park, ignored
                 for the others: the F-63 owner ledger (duck-typed —
                 anything with ``has_contract(task_id, contract_hash)``);
@@ -1400,14 +1586,23 @@ class TaskQueue:
             raise StateError(f"{task_id}: attempt reset requires evidence")
         task = self.get(task_id)
         parked_on = (task.get("attempts") or [{}])[-1].get("escalation")
+        # F-79 AC-2: the reset is the one resume command for ANY park
+        # holding a normal PR link (keep_pr_eligible — never
+        # credential_added/stale_base/pr_closed, which keep their own
+        # exits); without a PR link it stays what it was, the
+        # attempts_exhausted/ci_failed/scope_change_needed fresh-run
+        # reset.
         if not (task.get("status") == "needs_human"
-                and parked_on in RESET_WRITER_ESCALATIONS):
+                and (parked_on in RESET_WRITER_ESCALATIONS
+                     or keep_pr_eligible(task))):
             raise TransitionError(
                 f"{task_id}: attempt reset needs a needs_human task whose "
-                "last attempt escalated attempts_exhausted (or ci_failed, "
-                "F-75; or scope_change_needed, F-78)"
+                "last attempt escalated attempts_exhausted, ci_failed or "
+                "scope_change_needed, or — any other escalation but "
+                "credential_added, stale_base and pr_closed, which keep "
+                "their own exits — one that holds a normal PR link (F-79)"
             )
-        if parked_on == "scope_change_needed":
+        if parked_on in SCOPE_RECOVERY_ESCALATIONS:
             # F-78 review finding: the F-65 gate is THIS layer's demand,
             # not only the command's — a widened contract the owner has
             # not re-approved moves nothing, whoever calls. The ledger is
@@ -1418,7 +1613,7 @@ class TaskQueue:
             if ledger is None or not ledger.has_contract(
                     task_id, contract_hash(task)):
                 raise TransitionError(
-                    f"{task_id}: a scope_change_needed reset demands the "
+                    f"{task_id}: a {parked_on} reset demands the "
                     "owner-ledger approval of the task's CURRENT (widened) "
                     "contract — pass the ledger and record the "
                     "re-approval first (`factory approve --adopt`); a "
@@ -1428,20 +1623,18 @@ class TaskQueue:
         if keep_pr and not keep_pr_eligible(task):
             raise TransitionError(
                 f"{task_id}: a reset that keeps the PR needs a needs_human "
-                "task whose last attempt escalated ci_failed (F-77) or "
-                "scope_change_needed (F-78) and which holds a normal PR "
-                "link (no escalation draft, not merged) — every other "
+                "task that holds a normal PR link (no escalation draft, "
+                "not merged) and is not parked on credential_added, "
+                "stale_base or pr_closed (their own exits) — every other "
                 "reset re-queues a fresh run"
             )
         slice_id = task["attempts"][-1].get("slice_id") or task_id
-        if keep_pr:
-            new_status = "in_review"
-        else:
-            new_status = (
-                "blocked"
-                if unmet_dependencies(task, self.doc.get("tasks", []))
-                else "ready"
-            )
+        # F-79 AC-2: the one target rule — in_review (PR open, kept),
+        # the fresh-run re-queue (PR closed, or no PR link), or a
+        # refusal when a PR link is held and GitHub's word is missing.
+        new_status = _requeue_target(
+            task, self.doc.get("tasks", []), keep_pr=keep_pr,
+            pr_closed=pr_closed, what="an attempt reset")
         reason = RECOVERY_TRANSITIONS.get((_status_of(task), new_status))
         assert reason is not None  # every target is in the recovery table
         _check_kind_rules(task, _status_of(task), new_status)
@@ -1455,11 +1648,14 @@ class TaskQueue:
             "slice_id": slice_id,
             "prior_attempts": len(task.get("attempts") or []),
         })
+        if new_status != "in_review":
+            _drop_wip(task)  # F-79: a fresh run resumes nothing
         self.save()
         return new_status
 
     def recover_scope(self, task_id: str, *, ledger, evidence: str,
-                      done_by: str | None = None) -> str:
+                      done_by: str | None = None,
+                      pr_closed: bool = False) -> str:
         """Re-queue a scope-escalated task after the owner re-approves
         its (possibly widened) contract: the one writer of that edge
         (F-65 AC-3 — the minimal path this WO had to build; the spec
@@ -1520,16 +1716,21 @@ class TaskQueue:
                 "refuses non-draft tasks), then recover; a widened scope "
                 "the owner has not re-approved does not move"
             )
-        new_status = (
-            "blocked" if unmet_dependencies(task, self.doc.get("tasks", []))
-            else "ready"
-        )
+        # F-79 AC-2: this exit only ever re-queues a FRESH run, so a
+        # scope park holding a normal PR link takes it only on GitHub's
+        # word that the PR is closed — an open PR is kept through the
+        # budget reset (recover_attempts(keep_pr=True)), never
+        # re-queued under itself.
+        new_status = _requeue_target(
+            task, self.doc.get("tasks", []), keep_pr=False,
+            pr_closed=pr_closed, what="the scope re-queue")
         reason = RECOVERY_TRANSITIONS.get((_status_of(task), new_status))
         assert reason is not None  # needs_human → ready/blocked is in the table
         _check_kind_rules(task, _status_of(task), new_status)
         _check_slice_rules(task, new_status)
         _check_owner_step_rules(task, new_status)
         task["status"] = new_status
+        _drop_wip(task)  # F-79: a fresh run resumes nothing
         self.save()
         return new_status
 

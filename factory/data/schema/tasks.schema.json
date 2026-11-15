@@ -320,7 +320,17 @@
               "type": "array",
               "items": { "type": "string" },
               "maxItems": 8,
-              "description": "F-76: PR head SHAs whose failed CI runs the sweep already re-ran once (the flake guard — once per head, across runs, so a red head that keeps failing is never re-run twice). The sweep keeps at most the last 8."
+              "description": "F-76: PR head SHAs whose failed CI runs the sweep already re-ran once (the flake guard — once per head, across runs, so a red head that keeps failing is never re-run twice). The sweep keeps at most the last 8."},
+            "wip": {
+              "type": "object",
+              "description": "F-79: a fix round's kept work — a round on this task's normal PR passed L0 and L1 and then did not publish (review failed, or the round escalated), so the parent kept its tree as ONE factory-built commit on links.pushed_head, in a git bundle under <factory_root>/wip/<project>/<task>/<run_id>.bundle (never pushed: a head that has not passed review never reaches the PR). The next fix round on the task starts from it only while `parent` is still exactly links.pushed_head and the remote branch still holds it; otherwise it is ignored and cleared. Cleared when a round publishes, when the PR merges or closes, and on a fresh-run re-queue. Written only by TaskQueue.record_wip.",
+              "additionalProperties": false,
+              "required": ["sha", "parent", "run_id"],
+              "properties": {
+                "sha": { "type": "string", "pattern": "^[0-9a-f]{40,64}$" },
+                "parent": { "type": "string", "pattern": "^[0-9a-f]{40,64}$" },
+                "run_id": { "type": "string", "pattern": "^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$" }
+              }
             }
           }
         }

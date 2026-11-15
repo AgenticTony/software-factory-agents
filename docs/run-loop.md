@@ -77,6 +77,7 @@ This takes about 15 minutes and is not a full review. Its sources:
 | 2026-11-14 | wo21 run 5 (F-76 live) | needs_human ci_failed, then a stalled recovery | 4 (revalidate, reset-attempts, merge #138, the repair) | 0 (session-less park) | 0 model tokens | ~8 min (sweep) | F-77 existed but was unmerged when needed; recover ran pre-F-77 code |
 | 2026-11-14 | wo21 run 6 (F-77 live) | needs_human scope_change_needed (budget spent 2/2, PR kept) | 2 (reset, merge #139) | 60 + 43 | pending usage | ~29 min | a scope park on an open PR with spent budget has no exit that keeps the work (F-78); `factory adopt` named by the contract but absent from the CLI |
 | 2026-11-14 | F-78 build (session) | branch held for review | 2 (approve F-78, merge pending) | — (session build, not a factory run) | — | — | **finding: the SFA profile declares `repo.branch_protection: unavailable` on a PUBLIC repo whose owner has ADMIN — a false declaration (the schema allows it only for plan-limit-403 private repos); `factory loop` on this repo correctly refused to build.** Owner deciding protection separately; F-78 built session-style on a branch instead |
+| 2026-11-14 | wo21 run 7 (F-78 live) | **pr_opened**: fix round passed L0, L1 and review and pushed to #163; the PR's own tests went green | 3 (adopt, reset, loop) plus 2 unrelated (merge JobFinderOS #165, merge #163) | 92 | 227k in / 61k out / 4.0M cache-read | 26 min | the loop prints a stale pre-round `not ready` line; a `main`-side advisory reddens every PR and a re-run reuses the stale merge commit |
 
 ## Retros
 
@@ -146,8 +147,22 @@ After #139 merged and main was pulled, wo21 was re-parked by hand (`ready → ne
 
 The target is 2 owner touches per task: approve and merge.
 
+### Run 2026-11-14 (evening): wo21 — F-78's first live recovery, and the first fix round that published
+- **Goal:** resume the scope-parked wo21 on #163 with the widened contract (`backend/app/api/v1/applications.py` in scope, `max_attempts` 3).
+- **What happened:** `factory approve --adopt`, then `factory recover --reset-attempts` kept the PR and returned the task to `in_review`. The next `factory loop` ran the CI fix round as run `20261114T184258Z-140cfb`: one attempt, 92 turns, 26 minutes. L0, L1 and review passed (3 review findings, none dropped) and the round pushed `1c7e85f` to #163 under the factory identity. Both backend test jobs went green on that head.
+- **Escalated:** none.
+- **The one red check was not the task's.** `Security audit (pip-audit)` failed on `dnspython 2.9.0`, an advisory published against a pin already on the project's `main`. It was fixed on `main` by a two-line lock bump (JobFinderOS #165). Re-running the failed job did not help: a re-run reuses the run's original merge commit, built against the old `main`. A close-and-reopen of the PR produced a fresh merge commit, and all 8 checks passed.
+- **Owner touches:** 3 for the task (adopt, reset, loop). Two more for the unrelated advisory and the merge.
+- **Cost:** 227k input, 61k output and 4.0M cache-read tokens.
+- **What broke in the factory:**
+  1. **The loop printed a stale line.** Under the run that published, it printed `not ready: CI red (Backend…)`, which was the sweep's read of the old head from before the round. The line is true when read and false when printed. Small reporting fix.
+  2. **A red caused by `main` looks the same as a red caused by the task.** With budget left, the next sweep would have started a paid fix round for an advisory the task did not introduce. The factory has no check for "this check also fails on the default branch". Watch for a second case before building anything.
+  3. **A re-run cannot see a fix that landed on the default branch.** F-75's flake guard re-runs the failed job, which reuses the old merge commit. That is right for flakes and useless for a `main`-side fix. Same watch item as 2.
+- **Fix as a WO?** No new one from this run. F-79 (kept fix-round work, one resume rule) was already in build and covers what the afternoon run lost. Items 2 and 3 wait for a second occurrence.
+
+
 ## Known gaps carried forward (fix only if a run hits them)
 - The clone has no virtualenv and no git identity before the session (F-73 AC-2, shelved). wo21 run 1 burned turns on it.
 - A failed session records no token usage (F-73 AC-1, shelved).
-- A retry gets only the failure line, not the previous attempt's work (F-73 AC-3, shelved).
+- A retry gets only the failure line, not the previous attempt's work (F-73 AC-3, shelved) — fixed for fix rounds on an open PR by F-79 (the kept commit plus that round's review findings); a fresh run's later attempts still get only the progress log.
 - Local queue state lives in the repo's `.factory/tasks.json`, so a contract PR forces the owner to discard local state before pulling (step 3). This is new from this prep and becomes a WO only if it bites again.

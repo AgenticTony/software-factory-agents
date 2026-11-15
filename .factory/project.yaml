@@ -319,6 +319,15 @@ paths:
     # fix round).
     - "tests/test_f78.py"
     - "tests/_support/f78.py"
+    # F-79: same precedent — the kept-work / one-resume-rule contract
+    # tests judge the protected state/approve/orchestrator modules and
+    # the schema (the WIP writer and its gate, the widened reset and
+    # merged edges, the never-ready-under-an-open-PR rule). wip.py is
+    # the store those modules trust: what a round is SEEDED from is
+    # judge surface, protected from the day it exists.
+    - "tests/test_f79.py"
+    - "tests/_support/f79.py"
+    - "factory/wip.py"
     # F-71: the dependency policy is judge surface — deps.py decides
     # what a manifest change means, registry.py decides whether a
     # package may be installed, and the generator writes the near-miss

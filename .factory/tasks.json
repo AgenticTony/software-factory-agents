@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-14T16:20:00Z",
+  "updated_at": "2026-11-14T19:00:00Z",
   "tasks": [
     {
       "id": "F-00",
@@ -6005,6 +6005,80 @@
           "tests/test_f78.py",
           "tests/_support/f78.py",
           "TASK-CONTRACT.md",
+          "BUILD-ORDER.md",
+          ".factory/tasks.json",
+          ".factory/project.yaml",
+          ".factory/BOOTSTRAP.md",
+          "docs/run-loop.md"
+        ]
+      }
+    },
+    {
+      "id": "F-79",
+      "title": "Fix-round work survives, and any PR park resumes",
+      "source": "BUILD-ORDER.md#f-79--fix-round-work-survives-and-any-pr-park-resumes",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-78"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "Validated fix-round work is kept and resumed: a round on a task's normal PR that passes L0 and L1 and then does not publish keeps its change locally (one parent-built commit on `links.pushed_head`, a bundle under the factory root, `links.wip` through a dedicated writer — never pushed); the next fix round starts from it only while that parent is still the pushed head on the remote, its prompt says so and carries the previous round's review findings; gates and the publish path see the whole range; cleared on publish, merge, close and a fresh-run re-queue.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f79.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "One resume rule: `factory recover <task> --reset-attempts --evidence` keeps the PR (`needs_human → in_review`, the F-77 shape) for ANY park holding a normal PR link GitHub reports open; `scope_change_needed` (ledger), `stale_base` (`--revalidate`) and `credential_added` (evidence exit only) keep their own gate; escalation draft PRs stay with `--accept/--reject`; closed → fresh-run re-queue, merged/unreadable → refused; the gate lives in the state-layer writers and no task lands `ready` while holding a normal open PR.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f79.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "A hand-merged PR is recognised on any park: the sweep takes the merged recovery edge for the normal PR of any `needs_human` task GitHub reports merged, clears any kept work and logs it; escalation draft PRs, open PRs and unreadable states are left alone.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f79.py::test_ac_3"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 150,
+        "wall_clock_min": 120
+      },
+      "scope": {
+        "paths": [
+          "factory/wip.py",
+          "factory/state.py",
+          "factory/approve.py",
+          "factory/orchestrator.py",
+          "factory/cli.py",
+          "factory/data/schema/tasks.schema.json",
+          "tests/test_f79.py",
+          "tests/_support/f79.py",
+          "tests/test_f77.py",
+          "tests/test_f78.py",
+          "TASK-CONTRACT.md",
+          "VALIDATOR-SPEC.md",
           "BUILD-ORDER.md",
           ".factory/tasks.json",
           ".factory/project.yaml",
