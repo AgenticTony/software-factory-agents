@@ -249,34 +249,37 @@ def test_ac_1(tmp_path: Path, monkeypatch, capsys):
         assert len(p.log()) == log_before, f"{name}: the refusal logged"
         assert confirmed == [], f"{name}: refused before the prompt"
 
-    # (4) attempts_exhausted holding an OPEN normal PR link: today's
-    # behaviour — ready, and GitHub is never even asked.
+    # (4) attempts_exhausted holding an OPEN normal PR link. AMENDED BY
+    # F-79 (BUILD-ORDER §F-79 AC-2 — one resume rule replaces the
+    # per-class list this arm pinned): F-77 left this park re-queueing
+    # `ready` with GitHub never asked — under its own open PR, where it
+    # waited forever. It now follows the PR rule like ci_failed: open
+    # keeps the PR (in_review), and the state layer accepts the target.
     p = Parked(tmp_path / "exhausted", monkeypatch)
     q = p.queue()
     _append_escalation(q, "attempts_exhausted")
     q.save()
     assert p.env.task()["attempts"][-1]["escalation"] == "attempts_exhausted"
 
-    def never(url):
-        raise AssertionError("attempts_exhausted must not read PR state")
-
     readied = []
     status = recover_task(
         p.queue(), "T-1", reset_attempts=True, evidence=EVIDENCE,
-        done_by="owner", factory_root=p.env.root, pr_state=never,
+        done_by="owner", factory_root=p.env.root,
+        pr_state=lambda url: "open",
         pr_ready=readied.append, confirm=lambda question: True,
         echo=lambda text: None)
-    assert status == "ready" and p.env.task()["status"] == "ready"
-    assert readied == []
+    assert status == "in_review" and p.env.task()["status"] == "in_review"
+    assert readied == [p.url]
     assert p.log()[-1]["escalation"] == "attempts_exhausted"
-    # … and the state layer refuses the in_review target for it outright
+    # … and the state layer never re-queues it on a guess: without
+    # GitHub's word (keep_pr / pr_closed) the writer refuses.
     p = Parked(tmp_path / "exhausted-state", monkeypatch)
     q = p.queue()
     _append_escalation(q, "attempts_exhausted")
     q.save()
     snap = p.snapshot()
-    with pytest.raises(TransitionError, match="ci_failed"):
-        p.queue().recover_attempts("T-1", EVIDENCE, keep_pr=True)
+    with pytest.raises(TransitionError, match="GitHub"):
+        p.queue().recover_attempts("T-1", EVIDENCE)
     assert p.snapshot() == snap
 
     # (5) the gate lives in the state layer: the generic transition

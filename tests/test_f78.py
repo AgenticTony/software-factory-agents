@@ -187,10 +187,12 @@ def test_ac_1(tmp_path: Path, monkeypatch):
                 confirm=lambda question: True, echo=lambda text: None)
         assert p.snapshot() == snap, f"{name}: the refusal wrote the queue"
 
-    # (5) the state layer: the keep-PR target is the scope/ci_failed
-    # parks' alone; scope_missing and attempts_exhausted are refused
-    # (no ledger demanded for those — the gate is the park, not the
-    # contract).
+    # (5) the state layer: the keep-PR target through the writer.
+    # AMENDED BY F-79 (BUILD-ORDER §F-79 AC-2 — one resume rule replaces
+    # the per-class list this arm pinned): scope_missing and
+    # attempts_exhausted parks that hold a normal PR link were refused
+    # here; they now take the target like every PR-holding park. What
+    # still refuses is a park with NO normal PR link — nothing to keep.
     p = _scope_park(tmp_path / "state", monkeypatch)
     ledger = ApprovalLedger.for_project(p.env.root, "fixture")
     new_status = p.queue().recover_attempts(
@@ -201,6 +203,16 @@ def test_ac_1(tmp_path: Path, monkeypatch):
         q = p.queue()
         append_escalation(q, escalation)
         q.save()
+        ledger = ApprovalLedger.for_project(p.env.root, "fixture")
+        assert q.recover_attempts(
+            "T-1", EVIDENCE, done_by="owner", keep_pr=True,
+            ledger=ledger) == "in_review"
+        p = _scope_park(tmp_path / f"nopr-{escalation}", monkeypatch)
+        q = p.queue()
+        append_escalation(q, escalation)
+        q.get("T-1")["links"].pop("pr")
+        q.save()
+        ledger = ApprovalLedger.for_project(p.env.root, "fixture")
         with pytest.raises(TransitionError):
             q.recover_attempts("T-1", EVIDENCE, done_by="owner",
                                keep_pr=True, ledger=ledger)
@@ -239,10 +251,16 @@ def test_ac_1(tmp_path: Path, monkeypatch):
             confirm=lambda question: True, echo=lambda text: None)
 
     # (7) the no-flag scope exit is unchanged: re-queue, NO marker.
+    # AMENDED BY F-79 (AC-2): the fixture park holds a normal PR link,
+    # and no exit lands a task `ready` under its own open PR any more —
+    # this exit reads GitHub and takes the re-queue when the PR is
+    # CLOSED (an open one refuses, naming --reset-attempts:
+    # tests/test_f79.py::test_ac_2).
     p = _scope_park(tmp_path / "noflag", monkeypatch)
     status = recover_task(
         p.queue(), "T-1", evidence="widened and checked",
         done_by="owner", factory_root=p.env.root,
+        pr_state=_pr_state("closed"),
         confirm=lambda question: True, echo=lambda text: None)
     assert status == "ready"
     assert not p.env.task().get("attempt_resets"), \

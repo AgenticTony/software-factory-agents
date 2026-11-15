@@ -149,5 +149,5 @@ The target is 2 owner touches per task: approve and merge.
 ## Known gaps carried forward (fix only if a run hits them)
 - The clone has no virtualenv and no git identity before the session (F-73 AC-2, shelved). wo21 run 1 burned turns on it.
 - A failed session records no token usage (F-73 AC-1, shelved).
-- A retry gets only the failure line, not the previous attempt's work (F-73 AC-3, shelved).
+- A retry gets only the failure line, not the previous attempt's work (F-73 AC-3, shelved) — fixed for fix rounds on an open PR by F-79 (the kept commit plus that round's review findings); a fresh run's later attempts still get only the progress log.
 - Local queue state lives in the repo's `.factory/tasks.json`, so a contract PR forces the owner to discard local state before pulling (step 3). This is new from this prep and becomes a WO only if it bites again.
