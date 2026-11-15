@@ -309,6 +309,24 @@ class BypassDenials:
         self.denied: set[str] = set()
         self.count: int = 0
 
+
+class EgressDenials:
+    """F-84 AC-3: the same shared-state shape as :class:`BypassDenials`,
+    for the egress policy hooks — the WebSearch deny (AC-1) and the
+    undeclared-install deny (AC-2).
+
+    ``denied`` maps the denied tool_use_id to its trace tag
+    (``"web_search"`` / ``"undeclared_install"``) so the F-30 tap can
+    stamp the right reason onto the call's ``tool_call`` event;
+    ``run_session`` stamps ``count`` onto the :class:`SessionRecord`
+    (``egress_denials``), and the orchestrator sums it onto the attempt
+    record like ``sandbox_bypass_denials``.
+    """
+
+    def __init__(self) -> None:
+        self.denied: dict[str, str] = {}
+        self.count: int = 0
+
 # F-51 (I-1): the staging source is the package itself (Path(__file__)'s
 # own dir — inside the package, so a wheel install stages from
 # site-packages exactly as this checkout stages from the repo). The old
@@ -563,6 +581,11 @@ SEATS: dict[str, SeatConfig] = {
         # the declared scope". The other seats never get it: a reviewer
         # or verifier requesting scope has nothing to say.
         allowed_tools=(VENT_QUALIFIED_NAME, "mcp__request_scope__request_scope"),
+        # F-84 AC-1: NO seat searches the open web (owner decision,
+        # 2026-11-15) — search results are untrusted text entering the
+        # session's context. The options layer removes the tool and
+        # web_search_hook denies it under bypassPermissions.
+        disallowed_tools=("WebSearch",),
         # See the module docstring: the sandbox is the permission system;
         # prompts are bypassed, hooks + srt enforce the policy.
         permission_mode="bypassPermissions",
@@ -572,7 +595,8 @@ SEATS: dict[str, SeatConfig] = {
         allowed_tools=(VENT_QUALIFIED_NAME,),
         # WO: "the reviewer gets no Write/Edit". NotebookEdit is the same
         # class of tool, so it goes too — a reviewer that cannot mutate.
-        disallowed_tools=("Write", "Edit", "NotebookEdit"),
+        # F-84: WebSearch goes too, every seat (see the implementer).
+        disallowed_tools=("Write", "Edit", "NotebookEdit", "WebSearch"),
         # Review round finding 8: the default permission mode asks someone
         # to approve each Bash call, and a headless session has nobody to
         # ask — the reviewer could never run the read-only checks its spec
@@ -591,7 +615,7 @@ SEATS: dict[str, SeatConfig] = {
         # (no edit tools, same integrity guard in run_session_sandboxed).
         # A verifier that could write the workspace could "fix" the code a
         # finding names and then vote the finding out on what it wrote.
-        disallowed_tools=("Write", "Edit", "NotebookEdit"),
+        disallowed_tools=("Write", "Edit", "NotebookEdit", "WebSearch"),
         permission_mode="bypassPermissions",
     ),
     "arbiter": SeatConfig(
@@ -603,7 +627,7 @@ SEATS: dict[str, SeatConfig] = {
         # clean clone is gone by the time a review stops converging), so
         # the integrity guard matters twice over: a ruling bought with a
         # workspace write would ride the NEXT round's `git add -A`.
-        disallowed_tools=("Write", "Edit", "NotebookEdit"),
+        disallowed_tools=("Write", "Edit", "NotebookEdit", "WebSearch"),
         permission_mode="bypassPermissions",
     ),
     "contract_reviewer": SeatConfig(
@@ -614,7 +638,7 @@ SEATS: dict[str, SeatConfig] = {
         # contract (no edit tools, the integrity guard in
         # run_session_sandboxed). It reports findings; a seat that could
         # write its clone could plant the evidence its own findings cite.
-        disallowed_tools=("Write", "Edit", "NotebookEdit"),
+        disallowed_tools=("Write", "Edit", "NotebookEdit", "WebSearch"),
         permission_mode="bypassPermissions",
     ),
 }
@@ -1054,6 +1078,188 @@ def sandbox_bypass_hook(denials: BypassDenials | None = None) -> HookMatcher:
     return HookMatcher(matcher="Bash", hooks=[cast(HookCallback, _hook)])
 
 
+# ------------------------------------------------------- F-84 egress policy --
+
+WEB_SEARCH_DENY_REASON = (
+    "WebSearch is not available inside a factory session (F-84): search "
+    "results are untrusted text entering the session's context. Fetch "
+    "grounding from the project's docs allowlist (WebFetch) instead."
+)
+INSTALL_DENY_REASON = (
+    "package installs come from the lock (F-84): the project's setup ran "
+    "before this session, and the registries are reachable only when the "
+    "task's contract declares the dependency. If a tool or package is "
+    "missing, report it as a finding in your final report — do not "
+    "install, download or work around it."
+)
+
+# What makes a Bash invocation an INSTALL, by program. The value is the
+# set of subcommands that fetch/bootstrap packages. Over-matching is the
+# safe direction for a deny-layer; the structural fence underneath is
+# the session settings' network allowlist (F-84 AC-2) — without the
+# registry on it, an obfuscated install the lexer misses still cannot
+# fetch anything.
+_INSTALL_SUBCOMMANDS = {
+    "pip": frozenset({"install", "download"}),
+    "pip3": frozenset({"install", "download"}),
+    "pipx": frozenset({"install", "runpip"}),
+    "npm": frozenset({"install", "i", "add", "ci"}),
+    "pnpm": frozenset({"install", "i", "add", "ci"}),
+    "yarn": frozenset({"install", "i", "add"}),
+    "bun": frozenset({"install", "i", "add", "x"}),
+    "uv": frozenset({"pip", "add", "install", "tool", "x", "run", "sync"}),
+}
+# Programs whose CLIs interleave value-taking flags before the
+# subcommand (``npm --prefix X install y``): every non-flag token is
+# scanned, not just the first — the deny-layer errs toward denying.
+_INSTALL_SCAN_ALL = frozenset({"npm", "pnpm", "yarn", "bun"})
+# ``npx``/``uvx`` fetch a package to run it whatever their arguments
+# look like.
+_INSTALL_PROGRAMS = frozenset({"npx", "uvx"})
+_PYTHON_PROGRAMS = frozenset({"python", "python3", "pypy", "pypy3"})
+
+
+def _install_class(tokens: list[str]) -> str | None:
+    """The install-class label of one invocation (``"pip install"``,
+    ``"npm install"``, ``"ensurepip"``, …) or None — recursing into
+    ``sh -c`` payloads and prefix runners exactly like the push/gh guard,
+    so ``sh -c 'pip install x'`` and ``env pip install x'`` are seen as
+    their bare selves. Registry, URL, git and local-wheel sources all
+    begin with the same subcommand — matching the SUBCOMMAND (not the
+    source) is what covers them all."""
+    if not tokens:
+        return None
+    program = Path(tokens[0]).name
+    if program in _INSTALL_PROGRAMS:
+        return program
+    if program in _INSTALL_SUBCOMMANDS:
+        allowed = _INSTALL_SUBCOMMANDS[program]
+        if program in _INSTALL_SCAN_ALL:
+            # The npm family interleaves value-taking flags before the
+            # subcommand (npm --prefix X install y) — scan every
+            # non-flag token; over-matching is the safe direction.
+            for token in tokens[1:]:
+                if not token.startswith("-") and token in allowed:
+                    return f"{program} {token}"
+            return None
+        for token in tokens[1:]:
+            if token.startswith("-"):
+                continue
+            if token in allowed:
+                return f"{program} {token}"
+            return None  # pip list / npm ls / npm run — not an install
+        return None
+    if program in _PYTHON_PROGRAMS:
+        # python -m pip install x / python -m ensurepip: the module
+        # after ``-m`` decides; a bare ``python script.py`` does not.
+        rest = tokens[1:]
+        try:
+            module_at = rest.index("-m") + 1
+            module = rest[module_at]
+        except (ValueError, IndexError):
+            return None
+        if module == "ensurepip":
+            return "ensurepip"
+        if module in ("pip", "uv"):
+            return _install_class([module, *rest[module_at + 1:]])
+        return None
+    if program in _BASH_SHELLS:
+        try:
+            payload = tokens.index("-c", 1) + 1
+        except ValueError:
+            return None
+        return _install_class(tokens[payload:])
+    if program in _BASH_PREFIX_RUNNERS:
+        rest = [
+            token
+            for token in tokens[1:]
+            if not token.startswith("-") and "=" not in token
+        ]
+        return _install_class(rest)
+    return None
+
+
+def web_search_hook(denials: EgressDenials | None = None) -> HookMatcher:
+    """PreToolUse hook: deny every WebSearch call (F-84 AC-1, owner
+    decision 2026-11-15 — no seat searches the open web).
+
+    Two layers hold the line: the seat configs list WebSearch in
+    ``disallowed_tools`` (the CLI never offers the tool), and this hook
+    denies it under ``bypassPermissions`` (a deny hook still blocks
+    there — F-06's established fact), counting each refusal into
+    ``denials`` so it reaches the trace, the record and the attempt.
+    WebFetch is deliberately untouched: it stays bounded to the
+    profile's ``docs_allowlist`` by the session's network settings.
+    """
+
+    state = denials if denials is not None else EgressDenials()
+
+    async def _hook(
+        input: dict[str, Any], tool_use_id: str | None, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        if str(input.get("tool_name") or "") != "WebSearch":
+            return {}  # the matcher routes only WebSearch; defence anyway
+        if tool_use_id is not None:
+            state.denied[str(tool_use_id)] = "web_search"
+        state.count += 1
+        return _deny(WEB_SEARCH_DENY_REASON)
+
+    return HookMatcher(matcher="WebSearch", hooks=[cast(HookCallback, _hook)])
+
+
+def install_guard_hook(
+    declared_dependencies: bool, denials: EgressDenials | None = None
+) -> HookMatcher:
+    """PreToolUse hook over Bash: deny install-class commands when the
+    task's contract declares no ``dependencies`` (F-84 AC-2/AC-3).
+
+    Installs come from the lock — the F-73 setup that runs before the
+    session — so a session with an undeclared contract may install
+    nothing: not from the registry, not from a URL, a git URL or a
+    local wheel (all share the install subcommand the lexer matches),
+    not via ensurepip/uv/npx. When the contract DOES declare
+    dependencies the hook is inert: the registries are on that
+    session's network allowlist, and L0's F-71 check judges the
+    manifest. The refusal names the policy and the way out (report it
+    as a finding), and each denial counts into ``denials``.
+
+    Residual (documented, best-effort deny-layer — NOT an
+    evasion-proof boundary, the bash_guard precedent): pipes feeding a
+    shell's stdin, interpreters spelled without ``-m``, and
+    unenumerated wrappers slip past the lexer. The structural fence
+    underneath is the settings: without the registries on the session's
+    allowlist, an obfuscated install can fetch nothing, and a
+    local-wheel install only runs code the session could already run —
+    confined by the same sandbox, judged on the same clean clone.
+    """
+
+    state = denials if denials is not None else EgressDenials()
+
+    async def _hook(
+        input: dict[str, Any], tool_use_id: str | None, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        if declared_dependencies:
+            # The contract allows the installs: the registries are on
+            # this session's network allowlist and L0's F-71 check
+            # judges the manifest — the guard is inert.
+            return {}
+        command = str((input.get("tool_input") or {}).get("command", ""))
+        if not command:
+            return {}
+        dequoted = command.translate(_BASH_QUOTES)
+        for invocation in _bash_invocations(dequoted):
+            label = _install_class(invocation)
+            if label is None:
+                continue
+            if tool_use_id is not None:
+                state.denied[str(tool_use_id)] = "undeclared_install"
+            state.count += 1
+            return _deny(f"{label}: {INSTALL_DENY_REASON}")
+        return {}
+
+    return HookMatcher(matcher="Bash", hooks=[cast(HookCallback, _hook)])
+
+
 # ----------------------------------------------------------- options/record --
 
 
@@ -1207,6 +1413,8 @@ def build_options(
     bypass_denials: BypassDenials | None = None,
     propose_collector: Any = None,
     scope_collector: Any = None,
+    egress_denials: EgressDenials | None = None,
+    declared_dependencies: bool = False,
     resume: str | None = None,
 ) -> ClaudeAgentOptions:
     """Build the per-seat ClaudeAgentOptions (WO F-06 options list).
@@ -1223,6 +1431,13 @@ def build_options(
     the seat's static default, which stays empty because the prompt
     *files* are unreadable inside the sandbox — the orchestrator
     assembles them outside and passes the text.
+
+    F-84 adds the egress pair to every seat: ``web_search_hook`` (no
+    seat searches the open web) and ``install_guard_hook`` (installs
+    come from the lock; an undeclared contract may install nothing).
+    ``declared_dependencies`` is the task's contract fact — True keeps
+    the install guard inert (the registries are on that session's
+    network allowlist and L0's F-71 check judges the manifest).
 
     ``vent_collector`` (F-27): attach the in-process ``vent`` tool closed
     over this run's collector. Both seats list the tool in
@@ -1250,6 +1465,9 @@ def build_options(
     stamps onto the record. ``None`` still denies — the hook makes its
     own state — but only the count that rides a record reaches the
     attempt accounting.
+
+    ``egress_denials`` (F-84 AC-3): the same shape for the egress pair —
+    the hook counts, the tap tags, the record carries ``count``.
 
     ``resume`` (F-85): a session id to CONTINUE — the SDK's resume loads
     the named session's transcript and appends the new prompt as the next
@@ -1294,6 +1512,8 @@ def build_options(
                 protected_path_hook(protected),
                 bash_guard_hook(protected),
                 sandbox_bypass_hook(bypass_denials),
+                web_search_hook(egress_denials),
+                install_guard_hook(declared_dependencies, egress_denials),
             ]
         },
     )
@@ -1369,6 +1589,11 @@ class SessionRecord:
     attempt record and ``factory status`` totals for the week. Zero on
     every record built before F-42 (``from_dict`` defaults it).
 
+    ``egress_denials`` (F-84 AC-3) counts the egress-policy refusals —
+    WebSearch calls and install-class Bash commands the hooks denied —
+    and follows the same accounting (attempt record sum, weekly total).
+    Zero on every record built before F-84.
+
     ``permission_denials_dropped`` (F-56 AC-3) counts the denials past
     :data:`DENIAL_LIST_MAX` that did not fit the bounded list — with the
     per-entry truncation marked on each kept entry whose
@@ -1412,6 +1637,12 @@ class SessionRecord:
     vents: list[dict[str, Any]] = field(default_factory=list)
     skills: list[str] = field(default_factory=list)
     sandbox_bypass_denials: int = 0
+    # F-84 AC-3: WebSearch calls and undeclared install commands the
+    # PreToolUse hooks refused, the same style as
+    # sandbox_bypass_denials — summed onto the attempt record and shown
+    # in the weekly summary. Zero on every record built before F-84
+    # (``from_dict`` defaults it).
+    egress_denials: int = 0
     proposed_tasks: list[dict[str, Any]] = field(default_factory=list)
     propose_facts: list[dict[str, Any]] = field(default_factory=list)
     # F-57 review round 1 (S1): how many propose_task calls the session
@@ -1490,7 +1721,7 @@ def record_field_error(record: SessionRecord) -> str | None:
     if not isinstance(record.is_error, bool):
         return bad("is_error", "not a boolean")
     for name in ("permission_denials_dropped", "sandbox_bypass_denials",
-                  "propose_calls"):
+                  "egress_denials", "propose_calls"):
         value = getattr(record, name)
         if (isinstance(value, bool) or not isinstance(value, int)
                 or value < 0):
@@ -1796,6 +2027,7 @@ def _tap_tool_calls(
     token: str | None,
     sink: Callable[[dict[str, Any]], None],
     denied: "set[str] | None" = None,
+    egress_denied: "dict[str, str] | None" = None,
 ) -> None:
     """Turn one SDK stream message into tool_call trace events (F-30).
 
@@ -1812,6 +2044,10 @@ def _tap_tool_calls(
     stamped ``denied: "sandbox_bypass"``, so each denial lands in the
     trace as an explicit fact instead of being lost in a tool result.
     The id leaves the set as its event is written — one mark per denial.
+
+    ``egress_denied`` (F-84 AC-3) is the same shape for the egress pair:
+    id → tag (``"web_search"`` / ``"undeclared_install"``), stamped the
+    same way so the refusal's REASON rides the trace event.
     """
     stamp = now_iso()
     for block in getattr(message, "content", None) or []:
@@ -1835,6 +2071,8 @@ def _tap_tool_calls(
             if denied is not None and str(use_id) in denied:
                 event["denied"] = "sandbox_bypass"
                 denied.discard(str(use_id))
+            if egress_denied is not None and str(use_id) in egress_denied:
+                event["denied"] = egress_denied.pop(str(use_id))
             with contextlib.suppress(Exception):
                 sink(event)
             continue
@@ -1918,6 +2156,7 @@ async def run_session(
     toolkit: dict | None = None,
     propose_collector: Any = None,
     scope_collector: Any = None,
+    declared_dependencies: bool = False,
     resume: str | None = None,
 ) -> SessionRecord:
     """Run one seat's session and return what it recorded.
@@ -1985,6 +2224,14 @@ async def run_session(
             alone); its requests ride the record out as
             ``scope_requests`` on every exit path. ``Any``-typed for
             the same cycle reason.
+        declared_dependencies: F-84 — whether the task's contract
+            declares ``dependencies`` (F-71). It rides to
+            :func:`install_guard_hook`: False denies install-class Bash
+            commands (installs come from the lock, in the F-73 setup
+            that ran before this session); True leaves the guard inert —
+            the session's network settings carry the registries and
+            L0's dependency check judges the manifest. The WebSearch
+            deny applies either way (every seat).
         resume: F-85 — a session id to CONTINUE (see
             :func:`build_options`): the ONE repair turn a seat whose
             verdict failed to parse gets, appending to the same
@@ -2022,6 +2269,10 @@ async def run_session(
     # into it), this tap (which marks each denial onto its trace event)
     # and the record below (which carries the count out of the sandbox).
     bypass_denials = BypassDenials()
+    # F-84 AC-3: the same shape for the egress pair — the WebSearch and
+    # undeclared-install hooks count into it, the tap tags each denial's
+    # trace event with its reason, and the record carries the count.
+    egress_denials = EgressDenials()
     options = build_options(
         seat,
         cwd,
@@ -2039,6 +2290,8 @@ async def run_session(
         bypass_denials=bypass_denials,
         propose_collector=propose_collector,
         scope_collector=scope_collector,
+        egress_denials=egress_denials,
+        declared_dependencies=declared_dependencies,
         resume=resume,
     )
 
@@ -2062,6 +2315,10 @@ async def run_session(
         # outcome, the attempts the session made to leave the sandbox
         # reach the attempt record, not only the trace.
         record.sandbox_bypass_denials = bypass_denials.count
+        # ...and the egress-denial count (F-84 AC-3): whatever the
+        # outcome, the WebSearch calls and undeclared install attempts
+        # the hooks refused reach the attempt record, not only the trace.
+        record.egress_denials = egress_denials.count
         # ...and the propose tool's accepted set (F-57 AC-1): whatever
         # the outcome, the tasks the session proposed through the tool
         # ride out with it — an aborted session's partial set included.
@@ -2139,10 +2396,12 @@ async def run_session(
                         # tool_call event is on the wire before the
                         # stream yields its ResultMessage (AC-2); a call
                         # the bypass hook denied is marked as it closes
-                        # (F-42 AC-5).
+                        # (F-42 AC-5), and so is each egress denial,
+                        # tagged with its reason (F-84 AC-3).
                         _tap_tool_calls(message, pending_calls, seat,
                                         token, trace_sink,
-                                        denied=bypass_denials.denied)
+                                        denied=bypass_denials.denied,
+                                        egress_denied=egress_denials.denied)
                     if isinstance(message, ResultMessage):
                         result_message = message
             except _WallClock:
@@ -2211,6 +2470,11 @@ async def run_session(
                             # is the fact, the result only decorates it.
                             event["denied"] = "sandbox_bypass"
                             bypass_denials.denied.discard(use_id)
+                        if use_id in egress_denials.denied:
+                            # F-84 AC-3: the same flush-open rule for the
+                            # egress denials, tagged with their reason.
+                            event["denied"] = egress_denials.denied.pop(
+                                use_id)
                         with contextlib.suppress(Exception):
                             trace_sink(event)
                 await _close_stream(stream)
@@ -2317,7 +2581,10 @@ def probe_session_interpreter(
             # all; the cast keeps the [None] impossible shape typed away.
             toolchain=default_toolchain(
                 extra=cast("list[Path]", [_bundled_cli()])),
-
+            # F-84: the session shape — the probe replicates what a real
+            # session's settings allow, and a session reaches the
+            # registries only through a declared-deps contract.
+            drop_network_allowlist=True,
         )
         settings_path = run_dir / "probe-settings.json"
         write_settings(settings, settings_path)
@@ -2365,6 +2632,7 @@ def run_session_sandboxed(
     propose: dict | None = None,
     deny_read: "Sequence[Path]" = (),
     scratch_files: "Mapping[str, str] | None" = None,
+    declared_dependencies: bool = False,
     resume: str | None = None,
 ) -> SessionRecord:
     """Run one session with the whole runner process inside the F-05 sandbox.
@@ -2430,6 +2698,18 @@ def run_session_sandboxed(
             staged file could ride that seat's diff — refused. The
             scratch is cleaned with the run; names must be bare
             filenames (no path), or the session refuses to start.
+        declared_dependencies: F-84 — whether the task's contract
+            declares ``dependencies`` (F-71). It shapes BOTH halves of
+            the session's confinement: the srt settings drop the
+            profile's ``network_allowlist`` (the package registries)
+            when False, and the in-sandbox install guard denies
+            install-class Bash commands. True keeps the registries
+            reachable and the guard inert — L0's dependency check
+            judges the manifest, as today. WebSearch is denied for
+            every seat either way (owner decision, 2026-11-15). The
+            seats with no task contract of their own (the importer's,
+            the pre-approval contract review) take the default False —
+            an unapproved contract grants nothing.
         resume: F-85 — a session id to CONTINUE (the repair turn a seat
             whose verdict failed to parse gets). The session's
             transcript must still be in the scratch HOME this call
@@ -2541,6 +2821,7 @@ def run_session_sandboxed(
             read_only=review_guard, writable_roots=reviewer_writable,
             run_id=run_id, task_id=task_id, trace_sink=trace_sink,
             toolkit=toolkit, propose=propose, deny_read=deny_read,
+            declared_dependencies=declared_dependencies,
             resume=resume,
         )
     finally:
@@ -2882,6 +3163,7 @@ def _run_prepared(
     toolkit: dict | None = None,
     propose: dict | None = None,
     deny_read: "Sequence[Path]" = (),
+    declared_dependencies: bool = False,
     resume: str | None = None,
 ) -> SessionRecord:
     """Stage the runner, write settings, run the sandboxed entry and parse
@@ -2901,6 +3183,14 @@ def _run_prepared(
     dirs — HOME/TMPDIR/CLAUDE_CODE_TMPDIR point there and the settings'
     writable list is exactly it. None is the single-session shape (the
     run dir's .home/.tmp plus ``writable_roots``).
+
+    ``declared_dependencies`` (F-84) is the task's contract fact, and it
+    lands in BOTH halves of the session's confinement: the settings
+    built here drop the profile's ``network_allowlist`` (the package
+    registries) when it is False, and the spec carries it into the
+    sandbox so :func:`run_session` wires :func:`install_guard_hook`
+    with it. The gates and the F-73 setup never pass it — their
+    installs ARE the lock.
     """
     # The pinned CLI (finding 5): the SDK's bundled binary, or an explicit
     # test override. An auto-discovered ~/.local/bin/claude is never used —
@@ -2976,6 +3266,12 @@ def _run_prepared(
                 # F-85: a session id to CONTINUE (the repair turn) —
                 # None is every ordinary session.
                 "resume": resume,
+                # F-84: the task's contract fact — with declared
+                # dependencies the in-sandbox install guard is inert
+                # (the registries are on this session's network
+                # allowlist); without them install-class Bash commands
+                # are denied. WebSearch is denied either way.
+                "declared_dependencies": bool(declared_dependencies),
                 "cwd": str(run_dir),
                 "max_turns": max_turns,
                 "timeout_min": timeout_min,
@@ -3024,6 +3320,10 @@ def _run_prepared(
         scratch_write=scratch,
         record_write=record_path.parent,
         deny_read=deny_read,
+        # F-84: a session reaches the package registries only when the
+        # task's contract declares its dependencies — otherwise installs
+        # come from the lock, in the F-73 setup that already ran.
+        drop_network_allowlist=not declared_dependencies,
     )
     write_settings(settings, settings_path)
 
@@ -3497,6 +3797,7 @@ def _main(argv: list[str] | None = None) -> int:
                 model=spec.get("model"),
                 system_prompt=spec.get("system_prompt"),
                 resume=spec.get("resume"),
+                declared_dependencies=bool(spec.get("declared_dependencies")),
                 cli_path=Path(spec["cli_path"]) if spec.get("cli_path") else None,
                 run_id=spec.get("run_id"),
                 task_id=spec.get("task_id"),

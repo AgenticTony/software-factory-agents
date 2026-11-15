@@ -729,9 +729,11 @@ def test_ac_5(tmp_path: Path, monkeypatch):
         # Hooks are wired: protected-path + bash guard.
         assert options.hooks and set(options.hooks) == {"PreToolUse"}
 
-    # The reviewer seat cannot write; the implementer seat can.
+    # The reviewer seat cannot write; the implementer seat can. F-84:
+    # every seat refuses WebSearch (the implementer's disallowed list is
+    # exactly that — the edit-tool denies stay the judge seats' own).
     assert set(SEATS["reviewer"].disallowed_tools) >= {"Write", "Edit"}
-    assert not SEATS["implementer"].disallowed_tools
+    assert set(SEATS["implementer"].disallowed_tools) == {"WebSearch"}
 
     # session_env never reads the ambient environment at all.
     env = session_env(DEFAULT_BASE_URL, "tok", 1000)

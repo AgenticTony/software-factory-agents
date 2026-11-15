@@ -86,7 +86,7 @@ What we add that they haven't published:
         ▼                                                       ▼
 ┌── SANDBOXED SESSION (Seatbelt / srt) ──────────┐      ┌── REVIEW SESSION ─────────────────┐
 │ fresh partial clone · writes only in run dir   │      │ fresh context · read-only tools   │
-│ network: model endpoint + docs + registries    │      │ sees contract + diff, not the     │
+│ network: model endpoint + docs (F-84)          │      │ sees contract + diff, not the     │
 │ no GitHub token · no prod secrets              │      │ implementer's narrative (L2)      │
 │ hooks deny edits to protected paths            │      └───────────────────────────────────┘
 │ implement → L0 → L1 (inner loop, own checks)   │
@@ -107,6 +107,8 @@ What we add that they haven't published:
         ▼
        done ──▶ metrics ──▶ (Phase 4) meta loop: delta edits to skills only, never to evaluators
 ```
+
+*(F-84, owner decision 2026-11-15: the session sandbox's network is model endpoint + `docs_allowlist` — the registries this v2 diagram still listed moved to the gate/setup settings, reachable in a session only through a contract that declares `dependencies` (F-71); WebSearch is no seat's tool.)*
 
 The inline blueprint diagram from this session shows the same flow.
 

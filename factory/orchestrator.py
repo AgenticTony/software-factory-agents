@@ -1157,6 +1157,13 @@ def _implementer_prompt(task: dict, slice_: dict | None, branch: str, history: s
                         ci_findings: list[str] | None = None,
                         kept: dict | None = None,
                         setup_command: str | None = None) -> str:
+    # F-84: the declared dependencies (if any) shape the install line
+    # below — a declared contract may install exactly what it declared.
+    declared = [
+        f"{entry.get('ecosystem')}:{entry.get('name')}"
+        for entry in task.get("dependencies") or []
+        if isinstance(entry, dict) and entry.get("name")
+    ]
     contract = {
         "acceptance": task.get("acceptance", []),
         "out_of_scope": task.get("out_of_scope", []),
@@ -1196,6 +1203,20 @@ def _implementer_prompt(task: dict, slice_: dict | None, branch: str, history: s
              "or reinstall them."]
             if setup_command else []
         ),
+        # F-84 AC-3: one line — installs come from the lock (the setup
+        # above), and a missing tool is a finding, never a workaround.
+        # A contract that declares dependencies may install exactly what
+        # it declared (F-71 judges the manifest).
+        "- Installs come from the lock: package installs and downloads "
+        "are refused in this session"
+        + (
+            f", except the dependencies this contract declares "
+            f"({', '.join(declared)})"
+            if declared else ""
+        )
+        + ", and web search is refused outright. If a tool or package "
+        "you need is missing, report that as a finding in your final "
+        "report — do not install, download or work around it.",
         f"- Commits in this clone are made as the configured factory identity "
         f"(`{_IDENTITY_NAME} <{_IDENTITY_EMAIL}>`, the repo-local git config). "
         "Commit as that identity only — never set or fake another author, "
@@ -4164,6 +4185,14 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                            / re.sub(r"[^\w.-]", "_", task_id))
             reports_dir.mkdir(parents=True, exist_ok=True)
 
+        # F-84: the task's contract fact that shapes every session's
+        # egress — with declared dependencies (F-71) the task's sessions
+        # reach the package registries and the install guard is inert;
+        # without them the settings drop the profile's network_allowlist
+        # and install-class Bash commands are denied (installs come from
+        # the lock, in the F-73 setup). WebSearch is denied for every
+        # seat either way — that one is not contract-dependent.
+        declared_deps = bool(task.get("dependencies"))
         # F-73 AC-1: the run clone's own setup seam — the same sandboxed
         # runner, settings shape and per-command timeout L0's setup uses,
         # bound to the SESSION's clone. Built once per run (the venv it
@@ -4215,6 +4244,15 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                 # attempts count on the attempt, not only in the trace.
                 "sandbox_bypass_denials": sum(
                     getattr(r, "sandbox_bypass_denials", 0) or 0
+                    for r in records if r is not None
+                ),
+                # F-84 AC-3: WebSearch calls and undeclared install
+                # commands this round's sessions had refused by the
+                # egress hooks — the same accounting as the bypass
+                # denials, so a refused install is a visible fact, not
+                # a mysterious network error.
+                "egress_denials": sum(
+                    getattr(r, "egress_denials", 0) or 0
                     for r in records if r is not None
                 ),
                 # F-59 AC-4: the attempt's provider record — from the
@@ -4462,6 +4500,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                     srt_bin_path=ctx.srt_bin_path,
                     run_id=work.run_id, task_id=task_id,
                     trace_sink=trace.append, toolkit=toolkit_reviewer,
+                    declared_dependencies=declared_deps,
                 )
             except Exception as exc:  # noqa: BLE001 — never fails the round
                 trace.append({
@@ -4569,6 +4608,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                 srt_bin_path=ctx.srt_bin_path,
                 run_id=work.run_id, task_id=task_id,
                 trace_sink=trace.append, toolkit=toolkit_reviewer,
+                declared_dependencies=declared_deps,
             )[0]
             session_seconds += time.monotonic() - t0
             retry_records.append(record)
@@ -4700,6 +4740,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                     srt_bin_path=ctx.srt_bin_path,
                     run_id=work.run_id, task_id=task_id,
                     trace_sink=trace.append, toolkit=toolkit_reviewer,
+                    declared_dependencies=declared_deps,
                 )
             except Exception as exc:  # noqa: BLE001 — never fails the round
                 trace.append({
@@ -4939,6 +4980,9 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                         run_id=work.run_id, task_id=task_id,
                         trace_sink=trace.append,  # F-30: live tool_call events
                         toolkit=toolkit_implementer,  # F-22: vetted toolkit
+                        # F-84: the contract's declared dependencies shape
+                        # this session's registry egress.
+                        declared_dependencies=declared_deps,
                     )
                     session_seconds += time.monotonic() - t0
                     records = [impl]
@@ -5250,6 +5294,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                     run_id=work.run_id, task_id=task_id,
                                     trace_sink=trace.append,  # F-30
                                     toolkit=toolkit_reviewer,  # F-22: narrowed
+                                    declared_dependencies=declared_deps,
                                     # F-85: the seats' scratch HOMEs stay
                                     # until this round's verdicts are
                                     # parsed (a repair turn resumes a seat
@@ -5336,6 +5381,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                         srt_bin_path=ctx.srt_bin_path,
                                         run_id=work.run_id, task_id=task_id,
                                         trace_sink=trace.append,  # F-30
+                                        declared_dependencies=declared_deps,
                                         # F-22 × F-38: the verifier gets the
                                         # REVIEWER's narrowed toolkit, not the
                                         # implementer's — it judges the
@@ -5535,6 +5581,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                     run_id=work.run_id, task_id=task_id,
                                     trace_sink=trace.append,  # F-30
                                     toolkit=toolkit_reviewer,  # F-22: narrowed
+                                    declared_dependencies=declared_deps,
                                     # F-85: kept for this review's repair
                                     # turns, swept below.
                                     keep_scratch=True,
@@ -5609,6 +5656,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                         srt_bin_path=ctx.srt_bin_path,
                                         run_id=work.run_id, task_id=task_id,
                                         trace_sink=trace.append,  # F-30
+                                        declared_dependencies=declared_deps,
                                         # The verifier judges the reviewers'
                                         # findings against the same read-only
                                         # evidence surface they had (F-22 x
@@ -5773,6 +5821,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                 run_id=work.run_id, task_id=task_id,
                                 trace_sink=trace.append,
                                 toolkit=toolkit_reviewer,
+                                declared_dependencies=declared_deps,
                             )
                             session_seconds += time.monotonic() - t0
                             records.append(arb_record)
@@ -6766,6 +6815,7 @@ def _recover_accept_leased(
                         srt_bin_path=srt_bin_path,
                         run_id=work.run_id, task_id=task_id,
                         toolkit=toolkit_reviewer,
+                        declared_dependencies=bool(task.get("dependencies")),
                     )
                 except Exception:  # noqa: BLE001 — the re-run is the fallback
                     return None
@@ -6795,6 +6845,7 @@ def _recover_accept_leased(
                     system_prompt=reviewer_system, srt_bin_path=srt_bin_path,
                     run_id=work.run_id, task_id=task_id,
                     toolkit=toolkit_reviewer,
+                    declared_dependencies=bool(task.get("dependencies")),
                 )[0]
                 return record
 
@@ -6806,6 +6857,7 @@ def _recover_accept_leased(
                 srt_bin_path=srt_bin_path, run_id=work.run_id,
                 task_id=task_id,
                 toolkit=toolkit_reviewer,
+                declared_dependencies=bool(task.get("dependencies")),
                 keep_scratch=True,  # F-85: repairs resume in-seat
             )
             verdicts, _ = parse_reviews_with_retry(reviews, rerun, stop=_is_quota)

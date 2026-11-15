@@ -369,6 +369,13 @@ paths:
     - "factory/deps.py"
     - "factory/registry.py"
     - "scripts/generate_top_packages.py"
+    # F-84: the session egress policy is judge surface — the schema that
+    # records network_allowlist's gate-only meaning, and the contract
+    # tests that pin the WebSearch deny, the registry drop and the
+    # refusal's visibility (sandbox.py/session.py are protected above,
+    # F-28). A session weakening any of them edits what confines it.
+    - "factory/data/schema/project.schema.json"
+    - "tests/test_f84.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 

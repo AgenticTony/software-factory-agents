@@ -835,6 +835,7 @@ def build_settings(
     record_write: Path | None = None,
     local_binding: bool = False,
     deny_read: "Sequence[Path]" = (),
+    drop_network_allowlist: bool = False,
 ) -> dict:
     """Build the srt settings dict for one run from the project profile.
 
@@ -908,6 +909,18 @@ def build_settings(
             write a record of its choosing there either way — the trust
             boundary is the entry process, unchanged from the stdout
             line it replaces (see session.py's F-56 notes).
+        drop_network_allowlist: F-84 — SESSION seats only: omit the
+            profile's ``network_allowlist`` (the package registries)
+            from the network allowlist, keeping the model endpoint and
+            ``docs_allowlist``. Owner decision, 2026-11-15: a session
+            installs nothing the contract did not allow — installs come
+            from the lock, in the F-73 setup that runs before the
+            session, and the registries are reachable inside a session
+            only when the task's contract declares ``dependencies``
+            (F-71), when L0's dependency check judges the manifest.
+            The gate runner's settings (L0/L1, setup, the re-validation
+            clone) and the F-73 setup NEVER drop it: their installs ARE
+            the lock. Default False keeps every existing caller's shape.
 
     Returns:
         A settings dict accepted by ``srt --settings``.
@@ -973,7 +986,10 @@ def build_settings(
     allowed_domains = [
         *(_endpoint_host(endpoint) for endpoint in endpoints),
         *profile.get("docs_allowlist", []),
-        *profile.get("network_allowlist", []),
+        # F-84: dropped for session seats unless the task's contract
+        # declares its dependencies (see drop_network_allowlist).
+        *([] if drop_network_allowlist
+          else profile.get("network_allowlist", [])),
     ]
     denied_names = sorted(
         set(_FORBIDDEN_ENV_EXACT)

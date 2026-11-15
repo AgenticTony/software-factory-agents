@@ -232,7 +232,7 @@
     },
     "docs_allowlist": { "type": "array", "items": { "type": "string" } },
     "standards": { "type": "array", "items": { "type": "string" }, "description": "Repo-relative paths of the project's coding-standards docs. Read by the L2 reviewer only, never pushed to the implementer (VALIDATOR-SPEC L2)." },
-    "network_allowlist": { "type": "array", "items": { "type": "string" }, "description": "Extra domains (package registries) beyond docs_allowlist and the model endpoint" },
+    "network_allowlist": { "type": "array", "items": { "type": "string" }, "description": "Extra domains (package registries) beyond docs_allowlist and the model endpoint. F-84: GATE/SETUP egress only — a session's settings drop these domains unless the task's contract declares dependencies (F-71); owner decision 2026-11-15." },
     "sandbox": {
       "type": "object",
       "description": "Sandbox capability opt-ins (factory.sandbox.build_settings). Absent means the defaults: nothing extra is granted.",
