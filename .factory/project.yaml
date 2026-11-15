@@ -354,6 +354,13 @@ paths:
     # re-run, no shrink, the repair's usage on the attempt) — the same
     # precedent as F-79/F-83's.
     - "tests/test_f85.py"
+    # F-73: the ready-clone contract tests judge the protected
+    # orchestrator/state modules and the schema (the clone's git
+    # identity and setup before the session, the setup_failed refusal
+    # that spends no budget, the pre-push identity check and repair) —
+    # the same precedent as F-79's.
+    - "tests/test_f73.py"
+    - "tests/_support/f73.py"
     # F-71: the dependency policy is judge surface — deps.py decides
     # what a manifest change means, registry.py decides whether a
     # package may be installed, and the generator writes the near-miss

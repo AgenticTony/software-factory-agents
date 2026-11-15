@@ -337,7 +337,14 @@ ESCALATION_PR_LABEL = "factory-escalation"
 _UNSAFE_WORKFLOW_TRIGGERS = frozenset({"pull_request_target", "workflow_run"})
 _WORKFLOW_DIR = ".github/workflows"
 
-_IDENTITY = ("-c", "user.name=Software Factory", "-c", "user.email=factory@localhost",
+# F-73: the factory's commit identity — one source for the -c arguments
+# the parent commits with (_IDENTITY), the repo-local config the run
+# clone gets before any session (_set_clone_identity) and the identity
+# every published commit is checked against (_foreign_identities).
+_IDENTITY_NAME = "Software Factory"
+_IDENTITY_EMAIL = "factory@localhost"
+_IDENTITY = ("-c", f"user.name={_IDENTITY_NAME}",
+             "-c", f"user.email={_IDENTITY_EMAIL}",
              "-c", "commit.gpgsign=false")
 
 # F-75: the publish-path CI-feedback seams. The defaults are the real
@@ -556,7 +563,10 @@ def sandboxed_runner(
 
 
 def _gate_settings(profile: dict, clean: RunDir, factory_root: Path) -> None:
-    """srt settings for the gate commands: the clean clone only, no token.
+    """srt settings for the gate commands: clones only, no token.
+
+    Written for L0's clean clone and — F-73 — for the run clone's own
+    setup pass, the same settings shape either way.
 
     The model endpoint is on the allowlist only because ``build_settings``
     always adds it; the gate environment carries no credential for it.
@@ -1145,7 +1155,8 @@ def _implementer_prompt(task: dict, slice_: dict | None, branch: str, history: s
                         attempt: int, max_attempts: int,
                         fix_findings: list[str] | None = None,
                         ci_findings: list[str] | None = None,
-                        kept: dict | None = None) -> str:
+                        kept: dict | None = None,
+                        setup_command: str | None = None) -> str:
     contract = {
         "acceptance": task.get("acceptance", []),
         "out_of_scope": task.get("out_of_scope", []),
@@ -1176,6 +1187,19 @@ def _implementer_prompt(task: dict, slice_: dict | None, branch: str, history: s
         f"- You are on branch `{branch}` in this directory. Commit as you go if you "
         "like; the orchestrator commits whatever the working tree holds when you stop.",
         "- Never push, never run `gh`, never touch protected paths.",
+        # F-73 AC-1: the clone was readied before this session — the
+        # profile's setup already ran in it, and commits ride the
+        # repo-local factory identity (never another name or email).
+        *(
+            [f"- Setup has already run in this clone (`{setup_command}`) — the "
+             "project's environment and dependencies are ready; do not rebuild "
+             "or reinstall them."]
+            if setup_command else []
+        ),
+        f"- Commits in this clone are made as the configured factory identity "
+        f"(`{_IDENTITY_NAME} <{_IDENTITY_EMAIL}>`, the repo-local git config). "
+        "Commit as that identity only — never set or fake another author, "
+        "committer, name or email.",
         # F-65: the declared file scope is part of the contract the
         # owner approved — a file outside it is a REQUEST, never an edit.
         "- You may change ONLY the files `scope.paths` above names (plus this "
@@ -1713,6 +1737,84 @@ def _squash_round_history(work: RunDir, branch: str, base_sha: str,
     hardened_git(work.root, "update-ref", f"refs/heads/{branch}", rebuilt)
     hardened_git(work.root, "checkout", "-q", "--force", branch)
     return rebuilt
+
+
+def _set_clone_identity(work: RunDir) -> None:
+    """F-73 AC-1: the factory's commit identity as repo-local git config.
+
+    Set in EVERY attempt (a prior attempt's session could have unset or
+    changed it): a plain ``git commit`` by the session then lands as the
+    factory's identity, never as the host's or the repository owner's
+    (wo21's c8a8ead — agent work attributed to a human in a public
+    repository).
+    """
+    hardened_git(work.root, "config", "user.name", _IDENTITY_NAME)
+    hardened_git(work.root, "config", "user.email", _IDENTITY_EMAIL)
+    hardened_git(work.root, "config", "commit.gpgsign", "false")
+
+
+def _ready_clone(work: RunDir, runner: "Callable | None", command: str | None,
+                 timeout_sec: int) -> "str | None":
+    """F-73 AC-1: ready the run clone before any session.
+
+    The factory identity as repo-local config (every attempt), then the
+    profile's ``commands.setup`` through the run clone's own sandboxed
+    gate runner — the same runner, sandbox and timeout L0's setup uses,
+    so the session starts with the environment the project's commands
+    assume instead of spending turns rebuilding it.
+
+    Args:
+        runner: The run clone's sandboxed gate runner, or None when the
+            profile declares no setup command.
+        command: The profile's ``commands.setup``, or None.
+        timeout_sec: The per-command cap (the gate timeout).
+
+    Returns:
+        None when the clone is ready; the failure text (the setup
+        output tail, or the dirty paths git reports) when setup exited
+        non-zero or left tracked files modified or untracked files git
+        does not ignore — the caller records ``setup_failed`` and
+        starts no session.
+    """
+    _set_clone_identity(work)
+    if not command:
+        return None
+    assert runner is not None  # built with the command, in _run_task
+    result = runner("setup", command, work.root, timeout_sec)
+    if result.timed_out or result.exit_code != 0:
+        state = (f"setup timed out after {timeout_sec}s" if result.timed_out
+                 else f"setup failed (exit {result.exit_code})")
+        return f"{state}; output tail: {(result.output or '').strip()[-400:]}"
+    dirty = _git_out(work.root, "status", "--porcelain")
+    if dirty:
+        return ("setup left the clone dirty — tracked files modified or "
+                f"untracked files git does not ignore: {dirty[:400]}")
+    return None
+
+
+def _foreign_identities(work: RunDir, base_sha: str,
+                        head_sha: str) -> "list[str]":
+    """F-73 AC-2: every author/committer identity in base..head that is
+    not the factory's, as ``"Name <email>"`` strings (deduped, capped).
+
+    A log line that does not split into exactly four fields (a name
+    carrying the separator byte) is foreign whole: the check fails
+    closed toward repair, never toward publishing an identity it could
+    not parse.
+    """
+    factory = f"{_IDENTITY_NAME} <{_IDENTITY_EMAIL}>"
+    out = _git_out(work.root, "log", "--format=%an%x1f%ae%x1f%cn%x1f%ce",
+                   f"{base_sha}..{head_sha}")
+    foreign: list[str] = []
+    for line in out.splitlines():
+        fields = line.split("\x1f")
+        found = ([line] if len(fields) != 4
+                 else [f"{fields[0]} <{fields[1]}>",
+                       f"{fields[2]} <{fields[3]}>"])
+        for identity in found:
+            if identity != factory and identity not in foreign:
+                foreign.append(identity)
+    return foreign[:8]
 
 
 def _unsafe_workflow_triggers(repo: Path, base_sha: str) -> "list[str]":
@@ -4062,6 +4164,20 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                            / re.sub(r"[^\w.-]", "_", task_id))
             reports_dir.mkdir(parents=True, exist_ok=True)
 
+        # F-73 AC-1: the run clone's own setup seam — the same sandboxed
+        # runner, settings shape and per-command timeout L0's setup uses,
+        # bound to the SESSION's clone. Built once per run (the venv it
+        # creates is anchored ignored and survives every attempt);
+        # _ready_clone runs the command in each attempt, before any
+        # session, and re-sets the factory identity every time.
+        setup_command = (profile.get("commands") or {}).get("setup")
+        setup_runner = None
+        if setup_command:
+            _gate_settings(profile, work, ctx.factory_root)
+            setup_runner = sandboxed_runner(
+                work.root, work.settings_path,
+                srt_bin_path=ctx.srt_bin_path, on_escapee=trace.append)
+
         def attempt_record(attempt_no, started, outcome, records, report_path, **extra):
             # F-83 AC-1: per-seat turns, and ``turns`` is the
             # IMPLEMENTER's count — the number budget.max_turns bounds.
@@ -4198,6 +4314,20 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
             try:
                 head = _git_out(work.root, "rev-parse", "--verify",
                                 f"refs/heads/{branch}")
+                # F-73 AC-2: the same identity rule on the escalation
+                # push. The single-commit snapshot below already
+                # re-attributes the whole range (parent-built under the
+                # factory identity); this names what the round's history
+                # carried, so the attempt record says it.
+                foreign = _foreign_identities(work, base_sha, head)
+                if foreign:
+                    trace.append({"type": "identity_repair",
+                                  "at": "escalation",
+                                  "foreign": [_esc(f) for f in foreign]})
+                    note = (note + " — foreign identities in the round's "
+                            "history (" + "; ".join(_esc(f) for f in foreign)
+                            + ") were re-attributed by the single-commit "
+                            "snapshot (F-73)")
                 # R1-F3 + R2-F1 part 2: the escalation PR pushes ONE
                 # commit on the base (tree asserted equal) whose message
                 # carries [skip ci] — no runner sees the content until
@@ -4747,6 +4877,22 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                 trace.run_end("aborted")  # no attempt recorded: the run stopped
                 return RunResult("peak_window", task_id)
 
+            # F-73 AC-1: ready the clone before any session — the factory
+            # identity (re-set every attempt) and the profile's setup. A
+            # broken setup fails every task the same way, so like an
+            # orchestrator error it stops the loop; but no session ran,
+            # so it spends no attempt budget.
+            setup_refusal = _ready_clone(work, setup_runner, setup_command,
+                                         ctx.gate_timeout_sec)
+            if setup_refusal is not None:
+                reason = _esc(setup_refusal)
+                attempt = attempt_record(
+                    attempt_no, started, "fail", [], None,
+                    escalation="setup_failed", note=reason)
+                finish(attempt, _abort_requeue_status(queue.get(task_id)),
+                       [f"1. [setup_failed] {reason}"])
+                return RunResult("error", task_id, escalation="setup_failed")
+
             # This round's state, initialised before anything can raise: the
             # error path below records its attempt from whatever exists.
             round_no += 1
@@ -4779,7 +4925,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                         log.render(omit_last_findings=prev_findings is not None),
                         attempt_no, max_attempts, fix_findings=prev_findings,
                         ci_findings=ci_fix_findings,
-                        kept=kept if round_no == 1 else None)
+                        kept=kept if round_no == 1 else None,
+                        setup_command=setup_command)
                     t0 = time.monotonic()
                     impl = ctx.session_runner(
                         "implementer", prompt, work.root, profile,
@@ -5772,6 +5919,24 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
 
                 if passed:
                     with trace.phase("publish"):
+                        # F-73 AC-2: nothing is published under another
+                        # identity. Every author and committer in
+                        # base..head is checked BEFORE any rebuild; a
+                        # foreign identity (a session committed as
+                        # someone else) rebuilds the branch as ONE commit
+                        # on the base through F-72's squash, tree asserted
+                        # equal — the run is NOT failed: the content was
+                        # validated, only the attribution is corrected.
+                        # The identities found are named in the attempt
+                        # record, escaped.
+                        foreign = _foreign_identities(
+                            work, base_sha, cast(str, head_sha))
+                        identity_repaired = bool(foreign)
+                        if foreign:
+                            trace.append({
+                                "type": "identity_repair", "at": "publish",
+                                "foreign": [_esc(f) for f in foreign],
+                            })
                         # F-72 AC-1 integrity: a guarded change this run
                         # converted and a later round reverted must leave
                         # NO trace in the published history — the round
@@ -5782,7 +5947,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                         # protected-path change (any commit), which
                         # check_push_content's history scan re-proves for
                         # secrets.
-                        if guard_retried:
+                        if guard_retried or identity_repaired:
                             head_sha = _squash_round_history(
                                 work, branch, base_sha, cast(str, head_sha),
                                 f"{task_id}: attempt {attempt_no}")
@@ -5866,18 +6031,20 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                             # UPDATES the branch the run's PR sits on —
                             # no new PR, links.pr unchanged. A
                             # fast-forward only: the validated head must
-                            # descend from the last pushed SHA. The one
-                            # exception is F-72's integrity squash (a
+                            # descend from the last pushed SHA. The two
+                            # exceptions re-root the branch on the base
+                            # by design — F-72's integrity squash (a
                             # guarded change this run converted and a
-                            # later round reverted): it re-roots the
-                            # branch on the base by design, so the
-                            # ancestry requirement cannot hold — the
-                            # LEASE carries the whole guard there (the
-                            # remote ref must still equal exactly the
-                            # last pushed SHA; any concurrent push or a
-                            # force-push under the wait refuses instead
-                            # of overwriting). Never a bare --force.
-                            if (not guard_retried and (
+                            # later round reverted) and F-73's identity
+                            # repair (a foreign-authored commit in the
+                            # range) — so the ancestry requirement cannot
+                            # hold there — the LEASE carries the whole
+                            # guard in both (the remote ref must still
+                            # equal exactly the last pushed SHA; any
+                            # concurrent push or a force-push under the
+                            # wait refuses instead of overwriting).
+                            # Never a bare --force.
+                            if (not (guard_retried or identity_repaired) and (
                                     ci_pushed_sha is None or not _is_ancestor(
                                         work.root, ci_pushed_sha,
                                         cast(str, head_sha)))):
@@ -5940,7 +6107,17 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                                  pr=url,
                                                  sentinels=list(cast("Any", l0).sentinel_results),
                                                  review_drops=_review_drops(l2),
-                                                 final_review=final_field)
+                                                 final_review=final_field,
+                                                 note=(
+                                                     "published under the factory "
+                                                     "identity: the round's history "
+                                                     "carried foreign author/committer "
+                                                     "identities ("
+                                                     + "; ".join(_esc(f) for f in foreign)
+                                                     + "); the branch was rebuilt as one "
+                                                     "commit on the base, the validated "
+                                                     "tree unchanged (F-73)"
+                                                 ) if identity_repaired else None)
                         queue.append_attempt(task_id, attempt)
                         # A passed round's findings were accepted as non-blocking:
                         # recording their keys would poison a later fix round

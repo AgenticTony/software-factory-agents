@@ -371,7 +371,14 @@ def build_rehearsal_fixture(dest: Path) -> RehearsalFixture:
     _write(dest / "package.json", '{"name": "rehearsal-fixture", "private": true}\n')
     _write(dest / "lint-manifest.txt", "rehearsal fixture lint manifest\n")
     _write(dest / "vendor" / "tiny-kit" / "package.json", _TINY_KIT)
-    _write(dest / "vendor" / "tiny-kit" / "bin" / "lint.js", _LINT_JS)
+    # F-73: committed executable — `npm install ./vendor/tiny-kit` sets the
+    # exec bit on a local package's bin file, and a 644 source made every
+    # setup run leave a mode-only ` M` on a tracked file. L0's clean clone
+    # never noticed (it is discarded); the run clone's pre-session setup
+    # (F-73 AC-1) refuses a dirty tree, so the fixture now commits the
+    # mode npm leaves anyway.
+    _write(dest / "vendor" / "tiny-kit" / "bin" / "lint.js", _LINT_JS,
+           executable=True)
 
     remote = dest.parent / f"{dest.name}-remote.git"
     _write(dest / ".factory" / "project.yaml", yaml.safe_dump(_profile(dest, remote)))

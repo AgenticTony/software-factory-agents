@@ -20,6 +20,7 @@ construction and the remote-advance push are paid once.
 """
 
 import ast
+import json
 import re
 import shutil
 import subprocess
@@ -263,20 +264,22 @@ def test_ac_3(rehearsal, monkeypatch):
     # 2, finding 3: on macOS a leaked PATH can fail setup via the real
     # npm EPERM instead, so only the guard message attributes the failure
     # to the canary rather than to whatever else the leak breaks).
+    # F-73: the run clone's own setup now runs BEFORE any session under
+    # the same sandbox, so the canary fires there FIRST — the outcome is
+    # the pre-session setup_failed stop (error), and the guard's message
+    # is the attempt's note, no longer an L0 finding.
     with monkeypatch.context() as m:
         m.setattr(sandbox_module, "_path_outside_home", lambda path: path)
         fixture, root = rehearsal()
         with pytest.raises(RehearsalError) as exc:
             run_rehearsal(fixture, root, now=lambda: OFF_PEAK)
     result = exc.value.result
-    assert result.outcome == "needs_human", result
-    # F-72: the escalation keeps the run's work as DRAFT PRs only —
-    # a rehearsal never opens a validated PR.
-    assert all(pr.draft for pr in exc.value.prs)
-    findings = [f["id"] for f in (result.reports.get("L0") or {}).get("findings") or []]
-    assert "setup_failed" in findings, result.reports["L0"]
-    setup = next(c for c in result.reports["L0"]["commands"] if c["name"] == "setup")
-    assert "env-guard:" in setup["output"], (
+    assert result.outcome == "error", result
+    assert result.escalation == "setup_failed", result
+    assert exc.value.prs == [], "no session ran, so nothing was pushed"
+    task = json.loads(
+        (fixture.repo / ".factory" / "tasks.json").read_text())["tasks"][0]
+    assert "env-guard:" in (task["attempts"][-1].get("note") or ""), (
         "the failure must be attributed to the env guard, not to whatever "
         "else a leaked PATH happens to break on this host"
     )
@@ -438,20 +441,20 @@ def test_review1_path_leak_covers_absolute_home_entries(rehearsal, monkeypatch):
     def tilde_only_filter(path):
         return ":".join(e for e in path.split(":") if e and not e.startswith("~"))
 
+    # F-73: the run clone's pre-session setup fires the canary FIRST —
+    # the recorded cause is the attempt note, and no session ran.
     with monkeypatch.context() as m:
         m.setattr(sandbox_module, "_path_outside_home", tilde_only_filter)
         fixture, root = rehearsal()
         with pytest.raises(RehearsalError) as exc:
             run_rehearsal(fixture, root, now=lambda: OFF_PEAK)
     result = exc.value.result
-    assert result.outcome == "needs_human", result
-    # F-72: the escalation keeps the run's work as DRAFT PRs only —
-    # a rehearsal never opens a validated PR.
-    assert all(pr.draft for pr in exc.value.prs)
-    findings = [f["id"] for f in (result.reports.get("L0") or {}).get("findings") or []]
-    assert "setup_failed" in findings, result.reports["L0"]
-    setup = next(c for c in result.reports["L0"]["commands"] if c["name"] == "setup")
-    assert "env-guard:" in setup["output"], (
+    assert result.outcome == "error", result
+    assert result.escalation == "setup_failed", result
+    assert exc.value.prs == [], "no session ran, so nothing was pushed"
+    task = json.loads(
+        (fixture.repo / ".factory" / "tasks.json").read_text())["tasks"][0]
+    assert "env-guard:" in (task["attempts"][-1].get("note") or ""), (
         "the guard, not incidental EPERM, must be the recorded cause"
     )
 

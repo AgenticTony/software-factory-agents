@@ -584,6 +584,8 @@ def attempt_budget_used(task: dict, slice_id: str) -> int:
             continue
         if a.get("escalation") == "scope_missing":
             continue  # F-65: session-less pre-seat refusal, no budget
+        if a.get("escalation") == "setup_failed":
+            continue  # F-73: the clone's setup failed before any session
         if a.get("outcome") == "aborted":
             if a.get("escalation") != "quota_exhausted":
                 continue  # a non-quota abort (peak window, crash): free
