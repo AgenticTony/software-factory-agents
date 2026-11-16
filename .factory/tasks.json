@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-16T18:50:00Z",
+  "updated_at": "2026-11-16T22:40:41Z",
   "tasks": [
     {
       "id": "F-00",
@@ -6485,7 +6485,7 @@
       "source": "BUILD-ORDER.md#f-86--a-lint-or-typecheck-failure-gets-one-short-repair-not-a-new-attempt",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-72",
         "F-83"
@@ -6549,7 +6549,9 @@
           }
         }
       ],
-      "acceptance_hash": "64d568291558c9e640e4259795407fd075239620536b6fe2294c7eb6fac8a650"
+      "acceptance_hash": "64d568291558c9e640e4259795407fd075239620536b6fe2294c7eb6fac8a650",
+      "approved_at": "2026-11-16T22:40:32Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-87",
@@ -6557,7 +6559,7 @@
       "source": "BUILD-ORDER.md#f-87--the-install-guard-recognises-the-spellings-it-misses",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-84"
       ],
@@ -6606,7 +6608,10 @@
           ".factory/project.yaml",
           ".factory/BOOTSTRAP.md"
         ]
-      }
+      },
+      "acceptance_hash": "53a56799dd111dd2d623888f3aab4c381dc839611cf5e383458d7b9120531f02",
+      "approved_at": "2026-11-16T22:40:41Z",
+      "approved_by": "Anthony"
     }
   ]
 }
