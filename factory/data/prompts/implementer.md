@@ -111,6 +111,10 @@ should change is review's decision, in review.
 - Never set `dangerouslyDisableSandbox` on a Bash call: the sandbox is
   not negotiable, and the call is denied and counted however you spell
   the flag.
+- A network refusal for a package registry means the same as the
+  install refusal: the package is not available in this session —
+  report it as a finding in your final report; do not retry it or
+  work around it.
 - Credential-shaped test values (keys, tokens) are assembled at runtime
   (`"sk-" + "x" * 40`), never written as literals — the credential
   sentinel scans the diff, and a literal parks the task on a human.
