@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-16T14:49:07Z",
+  "updated_at": "2026-11-16T18:50:00Z",
   "tasks": [
     {
       "id": "F-00",
@@ -6550,6 +6550,63 @@
         }
       ],
       "acceptance_hash": "64d568291558c9e640e4259795407fd075239620536b6fe2294c7eb6fac8a650"
+    },
+    {
+      "id": "F-87",
+      "title": "The install guard recognises the spellings it misses",
+      "source": "BUILD-ORDER.md#f-87--the-install-guard-recognises-the-spellings-it-misses",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-84"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "The install guard classifies the spellings F-84's review found as installs for a task without declared dependencies — combined shell flags (bash -lc), versioned pips (pip3.12, /usr/bin/pip3.11), python3.12 -m pip, python -c that imports pip, a download piped into an interpreter or shell (curl … | python, wget -qO- … | sh), poetry add|install, pipenv install|sync, conda|mamba install|create, npm exec, pnpm dlx, yarn dlx — each refused with the F-84 reason, while pip list, npm run/ls/test, poetry run pytest, conda list, pytest and a python -c that does not import pip pass untouched. One classifier (the existing tables and recursion extended, no second detector); the network settings are unchanged.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f87.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "When the classifier does not match but a command fails with the proxy's refusal for a registry host, nothing changes (no new detector): the implementer prompt says, in one line, that a network refusal for a package registry means the same thing as the install refusal — report it as a finding.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f87.py::test_ac_2"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 80,
+        "wall_clock_min": 60
+      },
+      "scope": {
+        "paths": [
+          "factory/session.py",
+          "factory/data/prompts/implementer.md",
+          "tests/test_f87.py",
+          "tests/test_f09.py",
+          "BUILD-ORDER.md",
+          ".factory/tasks.json",
+          ".factory/project.yaml",
+          ".factory/BOOTSTRAP.md"
+        ]
+      }
     }
   ]
 }

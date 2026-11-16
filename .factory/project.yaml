@@ -383,6 +383,11 @@ paths:
     # F-28). A session weakening any of them edits what confines it.
     - "factory/data/schema/project.schema.json"
     - "tests/test_f84.py"
+    # F-87: the install-spelling contract tests judge the protected
+    # session module's guard — the tables, the combined-flag recursion
+    # and the pipe view (the test_f84 precedent; session.py and the
+    # prompts are protected above).
+    - "tests/test_f87.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 

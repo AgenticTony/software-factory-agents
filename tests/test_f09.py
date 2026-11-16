@@ -53,8 +53,10 @@ def _sha(text: str) -> str:
 # prompt edit can never ride a green run.
 PROMPT_PINS = {
     # F-42; re-pinned for AC-3 (the attribution and sandbox-bypass rules);
-    # re-pinned for F-65 (the declared-file-scope / request_scope rule).
-    IMPLEMENTER_FILE: "c23bc53b9ca67e01594b7c5380c6a270e1842d18783b64e11cc82a2617721219",
+    # re-pinned for F-65 (the declared-file-scope / request_scope rule);
+    # re-pinned for F-87 (a registry network refusal = the install
+    # refusal: report it as a finding).
+    IMPLEMENTER_FILE: "2e5f49ceda29965e8cde446c1634acc19c9218f630e99574d8191064dfeedac8",
     # F-41; re-pinned for AC-6 (a surviving major fails the round).
     REVIEWER_FILE: "1306ee568d0f09b02aef2c34694d61e343163a1abde54d19001fba9f55acba22",
     # F-38; re-pinned in its review round (the unanimous-rule paragraph).

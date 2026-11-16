@@ -781,9 +781,11 @@ _BASH_SEPARATORS = re.compile(r"[\n;&|()<>]")
 # Shell programs whose `-c` payload is itself a command to scan.
 _BASH_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash", "fish"})
 # Wrappers that prefix a real command (their own flags / VAR=val tokens
-# are skipped before recursing).
+# are skipped before recursing). F-87 adds sudo; round 2 adds timeout —
+# and every wrapper's VALUE-taking flags (with their values) are skipped
+# by the shared _prefix_command, both guards alike.
 _BASH_PREFIX_RUNNERS = frozenset(
-    {"env", "command", "exec", "xargs", "nice", "nohup"}
+    {"env", "command", "exec", "xargs", "nice", "nohup", "sudo", "timeout"}
 )
 # git global options that consume the NEXT token as their value when it
 # is not attached with '=' (attached forms are single '-…' tokens).
@@ -958,9 +960,12 @@ def _invocation_violation(tokens: list[str]) -> str | None:
     subcommand (global options like ``-C .``/``-c k=v`` skipped first), or
     gh itself — so a commit message about push notifications, ``git log
     --grep=push`` or ``grep -rn push src/`` pass (round 3). Shells'
-    ``-c`` payloads and prefix wrappers (env/command/exec/xargs…) are
-    recursed into, and the de-quoted token stream already merges
-    quote-split and backslash-split words (round 2)."""
+    ``-c`` payloads (combined ``-lc`` flags included, round 3 — found
+    through ``_c_payload_index`` like the install guard) and prefix
+    wrappers/assignments (through ``_prefix_command``) are recursed
+    into, and the de-quoted token stream already merges quote-split and
+    backslash-split words (round 2)."""
+    tokens = _prefix_command(tokens)
     if not tokens:
         return None
     program = Path(tokens[0]).name
@@ -979,18 +984,10 @@ def _invocation_violation(tokens: list[str]) -> str | None:
     if program == "gh":
         return "gh"
     if program in _BASH_SHELLS:
-        try:
-            payload = tokens.index("-c", 1) + 1
-        except ValueError:
+        payload = _c_payload_index(tokens)
+        if payload is None:
             return None
         return _invocation_violation(tokens[payload:])
-    if program in _BASH_PREFIX_RUNNERS:
-        rest = [
-            token
-            for token in tokens[1:]
-            if not token.startswith("-") and "=" not in token
-        ]
-        return _invocation_violation(rest)
     return None
 
 
@@ -1101,81 +1098,421 @@ INSTALL_DENY_REASON = (
 # fetch anything.
 _INSTALL_SUBCOMMANDS = {
     "pip": frozenset({"install", "download"}),
-    "pip3": frozenset({"install", "download"}),
     "pipx": frozenset({"install", "runpip"}),
-    "npm": frozenset({"install", "i", "add", "ci"}),
-    "pnpm": frozenset({"install", "i", "add", "ci"}),
-    "yarn": frozenset({"install", "i", "add"}),
+    "npm": frozenset({"install", "i", "add", "ci", "exec"}),
+    "pnpm": frozenset({"install", "i", "add", "ci", "dlx"}),
+    "yarn": frozenset({"install", "i", "add", "dlx"}),
     "bun": frozenset({"install", "i", "add", "x"}),
     "uv": frozenset({"pip", "add", "install", "tool", "x", "run", "sync"}),
+    # F-87: the second-tier managers — poetry/pipenv build environments,
+    # conda/mamba bootstrap whole pythons, dlx/exec/npx fetch-to-run.
+    "poetry": frozenset({"add", "install"}),
+    "pipenv": frozenset({"install", "sync"}),
+    "conda": frozenset({"install", "create"}),
+    "mamba": frozenset({"install", "create"}),
 }
 # Programs whose CLIs interleave value-taking flags before the
-# subcommand (``npm --prefix X install y``): every non-flag token is
-# scanned, not just the first — the deny-layer errs toward denying.
-_INSTALL_SCAN_ALL = frozenset({"npm", "pnpm", "yarn", "bun"})
+# subcommand (``npm --prefix X install y``, ``conda env create -f x``,
+# ``poetry -P other.toml add y``): every non-flag token is scanned, not
+# just the first — the deny-layer errs toward denying.
+_INSTALL_SCAN_ALL = frozenset(
+    {"npm", "pnpm", "yarn", "bun", "poetry", "pipenv", "conda", "mamba"}
+)
 # ``npx``/``uvx`` fetch a package to run it whatever their arguments
 # look like.
 _INSTALL_PROGRAMS = frozenset({"npx", "uvx"})
 _PYTHON_PROGRAMS = frozenset({"python", "python3", "pypy", "pypy3"})
+# F-87: versioned spellings — ``pip3.12``, ``/usr/bin/pip3.11``,
+# ``python3.13 -m pip``. The base name carries the meaning; the version
+# never changes it. Normalised to the bare name before the table
+# lookup, so ``pip3.12 install x`` refuses as ``pip install``. The
+# trailing ``t?`` is CPython's free-threaded binary (python3.13t).
+_VERSIONED_PIP_RE = re.compile(r"pip\d*(?:\.\d+)*")
+_VERSIONED_PYTHON_RE = re.compile(r"(?:python|pypy)\d*(?:\.\d+)*t?")
+# F-87: a download piped into an interpreter or shell — the classic
+# ``curl … | sh`` bootstrap — executes the fetched bytes. Only the
+# producers here count (a ``cat file | sh`` runs local bytes the
+# session could run anyway); only an interpreter/shell consumer does.
+_INSTALL_DOWNLOADER_PROGRAMS = frozenset({"curl", "wget"})
+_INSTALL_PIPE_INTERPRETER_PROGRAMS = frozenset({"node"})
+# Statement boundaries for the pipe view (|| is a boundary, not a
+# pipe; |& is a PIPE — stderr merged in, round 1 — so the & of |& is
+# never a boundary); a lone | (or |&) splits a pipeline into stages.
+_INSTALL_STATEMENT_SPLIT = re.compile(r"\|\||[\n;()<>]|(?<!\|)&")
+_INSTALL_STAGE_SPLIT = re.compile(r"(?<!\|)\|&?(?!\|)")
 
 
-def _install_class(tokens: list[str]) -> str | None:
+def _c_payload_index(tokens: list[str]) -> int | None:
+    """Index of the first token of a ``-c`` payload, or None.
+
+    ``-c`` may be spelled combined with other short flags — ``bash
+    -lc``, ``sh -ec``, ``python -qc`` (the F-87 gap) — so any
+    single-dash flag token containing a ``c`` is a carrier and the
+    NEXT token begins the payload. ``--long`` options never carry
+    (their ``c`` belongs to a word); ``--`` ends the options."""
+    for index in range(1, len(tokens)):
+        token = tokens[index]
+        if token == "--":
+            return None
+        if (
+            token.startswith("-")
+            and not token.startswith("--")
+            and "c" in token[1:]
+        ):
+            return index + 1
+    return None
+
+
+def _pip_import_label(name: str) -> str | None:
+    """The label for one imported module name, or None: pip itself
+    (any versioned spelling) and ensurepip count; nothing else does —
+    ``pipeline``, ``pipes`` and ``pipx`` are not pip."""
+    if name == "ensurepip":
+        return "ensurepip"
+    if _VERSIONED_PIP_RE.fullmatch(name):
+        return "python -c pip"
+    return None
+
+
+def _python_c_import(code: list[str]) -> str | None:
+    """Whether ``python -c`` code imports pip or ensurepip — the
+    in-process spelling of an install (``python -c "import pip;
+    pip.main(['install', 'x'])"``). Round 1: the modern spellings —
+    dotted modules (``import pip._internal``, ``from
+    pip._internal.cli.main import main``) and comma lists (``import
+    sys,pip``, with or without the space) — are matched on each name's
+    first dotted component; ``import pipeline`` and ``import pipes``
+    never match. Accepted over-deny (round 2): ``from . import pip``
+    refuses too — it IS an import of a module named pip (a relative
+    one), and telling those apart is not worth a parser."""
+    index = 0
+    while index < len(code):
+        token = code[index]
+        if token == "import":
+            # one or more comma-separated targets (``import a, b``),
+            # each judged on its first dotted component
+            target_at = index + 1
+            while target_at < len(code):
+                for part in code[target_at].split(","):
+                    label = _pip_import_label(part.split(".")[0])
+                    if label is not None:
+                        return label
+                if not code[target_at].endswith(","):
+                    break  # the target list ended (no trailing comma)
+                target_at += 1
+        elif token == "from" and index + 1 < len(code):
+            label = _pip_import_label(code[index + 1].split(".")[0])
+            if label is not None:
+                return label
+        index += 1
+    return None
+
+
+def _effective_program(tokens: list[str]) -> str:
+    """The program a stage really runs — the head of
+    :func:`_prefix_command` (wrappers skipped), so ``sudo -E curl …``
+    and ``env FOO=1 wget …`` still name their downloader."""
+    rest = _prefix_command(tokens)
+    return Path(rest[0]).name if rest else ""
+
+
+# Round 2: every wrapper's value-taking short/long options — the value
+# is never the command, so each is skipped WITH its value (a value
+# spelled attached, ``--adjustment=5``, is one token and already
+# flag-shaped). env's ``-S`` is deliberately absent: its string IS the
+# command, so it stays flag-only. timeout's first POSITIONAL (the
+# duration) is skipped separately in _prefix_command.
+_WRAPPER_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "sudo": frozenset(
+        {"-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-U"}
+    ),
+    "env": frozenset({"-u", "--unset", "-C", "--chdir"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "xargs": frozenset({
+        "-n", "-I", "-L", "-P", "-d", "-E", "-s", "-a",
+        "--max-args", "--replace", "--max-lines", "--max-procs",
+        "--delimiter", "--eof", "--arg-file", "--max-chars",
+    }),
+    "timeout": frozenset({"-s", "-k", "--signal", "--kill-after"}),
+}
+
+
+def _prefix_command(tokens: list[str]) -> list[str]:
+    """The command an invocation really runs: leading VAR=val
+    assignments are stripped (round 3, ONE place — so ``FOO=1 git
+    push`` and ``env FOO=1 git push`` behave the same), then each
+    wrapper's flags and VAR=val tokens are skipped, its value-taking
+    options skip their values too (round 2's table), stacked wrappers
+    (``env sudo …``) unwrap recursively, and timeout skips its duration
+    positional. Empty when nothing real follows."""
+    start = 0
+    while start < len(tokens) and "=" in tokens[start]:
+        start += 1
+    tokens = tokens[start:]
+    index = 0
+    while index < len(tokens):
+        program = Path(tokens[index]).name
+        if program not in _BASH_PREFIX_RUNNERS:
+            return tokens[index:]
+        value_flags = _WRAPPER_VALUE_FLAGS.get(program, frozenset())
+        index += 1
+        while index < len(tokens):
+            token = tokens[index]
+            if token in value_flags:
+                index += 2  # the option and its separate value
+                continue
+            if token.startswith("-") or "=" in token:
+                index += 1
+                continue
+            break  # the wrapped command — stop skipping
+        if program == "timeout" and index < len(tokens):
+            # the first positional is the DURATION, then the command
+            # (flags may precede it: ``timeout -s KILL 30 cmd``)
+            index += 1
+    return []
+
+
+# Round 1: a run-type subcommand hands the rest of the line to ANOTHER
+# program (``poetry run pytest``), so the manager's own scan stops
+# there — reading on would deny the wrapped command's arguments
+# (``poetry run pytest -k install``). ``exec`` is deliberately absent:
+# for npm it fetches a package to run it.
+_MANAGER_RUN_SUBCOMMANDS = frozenset(
+    {"run", "run-script", "test", "t", "start"}
+)
+# The run-subcommand flags that consume the NEXT token (conda run's
+# environment selectors: ``conda run -n env pytest``).
+_MANAGER_RUN_VALUE_FLAGS = frozenset({"-n", "--name", "-p", "--prefix"})
+# Round 2: the managers' value-taking flags BEFORE the subcommand. A
+# run word right after one of these is its VALUE, not a subcommand
+# (``npm --prefix test install lodash``: ``test`` is a directory name)
+# — the scan reads past it to the real subcommand. One shared table:
+# over-listing only means an occasional run word is read as a value,
+# and the wrapped command is still classified on its own tokens.
+_MANAGER_VALUE_FLAGS = frozenset({
+    "--prefix", "--filter", "--cwd", "--dir", "--directory", "-C",
+    "-w", "--workspace", "-P", "--project", "--python",
+})
+
+
+def _run_tail(tokens: list[str]) -> list[str]:
+    """The command a run-type subcommand wraps: the manager's flags are
+    skipped (value-taking ones with their values) until the wrapped
+    program's tokens begin."""
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in _MANAGER_RUN_VALUE_FLAGS and index + 1 < len(tokens):
+            index += 2  # the flag and its separate value
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return tokens[index:]
+    return []
+
+
+def _install_invocations(dequoted: str) -> list[tuple[str | None, list[str]]]:
+    """The install guard's pipe-aware counterpart of
+    :func:`_bash_invocations` (which the push/gh guard keeps): one
+    ``(downloader feeding this stage, tokens)`` pair per invocation.
+    ``||``/``&&``, redirections and subshells are statement boundaries
+    (no pipe relation — ``curl x || python y`` runs python only on
+    curl's FAILURE); a single ``|`` makes the next stage a consumer of
+    the previous one's output, and a downloader stays the feeder for
+    the rest of its pipeline (``curl … | jq . | sh`` launders nothing).
+    Empty parts between adjacent separators drop out."""
+    stages: list[tuple[str | None, list[str]]] = []
+    for statement in _INSTALL_STATEMENT_SPLIT.split(dequoted):
+        downloader: str | None = None
+        for stage in _INSTALL_STAGE_SPLIT.split(statement):
+            tokens = stage.split()
+            if not tokens:
+                continue
+            stages.append((downloader, tokens))
+            head = _effective_program(tokens)
+            if head in _INSTALL_DOWNLOADER_PROGRAMS:
+                downloader = head
+        # a new statement never inherits the previous pipe
+    return stages
+
+
+_INSTALL_SUBST_OPEN_RE = re.compile(r"[\$<]\(|`")
+_INSTALL_SUBST_EXECUTORS = frozenset({"eval", "source", "."})
+
+
+def _substitution_install(command: str, dequoted: str) -> str | None:
+    """Round 1: the installer idiom Homebrew/nvm/rustup document — a
+    downloader inside ``$( … )``, ``<( … )`` or backticks, in a
+    statement whose PROGRAM is a shell, an interpreter, ``eval``,
+    ``source`` or ``.`` — executes the fetched bytes (``bash -c
+    "$(curl …)"``, ``sh <(curl …)``, ``eval "$(curl …)"``). The program
+    rule keeps readers untouched: ``x=$(curl …)`` and ``echo "$(curl
+    …)"`` pass. Scans the de-quoted text AND the raw command, so
+    backtick and quote-wrapped spellings both match; a sudo/env inside
+    the substitution is unwrapped first. Accepted over-deny (round 2):
+    a shell running a LOCAL script that takes a fetched argument
+    (``bash scripts/build.sh "$(curl …)"``) refuses too — the check
+    names the statement's program, same class as the echo-in-shell
+    note on the hook."""
+    for text in (dequoted, command):
+        for match in _INSTALL_SUBST_OPEN_RE.finditer(text):
+            words = text[match.end():].split()
+            index = 0
+            while index < len(words):
+                head = Path(words[index]).name
+                if head == "sudo":
+                    index += 1
+                    while index < len(words) and words[index].startswith("-"):
+                        index += 1
+                elif head == "env":
+                    index += 1
+                    while index < len(words) and "=" in words[index]:
+                        index += 1
+                else:
+                    break
+            if index >= len(words):
+                continue
+            downloader = Path(words[index]).name
+            if downloader not in _INSTALL_DOWNLOADER_PROGRAMS:
+                continue
+            head_text = text[: match.start()]
+            boundary = max(head_text.rfind(ch) for ch in "\n;|&")
+            # leading assignments and wrappers are not the program
+            # (ONE strip: _prefix_command, round 3)
+            tokens = _prefix_command(head_text[boundary + 1:].split())
+            if not tokens:
+                continue
+            program = Path(tokens[0]).name or tokens[0]  # Path(".").name is ""
+            if (
+                program in _BASH_SHELLS
+                or program in _INSTALL_SUBST_EXECUTORS
+                or program in _INSTALL_PIPE_INTERPRETER_PROGRAMS
+                or _VERSIONED_PYTHON_RE.fullmatch(program)
+            ):
+                return f"{downloader} | {program}"
+    return None
+
+
+def _install_class(
+    tokens: list[str], piped_from: str | None = None
+) -> str | None:
     """The install-class label of one invocation (``"pip install"``,
-    ``"npm install"``, ``"ensurepip"``, …) or None — recursing into
-    ``sh -c`` payloads and prefix runners exactly like the push/gh guard,
-    so ``sh -c 'pip install x'`` and ``env pip install x'`` are seen as
-    their bare selves. Registry, URL, git and local-wheel sources all
-    begin with the same subcommand — matching the SUBCOMMAND (not the
-    source) is what covers them all."""
+    ``"npm install"``, ``"ensurepip"``, ``"curl | sh"``, …) or None —
+    recursing into ``sh -c`` payloads (combined ``-lc`` flags included,
+    F-87) and prefix runners exactly like the push/gh guard, so ``sh -c
+    'pip install x'`` and ``env pip install x'`` are seen as their bare
+    selves. Versioned spellings (``pip3.12``, ``python3.13 -m pip``)
+    normalise to the bare name. ``piped_from`` names a downloader whose
+    output feeds a bare interpreter or shell — the pipe idiom. Registry,
+    URL, git and local-wheel sources all begin with the same subcommand
+    — matching the SUBCOMMAND (not the source) is what covers them all.
+
+    Residual (documented, best-effort deny-layer — NOT an
+    evasion-proof boundary): heredoc bodies, ``__import__``-style
+    obfuscation inside ``-c`` code, a ``-c`` payload whose pip import
+    FOLLOWS a shell separator (quotes are stripped before the split,
+    so ``python -c "import pipes; import pip"`` scans the first
+    statement only), a manager value flag missing from
+    ``_MANAGER_VALUE_FLAGS`` whose value is a run word (``npm --cache
+    test install x`` hides the install — the table lists the common
+    flags, not every manager's CLI), and managers/interpreters the
+    tables do not name (cargo, deno, gem…). The
+    structural fence underneath is unchanged: without the registries on
+    the session's allowlist, none of these can fetch anything."""
+    if not tokens:
+        return None
+    # Leading VAR=val assignments and prefix wrappers (with their value
+    # flags) are not the program — ONE strip, in _prefix_command (round
+    # 3), shared with the push/gh guard and _effective_program.
+    tokens = _prefix_command(tokens)
     if not tokens:
         return None
     program = Path(tokens[0]).name
     if program in _INSTALL_PROGRAMS:
         return program
-    if program in _INSTALL_SUBCOMMANDS:
-        allowed = _INSTALL_SUBCOMMANDS[program]
-        if program in _INSTALL_SCAN_ALL:
+    base = "pip" if _VERSIONED_PIP_RE.fullmatch(program) else program
+    if base in _INSTALL_SUBCOMMANDS:
+        allowed = _INSTALL_SUBCOMMANDS[base]
+        if base in _INSTALL_SCAN_ALL:
             # The npm family interleaves value-taking flags before the
             # subcommand (npm --prefix X install y) — scan every
             # non-flag token; over-matching is the safe direction.
-            for token in tokens[1:]:
+            for index in range(1, len(tokens)):
+                token = tokens[index]
                 if not token.startswith("-") and token in allowed:
-                    return f"{program} {token}"
+                    return f"{base} {token}"
+                if token in _MANAGER_RUN_SUBCOMMANDS:
+                    if index > 1 and tokens[index - 1] in _MANAGER_VALUE_FLAGS:
+                        continue  # a flag's value, not a subcommand
+                    # a run-type subcommand wraps ANOTHER command — the
+                    # manager's tokens end here, and the wrapped command
+                    # is classified as its own invocation
+                    return _install_class(_run_tail(tokens[index + 1:]))
             return None
         for token in tokens[1:]:
             if token.startswith("-"):
                 continue
             if token in allowed:
-                return f"{program} {token}"
+                return f"{base} {token}"
             return None  # pip list / npm ls / npm run — not an install
         return None
-    if program in _PYTHON_PROGRAMS:
-        # python -m pip install x / python -m ensurepip: the module
-        # after ``-m`` decides; a bare ``python script.py`` does not.
+    if _VERSIONED_PYTHON_RE.fullmatch(program):
+        # python3.12 -m pip install x / python -m ensurepip / python -c
+        # "import pip": the module or the -c code decides; a bare
+        # ``python script.py`` does not.
         rest = tokens[1:]
+        module = None
+        module_at = 0
         try:
             module_at = rest.index("-m") + 1
             module = rest[module_at]
         except (ValueError, IndexError):
-            return None
+            module = None
         if module == "ensurepip":
             return "ensurepip"
         if module in ("pip", "uv"):
             return _install_class([module, *rest[module_at + 1:]])
+        if module is not None:
+            return None  # its own module — never a stdin script
+        code_at = _c_payload_index(tokens)
+        if code_at is not None:
+            return _python_c_import(rest[code_at - 1:])
+        if any(not token.startswith("-") for token in rest):
+            return None  # a script file — its own code
+        # flags at most: the interpreter takes its script from stdin,
+        # so a download piped in is executed
+        if piped_from in _INSTALL_DOWNLOADER_PROGRAMS:
+            return f"{piped_from} | {program}"
         return None
     if program in _BASH_SHELLS:
-        try:
-            payload = tokens.index("-c", 1) + 1
-        except ValueError:
-            return None
-        return _install_class(tokens[payload:])
-    if program in _BASH_PREFIX_RUNNERS:
-        rest = [
-            token
+        payload = _c_payload_index(tokens)
+        if payload is not None:
+            return _install_class(tokens[payload:])
+        # ``-s`` (alone or combined, round 1: ``bash -s stable``) means
+        # the script IS stdin and everything after it is its arguments.
+        reads_stdin = any(
+            token.startswith("-")
+            and not token.startswith("--")
+            and "s" in token[1:]
             for token in tokens[1:]
-            if not token.startswith("-") and "=" not in token
-        ]
-        return _install_class(rest)
+        )
+        if not reads_stdin and any(
+            not token.startswith("-") for token in tokens[1:]
+        ):
+            return None  # a script file — its own code
+        # flags at most (or -s): the shell reads its script from stdin
+        if piped_from in _INSTALL_DOWNLOADER_PROGRAMS:
+            return f"{piped_from} | {program}"
+        return None
+    # (wrappers were unwrapped by _prefix_command at the top — round 3)
+    # ``curl … | node``: the npm world's pipe idiom (python and the
+    # shells are handled above, with their own code rules).
+    if (
+        piped_from in _INSTALL_DOWNLOADER_PROGRAMS
+        and program in _INSTALL_PIPE_INTERPRETER_PROGRAMS
+    ):
+        return f"{piped_from} | {program}"
     return None
 
 
@@ -1217,18 +1554,36 @@ def install_guard_hook(
     session — so a session with an undeclared contract may install
     nothing: not from the registry, not from a URL, a git URL or a
     local wheel (all share the install subcommand the lexer matches),
-    not via ensurepip/uv/npx. When the contract DOES declare
+    not via ensurepip/uv/npx. F-87 widens the lexer to the spellings a
+    session realistically writes — combined shell flags (``bash -lc``),
+    versioned pips (``pip3.12``), ``python -c`` that imports pip
+    (dotted modules and comma lists included), a download piped into
+    an interpreter or shell (``|``, ``|&``, ``bash -s``), the
+    substitution idiom (``bash -c "$(curl …)"``, ``sh <(curl …)``,
+    ``eval``/``source``/``.``), poetry/pipenv/conda/mamba (whose
+    ``run``-type subcommands stop the manager's scan and classify the
+    wrapped command instead), the dlx/exec fetch-to-run subcommands,
+    and sudo/env-wrapped forms of all of these — so the refusal (not a
+    bare network error) is what the session sees. When
+    the contract DOES declare
     dependencies the hook is inert: the registries are on that
     session's network allowlist, and L0's F-71 check judges the
     manifest. The refusal names the policy and the way out (report it
     as a finding), and each denial counts into ``denials``.
 
     Residual (documented, best-effort deny-layer — NOT an
-    evasion-proof boundary, the bash_guard precedent): pipes feeding a
-    shell's stdin, interpreters spelled without ``-m``, and
-    unenumerated wrappers slip past the lexer. The structural fence
-    underneath is the settings: without the registries on the session's
-    allowlist, an obfuscated install can fetch nothing, and a
+    evasion-proof boundary, the bash_guard precedent): heredoc bodies,
+    obfuscated ``-c`` code (``__import__``), a pip import after a shell
+    separator inside ``-c`` code, and managers/interpreters the tables
+    do not name (cargo, deno, gem…) still slip past the lexer — see
+    :func:`_install_class` for the full list. Known over-deny, kept
+    deliberately: a shell whose command SUBSTITUTION only reads the
+    download (``sh -c 'echo "$(curl …)"'``) refuses too — the check
+    names the statement's program, not the substitution's use, and a
+    session piping fetched text through a shell is not a shape this
+    factory's tasks need. The structural
+    fence underneath is the settings: without the registries on the
+    session's allowlist, an obfuscated install can fetch nothing, and a
     local-wheel install only runs code the session could already run —
     confined by the same sandbox, judged on the same clean clone.
     """
@@ -1247,14 +1602,23 @@ def install_guard_hook(
         if not command:
             return {}
         dequoted = command.translate(_BASH_QUOTES)
-        for invocation in _bash_invocations(dequoted):
-            label = _install_class(invocation)
+        for downloader, invocation in _install_invocations(dequoted):
+            label = _install_class(invocation, downloader)
             if label is None:
                 continue
             if tool_use_id is not None:
                 state.denied[str(tool_use_id)] = "undeclared_install"
             state.count += 1
             return _deny(f"{label}: {INSTALL_DENY_REASON}")
+        # round 1: the substitution idiom — the stage view above loses
+        # $( … )/<( … ) structure to the separator split, so it has its
+        # own program-based check
+        subst = _substitution_install(command, dequoted)
+        if subst is not None:
+            if tool_use_id is not None:
+                state.denied[str(tool_use_id)] = "undeclared_install"
+            state.count += 1
+            return _deny(f"{subst}: {INSTALL_DENY_REASON}")
         return {}
 
     return HookMatcher(matcher="Bash", hooks=[cast(HookCallback, _hook)])
