@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-15T21:55:00Z",
+  "updated_at": "2026-11-16T09:43:40Z",
   "tasks": [
     {
       "id": "F-00",
@@ -5690,7 +5690,7 @@
       "source": "BUILD-ORDER.md#f-73--ready-clones-the-factorys-identity-and-setup-before-the-session",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-72"
       ],
@@ -5727,7 +5727,10 @@
         "max_attempts": 3,
         "max_turns": 150,
         "wall_clock_min": 120
-      }
+      },
+      "acceptance_hash": "36226e1e62fcc1c46689399a2f1222aa389e79030c8c426b91868cb6492d0999",
+      "approved_at": "2026-11-16T09:43:39Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-74",
@@ -6404,7 +6407,7 @@
       "source": "BUILD-ORDER.md#f-84--a-session-installs-nothing-and-searches-nothing-the-contract-did-not-allow",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-71",
         "F-73"
@@ -6471,7 +6474,10 @@
           "tests/test_f06.py",
           "tests/test_f09.py"
         ]
-      }
+      },
+      "acceptance_hash": "fd9bcc6120465bbf4a063fb594b4f00c2a7d60a429e3532e1730fa7bcd072676",
+      "approved_at": "2026-11-16T09:43:40Z",
+      "approved_by": "Anthony"
     }
   ]
 }
