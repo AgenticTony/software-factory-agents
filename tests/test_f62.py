@@ -1215,6 +1215,12 @@ def test_status_and_importer_with_hostile_queue_touch_nothing_outside(
     _git(repo, "init", "-b", "main")
     _git(repo, "config", "user.email", "t@factory.invalid")
     _git(repo, "config", "user.name", "factory test")
+    # `git commit` otherwise spawns a detached `git maintenance run --auto`
+    # that creates and removes .git/objects/maintenance.lock while the
+    # snapshots below are taken (CI run 43842807669: lock in before, gone
+    # after). Housekeeping is not a write by the code under test.
+    _git(repo, "config", "maintenance.auto", "false")
+    _git(repo, "config", "gc.auto", "0")
     (repo / "README.md").write_text("# x\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-m", "base")
