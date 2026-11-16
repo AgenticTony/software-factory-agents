@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-15T18:33:14Z",
+  "updated_at": "2026-11-15T21:55:00Z",
   "tasks": [
     {
       "id": "F-00",
@@ -6397,6 +6397,81 @@
       "acceptance_hash": "73991f84e912756c8ad7ad77019c17731181df11c3b2440ce455810952bf9471",
       "approved_at": "2026-11-15T18:33:14Z",
       "approved_by": "Anthony"
+    },
+    {
+      "id": "F-84",
+      "title": "A session installs nothing and searches nothing the contract did not allow",
+      "source": "BUILD-ORDER.md#f-84--a-session-installs-nothing-and-searches-nothing-the-contract-did-not-allow",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-71",
+        "F-73"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "No seat's session can call WebSearch: every seat's options carry WebSearch in disallowed_tools and a PreToolUse deny hook refuses it under bypassPermissions (deny hooks still block there); WebFetch stays bounded to the profile's docs_allowlist as today.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f84.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Installs come from the lock, before the session: a session's srt settings drop the profile's network_allowlist (the package registries) unless the task's contract declares dependencies (F-71) — setup and the gates keep them. Proven on the real sandbox runner: pip and npm installs fail for a task with no declared dependencies (the proxy's own 403 refusal, nothing lands) and succeed for one with them; an install during L0's own setup still works.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f84.py::test_ac_2_real_runner_refuses_undeclared_installs"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "The refusal is visible: a refused install or search lands in the F-30 trace (a denied tag on the tool_call event), in an egress_denials counter on the session record and the attempt record (the sandbox_bypass_denials style), factory status shows the week's total, and the implementer prompt says in one line that installs come from the lock and a missing tool is a finding, never a workaround.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f84.py::test_ac_3_hooks_and_record"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 150,
+        "wall_clock_min": 120
+      },
+      "scope": {
+        "paths": [
+          "factory/sandbox.py",
+          "factory/session.py",
+          "factory/orchestrator.py",
+          "factory/trace.py",
+          "factory/status.py",
+          "factory/data/schema/tasks.schema.json",
+          "factory/data/schema/project.schema.json",
+          "tests/test_f84.py",
+          "TASK-CONTRACT.md",
+          "VALIDATOR-SPEC.md",
+          "DESIGN-LOCAL-FACTORY.md",
+          "BUILD-ORDER.md",
+          ".factory/tasks.json",
+          ".factory/project.yaml",
+          ".factory/BOOTSTRAP.md",
+          "tests/test_f06.py",
+          "tests/test_f09.py"
+        ]
+      }
     }
   ]
 }

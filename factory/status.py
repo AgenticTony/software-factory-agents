@@ -247,6 +247,15 @@ def _bypass_denials(attempt: dict) -> int:
     return max(value, 0)
 
 
+def _egress_denials(attempt: dict) -> int:
+    """One attempt's egress-denial count (F-84: refused WebSearch calls
+    and undeclared installs); malformed counts zero, same rule."""
+    value = attempt.get("egress_denials")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(value, 0)
+
+
 def compute_metrics(
     queue: dict,
     *,
@@ -839,6 +848,18 @@ def render_status(
         f"{bypass} Bash call(s) setting dangerouslyDisableSandbox, denied by "
         "the seats' PreToolUse hook (each lands in the run's trace; the "
         "sandbox is not negotiable)"
+    )
+    # F-84 AC-3: the same week window, the egress-policy refusals —
+    # WebSearch calls and undeclared install commands the hooks denied.
+    # Read beside the bypass count: repeated refusals mean a contract
+    # missing its dependencies, not a misbehaving seat.
+    egress = sum(_egress_denials(a) for a in week_attempts)
+    lines += ["", "## Egress denials this week", ""]
+    lines.append(
+        f"{egress} WebSearch call(s) and undeclared package install(s), "
+        "refused by the seats' egress hooks (each lands in the run's "
+        "trace; installs come from the lock, search is not a session "
+        "tool)"
     )
 
     # F-47 (I-9): processes that escaped a sandboxed command's process

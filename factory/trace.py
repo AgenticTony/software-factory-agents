@@ -303,7 +303,9 @@ class TraceWriter:
     def session_end(self, record: Any, seat: str) -> None:
         """One session's spend and outcome (AC-1's session_end row), plus
         the session's sandbox-bypass denial count (F-42 AC-5: the summary
-        next to the marked ``tool_call`` events, never instead of them).
+        next to the marked ``tool_call`` events, never instead of them)
+        and its egress-denial count (F-84 AC-3: refused WebSearch calls
+        and undeclared installs, same accounting).
 
         ``turns`` is TELEMETRY, session-reported (F-64 AC-1): only a
         non-bool int >= 0 renders; anything else a forged record carries
@@ -324,6 +326,7 @@ class TraceWriter:
             "model": getattr(record, "model", None),
             "duration_ms": getattr(record, "duration_ms", None),
             "sandbox_bypass_denials": getattr(record, "sandbox_bypass_denials", 0) or 0,
+            "egress_denials": getattr(record, "egress_denials", 0) or 0,
         })
 
     def gate_checks(self, report: dict) -> None:

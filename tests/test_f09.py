@@ -890,12 +890,15 @@ def test_review8_reviewer_seat_runs_headless():
     from factory.session import SEATS, build_options
 
     assert SEATS["reviewer"].permission_mode == "bypassPermissions"
-    assert SEATS["reviewer"].disallowed_tools == ("Write", "Edit", "NotebookEdit")
+    # F-84: WebSearch joins every seat's disallowed list.
+    assert SEATS["reviewer"].disallowed_tools == (
+        "Write", "Edit", "NotebookEdit", "WebSearch")
     options = build_options(
         "reviewer", REPO, 10, base_url="https://x", token="t"
     )
     assert options.permission_mode == "bypassPermissions"
-    assert set(options.disallowed_tools) == {"Write", "Edit", "NotebookEdit"}
+    assert set(options.disallowed_tools) == {
+        "Write", "Edit", "NotebookEdit", "WebSearch"}
 
 
 # ---------------------------------------- owner review round 2 (PR #19) --
