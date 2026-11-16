@@ -398,8 +398,14 @@ def test_ac_1(tmp_path: Path, monkeypatch):
     # (the one fresh clean clone per pass, inside the sweep's lease) plus
     # the `recover --revalidate` command's scratch clone (inside the
     # command's own idle_lease); the importer's call sits inside its own
-    # idle_lease.
-    assert src.count("create_run(") == 7, (
+    # idle_lease. — F-86 — _run_task now holds TWO sites beside its run
+    # clone: the round's first-pass gate clone (created before the
+    # round's try, bound to ``clean``) and the mechanical-gate repair's
+    # second-pass clone (created after the first was cleaned), both
+    # inside the same begin_run lease _run_task itself runs under
+    # (verified by reading: _run_task is called at the begin_run body,
+    # and both sites sit in its round loop).
+    assert src.count("create_run(") == 8, (
         "create_run gained or lost a call site: every writer under runs/ "
         "must hold the run lease (sweep under idle_lease, _run_task under "
         "begin_run, the F-72 accept round under idle_lease)"

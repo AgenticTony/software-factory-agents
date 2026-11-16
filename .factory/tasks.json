@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-16T09:43:40Z",
+  "updated_at": "2026-11-16T14:49:07Z",
   "tasks": [
     {
       "id": "F-00",
@@ -6478,6 +6478,78 @@
       "acceptance_hash": "fd9bcc6120465bbf4a063fb594b4f00c2a7d60a429e3532e1730fa7bcd072676",
       "approved_at": "2026-11-16T09:43:40Z",
       "approved_by": "Anthony"
+    },
+    {
+      "id": "F-86",
+      "title": "A lint or typecheck failure gets one short repair, not a new attempt",
+      "source": "BUILD-ORDER.md#f-86--a-lint-or-typecheck-failure-gets-one-short-repair-not-a-new-attempt",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-72",
+        "F-83"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 80,
+        "wall_clock_min": 60
+      },
+      "scope": {
+        "paths": [
+          "factory/orchestrator.py",
+          "factory/status.py",
+          "factory/data/schema/tasks.schema.json",
+          "tests/test_f86.py",
+          "tests/_support/f86.py",
+          "BUILD-ORDER.md",
+          "TASK-CONTRACT.md",
+          "VALIDATOR-SPEC.md",
+          "docs/run-loop.md",
+          ".factory/tasks.json",
+          ".factory/project.yaml",
+          ".factory/BOOTSTRAP.md",
+          "tests/test_f45.py"
+        ]
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "One repair round per attempt: when L0 fails and every failing finding is the lint or typecheck command's own result (new_error or command_failed, nothing else failed, nothing escalated, no repair yet this attempt), the parent runs ONE implementer-seat session in the same clone at LINT_REPAIR_TURN_CAP=10 (shrunk to the implementer budget's remainder; its turns count toward the attempt's implementer turns and max_turns, its wall time toward the clock beyond the review reserve), the failing commands' capped output as the only findings under the untrusted-data heading with a fix-exactly instruction; no repair runs unfunded (turns, wall clock or peak window — the refusal is traced naming the cap). The full L0 then runs again; pass continues to L1 and review as if L0 had passed first time, fail fails the attempt as today.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f86.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "It cannot be used to slip a change past the gates: the repair's diff passes exactly the gates an implementer round's diff passes — no weaker, no stronger — judged by the second full L0 through the existing rules with no new detector: a protected path fails protected_path_touched, a file outside the declared scope (a lint-config edit among them) fails out_of_scope, an added/removed manifest file escalates new_dependency, a noqa/type:ignore in a risk-path file fails the lint_suppression_added sentinel, a skip marker in a test file fails skip_marker_added, a contract-test deletion that cancels out of the net diff is refused by L1's red/green proof, and a reverted feature fails the full L0's own test command. Residual, named: a suppression or lint-config change in a non-risk, in-scope file is not an L0 finding — it reaches L2 review in the diff, exactly as an implementer's equivalent edit would; whether L0 should catch it is the owner's call.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f86.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "It is visible: the attempt record carries lint_repair (commands, turns, the second L0's outcome), the trace carries one lint_repair event per repair (plus skipped/error with the refusing reason), and factory status shows it on the attempt line.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f86.py::test_ac_3"
+          }
+        }
+      ],
+      "acceptance_hash": "64d568291558c9e640e4259795407fd075239620536b6fe2294c7eb6fac8a650"
     }
   ]
 }
