@@ -205,6 +205,22 @@
               "detail": { "type": "string" }
             }
           }
+        },
+        "lint_repair": {
+          "type": "object",
+          "description": "F-86: this attempt's ONE mechanical-gate repair round — ran when L0 failed on lint/typecheck alone (every failing finding the command's own output; no test, sentinel, protected-path, scope or dependency finding). The repair's turns count in turns/turns_by_seat like any implementer session; outcome is the second full L0's verdict (or aborted when the repair died on quota). Absent when no repair ran.",
+          "additionalProperties": false,
+          "required": ["commands", "turns", "outcome"],
+          "properties": {
+            "commands": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "enum": ["lint", "typecheck"] },
+              "description": "The profile commands whose failures triggered the repair, in gate order."
+            },
+            "turns": { "type": "integer", "minimum": 0 },
+            "outcome": { "enum": ["pass", "fail", "aborted"] }
+          }
         }
       }
     },

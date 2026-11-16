@@ -1009,6 +1009,16 @@ def render_task_status(
             outcome = str(attempt.get("outcome", "?"))
             if attempt.get("escalation"):
                 outcome += f" ({attempt['escalation']})"
+            # F-86 AC-3: the attempt's mechanical-gate repair — which
+            # commands triggered it and the turns it spent (already
+            # counted in the turns columns) shown on the attempt line.
+            repair = attempt.get("lint_repair")
+            if isinstance(repair, dict):
+                commands = ", ".join(
+                    str(c) for c in repair.get("commands") or []) or "?"
+                outcome += (f" · lint repair ({commands}, "
+                            f"{repair.get('turns', '?')} turns, "
+                            f"{repair.get('outcome', '?')})")
             by_seat = attempt.get("turns_by_seat")
             seats = ", ".join(f"{seat} {turns}" for seat, turns in
                               (by_seat or {}).items()) or "—"
