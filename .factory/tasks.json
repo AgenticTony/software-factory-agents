@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-17T14:00:00Z",
+  "updated_at": "2026-11-17T14:50:30Z",
   "tasks": [
     {
       "id": "F-00",
@@ -6701,7 +6701,7 @@
       "source": "BUILD-ORDER.md#f-93--a-merged-dependency-unblocks-its-dependents",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-92"
       ],
@@ -6759,7 +6759,10 @@
           ".factory/project.yaml",
           ".factory/BOOTSTRAP.md"
         ]
-      }
+      },
+      "acceptance_hash": "651882956adf8c8e0974d545725aa409446ecc2a651f7a451bc83dafff2c938c",
+      "approved_at": "2026-11-17T14:50:30Z",
+      "approved_by": "Anthony"
     }
   ]
 }
