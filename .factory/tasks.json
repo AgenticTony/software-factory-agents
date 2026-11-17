@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-17T14:50:30Z",
+  "updated_at": "2026-11-17T21:00:00Z",
   "tasks": [
     {
       "id": "F-00",
@@ -6763,6 +6763,92 @@
       "acceptance_hash": "651882956adf8c8e0974d545725aa409446ecc2a651f7a451bc83dafff2c938c",
       "approved_at": "2026-11-17T14:50:30Z",
       "approved_by": "Anthony"
+    },
+    {
+      "id": "F-94",
+      "title": "Reviews look for the same defect elsewhere, not just in the diff",
+      "source": "BUILD-ORDER.md#f-94--reviews-look-for-the-same-defect-elsewhere-not-just-in-the-diff",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-93"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "Contract review names the defect class: a sixth lens `defect_class` in `contractreview.LENSES` and `l2.CONTRACT_REVIEW_LENSES` with the spec's exact text (\"For each criterion that fixes a defect, name the defect class in one line and search the clone for other sites of the same class. A criterion that fixes one site of a class that occurs elsewhere is a finding: name each other site as file:line.\"); the prompt's heading reads `## The six lenses`; a scripted output with `lens: \"defect_class\"` parses; `tests/test_f80.py` pins follow.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f94.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "The reviewer seats get different lenses: seat 1 (every odd seat) gets today's assembled reviewer prompt (conformance), seat 2 (every even seat) the same base plus a defect-hunt lens block (enclosing function and failing input per hunk; the behaviour of every removed line and where it is re-established; grep callers and other sites of each defect class, reported with `sibling: true`); `reviewers: 1` gets both. `prompts.reviewer_seat_prompts` is the one assignment: every review site (round, final, revalidate), every per-seat repair and fresh retry (seat N keeps seat N's lens) and the eval fan-out use it, passed down through `run_sessions_parallel(seat_system_prompts=…)`; `prompt_versions` hashes each seat's own prompt.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f94.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "A finding outside the diff can never block: after parsing, a finding is a `sibling` only when the reviewer flagged it `\"sibling\": true` (strict) AND the parent proves its file resolves to a path tracked at the reviewed head that `base...head` does not change — either alone keeps today's rules (an unflagged finding on an untouched file blocks by its severity) (renames: old and new path both in the diff; `./`, `a/../b` and in-clone absolute paths normalise; `../`, untracked, case-variant and symlink-into-the-diff paths are not provable and keep today's rules). A sibling never fails the round, is never in the implementer's fix list, is kept in the report with its severity, marked `sibling`, and is exempt from the nit budget (F-23's out-of-delta drop still applies in fix rounds); a seat's declared fail resting on siblings alone does not fail the round; the verifier still votes on it (a unanimous major sibling survives a drop vote and still cannot block). In-diff findings keep today's rules exactly: the flag lowers no bar there.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f94.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "Surviving siblings reach F-82's follow-up draft: a sibling's file joins `scope.paths` only when it is a clean repo-relative path tracked on the base branch matching no protected or risk glob (`siblings.followup_scope_refusal`); any other file stays out and its criterion says it was left out and why; the PR body's \"Review findings left open\" section lists siblings after a line of their own; the draft stays `draft`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f94.py::test_ac_4"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 150,
+        "wall_clock_min": 120
+      },
+      "scope": {
+        "paths": [
+          "factory/contractreview.py",
+          "factory/l2.py",
+          "factory/prompts.py",
+          "factory/session.py",
+          "factory/orchestrator.py",
+          "factory/eval.py",
+          "factory/state.py",
+          "factory/prbody.py",
+          "factory/siblings.py",
+          "tests/test_f94.py",
+          "tests/_support/f94.py",
+          "tests/test_f80.py",
+          "tests/test_f09.py",
+          "tests/test_f38.py",
+          "TASK-CONTRACT.md",
+          "VALIDATOR-SPEC.md",
+          "README.md",
+          "BUILD-ORDER.md",
+          ".factory/tasks.json",
+          ".factory/project.yaml",
+          ".factory/BOOTSTRAP.md"
+        ]
+      }
     }
   ]
 }

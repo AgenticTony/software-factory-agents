@@ -15,6 +15,13 @@ Assembly rules (VALIDATOR-SPEC L2):
 * The **reviewer** gets the base prompt — axes, smell baseline, mandatory
   checklist, test-quality checks — plus every ``standards`` file's content,
   or an explicit "baseline only" statement when the project documents none.
+* The reviewer **seats** (F-94) differ by lens, never by base: seat 1 (and
+  every odd seat) gets exactly the assembled reviewer prompt — contract
+  conformance plus the standards axis — and seat 2 (every even seat) the
+  same text plus :data:`DEFECT_HUNT_LENS`. A one-seat fan-out gets both.
+  :func:`reviewer_seat_prompts` is the one place the assignment is made;
+  every review site (round, final, revalidate, eval) and every per-seat
+  retry asks it, and :func:`prompt_versions` hashes each seat's own text.
 * The **verifier** (F-38) gets the same standards assembly as the reviewer:
   it votes reviewer findings in or out, and judging whether a finding is
   "style-only" or cites a real documented standard needs the same texts.
@@ -193,6 +200,73 @@ def assemble_reviewer_prompt(profile: dict | None = None) -> str:
     return prompt + "\n\n## Project standards\n\n" + "\n".join(sections)
 
 
+# F-94: the defect-hunt lens — what the second reviewer seat adds to the
+# base prompt (JobFinderOS run 4, #176: both seats got the identical
+# prompt, so the second mostly duplicated the first, and neither looked
+# for the fixed defect's other sites). Pinned by literal in
+# tests/test_f94.py — editing it here without the pin fails the test.
+DEFECT_HUNT_LENS = (
+    "## Your lens: hunt the defect beyond the hunk\n"
+    "\n"
+    "On top of the review above, hunt for defects the diff causes or "
+    "leaves behind:\n"
+    "\n"
+    "- Read every hunk and its enclosing function, and ask what input or "
+    "state makes each line wrong.\n"
+    "- For every removed or replaced line, name the behaviour it "
+    "enforced and where the new code re-establishes it.\n"
+    "- Grep the callers of every changed function, and grep the codebase "
+    "for other sites of each defect class the diff fixes or touches. "
+    "Report each other site as its own finding with `\"sibling\": true`, "
+    "its `file` and `line`, and the defect class named in its `text`.\n"
+    "\n"
+    "Draw the line exactly. A defect this diff CAUSES — including a break "
+    "at an unchanged caller, test or config — is reported WITHOUT "
+    "`sibling` and judged by its severity like any finding. "
+    "`\"sibling\": true` is only for an older site of the same class that "
+    "this diff neither causes nor touches: the orchestrator records it for "
+    "a follow-up task and it does not fail this round, whatever its "
+    "severity — rate it by what the defect costs, and judge your verdict "
+    "on the diff alone. `sibling: true` on a file the diff changes lowers "
+    "nothing: a defect inside the diff is judged by the diff's rules.\n"
+)
+
+
+def reviewer_seat_lens(seat_no: int, reviewers: int) -> str:
+    """Which lens reviewer seat ``seat_no`` (1-based) of an N-seat
+    fan-out gets (F-94): ``"both"`` for a one-seat fan-out,
+    ``"conformance"`` for odd seats, ``"defect_hunt"`` for even ones."""
+    if max(1, int(reviewers)) == 1:
+        return "both"
+    return "conformance" if int(seat_no) % 2 == 1 else "defect_hunt"
+
+
+def reviewer_seat_prompts(profile: dict | None = None,
+                          reviewers: int = 2) -> list[str]:
+    """Every reviewer seat's system prompt, seat 1 first (F-94).
+
+    The conformance seat gets :func:`assemble_reviewer_prompt` unchanged
+    (today's job: the contract and the standards axis — the base prompt
+    IS the conformance review); a defect-hunt seat, and the single seat
+    of a one-seat fan-out (which carries both lenses), gets the same
+    base plus :data:`DEFECT_HUNT_LENS`. So two seats' prompts differ
+    only by the lens block.
+
+    Every reviewer fan-out and every per-seat retry or repair takes seat
+    N's prompt from here — a retried seat 2 keeps the defect hunt — and
+    the eval's fan-out uses the same list (F-48 parity). A reviewer
+    count below 1 is treated as 1 (the config layer refuses it).
+
+    Raises:
+        PromptError: As :func:`assemble_reviewer_prompt`.
+    """
+    base = assemble_reviewer_prompt(profile)
+    hunt = base + "\n\n" + DEFECT_HUNT_LENS
+    count = max(1, int(reviewers))
+    return [base if reviewer_seat_lens(n, count) == "conformance" else hunt
+            for n in range(1, count + 1)]
+
+
 def assemble_verifier_prompt(profile: dict | None = None) -> str:
     """The verifier's system prompt (F-38): the base file (vote rules, drop
     cases, tags) plus the same standards assembly the reviewer gets — the
@@ -248,10 +322,11 @@ def prompt_versions(profile: dict | None = None, *, reviewers: int = 2) -> dict[
     base file or to what assembly injects both show up as a new version.
 
     The reviewer fan-out (F-38) gets one entry per session —
-    ``reviewer-1`` .. ``reviewer-N`` — so every session's prompt hash is
-    recorded even though the fan-out shares one assembled prompt; the
-    verifier gets its own entry. A reviewer count below 1 is treated as 1
-    (the config layer refuses it; this stays total for direct callers).
+    ``reviewer-1`` .. ``reviewer-N`` — each the hash of THAT seat's own
+    prompt (F-94: the seats differ by lens, see
+    :func:`reviewer_seat_prompts`); the verifier gets its own entry. A
+    reviewer count below 1 is treated as 1 (the config layer refuses it;
+    this stays total for direct callers).
 
     Args:
         profile: The loaded ``project.yaml`` mapping (optional in tests).
@@ -262,8 +337,8 @@ def prompt_versions(profile: dict | None = None, *, reviewers: int = 2) -> dict[
         "verifier": <sha256>}``.
     """
     versions = {"implementer": prompt_hash(assemble_implementer_prompt(profile))}
-    reviewer_hash = prompt_hash(assemble_reviewer_prompt(profile))
-    for number in range(1, max(1, int(reviewers)) + 1):
-        versions[f"reviewer-{number}"] = reviewer_hash
+    for number, text in enumerate(
+            reviewer_seat_prompts(profile, reviewers), start=1):
+        versions[f"reviewer-{number}"] = prompt_hash(text)
     versions["verifier"] = prompt_hash(assemble_verifier_prompt(profile))
     return versions

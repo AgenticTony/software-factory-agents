@@ -397,6 +397,15 @@ paths:
     # state module's dependency rule and the one merged test it reads
     # (the test_f79 precedent; state.py is protected above).
     - "tests/test_f93.py"
+    # F-94: the review-lens contract tests judge the protected
+    # contractreview/l2/prompts/session/orchestrator/state/prbody modules
+    # (the sixth lens, the per-seat lens assignment, the parent's sibling
+    # rule and the follow-up scope filter); siblings.py decides which
+    # findings can never block and which files a follow-up may touch —
+    # judge surface from the day it exists (the F-80 precedent).
+    - "tests/test_f94.py"
+    - "tests/_support/f94.py"
+    - "factory/siblings.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 

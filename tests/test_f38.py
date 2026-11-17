@@ -398,7 +398,8 @@ def test_ac_5(tmp_path: Path, monkeypatch):
     assert set(versions) == {"implementer", "reviewer-1", "reviewer-2", "verifier"}
     loaded = load_profile(env.queue_path.parent / "project.yaml")
     assert versions == prompt_versions(loaded)
-    assert versions["reviewer-1"] == versions["reviewer-2"]
+    # F-94: the seats differ by lens, so their hashes differ.
+    assert versions["reviewer-1"] != versions["reviewer-2"]
     assert versions["verifier"] == prompt_hash(assemble_verifier_prompt(loaded))
     assert versions["verifier"] != versions["reviewer-1"]
 

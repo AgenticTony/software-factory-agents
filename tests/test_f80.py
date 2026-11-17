@@ -11,7 +11,8 @@ Three acceptance criteria (BUILD-ORDER §F-80):
   list; the parent parses the output strictly and stores a valid review
   under the factory root, keyed by the contract hash; the queue file is
   byte-identical;
-- AC-2 the five lenses are in the prompt, specific, and pinned;
+- AC-2 the lenses are in the prompt, specific, and pinned (five here;
+  F-94 added a sixth, defect_class — pinned below and in test_f94);
 - AC-3 ``factory approve <task-id>`` shows the stored review for the
   CURRENT contract hash before the y/N — blockers first, escaped — and
   never blocks on it.
@@ -54,7 +55,8 @@ from factory.state import RunInProgressError, TaskQueue
 
 NO_PEAK = FactoryConfig(peak_window=None)
 
-# AC-2's pins: the five lens instructions and the no-new-features rule,
+# AC-2's pins: the lens instructions (F-80's five, plus F-94's sixth,
+# defect_class) and the no-new-features rule,
 # held HERE as literals — an edit to the prompt that drops or rewrites
 # one fails against these, not against the constant it edited.
 LENS_PINS = {
@@ -78,6 +80,12 @@ LENS_PINS = {
     "budget": (
         "Flag a turn or attempt budget that is implausible for the size "
         "of the work."
+    ),
+    "defect_class": (
+        "For each criterion that fixes a defect, name the defect class in "
+        "one line and search the clone for other sites of the same class. "
+        "A criterion that fixes one site of a class that occurs elsewhere "
+        "is a finding: name each other site as file:line."
     ),
 }
 NO_FEATURES_PIN = (
@@ -511,7 +519,7 @@ def test_ac_1(tmp_path: Path, monkeypatch, capsys):
 
 
 # --------------------------------------------------------------------------
-# AC-2 — the five lenses are in the prompt and are specific
+# AC-2 — the lenses are in the prompt and are specific
 # --------------------------------------------------------------------------
 
 
@@ -520,7 +528,8 @@ def test_ac_2(tmp_path: Path):
     from factory.l2 import CONTRACT_REVIEW_LENSES, CONTRACT_REVIEW_SEVERITIES
 
     assert tuple(LENS_PINS) == (
-        "purpose", "testability", "scope", "ambiguity", "budget")
+        "purpose", "testability", "scope", "ambiguity", "budget",
+        "defect_class")
     assert CONTRACT_REVIEW_LENSES == tuple(LENS_PINS)
     assert CONTRACT_REVIEW_SEVERITIES == ("blocker", "major", "minor")
     assert tuple(contractreview.LENSES) == CONTRACT_REVIEW_LENSES
@@ -548,7 +557,7 @@ def test_ac_2(tmp_path: Path):
     # The lens block sits AFTER the untrusted material, in the parent's
     # own section — the source document cannot precede-and-override it
     # with a same-named heading (test_ac_1 arm 9 proves the fence).
-    assert prompt_lines.index("## The five lenses") > next(
+    assert prompt_lines.index("## The six lenses") > next(
         i for i, line in enumerate(prompt_lines)
         if line.startswith("## Source document"))
 

@@ -138,7 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="one fresh-context, read-only session reviews a task's "
              "contract and source document before you approve it (F-80): "
              "findings by lens (purpose, testability, scope, ambiguity, "
-             "budget) are stored under the factory root, keyed by the "
+             "budget, defect_class — F-94) are stored under the factory root, keyed by the "
              "contract hash, and shown by `factory approve`. Advice only "
              "— it never blocks, edits or approves; drives one model "
              "session, never inside the peak window")
