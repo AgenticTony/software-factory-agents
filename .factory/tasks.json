@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-17T12:00:00Z",
+  "updated_at": "2026-11-17T12:52:24Z",
   "tasks": [
     {
       "id": "F-00",
@@ -6619,7 +6619,7 @@
       "source": "BUILD-ORDER.md#f-92--every-park-has-an-owner-exit-and-a-failed-escalation-pr-keeps-the-real-question",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-87"
       ],
@@ -6690,7 +6690,10 @@
           ".factory/project.yaml",
           ".factory/BOOTSTRAP.md"
         ]
-      }
+      },
+      "acceptance_hash": "68334ad12042fa35d014bb0236c6c8362a1bbdf61c7bd0bb8e336488989a674f",
+      "approved_at": "2026-11-17T12:52:24Z",
+      "approved_by": "Anthony"
     }
   ]
 }

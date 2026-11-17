@@ -79,6 +79,8 @@ This takes about 15 minutes and is not a full review. Its sources:
 | 2026-11-14 | wo21 run 6 (F-77 live) | needs_human scope_change_needed (budget spent 2/2, PR kept) | 2 (reset, merge #139) | 60 + 43 | pending usage | ~29 min | a scope park on an open PR with spent budget has no exit that keeps the work (F-78); `factory adopt` named by the contract but absent from the CLI |
 | 2026-11-14 | F-78 build (session) | branch held for review | 2 (approve F-78, merge pending) | — (session build, not a factory run) | — | — | **finding: the SFA profile declares `repo.branch_protection: unavailable` on a PUBLIC repo whose owner has ADMIN — a false declaration (the schema allows it only for plan-limit-403 private repos); `factory loop` on this repo correctly refused to build.** Owner deciding protection separately; F-78 built session-style on a branch instead |
 | 2026-11-14 | wo21 run 7 (F-78 live) | **pr_opened**: fix round passed L0, L1 and review and pushed to #163; the PR's own tests went green | 3 (adopt, reset, loop) plus 2 unrelated (merge JobFinderOS #165, merge #163) | 92 | 227k in / 61k out / 4.0M cache-read | 26 min | the loop prints a stale pre-round `not ready` line; a `main`-side advisory reddens every PR and a re-run reuses the stale merge commit |
+| 2026-11-17 | wo22-followup run 1 (first run after F-83..F-87) | needs_human **pr_create_failed** (real cause: scope_change_needed) | 3 (contract review, approve, loop) + recovery pending | 38 | 67k in / 25k out / 1.6M cache-read; $1.10 | 13 min | escalation label never created → no draft PR; the pr_create_failed park has NO recovery command; notes still name `factory adopt` (2nd time); merged tasks never close on deploy-target profiles |
+| 2026-11-17 | wo22-followup run 2 (after the acceptance-edit unblock) | **pr_opened** (JobFinderOS #175), 1 attempt, CI green on the first wait (8 polls) | 3 (loop to demote, approve, loop) + the merge | 80 (= the cap) | 200k in / 48k out / 4.6M cache-read; $2.88 | 31 min | the implementer used every one of its 80 turns; F-84..F-87 still not exercised live (L0 passed first time, no malformed verdict, 0 denials) |
 | 2026-11-15 | wo22 run 1 (first run after F-79, F-80, F-82) | **pr_opened** (JobFinderOS #166), 2 attempts, CI green on the first wait | 3 (contract review, approve, loop) plus the merge | 53 (failed lint) + 23 | 230k in / 41k out / 3.6M cache-read; $2.65 nominal | 28 min | a lint error cost a whole attempt; a reviewer's malformed JSON cost a whole session again (F-85); contract review does not converge between runs |
 
 ## Retros
@@ -187,7 +189,44 @@ The target is 2 owner touches per task: approve and merge.
   5. **Updating the factory under a running loop is unsafe,** and nothing prevents it. The installed command runs from the main checkout. Watch item: a guard, or a separate install.
 - **Fix as a WO?** One new candidate, small: lint before finish (item 1). Items 3 and 4 are practice, recorded here. Item 5 waits for a second occurrence.
 
+### Run 2026-11-17: wo22-apply-link-recovery-followup, needs_human pr_create_failed (no PR; work on origin)
+- **Goal:** the F-82 follow-up of #166, and the first live run of F-73/F-83/F-84/F-85/F-86/F-87.
+- **The run** (`20261117T064411Z-2247d0`, 06:44–06:57Z): one attempt, 38 implementer turns (cap 80), $1.10. The implementer wrote the code and `test_wo22_followup.py` (+529/−33), then asked for wider scope instead of finishing: the approved AC-4 (email-only twins count, owner decision 2026-11-17) reverses the rule the parent's `test_wo22_apply_link_recovery.py::test_ac_2` pins ("an email-only twin is never handed off", lines 225–239), so L0 would fail on the locked parent test. **The request is correct.**
+- **Escalated:** `scope_change_needed` → F-72 kept the work: pushed `factory/wo22-apply-link-recovery-followup-20261117t064411z-2247d0` (02b11a8, `[skip ci]`), then `gh pr create --label factory-escalation` failed: the label does not exist on JobFinderOS. The park was rewritten to `pr_create_failed`.
+- **Whose fault:** the scope gap is the **contract's** (mine, as reviewer): I refuted CR-2 by checking only AC-3's status codes against the parent test, and never swept the parent tests for the rule AC-4 reverses. Same lesson as run-1 item 4, other direction: a reversed rule needs a sweep of every test that pins the old one. The PR failure and the dead end are the **factory's**.
+- **What the F-8x WOs did:** F-83 recorded per-seat turns and cost (works). F-86's lint repair, F-84/F-85 (review seats) and the L0–L2 gates never ran: the session escalated before validation. F-87: 0 sandbox-bypass and 0 egress denials, so nothing to judge. Run 3 is not yet the live proof of F-84..F-87.
+- **What broke in the factory:**
+  1. **The escalation label is never created.** F-72's BOOTSTRAP entry listed it as unverified ("an owner creates `factory-escalation` once per repo"); nothing did, and the first live escalation PR failed on it.
+  2. **A `pr_create_failed` park from the keep-work path is a dead end.** It replaces the original escalation (`scope_change_needed`), and every recovery predicate in `factory/state.py` is False for it; `links` is empty too, so the pushed branch is not recorded on the task. No command can resume it.
+  3. **Escalation notes name `factory adopt`**, which does not exist (`factory approve --adopt`). Second occurrence (first: wo21 run 6). Seven sites: `approve.py:1032,1157`, `orchestrator.py:4176,5246,6765,7016`, `state.py:1882`.
+  4. **Merged tasks never close on deploy-target profiles.** `_close_merged_tasks` skips any profile with a deploy target, so the parent `wo22-apply-link-recovery` (#166 merged) is still `in_review`, and a `depends_on` on it would block forever. Worked around by dropping the dependency.
+- **Fix as a WO?** Yes: **F-92** (spec in `docs/next-work-orders.md`, brief `docs/briefs/f92-brief.md`; full review standard, push path) covers 1–3 plus the wider hole the retro probe found — on a queue copy, `factory recover` refused six other no-PR park classes (`budget_exhausted`, `review_not_converging`, `orchestrator_error`, `setup_failed`, `publish_refused`, `new_dependency`). Item 4 is its own small WO.
+- **Unblocking this task without F-92:** an edit to the acceptance TEXT demotes a `needs_human` task to `draft` at the next run's hash audit (`demote_changed_contracts`; verified on a queue copy — a scope-only edit does not demote). AC-4 needs that edit anyway (it must say the parent test's email-only half changes), with the parent test file added to scope. Then `factory approve` and `factory loop`; the run starts fresh from main (the kept branch stays on origin for comparison).
 
+
+### Run 2026-11-17 (late morning): wo22-apply-link-recovery-followup, pr_opened (JobFinderOS #175)
+- **Unblock:** the AC-4 text gained the parent-test sentence and the parent test file joined the scope (backup `~/factory/backup/jfo-tasks-20261117T095530-pre-wo22fu-unblock.json`). The first `factory loop` demoted the task to draft through the hash audit and went idle (`unledgered (not acted on)`), then `factory approve` and `factory loop`. No hand-edit of status.
+- **The run** (`20261117T091007Z-920086`, 09:10–09:41Z): one attempt. Implementer 80 turns, exactly the cap; reviewers 6 + 7 turns, verifier 3. L0, L1 (red/green per AC) and L2 all passed first time. Published #175 (+558/−59 over 3 files) and CI was green on the first wait. $2.88.
+- **Reviewer check of #175 (head `31efc95`):**
+  - All 8 checks green.
+  - The parent test changed only in the email-only half, as AC-4 required.
+  - AC-1: the wrapper was deleted.
+  - AC-2: a two-pass `(id, title)` read, then full rows for the same-bucket ids only.
+  - AC-3: only 404/410/5xx carry `dead_code`.
+  - AC-4: email-only twins rank after every HTTP twin that passed the re-probe.
+  - One behaviour beyond the letter of the ACs: a twin whose only URL is link-degraded (an aggregator interstitial) is no longer an HTTP candidate. That matches the design doc's definition of a usable twin ("a non-degraded `url`"), and AC-4's own definition of email-only implies it.
+  - The JobFinderOS tests were not re-run locally; CI ran them on sqlite and postgres.
+- **F-82 drafted a follow-up** of 3 findings (`wo22-apply-link-recovery-followup-followup`):
+  - duplicated recovery-record code;
+  - 408/429 still show the "may have expired" text, which the contract kept on purpose but which reads wrong;
+  - a whitespace-only `application_email` yields an empty address.
+- **Escalated:** none. **Owner touches:** 3 plus the merge.
+- **What this run proved:** the acceptance-edit route out of a stuck park works with no factory change. F-83's per-seat numbers are on the record.
+- **Not exercised live, again:** F-86's lint repair, F-85's verdict repair and F-87's install guard. A clean run never reaches them. They stay unproven until a run trips them.
+- **Watch item:** the implementer ended at 80/80 turns. One more file of work would have cut the session at the cap. Raise `max_turns` for M-size follow-ups, or keep follow-ups to two files.
+- **Clean-up for the owner:**
+  - the first attempt's kept branch `factory/wo22-apply-link-recovery-followup-20261117t064411z-2247d0` on origin is now superseded;
+  - after #175 merges, the task stays `in_review` (the deploy-target close gap, item 4 of the run-1 retro).
 ## Known gaps carried forward (fix only if a run hits them)
 - ~~The clone has no virtualenv and no git identity before the session (F-73 AC-2, shelved). wo21 run 1 burned turns on it.~~ (F-73, 2026-11-15: the run clone gets the factory identity as repo-local config and the profile's `commands.setup` before each attempt's first session; nothing publishes under another identity — a foreign author or committer in base..head rebuilds the branch as one factory commit on the base, tree asserted equal.)
 - ~~A lint-only failure cost a whole attempt~~ (F-86, from the wo22 run-1 trace): when L0 fails on the lint or typecheck command alone, the attempt gets ONE repair round in the same clone — implementer seat, 10-turn cap funded by the attempt's own budgets, the command's output as the only finding under the untrusted-data heading — and the full gate runs again, judging the repair's diff exactly like any change. The repair is visible on the attempt record (`lint_repair`), the trace and `factory status`.
