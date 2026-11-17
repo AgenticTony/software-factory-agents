@@ -154,7 +154,8 @@ def build_parser() -> argparse.ArgumentParser:
                              "<factory-root>/config.yaml)")
 
     recover = sub.add_parser(
-        "recover", help="queue a fix round for a parked F-26 escalation")
+        "recover", help="move a parked (needs_human) task: every park "
+                        "has one exit (F-92)")
     recover.add_argument(
         "task_id",
         help="task id to recover (stale_base/pr_closed, "
@@ -163,19 +164,21 @@ def build_parser() -> argparse.ArgumentParser:
              "with --evidence and --reset-attempts, a "
              "scope_missing/"
              "scope_change_needed escalation with --evidence after the "
-             "widened contract is re-approved, or — F-72 — an "
-             "escalation draft PR answered with --accept/--reject)")
+             "widened contract is re-approved, an escalation draft PR "
+             "answered with --accept (new_dependency/risk_path_touched) "
+             "or --reject (any class), or — F-92 — ANY park holding no "
+             "PR link with --redraft --evidence)")
     recover.add_argument(
         "--yes", action="store_true",
         help="non-interactive confirmation (never allowed for "
              "credential_added, attempts_exhausted, ci_failed, a scope "
-             "escalation "
-             "or an escalation-PR accept/reject)",
+             "escalation, an escalation-PR accept/reject "
+             "or a --redraft)",
     )
     recover.add_argument(
         "--evidence", default=None,
         help="required for credential_added/attempts_exhausted/scope "
-             "escalations and for --accept: what you checked (e.g. 'test "
+             "escalations and for --accept and --redraft: what you checked (e.g. 'test "
              "fixture, not a real credential', 'all attempts died to the "
              "sandbox bind bug, fixed in PR #NN', or 'read the diff; "
              "requests is the documented client')",
@@ -212,7 +215,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="F-72: reject the escalation draft PR — closes it and "
              "returns the task to draft with its approval markers "
              "cleared (the contract can change; re-approval required). "
-             "new_dependency/risk_path_touched only; interactive, no --yes",
+             "Any class holding an escalation draft PR (F-92); "
+             "interactive, no --yes",
     )
     recover.add_argument(
         "--revalidate", action="store_true",
@@ -236,6 +240,16 @@ def build_parser() -> argparse.ArgumentParser:
              "must hold exactly it when the command runs. Without "
              "--head the in_review shape refuses and prints the current "
              "head plus the command to run",
+    )
+    recover.add_argument(
+        "--redraft", action="store_true",
+        help="F-92: return ANY needs_human park that holds no PR link "
+             "to draft — approval markers cleared, every attempt kept, "
+             "a progress-log entry written. The task runs again only "
+             "after `factory approve` (contract hash and ledger). "
+             "Requires --evidence; interactive, no --yes. A park holding "
+             "a PR keeps its own exit (--reset-attempts, --reject, or "
+             "the sweep's merged recovery)",
     )
     recover.add_argument(
         "--done-by", default=None,
@@ -509,7 +523,7 @@ def _run_recover(args: argparse.Namespace) -> int:
             evidence=args.evidence, reset_attempts=args.reset_attempts,
             accept=args.accept, reject=args.reject,
             revalidate=args.revalidate, head=args.head,
-            done_by=args.done_by,
+            redraft=args.redraft, done_by=args.done_by,
             factory_root=(Path(args.factory_root) if args.factory_root
                           else None),
         )
@@ -530,6 +544,10 @@ def _run_recover(args: argparse.Namespace) -> int:
             print(f"{args.task_id}: needs_human -> in_review "
                   "(PR kept — the sweep owns it again; attempts not "
                   "reset)")
+        elif status == "draft" and args.redraft:
+            print(f"{args.task_id}: needs_human -> draft "
+                  "(redrafted; edit the contract if needed, then "
+                  "`factory approve` it)")
         elif status == "draft":
             print(f"{args.task_id}: needs_human -> draft "
                   "(escalation rejected; contract re-approval required)")
@@ -992,8 +1010,11 @@ def _run_orchestrator(args: argparse.Namespace) -> int:
         # the exit code below says so.
         for result in loop.parked:
             where = result.pr or "no PR"
+            # F-92 AC-2: both classes when keeping the work replaced the
+            # one the run escalated on.
+            shown = getattr(result, "park_label", None) or result.escalation
             print(f"  parked: {result.task_id} "
-                  f"({result.escalation}) — {where}")
+                  f"({shown}) — {where}")
         print(f"factory loop: stopped ({loop.stop_reason}) after {len(loop.results)} run(s)")
         code = _EXIT[loop.stop_reason]
         if loop.parked and code == 0:

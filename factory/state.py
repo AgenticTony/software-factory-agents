@@ -247,6 +247,36 @@ def check_transition(current: str, new: str) -> str:
     return reason
 
 
+def park_class(task: dict) -> str | None:
+    """The class a parked task escalated on (F-92 AC-2) — the ONE read
+    every recovery predicate and writer makes.
+
+    The last attempt's ``original_escalation`` when present (the class
+    the run escalated on, recorded by the parent when keeping the work
+    failed: ``pr_create_failed``/``publish_refused`` replaced it), else
+    its ``escalation``. A ``scope_change_needed`` behind a failed PR
+    therefore recovers exactly as a plain one does, through the same
+    ledger gate. ``None`` when the task has no attempt.
+    """
+    attempts = task.get("attempts") or []
+    if not attempts:
+        return None
+    last = attempts[-1]
+    return last.get("original_escalation") or last.get("escalation")
+
+
+def park_label(attempt: dict) -> str | None:
+    """How an attempt's class reads to the owner (F-92 AC-2):
+    ``pr_create_failed (from scope_change_needed)`` when keeping the work
+    replaced the class, else the class alone; ``None`` when it escalated
+    on nothing."""
+    escalation = attempt.get("escalation")
+    original = attempt.get("original_escalation")
+    if escalation and original and original != escalation:
+        return f"{escalation} (from {original})"
+    return escalation or original
+
+
 def recovery_task_eligible(task: dict) -> bool:
     """Whether the F-26 recovery edges may move this task (round-4 f2).
 
@@ -258,7 +288,7 @@ def recovery_task_eligible(task: dict) -> bool:
     attempts = task.get("attempts") or []
     return (task.get("status") == "needs_human"
             and bool(attempts)
-            and attempts[-1].get("escalation") in RECOVERY_ESCALATIONS
+            and park_class(task) in RECOVERY_ESCALATIONS
             and bool((task.get("links") or {}).get("pr")))
 
 
@@ -274,7 +304,7 @@ def credential_recovery_eligible(task: dict) -> bool:
     attempts = task.get("attempts") or []
     return (task.get("status") == "needs_human"
             and bool(attempts)
-            and attempts[-1].get("escalation") in CREDENTIAL_RECOVERY_ESCALATIONS)
+            and park_class(task) in CREDENTIAL_RECOVERY_ESCALATIONS)
 
 
 ATTEMPTS_RESET_ESCALATIONS = ("attempts_exhausted", "ci_failed")
@@ -331,7 +361,7 @@ def merged_recovery_eligible(task: dict) -> bool:
     attempts = task.get("attempts") or []
     return (task.get("status") == "needs_human"
             and bool(attempts)
-            and bool(attempts[-1].get("escalation"))
+            and bool(park_class(task))
             and holds_normal_pr(task))
 
 # F-72 AC-4: the two escalation classes the owner answers with
@@ -358,9 +388,45 @@ def escalation_accept_eligible(task: dict) -> bool:
     links = task.get("links") or {}
     return (task.get("status") == "needs_human"
             and bool(attempts)
-            and attempts[-1].get("escalation") in ACCEPT_RECOVERY_ESCALATIONS
+            and park_class(task) in ACCEPT_RECOVERY_ESCALATIONS
             and bool(links.get("pr"))
             and links.get("escalation_pr") is True)
+
+def escalation_reject_eligible(task: dict) -> bool:
+    """Whether the owner's reject word may move this task (F-92).
+
+    ANY ``needs_human`` park holding an ESCALATION draft PR
+    (``links.pr`` + ``links.escalation_pr``) — whatever it escalated on.
+    F-72 gated the reject on the two accept classes, which left every
+    other class that keeps its work as an escalation draft
+    (``budget_exhausted``, ``review_not_converging``, …) with no owner
+    exit. Rejecting skips no gate: the PR is closed and the task lands
+    in ``draft`` with its approval markers cleared, so only ``factory
+    approve`` (the contract hash and the ledger) runs it again.
+    """
+    links = task.get("links") or {}
+    return (task.get("status") == "needs_human"
+            and bool(park_class(task))
+            and bool(links.get("pr"))
+            and links.get("escalation_pr") is True)
+
+
+# F-92 R1-1: the run-scoped links a drafted task drops (reject and
+# redraft): each describes a run or a pushed head the next fresh run
+# never continues.
+DRAFT_DROPPED_LINKS = ("branch", "pushed_head", "wip", "revalidated",
+                       "ci_rerun_heads")
+
+
+def redraft_eligible(task: dict) -> bool:
+    """Whether ``factory recover --redraft`` may move this task (F-92
+    AC-3): ANY ``needs_human`` park that holds no PR link at all. A park
+    holding a PR keeps its own exit (a normal PR resumes with the
+    reset, an escalation draft is rejected, a merged PR is the sweep's
+    merged recovery) — the redraft never duplicates one."""
+    return (task.get("status") == "needs_human"
+            and bool(park_class(task))
+            and not (task.get("links") or {}).get("pr"))
 
 # F-65 AC-3: the declared-scope escalations. Both park a task with no
 # GitHub signal at all (nothing was pushed; the task never reached a
@@ -384,7 +450,7 @@ def scope_recovery_eligible(task: dict) -> bool:
     attempts = task.get("attempts") or []
     return (task.get("status") == "needs_human"
             and bool(attempts)
-            and attempts[-1].get("escalation") in SCOPE_RECOVERY_ESCALATIONS)
+            and park_class(task) in SCOPE_RECOVERY_ESCALATIONS)
 
 # F-64 AC-2: how many quota-classified attempts (outcome "aborted",
 # escalation "quota_exhausted") requeue for FREE per task per UTC
@@ -423,7 +489,7 @@ def attempts_reset_eligible(task: dict) -> bool:
     attempts = task.get("attempts") or []
     return (task.get("status") == "needs_human"
             and bool(attempts)
-            and attempts[-1].get("escalation") in ATTEMPTS_RESET_ESCALATIONS)
+            and park_class(task) in ATTEMPTS_RESET_ESCALATIONS)
 
 
 def keep_pr_eligible(task: dict) -> bool:
@@ -447,7 +513,7 @@ def keep_pr_eligible(task: dict) -> bool:
     attempts = task.get("attempts") or []
     return (task.get("status") == "needs_human"
             and bool(attempts)
-            and attempts[-1].get("escalation") not in KEEP_PR_NEVER_ESCALATIONS
+            and park_class(task) not in KEEP_PR_NEVER_ESCALATIONS
             and holds_normal_pr(task))
 
 
@@ -636,7 +702,7 @@ def check_recovery_transition(task: dict, new: str) -> str:
             "TaskQueue.recover_attempts)"
         )
     if (new == "in_review"
-            and (task.get("attempts") or [{}])[-1].get("escalation")
+            and park_class(task)
             != "pr_closed"):
         raise TransitionError(
             f"recovery transition {task.get('status')} -> in_review is the "
@@ -1544,10 +1610,9 @@ class TaskQueue:
             ConcurrentWriteError: If another writer changed the file.
         """
         task = self.get(task_id)
-        attempts = task.get("attempts") or []
         eligible = (
             recovery_task_eligible(task)
-            and attempts[-1].get("escalation") == "stale_base"
+            and park_class(task) == "stale_base"
         )
         if not eligible:
             raise TransitionError(
@@ -1753,7 +1818,7 @@ class TaskQueue:
         if not (evidence or "").strip():
             raise StateError(f"{task_id}: attempt reset requires evidence")
         task = self.get(task_id)
-        parked_on = (task.get("attempts") or [{}])[-1].get("escalation")
+        parked_on = park_class(task)
         # F-79 AC-2: the reset is the one resume command for ANY park
         # holding a normal PR link (keep_pr_eligible — never
         # credential_added/stale_base/pr_closed, which keep their own
@@ -1879,7 +1944,7 @@ class TaskQueue:
             raise TransitionError(
                 f"{task_id}: the current contract (hash {chash[:12]}) has no "
                 "owner approval in the ledger — widen the scope in the "
-                "queue, record the re-approval (`factory adopt` shows the "
+                "queue, record the re-approval (`factory approve --adopt` shows the "
                 "contract and records the new hash; `factory approve` "
                 "refuses non-draft tasks), then recover; a widened scope "
                 "the owner has not re-approved does not move"
@@ -1955,7 +2020,8 @@ class TaskQueue:
                 "(links.pr + links.escalation_pr) — the supported reasons "
                 "are exactly those two"
             )
-        escalation = task["attempts"][-1]["escalation"]
+        # accept-eligible ⇒ the park class is one of the two accept classes.
+        escalation = cast(str, park_class(task))
         chash = contract_hash(task)
         if not ledger.has_escalation_waiver(
                 task_id, escalation, sha, contract_hash_value=chash):
@@ -1981,7 +2047,9 @@ class TaskQueue:
     def reject_escalation(self, task_id: str) -> str:
         """Reject an escalation draft PR: the one writer of the F-72
         reject edge (``needs_human → draft`` — the contract-changed edge's
-        pair, gated here on an accept-eligible escalation instead).
+        pair, gated here on a park holding an escalation draft PR instead;
+        F-92 widened it from the two accept classes to every class, see
+        :func:`escalation_reject_eligible`).
 
         The rejection clears the contract's approval markers
         (``acceptance_hash``/``approved_at``/``approved_by``): the whole
@@ -1991,24 +2059,61 @@ class TaskQueue:
         attempt record stays (append-only).
 
         Args:
-            task_id: Task parked on an accept-able escalation holding an
-                escalation draft PR.
+            task_id: A parked task holding an escalation draft PR.
 
         Returns:
             ``"draft"``.
 
         Raises:
-            TransitionError: The task isn't accept-eligible (the same two
-                escalation classes, the same PR link).
+            TransitionError: The task isn't a needs_human park holding an
+                escalation draft PR.
         """
         task = self.get(task_id)
-        if not escalation_accept_eligible(task):
+        if not escalation_reject_eligible(task):
             raise TransitionError(
                 f"{task_id}: escalation rejection needs a needs_human task "
-                "whose last attempt escalated new_dependency or "
-                "risk_path_touched and which holds an escalation draft PR "
-                "— the supported reasons are exactly those two"
+                "that holds an escalation draft PR (links.pr + "
+                "links.escalation_pr)"
             )
+        return self._to_draft(task)
+
+    def redraft(self, task_id: str, *, evidence: str) -> str:
+        """Return a parked task holding no PR to ``draft`` (F-92 AC-3):
+        the one writer of ``factory recover --redraft``.
+
+        The same edge and the same marker clear as
+        :meth:`reject_escalation` (``needs_human → draft``, approval
+        markers gone, every attempt record kept): the task runs again
+        only through ``factory approve``, which checks the contract
+        hash and the ledger. A park holding any PR link refuses — its
+        own exit applies.
+
+        Args:
+            task_id: A ``needs_human`` task holding no PR link.
+            evidence: What the owner checked; must not be blank (the
+                command records it in the progress log).
+
+        Returns:
+            ``"draft"``.
+
+        Raises:
+            StateError: Unknown task, or blank evidence.
+            TransitionError: The task isn't a no-PR park.
+        """
+        if not (evidence or "").strip():
+            raise StateError(f"{task_id}: a redraft requires evidence")
+        task = self.get(task_id)
+        if not redraft_eligible(task):
+            raise TransitionError(
+                f"{task_id}: a redraft needs a needs_human park that holds "
+                "no PR link — a task holding a PR keeps its own exit"
+            )
+        return self._to_draft(task)
+
+    def _to_draft(self, task: dict) -> str:
+        """``needs_human → draft`` with the approval markers cleared —
+        shared by the reject and redraft writers (their gates differ;
+        what they write does not)."""
         reason = ALLOWED_TRANSITIONS.get((_status_of(task), "draft"))
         assert reason is not None  # needs_human → draft is in the table
         _check_kind_rules(task, _status_of(task), "draft")
@@ -2019,6 +2124,21 @@ class TaskQueue:
         # the next approval re-freezes fresh fields over the stale ones.
         for marker in ("acceptance_hash", "approved_at", "approved_by"):
             task.pop(marker, None)
+        # F-92 R1-1: a drafted task runs FRESH, so the old run's links go
+        # with it — a later run must never pair its new PR with the old
+        # branch (the _finish_unrecorded_publish crash window merges
+        # links). The contract's own links (execution_record, step), the
+        # merged stamp and — on a reject — the closed escalation PR's
+        # ``pr``/``escalation_pr`` pair stay: F-72 AC-4 pins that a
+        # rejected task still names its closed PR (tests/test_f72.py,
+        # protected), and the pass-path completion clears the stale
+        # marker instead (_finish_unrecorded_publish). The command
+        # records what was dropped (the progress entry names the branch
+        # and PR) before calling the writer.
+        links = task.get("links")
+        if isinstance(links, dict):
+            task["links"] = {k: v for k, v in links.items()
+                             if k not in DRAFT_DROPPED_LINKS}
         self.save()
         return "draft"
 

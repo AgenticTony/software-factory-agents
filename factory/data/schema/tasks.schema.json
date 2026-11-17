@@ -141,6 +141,7 @@
         "pr": { "type": "string" },
         "validator_report": { "type": "string", "description": "Path to the stored validator report" },
         "escalation": { "$ref": "#/$defs/escalation" },
+        "original_escalation": { "$ref": "#/$defs/escalation", "description": "F-92: the class the run escalated on when keeping its work as an escalation draft PR failed and escalation was replaced by pr_create_failed/publish_refused. Parent-written only (the orchestrator's attempt record); every recovery predicate reads the park class through factory.state.park_class — this field first, else escalation." },
         "prompt_versions": { "type": "object", "description": "seat -> prompt content hash (F-09); used for credit assignment in F-19", "additionalProperties": { "type": "string" } },
         "skills": { "type": "array", "items": { "type": "string" }, "description": "Skills loaded in the session, name@version" },
         "note": { "type": "string" },

@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-16T22:40:41Z",
+  "updated_at": "2026-11-17T12:00:00Z",
   "tasks": [
     {
       "id": "F-00",
@@ -6612,6 +6612,85 @@
       "acceptance_hash": "53a56799dd111dd2d623888f3aab4c381dc839611cf5e383458d7b9120531f02",
       "approved_at": "2026-11-16T22:40:41Z",
       "approved_by": "Anthony"
+    },
+    {
+      "id": "F-92",
+      "title": "Every park has an owner exit, and a failed escalation PR keeps the real question",
+      "source": "BUILD-ORDER.md#f-92--every-park-has-an-owner-exit-and-a-failed-escalation-pr-keeps-the-real-question",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-87"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "The escalation label exists before the PR is created: `gh label create` through `remote_call`, never `--force`, \"already exists\" (any case) is success; a failed or hung create raises before `gh pr create` and the escalation lands `pr_create_failed` naming the label step; the label is never dropped.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f92.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "A failed escalation PR records `original_escalation` (parent-written schema field) and `links.branch` when pushed; every recovery predicate reads the park class through `factory.state.park_class`; the loop's parked line and `factory status` show both classes; `factory status <task>` prints a parked task's note escaped and capped; a scope_change_needed behind a failed PR re-queues through the same ledger gate.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f92.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "`factory recover <id> --redraft --evidence` (interactive, no `--yes`) moves any needs_human park holding no PR link to draft (markers cleared, attempts kept, progress-log entry); PR-holding parks are refused with their real exit named; `--reject` answers an escalation draft PR of any class; table-driven over the schema escalation enum.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f92.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "Every backticked `factory …` command in a string literal under `factory/` names a real subcommand and flag of the CLI parser (ast-based test); the seven `factory adopt` sites name `factory approve --adopt`.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f92.py::test_ac_4"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 150,
+        "wall_clock_min": 120
+      },
+      "scope": {
+        "paths": [
+          "factory/publish.py",
+          "factory/orchestrator.py",
+          "factory/state.py",
+          "factory/approve.py",
+          "factory/status.py",
+          "factory/cli.py",
+          "factory/data/schema/tasks.schema.json",
+          "tests/test_f92.py",
+          "TASK-CONTRACT.md",
+          "docs/run-loop.md",
+          "BUILD-ORDER.md",
+          ".factory/tasks.json",
+          ".factory/project.yaml",
+          ".factory/BOOTSTRAP.md"
+        ]
+      }
     }
   ]
 }

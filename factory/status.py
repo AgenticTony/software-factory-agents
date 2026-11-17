@@ -61,8 +61,9 @@ from factory.config import (
     FactoryConfig,
     load_config,
 )
-from factory.egress import strip_control_sequences
+from factory.egress import escape_approval_text, strip_control_sequences
 from factory.runs import project_component
+from factory.state import park_label
 from factory.vent import VENT_CATEGORIES, weeks_vents
 
 WEEK_DAYS = 7
@@ -402,11 +403,29 @@ def _week_escapees(
 def _escalation_of(task: dict) -> tuple[str | None, str | None]:
     """The task's escalation reason and note: the most recent attempt
     that carries one (the orchestrator appends the escalation to the
-    attempt that produced it)."""
+    attempt that produced it). F-92 AC-2: the reason reads both classes
+    — ``pr_create_failed (from scope_change_needed)`` — when keeping the
+    work replaced the one the run escalated on."""
     for attempt in reversed(task.get("attempts") or []):
         if attempt.get("escalation"):
-            return attempt["escalation"], attempt.get("note")
+            return park_label(attempt), attempt.get("note")
     return None, None
+
+
+# F-92 AC-2: the parked attempt's note in `factory status <task>` — the
+# owner's next step lives there. Session-derived text: every control and
+# bidi character is made VISIBLE (escape_approval_text, the approval
+# prompts' rule) and the note is capped like the PR body's session text.
+PARKED_NOTE_CAP = 2000
+
+
+def parked_note(note: str | None) -> str:
+    """The note as the status page shows it: escaped, then capped."""
+    shown = escape_approval_text(str(note or ""))
+    if len(shown) > PARKED_NOTE_CAP:
+        shown = (shown[:PARKED_NOTE_CAP]
+                 + f" […{len(shown) - PARKED_NOTE_CAP} more characters]")
+    return shown
 
 
 def needs_human_tasks(queue: dict) -> list[dict[str, Any]]:
@@ -969,6 +988,13 @@ def render_task_status(
     links = task.get("links") or {}
     if links.get("pr"):
         lines.append(f"- PR: {links['pr']}")
+    elif links.get("branch"):
+        lines.append(f"- pushed branch (no PR): {links['branch']}")
+    if task.get("status") == "needs_human":
+        reason, note = _escalation_of(task)
+        lines.append(f"- parked: {reason or 'no escalation recorded'}")
+        if note:
+            lines.append(f"- parked note: {parked_note(note)}")
 
     def turns_cell(attempt: dict) -> str:
         turns = attempt.get("turns")
@@ -1008,7 +1034,7 @@ def render_task_status(
         for attempt in attempts:
             outcome = str(attempt.get("outcome", "?"))
             if attempt.get("escalation"):
-                outcome += f" ({attempt['escalation']})"
+                outcome += f" ({park_label(attempt)})"
             # F-86 AC-3: the attempt's mechanical-gate repair — which
             # commands triggered it and the turns it spent (already
             # counted in the turns columns) shown on the attempt line.

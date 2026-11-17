@@ -73,6 +73,7 @@ was parked.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import re
 import shutil
@@ -187,6 +188,8 @@ from factory.state import (
     merged_recovery_eligible,
     now_iso,
     open_owner_steps,
+    park_class,
+    park_label,
     recovery_task_eligible,
     unmet_dependencies,
 )
@@ -345,6 +348,12 @@ _ESCALATION_PR_NEVER = frozenset({"credential_added", "quota_exhausted",
 ESCALATION_TITLE_PREFIX = "[escalation]"
 ESCALATION_PR_LABEL = "factory-escalation"
 
+# F-92 AC-2: the classes _keep_work writes IN PLACE of the class the run
+# escalated on (the fence or gh refused the escalation PR). Their attempt
+# carries ``original_escalation``; every recovery reads the park class
+# through factory.state.park_class (original first).
+KEEP_WORK_REPLACED = frozenset({"pr_create_failed", "publish_refused"})
+
 # R2-F1 guard 1: the two GitHub Actions triggers [skip ci] does NOT
 # suppress (both can run with secrets — pull_request_target by design,
 # workflow_run on the default branch's workflow files). A base workflow
@@ -388,6 +397,12 @@ class RunResult:
     pr: str | None = None
     escalation: str | None = None
     reports: dict = field(default_factory=dict)
+    # F-92 AC-2: how the park reads — ``pr_create_failed (from
+    # scope_change_needed)`` when keeping the work replaced the class —
+    # read off the parked task's last attempt (parent-written) by
+    # :func:`run_loop`; ``None`` elsewhere (callers fall back to
+    # ``escalation``).
+    park_label: str | None = None
     # F-26 round-4 finding 3: a fail-closed concurrency_wait carries its
     # cause — the PR URLs GitHub reports open, and those whose state
     # couldn't be resolved (presumed open) — so a stall can't look like a
@@ -2592,7 +2607,12 @@ def _finish_unrecorded_publish(
     if not url or (task.get("links") or {}).get("pr") == url:
         return None
     if last.get("outcome") == "pass":
-        task["links"] = {**(task.get("links") or {}), "pr": url}
+        # F-92 R1-1: a validated pass PR is never an escalation draft — a
+        # rejected task's closed escalation PR leaves the marker behind,
+        # and kept here it would make the sweep skip the new PR.
+        links = {k: v for k, v in (task.get("links") or {}).items()
+                 if k != "escalation_pr"}
+        task["links"] = {**links, "pr": url}
         queue.transition(task_id, "in_review")
         return RunResult("pr_opened", task_id, pr=url)
     if last.get("outcome") == "escalated":
@@ -3592,7 +3612,7 @@ def _sweep_stale_prs(
     recovery = [task for task in recovery if _approved(task)]
     for task in recovery:
         state = states.get(task["links"]["pr"])
-        escalation = (task.get("attempts") or [{}])[-1].get("escalation")
+        escalation = park_class(task)
         if state != "merged" and not recovery_task_eligible(task):
             # F-79 AC-3: every park holding a normal PR link is read
             # for the MERGED signal only; the re-open and rejection
@@ -4173,7 +4193,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
             f"{task_id} declares no file scope — add scope.paths (the "
             "repo-relative globs this task may change) and approve the "
             "contract, or (a parked task) record the re-approval with "
-            "`factory adopt` and `factory recover --evidence` "
+            "`factory approve --adopt` and `factory recover --evidence` "
             "(F-65 scope_missing)"
         )
         attempt = {
@@ -4492,7 +4512,20 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                 # passed.
                 record["lint_repair"] = round_lint_repair
             record.update({k: v for k, v in extra.items() if v is not None})
+            # F-92 AC-2: the class the run escalated on, when keeping its
+            # work replaced it. Parent state only — _keep_work set it on
+            # THIS call's replacement; it is consumed here, once, and only
+            # onto the replaced class's attempt (never a session field:
+            # nothing a session writes reaches ``kept_original``).
+            original = kept_original.pop("escalation", None)
+            if (original and record.get("escalation") in KEEP_WORK_REPLACED
+                    and original != record.get("escalation")):
+                record["original_escalation"] = original
             return record
+
+        # F-92 AC-2: _keep_work's replaced class, handed to the attempt
+        # record it returns into (see attempt_record).
+        kept_original: dict[str, str] = {}
 
         def _keep_work(escalation: str, note: str) -> "tuple[str | None, str, str]":
             """F-72 AC-3: keep the run's work as an escalation DRAFT PR.
@@ -4528,6 +4561,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                 (the original in the note) when the fence or gh refused,
                 so the attempt records what actually happened.
             """
+            kept_original.clear()
             # F-75 / R1-S1: once this run has PUBLISHED a PR, EVERY
             # later escalation — including the NEVER classes — keeps
             # THAT PR, converted to a draft: a red-CI PR must never sit
@@ -4561,6 +4595,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                 return None, escalation, note
             live = queue.get(task_id)
             old_links = dict(live.get("links") or {})
+            pushed_branch: str | None = None
             try:
                 head = _git_out(work.root, "rev-parse", "--verify",
                                 f"refs/heads/{branch}")
@@ -4599,6 +4634,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                     if path and (path == ".github" or path.startswith(".github/"))
                 })
                 if gh_paths:
+                    kept_original["escalation"] = escalation
                     return None, "publish_refused", (
                         "the escalation PR was refused and nothing was "
                         "pushed — the diff touches CI/runner config "
@@ -4610,6 +4646,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                 # R2-F1 guard 1: refuse where [skip ci] does not protect.
                 unsafe = _unsafe_workflow_triggers(work.root, base_sha)
                 if unsafe:
+                    kept_original["escalation"] = escalation
                     return None, "publish_refused", (
                         "the escalation PR was refused and nothing was "
                         "pushed — the base's workflows trigger "
@@ -4635,6 +4672,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                    secrets=egress_secrets)
                 push_branch(work.root, repo_cfg["remote"], branch, sha=head,
                             created=created, default_branch=default_branch)
+                pushed_branch = branch
                 url = ctx.open_pr(PullRequest(
                     remote=repo_cfg["remote"], base=default_branch,
                     head=branch, title=pr_title, body=body, draft=True,
@@ -4652,15 +4690,28 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                     queue, task_id, old_links, log, run_id=work.run_id)
                 return url, escalation, note
             except (PushRefused, PRBodyError) as exc:
+                kept_original["escalation"] = escalation
                 return None, "publish_refused", (
                     f"the escalation PR was refused and nothing was pushed "
                     f"({exc}); the original escalation was {escalation}: "
                     f"{note}"
                 )
             except PublishError as exc:
+                kept_original["escalation"] = escalation
+                if pushed_branch is not None:
+                    # F-92 AC-2: the branch IS on the remote — record it,
+                    # so the owner (and the redraft echo) can find the
+                    # work the failed PR would have carried. No PR link
+                    # is invented: the task holds none.
+                    live = queue.get(task_id)
+                    live["links"] = {**(live.get("links") or {}),
+                                     "branch": pushed_branch}
+                    queue.save()
                 return None, "pr_create_failed", (
                     f"the escalation PR could not be opened ({exc}); the "
                     f"original escalation was {escalation}: {note}"
+                    + (f" — the work is on the pushed branch {pushed_branch}"
+                       if pushed_branch is not None else "")
                 )
 
         def _repair_review_seat(seat_no, session, parse_error, spend):
@@ -5243,7 +5294,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                             "the implementer requested a wider scope: "
                             f"{shown}{refusal_note} — widen scope.paths in "
                             "the queue, record the re-approval "
-                            "(`factory adopt`), then `factory recover "
+                            "(`factory approve --adopt`), then `factory "
+                            "recover "
                             "--evidence` (a request never widens anything "
                             "by itself)"
                         )
@@ -6762,7 +6814,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                         "the same out-of-scope path(s) in two rounds of "
                         f"this run: {shown} — the implementer will not "
                         "revert them; widen scope.paths in the queue, "
-                        "record the re-approval (`factory adopt`), then "
+                        "record the re-approval (`factory approve "
+                        "--adopt`), then "
                         "`factory recover --evidence`, or drop the task "
                         "(the fix round told it to revert or request)"
                     )
@@ -7007,13 +7060,15 @@ def recover_accept_round(
             "risk_path_touched and which holds an escalation draft PR — "
             "the supported reasons are exactly those two"
         )
-    escalation = task["attempts"][-1]["escalation"]
+    # accept-eligible ⇒ the park class is one of the two accept classes.
+    escalation = cast(str, park_class(task))
     chash = contract_hash(task)
     if not ledger.has_contract(task_id, chash):
         raise RunError(
             f"{task_id}: the current contract (hash {chash[:12]}) has no "
             "owner approval in the ledger — an accept runs gates, which is "
-            "acting on the task; re-approve (`factory adopt`) first"
+            "acting on the task; re-approve (`factory approve --adopt`) "
+            "first"
         )
     profile_path = Path(queue.path).parent / "project.yaml"
     profile = load_profile(profile_path)
@@ -7351,6 +7406,25 @@ def _recover_accept_leased(
 # -------------------------------------------------------------- the loop --
 
 
+def _with_park_label(queue_path: Path | str, result: RunResult) -> RunResult:
+    """F-92 AC-2: the parked result with its owner-facing class — both
+    classes when keeping the work replaced the one the run escalated on.
+    Read off the queue's own record of the park (the parent-written
+    attempt), best-effort: an unreadable queue leaves the plain class."""
+    if not result.task_id:
+        return result
+    try:
+        attempts = TaskQueue(queue_path).get(result.task_id).get("attempts")
+    except Exception:  # noqa: BLE001 — a display read never fails the loop
+        return result
+    if not attempts:
+        return result
+    label = park_label(attempts[-1])
+    if label is None or label == result.escalation:
+        return result
+    return dataclasses.replace(result, park_label=label)
+
+
 def run_loop(queue_path: Path | str, profile_path: Path | str | None = None,
              **kwargs) -> LoopResult:
     """Run until the queue is empty, quota, the peak window or an
@@ -7377,7 +7451,7 @@ def run_loop(queue_path: Path | str, profile_path: Path | str | None = None,
         result = run_once(queue_path, profile_path, **kwargs)
         results.append(result)
         if result.outcome == "needs_human":
-            parked.append(result)  # F-72: park and carry on
+            parked.append(_with_park_label(queue_path, result))  # F-72
             continue
         if result.outcome in stops:
             return LoopResult(stops[result.outcome], results, parked=parked)
