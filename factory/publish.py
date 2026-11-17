@@ -653,6 +653,50 @@ def github_slug(remote_url: str) -> str:
     return match.group("slug")
 
 
+# F-92 AC-1: the escalation label as the factory creates it on a repo
+# that does not carry it yet. An existing label (the owner's colour and
+# description) is never touched: no --force, ever.
+ESCALATION_LABEL_DESCRIPTION = (
+    "Software Factory: a parked run's work, kept as a draft PR for the "
+    "owner's judgement"
+)
+ESCALATION_LABEL_COLOR = "d93f0b"
+
+# gh's refusal for a label the repo already carries (gh 2.x
+# pkg/cmd/label/create.go: 'label with name "<name>" already exists; use
+# `--force` to update its color and description'). GitHub matches label
+# names case-insensitively, so a label differing only in case answers the
+# same way — and gh pr create --label resolves it the same way.
+_LABEL_EXISTS = re.compile(r"already exists", re.IGNORECASE)
+
+
+def gh_label_ensure(gh: str, slug: str, label: str) -> None:
+    """Make sure ``label`` exists on ``slug`` (F-92 AC-1).
+
+    ``gh label create`` with a fixed description and colour, through
+    :func:`remote_call` (prompt-disabled, time-bounded). "Already exists"
+    is success; ``--force`` is never passed, so an owner's existing label
+    is never overwritten.
+
+    Raises:
+        PublishError: The create failed for any other reason (permissions,
+            network) — or :class:`RemoteCallTimeout` (a PublishError) when
+            it hung. The message names the label step.
+    """
+    proc = remote_call(
+        [gh, "label", "create", label, "--repo", slug,
+         "--description", ESCALATION_LABEL_DESCRIPTION,
+         "--color", ESCALATION_LABEL_COLOR],
+        env_extra=GH_NET_ENV, what=f"gh label create {label} ({slug})",
+    )
+    if proc.returncode == 0 or _LABEL_EXISTS.search(proc.stderr or ""):
+        return
+    raise PublishError(
+        f"gh label create {label} failed before the PR could be opened "
+        f"(the PR must carry the label): {proc.stderr.strip()[:500]}"
+    )
+
+
 def gh_pr_create(pr: PullRequest, *, gh_bin: Path | str | None = None) -> str:
     """Open the PR with ``gh pr create`` and return its URL.
 
@@ -682,13 +726,17 @@ def gh_pr_create(pr: PullRequest, *, gh_bin: Path | str | None = None) -> str:
         fh.write(pr.body)
         body_path = Path(fh.name)
     # F-72 AC-3: a draft PR (the escalation shape) and its one label.
-    # gh refuses --label for a label the repo does not carry — the
-    # escalation PR then fails into pr_create_failed, honest: the label
-    # is part of the contract, never silently skipped.
+    # gh refuses --label for a label the repo does not carry, so F-92
+    # AC-1 makes sure the label exists first (gh_label_ensure); a label
+    # that cannot be created raises here, BEFORE gh pr create, and the
+    # escalation lands pr_create_failed naming the label step — the
+    # label is part of the contract, never silently skipped.
     flags = ["--draft"] if pr.draft else []
     if pr.label:
         flags += ["--label", pr.label]
     try:
+        if pr.label:
+            gh_label_ensure(gh, slug, pr.label)
         proc = remote_call(
             [
                 gh, "pr", "create", "--repo", slug, "--base", pr.base, "--head", pr.head,

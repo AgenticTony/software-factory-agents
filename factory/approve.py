@@ -85,6 +85,8 @@ from factory.state import (
     keep_pr_eligible,
     now_iso,
     open_owner_steps,
+    park_class,
+    park_label,
     recovery_task_eligible,
     scope_recovery_eligible,
     unmet_dependencies,
@@ -675,6 +677,7 @@ def recover_task(
     reject: bool = False,
     revalidate: bool = False,
     head: str | None = None,
+    redraft: bool = False,
     done_by: str | None = None,
     factory_root: Path | None = None,
     pr_state: Callable[[str], str] | None = None,
@@ -741,6 +744,12 @@ def recover_task(
     open PR). An escalation draft PR stays with ``--accept``/``--reject``.
     A park holding no normal PR link re-queues a fresh run as before.
 
+    F-92: every park has an exit. ``--redraft --evidence`` returns ANY
+    park holding no PR link to ``draft`` (:func:`_recover_redraft_task`),
+    so it runs again only through ``factory approve``; every class
+    check reads :func:`factory.state.park_class` (a failed escalation
+    PR's ``original_escalation`` first).
+
     Refused — :class:`ApprovalError`, nothing written — when the task
     isn't parked on a recoverable escalation (the same gates the
     transitions enforce), or when GitHub does not report the PR
@@ -765,7 +774,11 @@ def recover_task(
             acknowledgment that new attempts are being spent.
         accept: The F-72 one-command answer to an escalation draft PR
             (new_dependency/risk_path_touched only).
-        reject: The F-72 rejection: close the PR, task → draft.
+        reject: The F-72 rejection: close the PR, task → draft (any
+            class holding an escalation draft PR, F-92).
+        redraft: F-92 AC-3: return ANY park holding no PR link to
+            ``draft`` (markers cleared, attempts kept, logged) —
+            evidence required, interactive only.
         done_by: Who confirmed a recovery (default: the git user, like
             ``factory tick``); recorded in the log entry and the reset
             marker.
@@ -808,6 +821,18 @@ def recover_task(
             f"{task_id}: --revalidate answers a stale_base park on its "
             "own — combine it with none of --accept, --reject, "
             "--reset-attempts or --evidence"
+        )
+    if redraft:
+        if accept or reject or reset_attempts or revalidate:
+            raise ApprovalError(
+                f"{task_id}: --redraft returns a park holding no PR to "
+                "draft on its own — combine it with none of --accept, "
+                "--reject, --reset-attempts or --revalidate"
+            )
+        return _recover_redraft_task(
+            queue, task_id, task, evidence=evidence, assume_yes=assume_yes,
+            done_by=done_by, factory_root=factory_root,
+            confirm=confirm, echo=echo,
         )
     if revalidate:
         return _recover_revalidate_task(
@@ -871,23 +896,24 @@ def recover_task(
         )
     if not recovery_task_eligible(task):
         raise ApprovalError(
-            f"{task_id}: not recoverable — a park holding a normal PR link "
-            "resumes with --evidence and --reset-attempts (the PR is kept "
-            "while GitHub reports it open); a stale_base/pr_closed "
+            f"{task_id}: not recoverable by this form — a park holding NO "
+            f"PR link returns to draft with `factory recover {task_id} "
+            "--redraft --evidence \"<what you checked>\"` (re-approval "
+            "required before it runs again); a park holding a normal PR "
+            "link resumes with --evidence and --reset-attempts (the PR is "
+            "kept while GitHub reports it open); a stale_base/pr_closed "
             "escalation holding a PR link, a credential_added escalation "
             "with --evidence, or an attempts_exhausted/ci_failed "
             "escalation with --evidence and --reset-attempts, can take "
             "the fix-round edge; an escalation DRAFT PR is answered with "
-            "--accept or --reject (new_dependency/risk_path_touched). "
-            "Re-open the PR on GitHub (the sweep returns it to in_review), "
-            "confirm the credential finding, grant a fresh attempt budget, "
-            "or change the contract and re-approve."
+            "--reject (any class) or --accept "
+            "(new_dependency/risk_path_touched)."
         )
     if reset_attempts:
         # F-79 AC-2: the two sweep parks keep their own gate. Neither
         # spent a budget (they are session-less), and a reset must not
         # walk a stale_base PR past the re-validation it failed.
-        parked_on = (task.get("attempts") or [{}])[-1].get("escalation")
+        parked_on = park_class(task)
         raise ApprovalError(
             f"{task_id}: --reset-attempts does not apply to a {parked_on} "
             "park — it is session-less and spent no budget, and its exit "
@@ -916,7 +942,7 @@ def recover_task(
     attempts = task.get("attempts") or []
     echo(
         f"{task_id}: {task.get('title')}\n"
-        f"  escalation: {attempts[-1].get('escalation')}\n"
+        f"  escalation: {park_label(attempts[-1])}\n"
         f"  PR: {url} (closed)\n"
         "  recover queues a fix round: the next run re-implements from "
         "the current default head on a fresh branch (work pushed to the "
@@ -976,8 +1002,7 @@ def _recover_revalidate_task(
     from factory.publish import PublishError as _PublishError
 
     factory_root = factory_root or FACTORY_ROOT_DEFAULT
-    attempts = task.get("attempts") or []
-    escalation = attempts[-1].get("escalation") if attempts else None
+    escalation = park_class(task)
     if task.get("status") == "in_review":
         # R2-1 + R3-1: the in_review VOUCH — the way back every guard
         # refusal line names. No gates run (the owner's word on a head
@@ -1029,7 +1054,8 @@ def _recover_revalidate_task(
         raise ApprovalError(
             f"{task_id}: the current contract (hash {chash[:12]}) has no "
             "owner approval in the ledger — a re-validation runs gates, "
-            "which is acting on the task; re-approve (`factory adopt`) "
+            "which is acting on the task; re-approve (`factory approve "
+            "--adopt`) "
             "first"
         )
     profile_path = Path(queue.path).parent / "project.yaml"
@@ -1154,7 +1180,7 @@ def _vouch_revalidate_head(
             f"{task_id}: the current contract (hash {chash[:12]}) has no "
             "owner approval in the ledger — a vouch unblocks a round that "
             "runs gates, which is acting on the task; re-approve "
-            "(`factory adopt`) first"
+            "(`factory approve --adopt`) first"
         )
     profile_path = Path(queue.path).parent / "project.yaml"
     profile = load_profile(profile_path)
@@ -1238,6 +1264,112 @@ def _vouch_revalidate_head(
     return "in_review"
 
 
+def _recover_redraft_task(
+    queue: TaskQueue,
+    task_id: str,
+    task: dict,
+    *,
+    evidence: str | None,
+    assume_yes: bool,
+    done_by: str | None,
+    factory_root: Path | None,
+    confirm: Callable[[str], bool],
+    echo: Callable[[str], None],
+) -> str:
+    """F-92 AC-3: ``factory recover --redraft --evidence`` — the exit for
+    ANY ``needs_human`` park that holds no PR link.
+
+    The task returns to ``draft`` through
+    :meth:`TaskQueue.redraft` (the reject edge's write: approval markers
+    cleared, every attempt record kept), so it runs again only through
+    ``factory approve`` — the contract hash and the ledger judge it like
+    any new contract. Interactive only (no ``--yes``), evidence required,
+    and the confirmation persisted to the progress log like every other
+    owner exit. A park holding a PR is refused with its own exit named
+    — the redraft never duplicates one.
+    """
+    from factory.state import holds_normal_pr, redraft_eligible
+
+    links = task.get("links") or {}
+    if task.get("status") == "needs_human" and links.get("pr"):
+        url = links["pr"]
+        if links.get("escalation_pr"):
+            exit_ = (f"it holds the escalation draft PR {url}: answer it "
+                     f"with `factory recover {task_id} --reject` (closes the "
+                     "PR, task → draft)")
+        elif holds_normal_pr(task):
+            exit_ = (f"it holds the PR {url}: resume it with `factory "
+                     f"recover {task_id} --evidence \"…\" "
+                     "--reset-attempts` (GitHub open: the PR is kept; "
+                     "closed: a fresh run)")
+        else:
+            exit_ = (f"its PR {url} is merged: the sweep's merged recovery "
+                     "moves it on the next `factory run`")
+        raise ApprovalError(
+            f"{task_id}: --redraft is for a park holding no PR link — "
+            f"{exit_}. Nothing was written."
+        )
+    if not redraft_eligible(task):
+        raise ApprovalError(
+            f"{task_id}: --redraft needs a needs_human park (status "
+            f"{task.get('status')!r}). Nothing was written."
+        )
+    if evidence is None or not evidence.strip():
+        raise ApprovalError(
+            f"{task_id}: a redraft requires --evidence — what you checked "
+            "(e.g. 'read the attempt note; the contract needs a wider "
+            "scope')"
+        )
+    if assume_yes:
+        raise ApprovalError(
+            f"{task_id}: a redraft is interactive only — --yes is not "
+            "accepted; the point is that a human read why it parked"
+        )
+    attempts = task.get("attempts") or []
+    escalation = park_class(task)
+    branch = links.get("branch")
+    echo(
+        f"{task_id}: {task.get('title')}\n"
+        f"  escalation: {park_label(attempts[-1])}\n"
+        + (f"  pushed branch: {branch} (kept on the remote; not reused)\n"
+           if branch else "")
+        + f"  evidence: {evidence.strip()}\n"
+        "  redraft returns the task to draft with its approval markers "
+        "cleared (every attempt is kept): edit the contract if it needs "
+        "it, then `factory approve` it — nothing runs before that."
+    )
+    if not confirm(f"Return {task_id} to draft?"):
+        raise ApprovalDeclined(f"{task_id}: redraft declined")
+    new_status = queue.redraft(task_id, evidence=evidence.strip())
+    _discard_wip(queue, factory_root, task_id)  # R1-1: a fresh run next
+    who = done_by or default_approver()
+    try:
+        ProgressLog.for_task(
+            factory_root or FACTORY_ROOT_DEFAULT,
+            queue.doc.get("project") or "unknown", task_id,
+        ).append({
+            "outcome": "recovered",
+            "escalation": escalation,
+            "evidence": evidence.strip(),
+            "done_by": who,
+            "recovered_at": now_iso(),
+            # R1-1: the run links the draft dropped, so the kept work
+            # stays findable after the queue forgets it.
+            **({"branch": branch} if branch else {}),
+            "note": f"{escalation} park returned to draft by {who} "
+                    "(approval markers cleared; re-approval required"
+                    + (f"; the pushed branch {branch} is no longer linked"
+                       if branch else "")
+                    + f"): {evidence.strip()}",
+        })
+    except ProgressLogError as exc:
+        raise ApprovalError(
+            f"{task_id}: moved to draft, but the progress log could not be "
+            f"written — the redraft is NOT durably recorded: {exc}"
+        ) from exc
+    return new_status
+
+
 def _recover_escalation_pr(
     queue: TaskQueue,
     task_id: str,
@@ -1258,10 +1390,14 @@ def _recover_escalation_pr(
 ) -> str:
     """The F-72 one-command answer to an escalation draft PR.
 
-    Eligible only for a ``new_dependency``/``risk_path_touched``
-    escalation holding an escalation draft PR (the state layer's
-    :func:`~factory.state.escalation_accept_eligible` — re-checked there,
-    the credential/attempts precedent). Both paths are interactive only:
+    ``--accept`` is eligible only for a ``new_dependency``/
+    ``risk_path_touched`` escalation holding an escalation draft PR (the
+    state layer's :func:`~factory.state.escalation_accept_eligible` —
+    re-checked there, the credential/attempts precedent); ``--reject``,
+    since F-92, for a park of ANY class holding one
+    (:func:`~factory.state.escalation_reject_eligible` — otherwise
+    ``budget_exhausted`` & co. with kept work had no exit). Both paths
+    are interactive only:
     ``--yes`` is refused, the confirmation IS the gate.
 
     ``--accept --evidence``: read the PR's head SHA from GitHub and show
@@ -1282,21 +1418,32 @@ def _recover_escalation_pr(
     """
     from factory.publish import gh_pr_close, gh_pr_head_sha, gh_pr_ready
     from factory.runs import RunError
-    from factory.state import escalation_accept_eligible
+    from factory.state import (
+        escalation_accept_eligible,
+        escalation_reject_eligible,
+    )
 
     if accept and reject:
         raise ApprovalError(
             f"{task_id}: give --accept or --reject, not both"
         )
-    if not escalation_accept_eligible(task):
+    if reject and not escalation_reject_eligible(task):
         raise ApprovalError(
-            f"{task_id}: --accept/--reject answer an escalation draft PR — "
+            f"{task_id}: --reject answers an escalation draft PR — a "
+            "needs_human park that holds one (links.pr + "
+            "links.escalation_pr). A park holding no PR link returns to "
+            f"draft with `factory recover {task_id} --redraft --evidence "
+            "\"<what you checked>\"`; a normal PR resumes with "
+            "--evidence and --reset-attempts."
+        )
+    if accept and not escalation_accept_eligible(task):
+        raise ApprovalError(
+            f"{task_id}: --accept answers an escalation draft PR — "
             "a needs_human task whose last attempt escalated "
             "new_dependency or risk_path_touched and which holds one "
             "(links.pr + links.escalation_pr). The supported reasons are "
-            "exactly those two; every other escalation keeps its current "
-            "exit (re-open or close the PR on GitHub, re-approve a "
-            "changed contract, or grant a budget reset)."
+            "exactly those two; any other escalation draft PR is answered "
+            "with --reject (the PR is closed, the task returns to draft)."
         )
     if assume_yes:
         raise ApprovalError(
@@ -1305,16 +1452,19 @@ def _recover_escalation_pr(
             "work on the PR"
         )
     attempts = task.get("attempts") or []
-    escalation = attempts[-1].get("escalation")
+    escalation = park_class(task)
     url = task["links"]["pr"]
     who = done_by or default_approver()
 
     if reject:
+        branch = (task.get("links") or {}).get("branch")
         echo(
             f"{task_id}: {task.get('title')}\n"
             f"  escalation: {escalation}\n"
             f"  PR: {url} (draft)\n"
-            "  reject closes the PR and returns the task to draft with "
+            + (f"  branch: {branch} (kept on the remote; unlinked)\n"
+               if branch else "")
+            + "  reject closes the PR and returns the task to draft with "
             "its approval markers cleared — the contract can change, and "
             "re-approval is required before anything runs again."
         )
@@ -1325,6 +1475,7 @@ def _recover_escalation_pr(
         # needs_human task holding a PR gh already closed (which a retry
         # would refuse on).
         new_status = queue.reject_escalation(task_id)
+        _discard_wip(queue, factory_root, task_id)  # R1-1: a fresh run
         try:
             (pr_close or gh_pr_close)(url)
         except PublishError as exc:
@@ -1341,6 +1492,9 @@ def _recover_escalation_pr(
                 "escalation": escalation,
                 "done_by": who,
                 "recovered_at": now_iso(),
+                # R1-1: the run links the draft dropped.
+                "pr": url,
+                **({"branch": branch} if branch else {}),
                 "note": f"escalation PR {url} closed; {task_id} rejected "
                         f"to draft by {who} (approval markers cleared)",
             })
@@ -1523,7 +1677,7 @@ def _recover_credential_task(
         )
     echo(
         f"{task_id}: {task.get('title')}\n"
-        f"  escalation: {attempts[-1].get('escalation')} "
+        f"  escalation: {park_label(attempts[-1])} "
         "(nothing was pushed; the finding is local to the run branch)\n"
         f"  evidence: {evidence.strip()}\n"
         + outcome
@@ -1663,7 +1817,7 @@ def _recover_attempts_task(
     # The escalation the task is actually parked on names every refusal
     # and the log entry — a ci_failed reset is not an attempts_exhausted
     # one (F-77: the two now land in different places).
-    escalation = attempts[-1].get("escalation")
+    escalation = park_class(task)
     if not reset_attempts:
         raise ApprovalError(
             f"{task_id}: {escalation} recovery requires "
@@ -1938,7 +2092,7 @@ def _recover_scope_task(
     scope_now = ", ".join(_scope_paths(task)) or "(none declared)"
     echo(
         f"{task_id}: {task.get('title')}\n"
-        f"  escalation: {attempts[-1].get('escalation')} "
+        f"  escalation: {park_label(attempts[-1])} "
         "(nothing was pushed; the request or refusal is in the attempt "
         "note)\n"
         f"  scope now declared: {scope_now}\n"
@@ -1971,7 +2125,7 @@ def _recover_scope_task(
             task_id,
         ).append({
             "outcome": "recovered",
-            "escalation": attempts[-1].get("escalation"),
+            "escalation": park_class(task),
             "evidence": evidence.strip(),
             "done_by": who,
             "recovered_at": now_iso(),

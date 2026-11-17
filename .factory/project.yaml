@@ -388,6 +388,11 @@ paths:
     # and the pipe view (the test_f84 precedent; session.py and the
     # prompts are protected above).
     - "tests/test_f87.py"
+    # F-92: the park-exit contract tests judge the publish path's label
+    # step, the one park-class helper every recovery predicate reads and
+    # the redraft writer (the test_f79 precedent; the schema is
+    # protected above).
+    - "tests/test_f92.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 
