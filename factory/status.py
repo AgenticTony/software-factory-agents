@@ -63,7 +63,7 @@ from factory.config import (
 )
 from factory.egress import escape_approval_text, strip_control_sequences
 from factory.runs import project_component
-from factory.state import park_label
+from factory.state import _is_merged, park_label, unmet_dependencies
 from factory.vent import VENT_CATEGORIES, weeks_vents
 
 WEEK_DAYS = 7
@@ -103,8 +103,7 @@ def is_merged(task: dict) -> bool:
     ``links.merged`` holds the merged PR's URL and is terminal for that
     PR only, so the stamp is the URL equality, never a flag.
     """
-    links = task.get("links") or {}
-    return bool(links.get("pr")) and links.get("merged") == links.get("pr")
+    return _is_merged(task.get("links") or {})  # F-93: the one definition
 
 
 def pr_number(url: str) -> str | None:
@@ -743,6 +742,48 @@ def _render_providers(
     return lines
 
 
+def dependency_line(task: dict, tasks: list) -> str:
+    """One task's dependencies, each with why it is met or open (F-93).
+
+    Met-or-open is :func:`factory.state.unmet_dependencies`'s verdict —
+    the picker's one rule; this only words it. A dependency met by merge
+    (its target merged, not ``done``) says so: ``DEP: merged #175, not
+    verified live`` — merged is not deployed, F-14 owns live truth. An
+    open one names what it waits on: its status, an unmerged PR or
+    slice, cross-repo, or an id not in this queue.
+    """
+    by_id = {t.get("id"): t for t in tasks}
+    unmet = unmet_dependencies(task, tasks)
+    parts: list[str] = []
+    for dep in task.get("depends_on") or []:
+        target = by_id.get(dep) if isinstance(dep, str) else None
+        links = (target or {}).get("links") or {}
+        pr = links.get("pr")
+        number = f"#{pr_number(pr) or pr}" if pr else ""
+        if dep not in unmet:
+            if (target or {}).get("status") == "done":
+                parts.append(f"{dep}: done")
+            else:
+                parts.append(f"{dep}: merged {number}, not verified live")
+            continue
+        if not isinstance(dep, str) or ":" in dep:
+            parts.append(f"{dep}: open (cross-repo, mark met by hand)")
+            continue
+        if target is None:
+            parts.append(f"{dep}: open (not in this queue)")
+            continue
+        why = [str(target.get("status", "?"))]
+        if pr:
+            why.append(f"merged {number}" if _is_merged(links)
+                       else f"PR {number} not merged")
+        slices = [s for s in target.get("slices") or []
+                  if s.get("status") != "merged"]
+        if slices:
+            why.append(f"{len(slices)} slice(s) not merged")
+        parts.append(f"{dep}: open ({', '.join(why)})")
+    return "; ".join(parts)
+
+
 def render_status(
     queue: dict,
     *,
@@ -833,6 +874,15 @@ def render_status(
         group = by_status[status]
         ids = ", ".join(t.get("id", "?") for t in group)
         lines.append(f"- {status} ({len(group)}): {ids}")
+
+    # -- Dependencies (F-93 AC-3) -------------------------------------------
+    waiting = [t for t in tasks
+               if t.get("depends_on") and t.get("status") != "done"]
+    if waiting:
+        lines += ["", "## Dependencies", ""]
+        for task in waiting:
+            lines.append(f"- {task.get('id', '?')} ({task.get('status', '?')}): "
+                         + dependency_line(task, tasks))
 
     # -- Quota used this week ---------------------------------------------
     notes: list[str] = []
@@ -985,6 +1035,9 @@ def render_task_status(
         f"- budget: {budget.get('max_attempts', '?')} attempts / "
         f"{cap_text} turns / {budget.get('wall_clock_min', '?')} min",
     ]
+    if task.get("depends_on"):
+        lines.append("- depends on: "
+                     + dependency_line(task, queue.get("tasks") or []))
     links = task.get("links") or {}
     if links.get("pr"):
         lines.append(f"- PR: {links['pr']}")

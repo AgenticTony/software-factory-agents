@@ -909,6 +909,17 @@ Acceptance:
 
 Residuals, named: a real `gh label create` against GitHub was not run (the stub replays gh 2.104's own already-exists text); that `gh pr create --label` resolves a case-variant label is GitHub's case-insensitive label matching, not re-proven here. Out of scope, its own small WO: merged tasks never close on deploy-target profiles.
 
+### F-93 — A merged dependency unblocks its dependents
+
+Found by JobFinderOS runs 2–3 (2026-11-16/17): on a profile with a deploy target (`deploy.mechanism: render … + cloudflare-pages`), `_close_merged_tasks` never closes a merged task — by design, F-14 AC-2 says only a recorded L4 PASS reaches `done`, and F-14 (`verify-live`) is a stub. The dependency rule counted only `done`, so every `depends_on` there waited forever: `wo22-apply-link-recovery` (#166) and its follow-up (#175) sit merged at `in_review`, F-82's own drafted follow-up-of-the-follow-up can never run, nine more drafts carry `depends_on`, and run 3 dropped its dependency by hand to run at all. Meeting a dependency early is the costlier failure (a child built on a base without its parent's code fails or publishes wrong), so the merged test is exact and every doubtful shape stays unmet.
+
+Acceptance:
+- AC-1 A same-repo dependency is met when its target is `done`, OR all of: status `in_review` or `deploying`; `links.merged` equals `links.pr` — `_is_merged`, moved from the orchestrator into `factory.state` and imported back (one definition; `status.is_merged` delegates to it); every slice `merged`. The rule lives only in `state._unmet_by_id`, so `sync_readiness`, `pick`, approval routing and every recovery re-queue see it. Test `tests/test_f93.py::test_ac_1`: on a deploy-target profile the real `run_once` stamps the parent merged (it stays `in_review`) and the next run picks and publishes the dependent; plus each reader directly.
+- AC-2 Nothing else counts as merged: an open PR; a stamp naming an older PR than `links.pr`; a stamp with no `links.pr`; `awaiting_owner` (owner steps open); `needs_human`/`draft`/`ready`/`blocked`/`in_progress` with a stale stamp; an unmerged slice; a cross-repo `repo:id` (even when a task of that literal id sits merged here); an id not in the queue. No task's status changes because of this WO, and `done` keeps its F-14 meaning (merged AND verified live). On a no-deploy profile nothing changes: the close pass takes a merged task to `done` first. Test `::test_ac_2`, table-driven.
+- AC-3 `factory status` names a dependency met by merge as `DEP: merged #175, not verified live` and lists every open dependency of a waiting task with its status (a `## Dependencies` section on the summary, a `depends on:` line on `factory status <task>`). TASK-CONTRACT §2 (`depends_on`, `blocked`) and §4 state the rule and that `done` is unchanged. Test `::test_ac_3`.
+
+Residuals, named: a merged PR later reverted on the default branch still meets its dependents (the revert is a new PR the queue does not see; F-14 owns deployed truth); a dependency cycle is unchanged (each side stays unmet); `factory approve --reconcile-bootstrap` (`approve.py` `_reconcile_entry`) reads the same rule: a bootstrap entry targeting `done` now passes its dependency check when the dependency is merged but still `in_review` — on a no-deploy profile that state is momentary (the close pass makes it `done`); on a deploy-target profile a reconciled `done` can sit on a parent that is merged, not verified live.
+
 ## Phase 1c — First outside project
 
 ### F-13 — Onboard JobFinderOS (pilot)

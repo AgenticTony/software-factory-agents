@@ -22,7 +22,7 @@ One record per work item (WO, story, or step). Big items are split into **slices
 | `title`, `source` | Human title; path (+ heading anchor) of the doc that owns the detail. The agent is given `source`, so the WO stays the spec. |
 | `kind` | `build` · `decision` · `research` · `owner_only` · `docs`. **Only `build` and `docs` are executed.** Decision/research/owner-only tasks are surfaced to you, never attempted (JobFinderOS WO-27 is a decision WO; WO-29/30 are research-gated). |
 | `priority` | `P1`–`P3`. Ties broken by queue order. |
-| `depends_on` | Task ids. Cross-repo deps are written `repo:id` (e.g. `soloadventurer-mobile:9b`) and are always treated as unmet until a human marks them met. |
+| `depends_on` | Task ids. Cross-repo deps are written `repo:id` (e.g. `soloadventurer-mobile:9b`) and are always treated as unmet until a human marks them met. A same-repo dependency is met when its target is `done`, or (F-93) **met by merge**: the target's status is `in_review` or `deploying`, its `links.merged` equals its `links.pr` (the one merged test, `factory.state._is_merged`), and every slice it has is `merged`. Anything else is unmet — an open PR, a stamp naming an older PR than `links.pr`, `awaiting_owner` (owner steps open), a stale stamp on a task moved back to `draft`/`ready`/`blocked`/`needs_human`, an unmerged slice, an id not in the queue. `done` is unchanged: merged AND verified live (F-14); a dependency met by merge is merged, not deployed, and `factory status` says so (`DEP: merged #175, not verified live`). Residual: a merged PR later reverted on the default branch still meets its dependents — the revert is a new PR the queue does not see; deployed truth is F-14's. |
 | `status` | See §3. |
 | `risk` | Static flags declared from the doc: `auth`, `payments`, `rls`, `migration`, `safety`, `privacy`, `new_dependency`, `deploy`, `cross_repo`, `external_service`, `factory_control` (changes to how work is chosen or judged: schemas, contracts, validator config). The validator adds dynamic flags from the diff (§ VALIDATOR-SPEC L0). |
 | `gates` | `spec_approval` (bool), `merge` (`human`/`auto`), `deploy` (`human`/`auto`). Any risk flag forces `human` on merge. In v0 everything is `human`. |
@@ -60,7 +60,7 @@ draft ──(you approve spec + contract)──▶ ready ◀──(deps met)─�
 | Status | Set by | Meaning |
 |---|---|---|
 | `draft` | importer / you | No approved contract yet. Not eligible. |
-| `blocked` | orchestrator | Contract approved, a dependency isn't `done`. |
+| `blocked` | orchestrator | Contract approved, a dependency isn't met (`done`, or met by merge — §2 `depends_on`). `factory status` lists each open dependency with its status. |
 | `ready` | orchestrator | Eligible to run. |
 | `in_progress` | orchestrator | A session owns a slice. Only **one** writer task at a time per repo (v0). |
 | `in_review` | orchestrator | Validator passed, PR open, waiting on your merge. |
@@ -139,11 +139,13 @@ Approval's own checks are mechanical (schema, scope presence, the F-71 pre-spend
 ```
 eligible = status == ready
            and kind in {build, docs}
-           and every depends_on is done
+           and every depends_on is met (done, or met by merge — §2)
            and no other writer task in_progress for this repo
 order by priority, then position in queue
 take the first incomplete slice of the first eligible task
 ```
+
+The dependency rule lives in one place, `factory.state._unmet_by_id`, so the picker, `sync_readiness`, approval routing and every recovery re-queue read the same verdict. F-93: on a profile with a deploy target, a merged task waits in `in_review` for F-14's live check; its dependents no longer wait with it — met by merge is enough to BUILD on, because the code is on the default branch. `done` is unchanged. On a no-deploy profile nothing changes: the close pass takes a merged task to `done` (or `awaiting_owner`) before the readiness pass runs.
 
 ## 5. The project profile (`.factory/project.yaml`)
 

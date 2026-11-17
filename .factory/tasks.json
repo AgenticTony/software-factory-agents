@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-17T12:52:24Z",
+  "updated_at": "2026-11-17T14:00:00Z",
   "tasks": [
     {
       "id": "F-00",
@@ -6694,6 +6694,72 @@
       "acceptance_hash": "68334ad12042fa35d014bb0236c6c8362a1bbdf61c7bd0bb8e336488989a674f",
       "approved_at": "2026-11-17T12:52:24Z",
       "approved_by": "Anthony"
+    },
+    {
+      "id": "F-93",
+      "title": "A merged dependency unblocks its dependents",
+      "source": "BUILD-ORDER.md#f-93--a-merged-dependency-unblocks-its-dependents",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-92"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "A same-repo dependency is met when its target is `done`, OR its status is `in_review`/`deploying`, `links.merged == links.pr` (the one `_is_merged`, moved to `factory.state`) and every slice is `merged`; the rule lives only in `state._unmet_by_id`, so `sync_readiness`, `pick`, approval routing and the recovery re-queue all see it; on a deploy-target profile the real loop picks the dependent of a merged `in_review` task.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f93.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Nothing else counts as merged: an open PR, a stamp naming another PR, `awaiting_owner`, `needs_human`/`draft`/`ready`/`blocked` with a stale stamp, an unmerged slice, a cross-repo `repo:id`, an unknown id all stay unmet; no task's status changes because of this WO; table-driven.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f93.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "`factory status` names a dependency met by merge as `merged #N, not verified live` and lists each open dependency of a blocked task with its status (summary and task page); TASK-CONTRACT §2/§4 state the rule and that `done` is unchanged.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f93.py::test_ac_3"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 100,
+        "wall_clock_min": 90
+      },
+      "scope": {
+        "paths": [
+          "factory/state.py",
+          "factory/orchestrator.py",
+          "factory/status.py",
+          "tests/test_f93.py",
+          "TASK-CONTRACT.md",
+          "BUILD-ORDER.md",
+          ".factory/tasks.json",
+          ".factory/project.yaml",
+          ".factory/BOOTSTRAP.md"
+        ]
+      }
     }
   ]
 }
