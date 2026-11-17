@@ -393,6 +393,10 @@ paths:
     # the redraft writer (the test_f79 precedent; the schema is
     # protected above).
     - "tests/test_f92.py"
+    # F-93: the merged-dependency contract tests judge the protected
+    # state module's dependency rule and the one merged test it reads
+    # (the test_f79 precedent; state.py is protected above).
+    - "tests/test_f93.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 

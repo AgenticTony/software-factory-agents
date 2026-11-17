@@ -739,7 +739,7 @@ def pick_next(tasks: list) -> Pick | None:
 
     eligible = status == ready
                and kind in {build, docs}
-               and every depends_on is done
+               and every depends_on is met (done, or merged: F-93)
                and no other writer task in_progress for this repo
 
     v0 allows one writer task per repo, and one queue is one repo, so any
@@ -782,14 +782,53 @@ def _unmerged_slices(task: dict) -> list:
     return [s for s in (task.get("slices") or []) if s.get("status") != "merged"]
 
 
+def _is_merged(links: dict) -> bool:
+    """Whether ``links.pr`` is the PR GitHub reported merged.
+
+    ``links.merged`` holds the merged PR's URL, not a flag (F-26 round-7
+    finding 1): publishing keeps a task's other links, so a boolean
+    stamp would carry over to the task's next PR (a rebuilt task, a
+    later slice), which then would never be polled, counted or
+    re-validated. A new PR on the task is simply not merged.
+
+    The ONE definition (F-93): the orchestrator's sweep, the dependency
+    rule (:func:`_unmet_by_id`) and ``factory status`` all read this.
+    Only the parent writes ``links.merged`` — the sweep after gh reports
+    MERGED, and :meth:`TaskQueue.recover_pr_merged` with the URL it read —
+    never a session.
+    """
+    return bool(links.get("pr")) and links.get("merged") == links.get("pr")
+
+
+# F-93: a dependency on a task in one of these statuses is met by its
+# merge alone — the task is past review and only F-14's live check is
+# left. ``awaiting_owner`` is NOT here: owner steps are still open, and
+# a no-deploy profile waits on them too.
+MERGED_DEPENDENCY_STATUSES = ("in_review", "deploying")
+
+
 def _unmet_by_id(task: dict, by_id: dict) -> list:
     """The task's open dependency ids against a prebuilt {id: task} index.
 
-    Implements the TASK-CONTRACT §2/§4 dependency rule: a ``repo:id``
-    dependency (anything with a colon) is cross-repo and is never met
-    automatically — a human must mark it met; a same-repo dependency is
-    met only when the referenced task is ``done`` in this queue; a
-    dependency on an id not in the queue counts as unmet.
+    Implements the TASK-CONTRACT §2/§4 dependency rule:
+
+    * a ``repo:id`` dependency (anything with a colon) is cross-repo and
+      is never met automatically — a human must mark it met;
+    * a dependency on an id not in the queue is unmet;
+    * a same-repo dependency is met when its target is ``done``, OR
+      (F-93, met by merge) when ALL of: the target's status is
+      ``in_review`` or ``deploying``; its PR is merged by the one test,
+      :func:`_is_merged` (``links.merged`` equals ``links.pr``); and
+      every slice it has is ``merged``. Anything else — an open PR, a
+      stamp naming an older PR, ``awaiting_owner``, a stale stamp on a
+      task moved back to ``draft``/``ready``/``blocked``/``needs_human``,
+      an unmerged slice — is unmet: meeting a dependency early costs
+      more than waiting.
+
+    ``done`` is unchanged: merged AND verified live (F-14). Merged is not
+    deployed. Residual: a merged PR later reverted on the default branch
+    still meets its dependents — the revert is a new PR the queue does
+    not see; deployed truth lives in F-14.
 
     Args:
         task: The task whose dependencies to check.
@@ -801,8 +840,16 @@ def _unmet_by_id(task: dict, by_id: dict) -> list:
             open_.append(dep)
             continue
         target = by_id.get(dep)
-        if target is None or target.get("status") != "done":
+        if target is None:
             open_.append(dep)
+            continue
+        if target.get("status") == "done":
+            continue
+        if (target.get("status") in MERGED_DEPENDENCY_STATUSES
+                and _is_merged(target.get("links") or {})
+                and not _unmerged_slices(target)):
+            continue
+        open_.append(dep)
     return open_
 
 

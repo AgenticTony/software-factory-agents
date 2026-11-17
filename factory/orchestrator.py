@@ -182,6 +182,7 @@ from factory.state import (
     StateError,
     TaskQueue,
     TransitionError,
+    _is_merged,
     attempt_budget_used,
     escalation_accept_eligible,
     holds_normal_pr,
@@ -2695,16 +2696,8 @@ _PR_STATES_STATUSES = ("ready", "in_progress", "in_review", "needs_human")
 _MERGE_TIMEOUT_SEC = 300
 
 
-def _is_merged(links: dict) -> bool:
-    """Whether ``links.pr`` is the PR GitHub reported merged.
-
-    ``links.merged`` holds the merged PR's URL, not a flag (round-7
-    finding 1): publishing keeps a task's other links, so a boolean
-    stamp would carry over to the task's next PR (a rebuilt task, a
-    later slice), which then would never be polled, counted or
-    re-validated. A new PR on the task is simply not merged.
-    """
-    return bool(links.get("pr")) and links.get("merged") == links.get("pr")
+# F-93: ``_is_merged`` moved to factory.state (imported above) — the
+# dependency rule reads it there, and one definition serves both.
 
 
 def _pr_urls(queue: TaskQueue, statuses: tuple,
