@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-18T10:00:00Z",
+  "updated_at": "2026-11-18T12:41:45Z",
   "tasks": [
     {
       "id": "F-00",
@@ -6770,7 +6770,7 @@
       "source": "BUILD-ORDER.md#f-94--reviews-look-for-the-same-defect-elsewhere-not-just-in-the-diff",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-93"
       ],
@@ -6848,7 +6848,10 @@
           ".factory/project.yaml",
           ".factory/BOOTSTRAP.md"
         ]
-      }
+      },
+      "acceptance_hash": "cb981dee5c6db00195819cf55ed0421fae00a4b14ad891d19128036879b40859",
+      "approved_at": "2026-11-18T12:41:44Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-95",
@@ -6856,7 +6859,7 @@
       "source": "BUILD-ORDER.md#f-95--the-eval-measures-what-f-94-added-and-the-misses-the-factory-actually-had",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-94"
       ],
@@ -6919,7 +6922,10 @@
           ".factory/project.yaml",
           ".factory/BOOTSTRAP.md"
         ]
-      }
+      },
+      "acceptance_hash": "9bf415956e4820cd09d88466c86a8e6903d60fc50ff11a8e018500ad700c2fa7",
+      "approved_at": "2026-11-18T12:41:45Z",
+      "approved_by": "Anthony"
     }
   ]
 }
