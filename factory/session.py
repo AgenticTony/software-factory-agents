@@ -3311,6 +3311,7 @@ def run_sessions_parallel(
     factory_root: Path | None = None,
     settings_path: Path | None = None,
     keep_scratch: bool = False,
+    seat_system_prompts: "Sequence[str] | None" = None,
     **session_kwargs,
 ) -> list[SessionRecord]:
     """Run the review fan-out: N independent sessions over one diff (F-38).
@@ -3355,6 +3356,11 @@ def run_sessions_parallel(
         keep_scratch: Leave each seat's scratch root on disk for the
             caller (F-85 repair resume); the caller sweeps (see above).
             Ignored by non-sandboxed runners.
+        seat_system_prompts: F-94 — one system prompt per spec, in spec
+            order, overriding ``system_prompt`` for that session (the
+            reviewer seats differ by lens). ``None`` keeps the shared
+            ``system_prompt`` for every session. A list whose length is
+            not the spec count refuses.
         **session_kwargs: Everything each session takes (max_turns,
             timeout_min, protected, system_prompt, …) — handed to the
             runner unchanged.
@@ -3374,6 +3380,12 @@ def run_sessions_parallel(
                 f"run_sessions_parallel is the review fan-out: seat {seat!r} "
                 "is not a guard seat (reviewer/verifier)"
             )
+    if seat_system_prompts is not None and (
+            len(seat_system_prompts) != len(specs)):
+        raise SessionConfigError(
+            f"run_sessions_parallel: {len(seat_system_prompts)} seat system "
+            f"prompts for {len(specs)} sessions — one per session"
+        )
     if not specs:
         return []
     if runner is None or runner is run_session_sandboxed:
@@ -3381,6 +3393,7 @@ def run_sessions_parallel(
             specs, run_dir, profile,
             factory_root=factory_root, settings_path=settings_path,
             keep_scratch=keep_scratch,
+            seat_system_prompts=seat_system_prompts,
             **session_kwargs,
         )
     # A test (or alternative) runner: same signature, same concurrency,
@@ -3390,10 +3403,22 @@ def run_sessions_parallel(
         session_kwargs.setdefault("factory_root", factory_root)
     with ThreadPoolExecutor(max_workers=len(specs)) as pool:
         futures = [
-            pool.submit(runner, seat, prompt, run_dir, profile, **session_kwargs)
-            for seat, prompt in specs
+            pool.submit(runner, seat, prompt, run_dir, profile,
+                        **_seat_kwargs(session_kwargs, seat_system_prompts,
+                                       index))
+            for index, (seat, prompt) in enumerate(specs)
         ]
         return [future.result() for future in futures]
+
+
+def _seat_kwargs(session_kwargs: dict,
+                 seat_system_prompts: "Sequence[str] | None",
+                 index: int) -> dict:
+    """One fan-out session's kwargs: the shared ones, with that seat's
+    own system prompt when the caller gave one per seat (F-94)."""
+    if seat_system_prompts is None:
+        return session_kwargs
+    return {**session_kwargs, "system_prompt": seat_system_prompts[index]}
 
 
 def _fanout_sandboxed(
@@ -3404,6 +3429,7 @@ def _fanout_sandboxed(
     factory_root: Path | None = None,
     settings_path: Path | None = None,
     keep_scratch: bool = False,
+    seat_system_prompts: "Sequence[str] | None" = None,
     **session_kwargs,
 ) -> list[SessionRecord]:
     """The real-runner fan-out: one shared guard, per-session settings and
@@ -3461,7 +3487,7 @@ def _fanout_sandboxed(
                 seat, prompt, run_dir, profile, per_session[index],
                 factory_root=factory_root,
                 read_only=True, scratch=per_scratch[index],
-                **session_kwargs,
+                **_seat_kwargs(session_kwargs, seat_system_prompts, index),
             )
 
         with ThreadPoolExecutor(max_workers=len(specs)) as pool:

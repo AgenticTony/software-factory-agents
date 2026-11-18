@@ -674,7 +674,7 @@ def run_l2_review(
         policy spent on seats whose first verdict failed to parse.
     """
     from factory import orchestrator
-    from factory.prompts import assemble_reviewer_prompt, assemble_verifier_prompt
+    from factory.prompts import assemble_verifier_prompt, reviewer_seat_prompts
 
     diff = _git(repo, "diff", "--no-color", "--no-ext-diff",
                 f"{base_ref}...{head_ref}")
@@ -682,14 +682,18 @@ def run_l2_review(
     l1_dict = l1.to_dict() if l1 is not None else {}
     review_prompt = orchestrator._review_prompt(task, diff, l0_dict, l1_dict)
     retry_records: list = []
+    # F-94 (F-48 parity): the run's seat lenses, seat for seat — and a
+    # re-run of seat N keeps seat N's lens, exactly as production's.
+    seat_systems = reviewer_seat_prompts(profile, reviewers)
 
     def _rerun_review_seat(seat_no=None, session=None, parse_error=None):
         """One retry of one reviewer seat: the same prompt through the
         same fan-out machinery — parse_reviews_with_retry drives it (it
-        passes the seat's 1-based position, its original session and the
-        parse failure, none of which the eval needs: it has no attempt
-        budget to fit and no trace to name the seat) and decides whether
-        the retry's verdict is used."""
+        passes the seat's 1-based position — which picks the seat's own
+        lens, F-94 — its original session and the parse failure, which
+        the eval does not need: it has no attempt budget to fit and no
+        trace to name the seat) and decides whether the retry's verdict
+        is used."""
         record = run_sessions_parallel(
             [("reviewer", review_prompt)],
             repo, profile,
@@ -698,7 +702,7 @@ def run_l2_review(
             max_turns=SEAT_MAX_TURNS,
             timeout_min=SEAT_TIMEOUT_MIN,
             protected=list((profile.get("paths") or {}).get("protected") or []),
-            system_prompt=assemble_reviewer_prompt(profile),
+            system_prompt=seat_systems[(seat_no or 1) - 1],
         )[0]
         retry_records.append(record)
         return record
@@ -711,7 +715,8 @@ def run_l2_review(
         max_turns=SEAT_MAX_TURNS,
         timeout_min=SEAT_TIMEOUT_MIN,
         protected=list((profile.get("paths") or {}).get("protected") or []),
-        system_prompt=assemble_reviewer_prompt(profile),
+        system_prompt=seat_systems[0],
+        seat_system_prompts=seat_systems,
     )
     # m-12: quota BEFORE parsing, production's order — a quota-hit
     # first-run seat is never parsed, never re-run (no tokens burned
@@ -748,6 +753,7 @@ def run_l2_review(
     return settle_review_verdict(
         union, {}, frozenset(), delta_mode=False,
         vote=vote, reviewers=reviewers,
+        outside_diff=orchestrator._outside_diff(repo, base_ref, head_ref),
     ), retries
 
 
@@ -757,12 +763,15 @@ def _count_blocking(l2: dict | None) -> int:
     Case-insensitive on purpose (F-44, review M-1): reports stored before
     F-44's parse-time canonicalisation may hold ``"Blocking"`` — this
     reads records on disk, not freshly parsed findings, so it keeps
-    tolerating the casing the parser no longer emits."""
+    tolerating the casing the parser no longer emits. An F-94 sibling
+    (outside the diff, never blocking) is not counted: it is not a
+    clean diff's false positive."""
     if not l2:
         return 0
     return sum(
         1 for f in l2.get("findings") or []
         if isinstance(f, dict)
+        and f.get("sibling") is not True
         and (f.get("severity") or "").strip().lower() == "blocking"
     )
 

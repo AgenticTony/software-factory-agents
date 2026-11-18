@@ -59,6 +59,9 @@ OPEN_FINDINGS_SECTION = "Review findings left open"
 # follow-up task carries every finding).
 OPEN_FINDINGS_MAX_LINES = 50
 OPEN_FINDINGS_MAX_CHARS = 6000
+# F-94: the line that opens the sibling sites inside that section.
+SIBLINGS_LINE = ("Sibling sites outside the diff (the same defect class "
+                 "elsewhere — never blocking, carried by the follow-up):")
 
 # Data that leaked, money that moved, a schema that migrated, a deploy that
 # shipped, a call an external service acted on: reverting the code recalls
@@ -439,8 +442,15 @@ def build_open_findings_section(reports: dict, task_id: str) -> "str | None":
     findings = [f for f in findings or [] if isinstance(f, dict)]
     if not findings:
         return None
+    # F-94: sibling sites (findings the parent proved sit outside the
+    # diff) follow the diff's own findings, under their own line, so the
+    # merger reads what this PR leaves open apart from what the same
+    # defect class left elsewhere.
+    findings = ([f for f in findings if f.get("sibling") is not True]
+                + [f for f in findings if f.get("sibling") is True])
     lines: list[str] = []
     used = 0
+    shown = 0
     for finding in findings[:OPEN_FINDINGS_MAX_LINES]:
         rendered = f"- {open_finding_line(finding)}"
         if len(rendered) > 1000:
@@ -448,11 +458,17 @@ def build_open_findings_section(reports: dict, task_id: str) -> "str | None":
             # the whole finding rides the Validator report and the
             # follow-up criterion, both uncapped.
             rendered = rendered[:1000] + " …"
-        if used + len(rendered) > OPEN_FINDINGS_MAX_CHARS and lines:
+        header = (finding.get("sibling") is True
+                  and SIBLINGS_LINE not in lines)
+        cost = len(rendered) + (len(SIBLINGS_LINE) + 1 if header else 0)
+        if used + cost > OPEN_FINDINGS_MAX_CHARS and lines:
             break
+        if header:
+            lines.append(SIBLINGS_LINE)
         lines.append(rendered)
-        used += len(rendered) + 1
-    omitted = len(findings) - len(lines)
+        used += cost + 1
+        shown += 1
+    omitted = len(findings) - shown
     if omitted > 0:
         lines.append(
             f"- … and {omitted} more finding(s) not shown here — every "

@@ -96,7 +96,7 @@ from factory.ci import settle as ci_settle
 from factory.config import CONFIG_FILE, FactoryConfig, in_peak_window, load_config
 from factory.contract import ContractError, budget_floor, contract_hash, load_profile
 from factory.egress import escape_approval_text, scrub_session_text, scrub_session_value
-from factory.gates import CommandResult, diff_name_status, git_rc
+from factory.gates import CommandResult, GateError, diff_name_status, git_rc
 from factory.gates import git as hardened_git
 from factory.l0 import run_l0
 from factory.l1 import run_l1
@@ -125,6 +125,7 @@ from factory.prompts import (
     assemble_reviewer_prompt,
     assemble_verifier_prompt,
     prompt_versions,
+    reviewer_seat_prompts,
 )
 from factory.provider import (
     ProviderError,
@@ -173,6 +174,12 @@ from factory.session import (
     run_sessions_parallel,
     run_settings_base,
     sweep_fanout_scratch,
+)
+from factory.siblings import (
+    diff_files,
+    followup_scope_refusal,
+    normalise_path,
+    tracked_paths,
 )
 from factory.state import (
     ELIGIBLE_KINDS,
@@ -745,7 +752,8 @@ def _progress_best_effort(log: ProgressLog, entry: dict, task_id: str) -> None:
 
 def _record_publish_followup(queue: TaskQueue, task_id: str, l2, profile: dict,
                              log: ProgressLog, trace_append, egress_secrets,
-                             run_id: str) -> "tuple[str, int] | None":
+                             run_id: str, *, repo: Path, base_ref: str
+                             ) -> "tuple[str, int] | None":
     """F-82 AC-2/AC-3: write the publish's follow-up draft — or remove,
     or keep, the one an earlier round left — then narrate it in the
     task's progress log.
@@ -762,7 +770,16 @@ def _record_publish_followup(queue: TaskQueue, task_id: str, l2, profile: dict,
     Best-effort by design: the publish is already durable (PR open or
     updated, attempt recorded, links saved, ``in_review``), and the
     findings still ride the PR body — a write failure is traced and
-    logged, never an escalation. Returns the RunResult's follow-up
+    logged, never an escalation.
+
+    F-94 AC-4: a sibling finding (flagged by the reviewer, its file
+    proven outside the diff — :func:`factory.l2.mark_siblings`) is
+    carried like any open finding, plus the parent's scope ruling —
+    ``scope_path`` when :func:`factory.siblings.followup_scope_refusal`
+    admits its file (tracked on ``base_ref`` in ``repo``, no protected
+    or risk glob), ``scope_refusal`` (the reason) otherwise.
+
+    Returns the RunResult's follow-up
     field: ``(followup_id, findings)`` when a draft the owner can act
     on now exists, None otherwise.
     """
@@ -771,6 +788,7 @@ def _record_publish_followup(queue: TaskQueue, task_id: str, l2, profile: dict,
             scrub_session_text(value, egress_secrets))
 
     findings: list = []
+    base_tracked: "frozenset | None" = None
     for finding in (l2.findings if l2 is not None else []):
         if not isinstance(finding, L2Finding):
             continue
@@ -784,6 +802,24 @@ def _record_publish_followup(queue: TaskQueue, task_id: str, l2, profile: dict,
         line = getattr(finding, "line", None)
         if isinstance(line, int):
             entry["line"] = line
+        if finding.sibling:
+            # F-94 AC-4: a sibling's file joins the draft's scope only
+            # when the PARENT admits it — a clean path tracked on the
+            # base branch, no protected or risk glob; otherwise the
+            # criterion says why it was left out. Judged on the raw
+            # file, before any escape.
+            if base_tracked is None:
+                try:
+                    base_tracked = frozenset(tracked_paths(repo, base_ref))
+                except GateError:
+                    base_tracked = frozenset()  # nothing provable: admit none
+            entry["sibling"] = True
+            refusal = followup_scope_refusal(finding.file, base_tracked,
+                                             profile)
+            if refusal is None:
+                entry["scope_path"] = normalise_path(finding.file)
+            else:
+                entry["scope_refusal"] = refusal
         findings.append(entry)
     remembered: "dict | None" = None
     try:
@@ -1141,6 +1177,17 @@ def _numbered_findings(reports: dict, extra: list[str],
             where = ""
             if finding.get("file"):
                 where = f" ({finding['file']}:{finding.get('line') or ''})"
+            if finding.get("sibling") is True:
+                # F-94 AC-3: a sibling site (reviewer-flagged, its file
+                # proven outside the diff) is never the implementer's work — fixing it would
+                # edit beyond the contract. The record keeps it, marked;
+                # the publish's follow-up draft carries it.
+                if include_dropped:
+                    lines.append(_line(
+                        f"[{layer} sibling {finding.get('id')}] "
+                        f"{finding.get('text')}{where} — outside the "
+                        "diff, for the follow-up, not to fix"))
+                continue
             lines.append(_line(
                 f"[{layer} {finding.get('id')}] {finding.get('text')}{where}"))
         if not include_dropped:
@@ -1202,6 +1249,23 @@ def _final_review_field(l2, repeat: bool) -> dict:
                 entry[key] = getattr(finding, key)
         findings.append(entry)
     return {"verdict": l2.verdict, "repeat": repeat, "findings": findings}
+
+
+def _outside_diff(root: Path, base_ref: str, head_ref: str
+                  ) -> "Callable[[str | None], bool] | None":
+    """F-94 AC-3: the parent's sibling rule for one reviewed diff — the
+    :meth:`factory.siblings.DiffFiles.is_sibling` of ``base...head`` in
+    the clone the reviewers read. Every review site and the eval hand
+    it to :func:`factory.l2.settle_review_verdict`.
+
+    Fail-closed: when git cannot answer (it just answered the same diff
+    for the reviewers, so this is a should-not-happen), None — nothing
+    is outside the diff, every finding keeps today's rules, and a
+    sibling can at worst block, never a real defect slip."""
+    try:
+        return diff_files(root, base_ref, head_ref).is_sibling
+    except GateError:
+        return None
 
 
 def _fix_findings(reports: dict, extra: list[str], l2, reviewed: bool,
@@ -4216,7 +4280,12 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
         return RunResult("needs_human", task_id, escalation="scope_missing")
     protected = list((profile.get("paths") or {}).get("protected") or [])
     implementer_system = assemble_implementer_prompt(profile)
+    # The arbiter's seat keeps the base reviewer prompt; the reviewer
+    # fan-out takes each seat's own lens (F-94): seat N of every review
+    # here — round, final, and any repair or re-run of seat N — gets
+    # reviewer_systems[N - 1].
     reviewer_system = assemble_reviewer_prompt(profile)
+    reviewer_systems = reviewer_seat_prompts(profile, ctx.config.reviewers)
     verifier_system = assemble_verifier_prompt(profile)
     session_seconds = 0.0
     # F-22: the project's vetted toolkit, per seat (a seat section in the
@@ -4752,7 +4821,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                     settings_path=seat_settings,
                     resume=session.session_id,
                     max_turns=REPAIR_TURN_CAP, timeout_min=fit.wall,
-                    protected=protected, system_prompt=reviewer_system,
+                    protected=protected,
+                    system_prompt=reviewer_systems[seat_no - 1],
                     srt_bin_path=ctx.srt_bin_path,
                     run_id=work.run_id, task_id=task_id,
                     trace_sink=trace.append, toolkit=toolkit_reviewer,
@@ -4860,7 +4930,9 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                 settings_path=base.with_name(
                     base.name + f"-retry{seat_no}"),
                 max_turns=retry_turns, timeout_min=retry_wall,
-                protected=protected, system_prompt=reviewer_system,
+                protected=protected,
+                # F-94: a fresh retry of seat N keeps seat N's lens.
+                system_prompt=reviewer_systems[seat_no - 1],
                 srt_bin_path=ctx.srt_bin_path,
                 run_id=work.run_id, task_id=task_id,
                 trace_sink=trace.append, toolkit=toolkit_reviewer,
@@ -5705,6 +5777,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                     timeout_min=remaining_review,
                                     protected=protected,
                                     system_prompt=reviewer_system,
+                                    # F-94: each seat's own lens.
+                                    seat_system_prompts=reviewer_systems,
                                     srt_bin_path=ctx.srt_bin_path,
                                     # The reviewers sit in the clean gate clone,
                                     # but their vents belong to the task's run.
@@ -5858,6 +5932,12 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                     union, prior, delta_files,
                                     delta_mode=delta is not None,
                                     vote=vote, reviewers=ctx.config.reviewers,
+                                    # F-94 AC-3: the parent's half of the
+                                    # sibling rule for base...head (the
+                                    # reviewer's flag is the other half).
+                                    outside_diff=_outside_diff(
+                                        clean.root, base_sha,
+                                        cast(str, head_sha)),
                                 )
                                 reports["L2"] = l2.to_dict()
                                 trace.gate_checks(reports["L2"])  # F-30 AC-3
@@ -5994,6 +6074,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                     timeout_min=remaining_final,
                                     protected=protected,
                                     system_prompt=reviewer_system,
+                                    # F-94: each seat's own lens.
+                                    seat_system_prompts=reviewer_systems,
                                     srt_bin_path=ctx.srt_bin_path,
                                     run_id=work.run_id, task_id=task_id,
                                     trace_sink=trace.append,  # F-30
@@ -6130,6 +6212,9 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                     union, prior, frozenset(),
                                     delta_mode=False, vote=vote,
                                     reviewers=ctx.config.reviewers, final=True,
+                                    outside_diff=_outside_diff(
+                                        clean.root, base_sha,
+                                        cast(str, head_sha)),
                                 )
                                 if reports.get("L2") is not None:
                                     # The round's delta review stays on the
@@ -6643,7 +6728,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                         # this is best-effort (see the helper).
                         followup_out = _record_publish_followup(
                             queue, task_id, l2, profile, log, trace.append,
-                            egress_secrets, work.run_id)
+                            egress_secrets, work.run_id,
+                            repo=work.root, base_ref=base_sha)
                         wipstore.discard(ctx.factory_root, project, task_id)
                         # ---- F-75 AC-1/AC-2: CI is part of done ----
                         # The bookkeeping above is durable (attempt,
@@ -7208,7 +7294,8 @@ def _recover_accept_leased(
             # repair turn then one parse retry per seat (F-85), the
             # verifier over findings, the ONE shared settle chain.
             protected = list((profile.get("paths") or {}).get("protected") or [])
-            reviewer_system = assemble_reviewer_prompt(profile)
+            # F-94: each seat's own lens, retries and repairs included.
+            reviewer_systems = reviewer_seat_prompts(profile, config.reviewers)
             verifier_system = assemble_verifier_prompt(profile)
             toolkit_reviewer = resolve_toolkit(profile, "reviewer")
             diff = hardened_git(clean.root, "diff", "--no-color",
@@ -7235,7 +7322,7 @@ def _recover_accept_leased(
                         resume=session.session_id,
                         max_turns=REPAIR_TURN_CAP, timeout_min=60.0,
                         protected=protected,
-                        system_prompt=reviewer_system,
+                        system_prompt=reviewer_systems[seat_no - 1],
                         srt_bin_path=srt_bin_path,
                         run_id=work.run_id, task_id=task_id,
                         toolkit=toolkit_reviewer,
@@ -7266,7 +7353,8 @@ def _recover_accept_leased(
                     settings_path=base_settings,
                     max_turns=REVIEWER_TURN_CAP,
                     timeout_min=60.0, protected=protected,
-                    system_prompt=reviewer_system, srt_bin_path=srt_bin_path,
+                    system_prompt=reviewer_systems[seat_no - 1],
+                    srt_bin_path=srt_bin_path,
                     run_id=work.run_id, task_id=task_id,
                     toolkit=toolkit_reviewer,
                     declared_dependencies=bool(task.get("dependencies")),
@@ -7277,7 +7365,8 @@ def _recover_accept_leased(
                 [("reviewer", prompt)] * config.reviewers, clean.root, profile,
                 runner=runner, factory_root=factory_root,
                 max_turns=REVIEWER_TURN_CAP, timeout_min=60.0,
-                protected=protected, system_prompt=reviewer_system,
+                protected=protected, system_prompt=reviewer_systems[0],
+                seat_system_prompts=reviewer_systems,
                 srt_bin_path=srt_bin_path, run_id=work.run_id,
                 task_id=task_id,
                 toolkit=toolkit_reviewer,
@@ -7335,6 +7424,7 @@ def _recover_accept_leased(
             l2 = settle_review_verdict(
                 union, {}, frozenset(), delta_mode=False, vote=vote,
                 reviewers=config.reviewers, final=True,
+                outside_diff=_outside_diff(clean.root, base, sha),
             )
             accept_reports["L2"] = l2.to_dict()
             if l2.verdict != "pass":

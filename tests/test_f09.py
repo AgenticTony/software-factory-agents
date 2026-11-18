@@ -26,6 +26,7 @@ from factory.contract import ContractError, load_profile, load_tasks
 from factory.l1 import run_l1
 from factory.l2 import L2Report, parse_verdict
 from factory.prompts import (
+    DEFECT_HUNT_LENS,
     IMPLEMENTER_FILE,
     PROMPTS_DIR,
     REVIEWER_FILE,
@@ -510,14 +511,17 @@ def test_implementer_prompt_carries_project_specifics_but_no_standards(tmp_path)
 def test_prompt_versions_hash_the_assembled_prompts(tmp_path):
     profile = _fixture_profile(tmp_path, standards=("docs/STANDARDS.md",))
     versions = prompt_versions(profile)
-    # F-38: one entry per fan-out session — reviewer-1/reviewer-2 share the
-    # assembled reviewer prompt — plus the verifier's own.
+    # F-38: one entry per fan-out session — plus the verifier's own.
+    # F-94: each seat's own prompt — seat 1 the assembled reviewer
+    # prompt, seat 2 the same plus the defect-hunt lens.
     assert set(versions) == {"implementer", "reviewer-1", "reviewer-2", "verifier"}
     for seat, digest in versions.items():
         assert re.fullmatch(r"[0-9a-f]{64}", digest)
     assert versions["implementer"] == prompt_hash(assemble_implementer_prompt(profile))
     assert versions["reviewer-1"] == prompt_hash(assemble_reviewer_prompt(profile))
-    assert versions["reviewer-2"] == versions["reviewer-1"]
+    assert versions["reviewer-2"] == prompt_hash(
+        assemble_reviewer_prompt(profile) + "\n\n" + DEFECT_HUNT_LENS)
+    assert versions["reviewer-2"] != versions["reviewer-1"]
     assert versions["verifier"] == prompt_hash(assemble_verifier_prompt(profile))
 
 

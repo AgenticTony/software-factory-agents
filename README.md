@@ -45,8 +45,10 @@ steps plus the `typecheck` (pyright) and `wheel` install jobs.
 
 `factory review-contract <task-id>` runs one read-only model session that
 reads a task's contract and the document its `source` names (as committed
-on the default branch) and reports findings under five lenses — purpose,
-testability, scope, ambiguity, budget. A valid review is stored under
+on the default branch) and reports findings under six lenses — purpose,
+testability, scope, ambiguity, budget, and (F-94) the defect class: a
+criterion that fixes one site of a defect that occurs elsewhere is a
+finding naming the other sites. A valid review is stored under
 `<factory-root>/contract-reviews/`, keyed by the contract hash, and
 `factory approve <task-id>` shows it above the y/N, blockers first. It is
 advice: nothing blocks on it and nothing is edited for you; any change to

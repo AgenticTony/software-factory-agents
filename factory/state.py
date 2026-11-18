@@ -1275,6 +1275,21 @@ def _lease_busy_message(queue_path: Path, holder_line: str) -> str:
     )
 
 
+def _followup_criterion(finding: dict) -> str:
+    """One follow-up criterion's text: the PR body's one-line rendering,
+    and for an F-94 sibling site the parent's scope ruling — a file it
+    left out of the draft's scope says so, with the reason (the owner
+    adds it by hand at approval, or not)."""
+    text = open_finding_line(finding)
+    if finding.get("sibling") is not True:
+        return text
+    refusal = finding.get("scope_refusal")
+    if isinstance(refusal, str) and refusal:
+        return (f"{text} (sibling site outside the diff; file left out of "
+                f"the follow-up's scope: {refusal})")
+    return f"{text} (sibling site outside the diff)"
+
+
 def _build_followup(task: dict, findings: list, floor: dict) -> dict:
     """The follow-up draft :meth:`TaskQueue.record_followup` writes —
     pure shape, no queue access, so the writer's decisions and the
@@ -1293,6 +1308,20 @@ def _build_followup(task: dict, findings: list, floor: dict) -> dict:
     ) or []
     scope_paths: list[str] = []
     for finding in findings:
+        if isinstance(finding, dict) and finding.get("sibling") is True:
+            # F-94 AC-4: a sibling site's file joins the scope only when
+            # the parent admitted it (``scope_path``: tracked on the base
+            # branch, no protected or risk glob — see
+            # factory.siblings.followup_scope_refusal); it is outside the
+            # original scope by definition, so the intersection rule
+            # below does not apply to it. Re-checked as a scope pattern
+            # here, so a malformed admission can never poison the load.
+            admitted = finding.get("scope_path")
+            if (isinstance(admitted, str) and admitted
+                    and admitted not in scope_paths
+                    and scope_pattern_error(admitted) is None):
+                scope_paths.append(admitted)
+            continue
         file = finding.get("file") if isinstance(finding, dict) else None
         if (not isinstance(file, str) or not file or file in scope_paths
                 or scope_pattern_error(file) is not None
@@ -1314,7 +1343,7 @@ def _build_followup(task: dict, findings: list, floor: dict) -> dict:
         "risk": list(task.get("risk") or []),
         "gates": {"spec_approval": True, "merge": "human", "deploy": "human"},
         "acceptance": [
-            {"id": f"AC-{index}", "text": open_finding_line(finding),
+            {"id": f"AC-{index}", "text": _followup_criterion(finding),
              "check": {"type": "manual"}}
             for index, finding in enumerate(findings, start=1)
         ],

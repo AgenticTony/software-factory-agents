@@ -150,10 +150,14 @@ def _fails_round(finding) -> bool:
     """Whether one finding's severity fails a round (blocking or major).
 
     Severity is canonical at parse (F-44), so this — like every consumer
-    in this module — compares the canonical spellings directly."""
+    in this module — compares the canonical spellings directly. A
+    sibling (F-94: the reviewer flagged it as an older site of the class
+    AND the parent proved its file is outside the diff — see
+    :func:`mark_siblings`) never fails a round, whatever its severity."""
     return (
         isinstance(finding, L2Finding)
         and finding.severity in _ROUND_FAILING_SEVERITIES
+        and not finding.sibling
     )
 
 # A fenced block (with or without the json tag) around the verdict object —
@@ -208,7 +212,14 @@ class L2Finding:
     — the F-38 fan-out fields — ``reported_by`` (1-based reviewer numbers
     that reported it, set by :func:`merge_reviews`), ``verifier_reason``
     and ``tag`` (set by :func:`parse_verifier_vote` /
-    :func:`apply_vote`) — and the shared location fields."""
+    :func:`apply_vote`) — and the shared location fields. F-94 adds
+    two: ``sibling_claim`` is the reviewer's own ``"sibling": true``
+    (parsed strictly — only the JSON literal ``true`` counts, any other
+    value is False, never a parse error), its claim that the defect
+    predates this diff and is another site of the class; ``sibling`` is
+    the PARENT's ruling (:func:`mark_siblings`) — True only when the
+    reviewer claimed it AND the parent proved the file is outside the
+    diff. A sibling cannot block and is not sent to the implementer."""
 
     id: str
     text: str
@@ -222,6 +233,8 @@ class L2Finding:
     reported_by: list = field(default_factory=list)
     verifier_reason: str | None = None
     tag: str | None = None
+    sibling_claim: bool = False
+    sibling: bool = False
 
 
 def _normalise_summary(text: str) -> str:
@@ -287,6 +300,11 @@ class L2Report(GateReport):
     no_progress_reason: str | None = None
     verifier_dropped: list = field(default_factory=list)
     verifier_error: str | None = None
+    # F-94: each reviewer seat's own declared verdict, seat 1 first (set
+    # by merge_reviews; empty for a single parsed verdict). Not stored:
+    # mark_siblings reads it to tell a seat's fail that rests only on
+    # sibling findings from one that does not.
+    declared_by: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -623,6 +641,11 @@ def _validated_report(data: Any) -> L2Report:
             file=item.get("file"),
             line=line,
             missed_earlier=missed,
+            # F-94: strict — the JSON literal true and nothing else
+            # (a string "true", 1 or a list is False, never a void
+            # verdict: the flag can only ever lower a bar, so an
+            # unreadable flag lowers none).
+            sibling_claim=item.get("sibling") is True,
         )
         finding.key = finding_key(finding)
         findings.append(finding)
@@ -966,6 +989,12 @@ def apply_convergence(
             and finding.file not in delta_files
             and not (finding.missed_earlier or "").strip()
         ):
+            # F-94: a sibling is outside the diff, so it is always outside
+            # the delta — the F-23 rule applies to it unchanged (a fix
+            # round re-litigates no old code without a why). The drop
+            # entry keeps it, marked sibling, and the F-41 final review
+            # (full diff, nothing out of delta) is the review whose
+            # siblings reach the publish's follow-up.
             # A named file the delta didn't touch, without a why. A
             # fileless finding is never dropped: it cannot be shown to
             # sit in unchanged code (round-1 finding 7).
@@ -985,10 +1014,15 @@ def apply_convergence(
         if report.parse_error is not None or report.declared == "fail" or heavy
         else "pass"
     )
-    l2_findings = [f for f in active if isinstance(f, L2Finding)]
+    # F-94: siblings neither make nor break the stop — they are not the
+    # round's work, so "every finding is a carried repeat" is judged over
+    # the in-diff findings alone.
+    in_diff = [f for f in active
+               if not (isinstance(f, L2Finding) and f.sibling)]
+    l2_findings = [f for f in in_diff if isinstance(f, L2Finding)]
     only_this_runs_carries = bool(
         l2_findings
-        and len(l2_findings) == len(active)
+        and len(l2_findings) == len(in_diff)
         and all(
             f.state == "carried"
             and prior.get(cast(str, f.key)) is not None
@@ -1165,7 +1199,12 @@ def merge_reviews(reports: Sequence[L2Report]) -> L2Report:
                 # every reporter's wording, so a wrong merge can never
                 # erase a defect from what the verifier and implementer see.
                 text = f"{text} (also reported: {other.text})"
-            merged[index] = replace(existing, severity=lead.severity, text=text)
+            # F-94: a merged entry claims sibling only if EVERY reporter
+            # did — one seat calling it this diff's defect keeps it
+            # judged as one.
+            merged[index] = replace(
+                existing, severity=lead.severity, text=text,
+                sibling_claim=existing.sibling_claim and finding.sibling_claim)
 
     declared = (
         "fail"
@@ -1177,6 +1216,82 @@ def merge_reviews(reports: Sequence[L2Report]) -> L2Report:
         verdict="fail" if declared == "fail" or blocking else "pass",
         findings=merged,
         declared=declared,
+        declared_by=[report.declared for report in reports],
+    )
+
+
+def mark_siblings(report: L2Report,
+                  outside_diff: "Callable[[str | None], bool]") -> L2Report:
+    """Mark the sibling sites — findings that cannot block (F-94 AC-3).
+
+    A finding is a sibling only when BOTH hold:
+
+    1. the reviewer claimed it — ``"sibling": true`` (``sibling_claim``,
+       parsed strictly): the defect predates this diff and is another
+       site of a class the diff fixes or touches; and
+    2. the parent PROVED its file is outside the diff — ``outside_diff``
+       (see :mod:`factory.siblings`: a path tracked at the reviewed head
+       that the diff does not change; renames count old and new path as
+       in the diff; anything not provable is in).
+
+    Either alone keeps today's rules exactly. The flag on a file the
+    diff changes lowers nothing (an in-diff ``blocking`` flagged sibling
+    still fails). An UNFLAGGED finding on an untouched file — a break
+    this diff causes at an unchanged caller, say — is judged by its
+    severity as before F-94: the file alone never makes a sibling,
+    because a regression reported where it shows up lives outside the
+    diff by nature. A finding with no file is never a sibling.
+
+    Residual, named: a reviewer that wrongly flags a diff-caused break
+    on an untouched file as a sibling makes it non-blocking. That takes
+    a mislabel by the reviewer (the defect-hunt lens draws the line
+    explicitly); without the flag nothing changes.
+
+    A sibling never fails a round (:func:`_fails_round`) — and neither
+    does a seat's declared ``fail`` that rests on siblings alone: a
+    seat that reported at least one finding, every one of them a
+    sibling, and declared fail is read as declaring pass (the defect
+    hunt rightly fails "its" review over an old site the round may not
+    touch). A seat that declared fail with no finding, or with any
+    in-diff finding, still fails the round. The unanimous rule
+    (:func:`apply_vote`) still refuses a verifier's drop of a sibling
+    every seat reported — it survives, recorded — but a unanimous major
+    sibling cannot block either: unanimity keeps a finding, it does not
+    make it in-diff.
+
+    Args:
+        report: The union (:func:`merge_reviews`) or a single parsed
+            verdict. An invalid one is returned unchanged.
+        outside_diff: ``file -> True`` when the parent proved the file
+            is a tracked path outside the diff.
+
+    Returns:
+        A new report: findings marked, declared verdict and verdict
+        recomputed.
+    """
+    if report.parse_error is not None:
+        return report
+    findings = [
+        replace(f, sibling=True)
+        if isinstance(f, L2Finding) and f.sibling_claim and f.file
+        and outside_diff(f.file)
+        else (replace(f, sibling=False) if isinstance(f, L2Finding) else f)
+        for f in report.findings
+    ]
+    seats = report.declared_by or [report.declared]
+    declared = "pass"
+    for number, seat_declared in enumerate(seats, start=1):
+        if seat_declared != "fail":
+            continue
+        own = [f for f in findings if isinstance(f, L2Finding)
+               and (not report.declared_by or number in f.reported_by)]
+        if own and all(f.sibling for f in own):
+            continue  # this seat's fail rests on siblings alone
+        declared = "fail"
+    heavy = any(_fails_round(f) for f in findings)
+    return replace(
+        report, findings=findings, declared=declared,
+        verdict="fail" if declared == "fail" or heavy else "pass",
     )
 
 
@@ -1307,7 +1422,7 @@ def parse_arbiter_rulings(output: Any, finding_ids: Sequence[str]) -> ArbiterOut
 # F-80 AC-1: the contract review's protocol. The enums are the whole
 # vocabulary — a lens or severity outside them fails the review.
 CONTRACT_REVIEW_LENSES = ("purpose", "testability", "scope", "ambiguity",
-                          "budget")
+                          "budget", "defect_class")
 CONTRACT_REVIEW_SEVERITIES = ("blocker", "major", "minor")
 CONTRACT_REVIEW_FINDING_KEYS = ("id", "lens", "severity", "text",
                                 "criterion", "suggested_change")
@@ -1657,7 +1772,9 @@ def apply_vote(
             decorated.append((0, 0, index, finding))
             continue
         tag = finding.tag or _default_tag(finding.severity)
-        if finding.severity == "blocking":
+        if finding.severity == "blocking" and not finding.sibling:
+            # (F-94: a sibling blocks nothing, so the verifier's
+            # pre-existing tag on it stands.)
             tag = "important"
         decorated.append((
             _SEVERITY_RANK.get(cast(str, finding.severity), 99),
@@ -1674,7 +1791,10 @@ def apply_vote(
         if (
             isinstance(finding, L2Finding)
             and finding.severity in ("minor", "note")
+            and not finding.sibling
         ):
+            # F-94: siblings are not nits of this diff — they never count
+            # against (or get cut by) its budget; they ride the follow-up.
             nits += 1
             if nits > NIT_BUDGET:
                 drops.append(
@@ -1743,6 +1863,7 @@ def settle_review_verdict(
     vote: VerifierOutcome | None = None,
     reviewers: int = 1,
     final: bool = False,
+    outside_diff: "Callable[[str | None], bool] | None" = None,
 ) -> L2Report:
     """The post-review verdict chain, as ONE function (F-48, review M-3):
     the fan-out's union, the verifier's vote when one ran, F-23
@@ -1777,12 +1898,29 @@ def settle_review_verdict(
         reviewers: The fan-out width (the unanimous rule's N).
         final: True only for F-41's final full review, which wraps
             convergence in :func:`final_review_verdict`.
+        outside_diff: F-94 — the parent's sibling rule for THIS diff
+            (:meth:`factory.siblings.DiffFiles.is_sibling`): the union
+            and the vote's survivors are marked by it FIRST
+            (:func:`mark_siblings`), so the vote, convergence and the
+            final rule all see which findings cannot block. ``None``
+            marks nothing — every finding keeps the pre-F-94 rules
+            (fail-closed: no diff known, nothing is outside it).
 
     Returns:
         The settled :class:`L2Report` — the verdict the round (or the
         eval's diff) is scored on.
     """
     report = union
+    if outside_diff is not None:
+        report = mark_siblings(report, outside_diff)
+        if vote is not None:
+            marked = {f.id: f for f in report.findings
+                      if isinstance(f, L2Finding)}
+            vote = vote._replace(kept=[
+                replace(f, sibling=marked[f.id].sibling)
+                if isinstance(f, L2Finding) and f.id in marked else f
+                for f in vote.kept
+            ])
     if vote is not None:
         report = apply_vote(report, vote, reviewers=reviewers)
     report = apply_convergence(
