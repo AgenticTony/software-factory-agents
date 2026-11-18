@@ -67,10 +67,17 @@ spread** over repeats — one run is a ratchet, not a measurement. Per
 seed it shows `caught k/N repeats`, the pass^k line (seeds caught on
 every repeat), the seeds never caught ("check the seed or grader
 first"), and "found, then dropped" — a finding on the seeded defect
-that the verifier voted out. Besides the bug classes, the seeds include
-shapes of real misses (F-95): a defect's second site that L2 must
-report as a non-blocking `sibling`, a diff that breaks an unchanged
-caller, and a clean diff next to old code of the same class.
+that the verifier voted out, each entry saying whether that run was
+still caught and the report counting the drops that cost a catch. Each
+diff's contract states the developer's task as intent (F-99): the
+eval's own description of the seeded bug — its title AND its id —
+never reaches a seat (contracts, branches and commit messages run on
+opaque EVAL-NN slots), so the numbers measure the reviewers, not the
+eval's own text. Besides the
+bug classes, the seeds include shapes of real misses (F-95): a defect's
+second site that L2 must report as a non-blocking `sibling`, a diff
+that breaks an unchanged caller, and a clean diff next to old code of
+the same class.
 
 - **On demand**: run `factory eval` whenever the validator changes
   (a gate, a prompt, the review fan-out) or after a run escaped it.

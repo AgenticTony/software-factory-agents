@@ -51,11 +51,11 @@ from factory.eval import (
 )
 
 SIBLING = "sibling-second-site"
-SIBLING_CONTRACT = f"EVAL-{SIBLING}"
+SIBLING_CONTRACT = seed_by_id(SIBLING).slot  # F-99: slot, not id
 FIXED_FILE = "app/owners.py"     # the site the seed diff fixes
 SIBLING_FILE = "app/gear.py"     # the untouched second site
 CALLER = "caller-break"
-CALLER_CONTRACT = f"EVAL-{CALLER}"
+CALLER_CONTRACT = seed_by_id(CALLER).slot
 CALLER_FILE = "app/report.py"    # the unchanged, broken caller
 CHANGED_FILE = "app/api.py"      # where the contract changed
 CLEAN_OLD = "clean-beside-old-site"
@@ -131,14 +131,15 @@ def test_ac_1(tmp_path: Path):
     base = hit["base"]
     assert base != "main"
     changed = _git(repo, "diff", "--name-only",
-                   f"{base}...eval/{SIBLING}").stdout.split()
+                   f"{base}...eval/{seed_by_id(SIBLING).slot}").stdout.split()
     assert changed == [FIXED_FILE], changed
     for rel in (FIXED_FILE, SIBLING_FILE):
         assert "if not owner_id:" in _git(repo, "show",
                                           f"{base}:{rel}").stdout, rel
         assert _git(repo, "cat-file", "-e", f"main:{rel}").returncode != 0
     assert "if not owner_id:" in _git(
-        repo, "show", f"eval/{SIBLING}:{SIBLING_FILE}").stdout
+        repo, "show",
+        f"eval/{seed_by_id(SIBLING).slot}:{SIBLING_FILE}").stdout
 
     # b) the same finding WITHOUT the flag blocks: the round fails, and a
     # blocked round is never a sibling catch.
@@ -264,7 +265,7 @@ def _isolation(tmp_path: Path):
     for repo in (first, second):
         for spec in old:
             tree = _git(repo, "ls-tree", "-r", "--name-only",
-                        f"eval/{spec.id}").stdout.split()
+                        f"eval/{spec.slot}").stdout.split()
             for rel in (FIXED_FILE, SIBLING_FILE, CALLER_FILE):
                 assert rel not in tree, (spec.id, rel)
         main_tree = _git(repo, "ls-tree", "-r", "--name-only",
@@ -308,7 +309,7 @@ def test_ac_2(tmp_path: Path):
     assert hit["caught_by"] == ["L2"]
     base = hit["base"]
     changed = _git(repo, "diff", "--name-only",
-                   f"{base}...eval/{CALLER}").stdout.split()
+                   f"{base}...eval/{seed_by_id(CALLER).slot}").stdout.split()
     assert CALLER_FILE not in changed and CHANGED_FILE in changed, changed
     assert "pack_summary" in _git(repo, "show",
                                   f"{base}:{CALLER_FILE}").stdout
@@ -510,7 +511,8 @@ def test_ac_3(tmp_path: Path):
     # sibling must not be counted at any severity.
     old_site = _sibling_finding(fid="R-5", severity="blocking")
     findings = dict(MOCK_SEED_FINDINGS)
-    findings[f"EVAL-{CLEAN_OLD}"] = [old_site]
+    findings[next(d for d in CLEAN_DIFFS
+                  if d.id == CLEAN_OLD).slot] = [old_site]
     # minor: not unanimous-protected, so the verifier's drop stands.
     findings[SIBLING_CONTRACT] = [_sibling_finding(severity="minor")]
     findings[CALLER_CONTRACT] = [_caller_finding()]

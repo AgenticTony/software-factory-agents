@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-18T12:41:45Z",
+  "updated_at": "2026-11-18T17:50:00Z",
   "tasks": [
     {
       "id": "F-00",
@@ -6926,6 +6926,77 @@
       "acceptance_hash": "9bf415956e4820cd09d88466c86a8e6903d60fc50ff11a8e018500ad700c2fa7",
       "approved_at": "2026-11-18T12:41:45Z",
       "approved_by": "Anthony"
+    },
+    {
+      "id": "F-99",
+      "title": "The eval stops telling the reviewers the answer",
+      "source": "BUILD-ORDER.md#f-99--the-eval-stops-telling-the-reviewers-the-answer",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-95"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "A required `contract_title` on every seed and clean diff: the task a developer would plausibly have been given that produced this diff, stated as intent, never naming the defect — and never REQUESTING it: a correct reviewer reading the contract must still have grounds to block the seed and pass the clean diffs. `_seed_task` uses it; `title` stays a report-only label. The specs' ids name their bug classes, so every spec also carries an opaque `slot` (`EVAL-01`… by position): the task's contract id, the `eval/` branch, the `eval-base/` setup ref, the setup/seed commit messages and the seat routing all use it, and the profile's sentinel descriptions name no seed class. The test runs every seed and clean diff through the real pipeline (scripted seats, captured prompts — reviewer seats 1..3 and the verifier) and proves that NO spec's id and NO spec's title appears in any seat's prompt (user or system, no layer-report exemption), nor any marker the diff, fixture or layer evidence doesn't itself carry; the tautological seed's acceptance text follows the same rule; a real task's prompt is unchanged (F-48 parity).",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f99.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "`clean-beside-old-site`'s docstring describes what `archive_trip` actually does, verified against the fixture by a test that EXECUTES `archive_trip`/`store.insert` (nothing moves, nothing persists) and checks the docstring's state claims against that probe — a docstring claiming the row moves fails (a mutation). Every clean diff's changed text is swept with the same claim lexicon where it states behaviour.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f99.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "Each \"found, then dropped\" entry carries `seed_caught` (whether that seed run was still caught by any layer); the report renders \"(seed still caught)\" or \"(seed missed)\" per entry and adds a count line of drops that cost a catch; old reports without the field render unchanged.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f99.py::test_ac_3"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 150,
+        "wall_clock_min": 120
+      },
+      "scope": {
+        "paths": [
+          "factory/eval.py",
+          "tests/test_f99.py",
+          "tests/test_profile_review.py",
+          "tests/_support/f16.py",
+          "tests/test_f16.py",
+          "tests/test_f48.py",
+          "tests/test_f95.py",
+          "tests/test_l2_review_fanout.py",
+          "VALIDATOR-SPEC.md",
+          "README.md",
+          "BUILD-ORDER.md",
+          ".factory/tasks.json",
+          ".factory/project.yaml",
+          ".factory/BOOTSTRAP.md"
+        ]
+      }
     }
   ]
 }
