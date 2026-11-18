@@ -63,7 +63,14 @@ over each seeded diff plus known-clean diffs, and writes a per-diff
 report: which layers caught each seed, every layer's verdict on each
 known-clean diff (a clean diff a layer wrongly failed shows as that
 layer's false positive), and the catch rate per layer as the **mean and
-spread** over repeats — one run is a ratchet, not a measurement.
+spread** over repeats — one run is a ratchet, not a measurement. Per
+seed it shows `caught k/N repeats`, the pass^k line (seeds caught on
+every repeat), the seeds never caught ("check the seed or grader
+first"), and "found, then dropped" — a finding on the seeded defect
+that the verifier voted out. Besides the bug classes, the seeds include
+shapes of real misses (F-95): a defect's second site that L2 must
+report as a non-blocking `sibling`, a diff that breaks an unchanged
+caller, and a clean diff next to old code of the same class.
 
 - **On demand**: run `factory eval` whenever the validator changes
   (a gate, a prompt, the review fan-out) or after a run escaped it.
@@ -74,9 +81,10 @@ spread** over repeats — one run is a ratchet, not a measurement.
 - **Repeats**: `--repeats N` (default 3, pending owner confirmation
   along with the cadence) runs each diff N times; every rate in the
   report carries its mean, stdev and min–max over the repeats. Each
-  repeat is a full L2 pass — up to 24 real sessions per repeat (16
-  reviewers + 8 verifiers in the last baseline), so N multiplies the
-  model cost: 72 sessions at the default N=3 versus 24 at N=1.
+  repeat is a full L2 pass over 11 diffs (8 seeds, 3 clean) — up to 33
+  real sessions per repeat at 2 reviewers (22 reviewers + 11
+  verifiers), so N multiplies the model cost: 99 sessions at the
+  default N=3 versus 33 at N=1.
 
 Owner steps per run: read the rendered report it prints and saves under
 `<factory-root>/eval/`, record it as tick evidence, and act on a layer

@@ -22,6 +22,7 @@ from pathlib import Path
 
 from factory.eval import (
     CLEAN_DIFFS,
+    SOLOADVENTURER_SEEDS,
     build_soloadventurer_fixture,
     catch_rate_by_layer,
     render_report,
@@ -374,8 +375,10 @@ def test_seeded_eval_excludes_quota_voids_from_its_rates(tmp_path):
     assert report["l2_quota_voided"] == 2
     text = render_report(report)
     assert "L2 quota-voided: 2" in text
-    assert "(pooled 0 of 5 seed runs" in text  # L2's rate over non-void seeds
-    assert "L2: 0 of 1 clean runs" in text
+    # L2's rate over non-void seeds; the clean count over non-void clean
+    # diffs (F-95 re-seat: counted from the tables, one void each).
+    assert f"(pooled 0 of {len(SOLOADVENTURER_SEEDS) - 1} seed runs" in text
+    assert f"L2: 0 of {len(CLEAN_DIFFS) - 1} clean runs" in text
     # The voided records themselves carry no verdict.
     voided = [r for r in report["seeds"] + report["clean"]
               if (r.get("layers") or {}).get("L2", {}).get("quota_voided")]
@@ -479,16 +482,21 @@ def test_seeded_eval_json_counts_false_fails(tmp_path):
     }
     report = run_seeded_eval(repo, session_runner=Seats(findings))
     # F-48 re-seat: the aggregate is per layer ({"failed", "judged"}),
-    # no longer the L2-only integer.
-    assert report["false_fail_on_clean"]["L2"] == {"failed": 1, "judged": 2}
-    assert "L2: 1 of 2 clean runs" in render_report(report)
+    # no longer the L2-only integer. F-95 re-seat: judged = every clean
+    # diff, counted from the table.
+    n_clean = len(CLEAN_DIFFS)
+    assert report["false_fail_on_clean"]["L2"] == {"failed": 1,
+                                                   "judged": n_clean}
+    assert f"L2: 1 of {n_clean} clean runs" in render_report(report)
 
 
 def test_seeded_eval_json_false_fail_zero_and_na(tmp_path):
     repo = _repo(tmp_path)
     report = run_seeded_eval(repo, session_runner=Seats())
-    assert report["false_fail_on_clean"]["L2"] == {"failed": 0, "judged": 2}
-    assert "L2: 0 of 2 clean runs" in render_report(report)
+    n_clean = len(CLEAN_DIFFS)  # F-95 re-seat: from the table
+    assert report["false_fail_on_clean"]["L2"] == {"failed": 0,
+                                                   "judged": n_clean}
+    assert f"L2: 0 of {n_clean} clean runs" in render_report(report)
     skipped = run_seeded_eval(repo)
     assert skipped["false_fail_on_clean"]["L2"] is None
     assert "- L2: n/a (0 judged)" in render_report(skipped)

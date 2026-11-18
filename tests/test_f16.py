@@ -81,7 +81,11 @@ def test_ac_1(tmp_path: Path):
     assert report["catch_rate"] == {
         "L0": pytest.approx(4 / len(SOLOADVENTURER_SEEDS)),
         "L1": pytest.approx(1 / len(SOLOADVENTURER_SEEDS)),
-        "L2": pytest.approx(1 / len(SOLOADVENTURER_SEEDS)),
+        # F-95 re-seat: three L2 seeds now (the self-mocking test, the
+        # sibling seed, the caller-break seed) — counted from the table.
+        "L2": pytest.approx(
+            sum(s.layer == "L2" for s in SOLOADVENTURER_SEEDS)
+            / len(SOLOADVENTURER_SEEDS)),
     }
     for seed in SOLOADVENTURER_SEEDS:
         record = next(r for r in report["seeds"] if r["id"] == seed.id)
