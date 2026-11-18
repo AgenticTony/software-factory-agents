@@ -88,10 +88,12 @@ the same class.
 - **Repeats**: `--repeats N` (default 3, pending owner confirmation
   along with the cadence) runs each diff N times; every rate in the
   report carries its mean, stdev and min–max over the repeats. Each
-  repeat is a full L2 pass over 11 diffs (8 seeds, 3 clean) — up to 33
-  real sessions per repeat at 2 reviewers (22 reviewers + 11
-  verifiers), so N multiplies the model cost: 99 sessions at the
-  default N=3 versus 33 at N=1.
+  repeat is a full L2 pass over 11 diffs (8 seeds, 3 clean) — 22
+  reviewer sessions per repeat at 2 reviewers plus the F-96 per-finding
+  verifier fan-out (one session per union finding, two per
+  blocking/major — the seed diffs carry one or two findings each, so
+  roughly 11–22 verifier sessions), so N multiplies the model cost:
+  expect around 100 sessions at the default N=3.
 
 Owner steps per run: read the rendered report it prints and saves under
 `<factory-root>/eval/`, record it as tick evidence, and act on a layer

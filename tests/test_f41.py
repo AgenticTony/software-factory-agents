@@ -415,8 +415,9 @@ def test_ac_1(tmp_path: Path):
     delta_prompt = [p for p in seats2.prompts("reviewer")
                     if "## Delta since the last review" in p][0]
     assert delta_prompt != final[0]
-    # No verifier anywhere: every scripted verdict was findings-free.
-    assert seats2.seats().count("verifier") == 1  # round 1's blocking finding only
+    # No verifier anywhere but round 1's finding: F-96 gives the
+    # blocking finding TWO sessions (every later verdict findings-free).
+    assert seats2.seats().count("verifier") == 2
     assert len(env2.prs) == 1
 
 
@@ -596,8 +597,9 @@ def test_ac_4(tmp_path: Path, monkeypatch):
         budget={"size": "S", "max_attempts": 3, "max_turns": 13, "wall_clock_min": 30},
     )])
     # The FINAL review carries one minor finding (declared pass), so its
-    # VERIFIER runs too — both verifier passes (round 1's and the final
-    # review's) are pinned at the fixed cap.
+    # VERIFIER runs too — every verifier session (round 1's two for its
+    # blocking finding, the final's one for the minor) is pinned at the
+    # fixed cap.
     seats = _fix_round(
         {"final": _verdict(
             _finding("late nit: trailing whitespace", severity="minor"),
@@ -612,7 +614,7 @@ def test_ac_4(tmp_path: Path, monkeypatch):
         REVIEWER_TURN_CAP
     }
     verifier_caps = [kw["max_turns"] for kw in seats.kwargs("verifier")]
-    assert len(verifier_caps) == 2  # round 1's vote + the FINAL vote
+    assert len(verifier_caps) == 3  # F-96: round 1's blocking x2 + the final minor
     assert set(verifier_caps) == {VERIFIER_TURN_CAP}
     attempt = env.task()["attempts"][-1]
     assert attempt["final_review"]["verdict"] == "pass"  # it really ran

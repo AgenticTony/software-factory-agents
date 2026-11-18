@@ -264,8 +264,14 @@ def test_ac_1(tmp_path: Path):
     real = {"id": "T-1", "title": "Wire the packing summary report",
             "acceptance": [], "out_of_scope": [], "risk": []}
     diff = "diff --git a/app/report.py b/app/report.py\n"
-    for prompt in (orchestrator._review_prompt(real, diff, {}, {}),
-                   orchestrator._verifier_prompt(real, diff, [])):
+    # F-96: the verifier prompt is per-finding — the real task's parity
+    # arm runs the builder with one finding, as every session gets it.
+    from factory.l2 import L2Finding
+    finding = L2Finding(id="U-1", text="x", axis="spec",
+                        severity="major", file="app/report.py")
+    for prompt in (
+            orchestrator._review_prompt(real, diff, {}, {}),
+            *orchestrator._verifier_finding_prompts(real, diff, [finding])):
         assert '"title": "Wire the packing summary report"' in prompt
 
 

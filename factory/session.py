@@ -120,6 +120,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
@@ -3312,8 +3313,14 @@ def run_sessions_parallel(
     settings_path: Path | None = None,
     keep_scratch: bool = False,
     seat_system_prompts: "Sequence[str] | None" = None,
+    ordinal_offset: int = 0,
+    max_workers: "int | None" = None,
+    admit: "Callable[[int], bool] | None" = None,
+    stop_on: "Callable[[SessionRecord], bool] | None" = None,
+    timeout_for: "Callable[[int], float] | None" = None,
+    on_record: "Callable[[SessionRecord], None] | None" = None,
     **session_kwargs,
-) -> list[SessionRecord]:
+) -> "list[SessionRecord | None]":
     """Run the review fan-out: N independent sessions over one diff (F-38).
 
     Every spec is a ``(seat, prompt)`` pair; every seat must be a guard
@@ -3361,6 +3368,35 @@ def run_sessions_parallel(
             reviewer seats differ by lens). ``None`` keeps the shared
             ``system_prompt`` for every session. A list whose length is
             not the spec count refuses.
+        ordinal_offset: F-96 — start the per-session settings ordinals
+            this far in (``<base>-v7.json`` for the first verifier spec
+            at offset 6). Kept for callers that still run the fan-out in
+            sequential slices; a single capped call (below) derives
+            v1..vN naturally and needs no offset.
+        max_workers: F-96 round 4 — cap the pool at this many concurrent
+            sessions over ALL specs, SLIDING (a freed worker picks the
+            next spec immediately; no barrier waits for a wave's slowest
+            session). ``None`` (the reviewer fan-out's shape) keeps one
+            worker per spec.
+        admit: F-96 round 4 — asked before each session STARTS (its spec
+            index in), in the worker; ``False`` means the session does
+            not run and its slot comes back ``None``. Only meaningful
+            with a cap; the caller learns which sessions could not start
+            positionally.
+        stop_on: F-96 round 4 — asked as each session's record arrives;
+            the first ``True`` sets a flag every later admission checks,
+            so no NEW session starts after it (sessions already running
+            finish). Slots refused because of it come back ``None``.
+        timeout_for: F-96 round 5 — called at each session's ADMISSION
+            (its spec index in) for that session's ``timeout_min``,
+            overriding the shared ``timeout_min`` kwarg — a session
+            admitted late into a windowed fan-out gets what is LEFT of
+            the window, not the whole one read at pool start.
+        on_record: F-96 round 5 — called in the worker, under a lock,
+            the moment each record exists — the trace, the spend and
+            the attempt's records see sessions as they finish, not
+            after the whole pool returns. ``None`` (every fan-out
+            before F-96) changes nothing.
         **session_kwargs: Everything each session takes (max_turns,
             timeout_min, protected, system_prompt, …) — handed to the
             runner unchanged.
@@ -3386,6 +3422,19 @@ def run_sessions_parallel(
             f"run_sessions_parallel: {len(seat_system_prompts)} seat system "
             f"prompts for {len(specs)} sessions — one per session"
         )
+    if isinstance(ordinal_offset, bool) or not isinstance(ordinal_offset, int) \
+            or ordinal_offset < 0:
+        raise SessionConfigError(
+            f"run_sessions_parallel: ordinal_offset must be a whole number "
+            f">= 0, got {ordinal_offset!r}"
+        )
+    if (max_workers is not None and (isinstance(max_workers, bool)
+                                     or not isinstance(max_workers, int)
+                                     or max_workers < 1)):
+        raise SessionConfigError(
+            f"run_sessions_parallel: max_workers must be a whole number "
+            f">= 1, got {max_workers!r}"
+        )
     if not specs:
         return []
     if runner is None or runner is run_session_sandboxed:
@@ -3394,6 +3443,12 @@ def run_sessions_parallel(
             factory_root=factory_root, settings_path=settings_path,
             keep_scratch=keep_scratch,
             seat_system_prompts=seat_system_prompts,
+            ordinal_offset=ordinal_offset,
+            max_workers=max_workers,
+            admit=admit,
+            stop_on=stop_on,
+            timeout_for=timeout_for,
+            on_record=on_record,
             **session_kwargs,
         )
     # A test (or alternative) runner: same signature, same concurrency,
@@ -3401,14 +3456,51 @@ def run_sessions_parallel(
     # stub sees the kwargs a real call would have.
     if factory_root is not None:
         session_kwargs.setdefault("factory_root", factory_root)
-    with ThreadPoolExecutor(max_workers=len(specs)) as pool:
+    stop_flag = threading.Event()
+    on_record_lock = (threading.Lock() if on_record is not None
+                      else contextlib.nullcontext())
+    base_kwargs = dict(session_kwargs)
+    if timeout_for is not None:
+        base_kwargs.pop("timeout_min", None)
+
+    def _stub_one(index: int, seat: str, prompt: str):
+        if stop_flag.is_set():
+            return None
+        if admit is not None and not admit(index):
+            return None
+        kwargs = _seat_kwargs(base_kwargs, seat_system_prompts, index)
+        if timeout_for is not None:
+            kwargs["timeout_min"] = timeout_for(index)
+        record = runner(seat, prompt, run_dir, profile, **kwargs)
+        if on_record is not None and record is not None:
+            with on_record_lock:
+                on_record(record)
+        if stop_on is not None and stop_on(record):
+            stop_flag.set()
+        return record
+
+    workers = max_workers or len(specs)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [
-            pool.submit(runner, seat, prompt, run_dir, profile,
-                        **_seat_kwargs(session_kwargs, seat_system_prompts,
-                                       index))
+            pool.submit(_stub_one, index, seat, prompt)
             for index, (seat, prompt) in enumerate(specs)
         ]
         return [future.result() for future in futures]
+
+
+def complete_records(
+        records: "list[SessionRecord | None]") -> "list[SessionRecord]":
+    """Narrow an UNCAPPED fan-out's result to its complete form (F-96
+    round 4): every slot a record, in spec order. An uncapped call
+    never refuses a session (no ``admit``/``stop_on``), so a ``None``
+    slot here is a caller bug and refuses loudly — a capped call's
+    ``None`` slots are its own to read positionally and must not come
+    here."""
+    if any(record is None for record in records):
+        raise SessionConfigError(
+            "complete_records: a refused slot in an uncapped fan-out — "
+            "read the None slots positionally instead")
+    return cast("list[SessionRecord]", records)
 
 
 def _seat_kwargs(session_kwargs: dict,
@@ -3430,8 +3522,14 @@ def _fanout_sandboxed(
     settings_path: Path | None = None,
     keep_scratch: bool = False,
     seat_system_prompts: "Sequence[str] | None" = None,
+    ordinal_offset: int = 0,
+    max_workers: "int | None" = None,
+    admit: "Callable[[int], bool] | None" = None,
+    stop_on: "Callable[[SessionRecord], bool] | None" = None,
+    timeout_for: "Callable[[int], float] | None" = None,
+    on_record: "Callable[[SessionRecord], None] | None" = None,
     **session_kwargs,
-) -> list[SessionRecord]:
+) -> "list[SessionRecord | None]":
     """The real-runner fan-out: one shared guard, per-session settings and
     per-session scratch. Each session goes through :func:`_run_prepared`
     — the SAME per-session prepare/run/parse step :func:`run_session_sandboxed`
@@ -3470,7 +3568,8 @@ def _fanout_sandboxed(
     per_scratch: list[tuple[Path, Path]] = []
     for seat, _ in specs:
         counts[seat] = counts.get(seat, 0) + 1
-        settings = fanout_seat_settings(base, seat, counts[seat])
+        settings = fanout_seat_settings(base, seat,
+                                        counts[seat] + ordinal_offset)
         per_session.append(settings)
         per_scratch.append(
             _scratch_dirs(settings.with_name(settings.name + "-scratch"))
@@ -3482,15 +3581,48 @@ def _fanout_sandboxed(
     baseline = _git_state(run_dir)
     records: list[SessionRecord | None] = [None] * len(specs)
     try:
-        def run_one(index: int, seat: str, prompt: str) -> SessionRecord:
-            return _run_prepared(
+        stop_flag = threading.Event()
+        on_record_lock = (threading.Lock() if on_record is not None
+                          else contextlib.nullcontext())
+        base_kwargs = dict(session_kwargs)
+        if timeout_for is not None:
+            base_kwargs.pop("timeout_min", None)
+
+        def run_one(index: int, seat: str,
+                    prompt: str) -> "SessionRecord | None":
+            # F-96 round 4: the admission gate runs at session START, in
+            # the worker — a capped pool slides (a freed worker takes
+            # the next spec at once), and the stop flag halts NEW
+            # starts after the first matching record. A refused session
+            # leaves its slot None; everything prepared for it is torn
+            # down with the rest.
+            if stop_flag.is_set():
+                return None
+            if admit is not None and not admit(index):
+                return None
+            kwargs = _seat_kwargs(base_kwargs, seat_system_prompts, index)
+            if timeout_for is not None:
+                # F-96 round 5: the window each session gets is read at
+                # ITS admission, never at pool start.
+                kwargs["timeout_min"] = timeout_for(index)
+            record = _run_prepared(
                 seat, prompt, run_dir, profile, per_session[index],
                 factory_root=factory_root,
                 read_only=True, scratch=per_scratch[index],
-                **_seat_kwargs(session_kwargs, seat_system_prompts, index),
+                **kwargs,
             )
+            if on_record is not None and record is not None:
+                # F-96 round 5: the record is observable the moment it
+                # exists — trace, spend and the attempt's records, under
+                # one lock so concurrent completions stay orderly.
+                with on_record_lock:
+                    on_record(record)
+            if stop_on is not None and stop_on(record):
+                stop_flag.set()
+            return record
 
-        with ThreadPoolExecutor(max_workers=len(specs)) as pool:
+        with ThreadPoolExecutor(
+                max_workers=max_workers or len(specs)) as pool:
             futures = [pool.submit(run_one, i, seat, prompt)
                        for i, (seat, prompt) in enumerate(specs)]
             for i, future in enumerate(futures):
@@ -3523,7 +3655,10 @@ def _fanout_sandboxed(
                 # stays for the caller, which sweeps it (see
                 # sweep_fanout_scratch) once the round's verdicts are
                 # parsed; cleanup_run's glob remains the crash backstop.
-    return [record for record in records if record is not None]
+    # Refused slots (admit/stop_on, F-96 round 4) stay None so the
+    # caller learns WHICH sessions could not start; an uncapped call
+    # never refuses and the list is complete as before.
+    return list(records)
 
 
 def _run_prepared(

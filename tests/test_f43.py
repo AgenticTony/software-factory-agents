@@ -532,8 +532,16 @@ _EGRESS_MODULES = {
             "parse_verdict", "_repair_verdict_usable",
             "_repair_vote_usable", "_collect_vote",
             # Prompt builders: session text riding INTO a session's prompt
-            # is the review flow itself (ingress), not egress.
-            "_implementer_prompt", "_reviewer_prompt", "_verifier_prompt",
+            # is the review flow itself (ingress), not egress. F-96: the
+            # per-finding verifier fan-out (prompt building, wave runner
+            # and vote folding) is the same class — verdict plumbing over
+            # finding objects, reaching egress only through the guarded
+            # reports channel. Round 2: the accept path's extracted
+            # fan-out and its repair collector are the same class.
+            "_implementer_prompt", "_reviewer_prompt",
+            "_verifier_finding_prompts", "run_verifier_fanout",
+            "run_accept_verifier_fanout", "accept_collect_vote",
+            "verifier_sessions_for",
             "dumps",
         },
     },
@@ -633,10 +641,13 @@ _EGRESS_MODULES = {
         "extra_attrs": (),
         "allow": {
             # Eval replays sessions through the orchestrator's own guarded
-            # machinery; report building is local-disk.
+            # machinery; report building is local-disk. F-96: the
+            # per-finding verifier fan-out is the orchestrator's own
+            # (prompt building and vote folding stay there, guarded).
             "run_sessions_parallel", "parse_verifier_vote",
-            "orchestrator", "_verifier_prompt", "append", "get", "dumps",
-            "str", "len", "list", "sorted",
+            "orchestrator", "run_verifier_fanout", "verifier_sessions_for",
+            "append", "get",
+            "dumps", "str", "len", "list", "sorted",
         },
     },
     "factory/status.py": {

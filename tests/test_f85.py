@@ -261,15 +261,20 @@ def test_ac_1(tmp_path):
     assert _repairs(events, "reviewer")[0]["outcome"] == "fell_back"
 
     # (d) The verifier's malformed vote gets the same ONE repair turn:
-    # the repaired vote is used (its drop is the recorded drop).
+    # the repaired vote is used (its drop is the recorded drop). F-96
+    # gives a serious finding TWO verifier sessions (a drop needs both),
+    # which would test F-96, not the repair: the finding is a MINOR —
+    # one session, the repair path alone under test.
     seats = Scripted(impls=Scripted.MOVING,
-                     reviews=(_verdict(_finding()), _verdict()))
+                     reviews=(_verdict(_finding(severity="minor")),
+                              _verdict()))
     repaired_vote = json.dumps({"votes": [
         {"id": "U-1", "keep": False,
          "reason": "not real: impl.py already returns 42"}]})
     wrapped = RepairSeats(
-        seats, seat1_result=_verdict(_finding()), seat2_result=_verdict(),
-        repairs=[_verdict()], retries=[_verdict(_finding())],
+        seats, seat1_result=_verdict(_finding(severity="minor")),
+        seat2_result=_verdict(),
+        repairs=[_verdict()], retries=[_verdict(_finding(severity="minor"))],
         verifier_result=BAD_VOTE_DROP, verifier_sid="resume-sid-v1",
         verifier_repairs=[_completed(repaired_vote, turns=2,
                                      seat="verifier")])
@@ -352,9 +357,11 @@ def test_ac_2(tmp_path):
     assert _repairs(events, "reviewer")[0]["outcome"] == "fell_back"
 
     # A repair that flips a vote (keep -> drop) is refused: today's
-    # vote-error path keeps every finding.
+    # vote-error path keeps every finding. (Minor finding — one verifier
+    # session, as in (d): the repair is under test, not the F-96 fold.)
     seats = Scripted(impls=Scripted.MOVING,
-                     reviews=(_verdict(_finding()), _verdict()))
+                     reviews=(_verdict(_finding(severity="minor")),
+                              _verdict()))
     repaired_vote = json.dumps({"votes": [
         {"id": "U-1", "keep": False, "reason": "changed my mind"}]})
     wrapped = RepairSeats(
@@ -417,15 +424,19 @@ def test_ac_3(tmp_path):
             and e.get("seat") == "reviewer"]
     assert len(ends) == 3  # 2 sessions + the repair
 
-    # Verifier repair: the verifier seat's numbers include it.
+    # Verifier repair: the verifier seat's numbers include it. (Minor
+    # finding — one verifier session, so the seat's numbers are the
+    # session's plus the repair's, nothing else.)
     seats = Scripted(impls=Scripted.MOVING,
-                     reviews=(_verdict(_finding()), _verdict()))
+                     reviews=(_verdict(_finding(severity="minor")),
+                              _verdict()))
     repaired_vote = json.dumps({"votes": [
         {"id": "U-1", "keep": True, "reason": "confirmed",
          "tag": "important"}]})
     wrapped = RepairSeats(
-        seats, seat1_result=_verdict(_finding()), seat2_result=_verdict(),
-        repairs=[_verdict()], retries=[_verdict(_finding())],
+        seats, seat1_result=_verdict(_finding(severity="minor")),
+        seat2_result=_verdict(),
+        repairs=[_verdict()], retries=[_verdict(_finding(severity="minor"))],
         verifier_result=BAD_VOTE_KEEP, verifier_sid="resume-sid-v1",
         verifier_repairs=[_completed(
             repaired_vote, turns=2, seat="verifier",

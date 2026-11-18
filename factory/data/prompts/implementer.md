@@ -126,4 +126,5 @@ should change is review's decision, in review.
   gate. Do not weaken, skip or rework them because they fail in-session.
 - End with a short factual summary of what changed and which acceptance
   items you believe are met. Claims are not evidence — the validator
-  re-runs everything — but an honest summary helps the reviewer navigate.
+  re-runs everything, and the reviewer never sees this summary; it is
+  the run's record, for the owner who reads the transcript.

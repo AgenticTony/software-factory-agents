@@ -412,6 +412,14 @@ paths:
     # support module carries the scripted seats those verdicts rest on.
     - "tests/test_f95.py"
     - "tests/_support/f95.py"
+    # F-96: the per-finding-verifier contract tests judge the protected
+    # l2/orchestrator/session/eval verdict path (the session plan, the
+    # two-to-drop rule, failure-keeps, the wave cap and the shared
+    # fan-out, the sibling rule in every seat's prompt and the
+    # out-of-delta exemption) — same precedent, protected from the day
+    # they exist.
+    - "tests/test_f96.py"
+    - "tests/_support/f96.py"
     # F-99: the eval-contract tests judge what the eval's seats are
     # prompted with (the contract_title leak check on captured prompts)
     # and the drop-cost rendering — the numbers `factory eval` reports

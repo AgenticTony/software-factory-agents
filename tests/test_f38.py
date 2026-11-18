@@ -126,17 +126,30 @@ def test_ac_1(tmp_path: Path):
     seat_calls = seats.seats()
     assert seat_calls.count("implementer") == 1
     assert seat_calls.count("reviewer") == 2  # the config default fan-out
-    assert seat_calls.count("verifier") == 1
+    # F-96: one verifier SESSION per finding — the major twice (two
+    # independent verifiers), each minor once: 4 sessions over 3 findings.
+    assert seat_calls.count("verifier") == 4
     # Both reviewers got the same diff: identical prompts, fresh contexts.
     r1, r2 = seats.prompts("reviewer")
     assert r1 == r2
     assert "## Diff (base...head)" in r1
-    # The verifier saw the union, including which reviewers reported what.
-    verifier_prompt = seats.prompts("verifier")[0]
-    for text in ("empty-state row renders unknown", "rename helper",
-                 "dead import os"):
-        assert text in verifier_prompt
-    assert "reported_by" in verifier_prompt
+    # Each verifier session saw exactly ONE finding of the union — its
+    # text and no other finding's — with which reviewers reported it;
+    # together the four prompts cover the three findings (the major's
+    # prompt twice, byte-identical).
+    verifier_prompts = seats.prompts("verifier")
+    texts = ("empty-state row renders unknown", "rename helper",
+             "dead import os")
+    for prompt in verifier_prompts:
+        assert "reported_by" in prompt
+        present = [t for t in texts if t in prompt]
+        assert len(present) == 1, present
+    covered = {t for prompt in verifier_prompts
+               for t in texts if t in prompt}
+    assert covered == set(texts)
+    major_prompts = [p for p in verifier_prompts
+                     if "empty-state" in p]
+    assert len(major_prompts) == 2 and major_prompts[0] == major_prompts[1]
 
     report = _report_of(env)
     findings = report["L2"]["findings"]

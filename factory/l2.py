@@ -112,6 +112,15 @@ verdict production never renders (review M-3: the eval over-reported
 false fails because it never ran the ``vote_rejected_fail`` branch that
 flips a verifier-vetoed declared fail to pass).
 
+F-96 splits the verifier itself: ONE fresh session per finding
+(:func:`verifier_sessions_for` — a ``blocking`` or ``major`` twice),
+each parsed alone (:func:`parse_verifier_vote` over a one-finding list)
+and folded by :func:`combine_finding_votes` into the one outcome
+:func:`apply_vote` consumes — a serious finding drops only when both
+its sessions agree, any failed session keeps its finding, and the
+unanimous rule stays on top. A mistake on one finding can no longer
+spill onto the others.
+
 Running the reviewer sessions themselves is F-10's wiring; everything here is
 pure parsing and judgement over the text sessions produced.
 """
@@ -286,10 +295,15 @@ class L2Report(GateReport):
     out and the ones the nit budget capped, each with its reason — they
     land in the attempt record and the stored report, but NEVER in the PR
     body (AC-4), which is why they don't ride ``dropped``.
-    ``verifier_error`` is set when the verifier's output was not valid
-    vote JSON: the vote then dropped nothing (every finding survived), and
-    the error names why — a broken verifier degrades to today's
-    no-filter review, never to a review that silently lost findings.
+    ``verifier_error`` names the FAILED verifier sessions (F-96: a
+    crashed, timed-out or shape-invalid session, or a vote the fold
+    refused to trust — one drop on a serious finding, an ambiguous
+    union id). It is NOT "the vote dropped nothing": since F-96 each
+    finding is voted alone, so the OTHER findings' drops still stand
+    beside the error, and every finding whose own session failed is
+    kept with the failure on its ``verifier_reason`` — a broken session
+    degrades its finding to kept, never the whole review to silently
+    lost findings.
     """
 
     layer: ClassVar[str] = "L2"
@@ -926,6 +940,10 @@ def apply_convergence(
       didn't change must carry ``missed_earlier`` explaining what the
       earlier round missed; without it, it is dropped as
       ``out_of_delta_without_missed_earlier`` and recorded in ``dropped``.
+      F-96 exempts the parent-ruled sibling (``sibling=True``, set by
+      :func:`mark_siblings` before this rule runs): an older site of a
+      defect class needs no why — it rides the follow-up, it is not
+      re-litigated here.
       A finding that names **no file** is never dropped: it cannot be
       shown to sit in unchanged code, and the contract-level findings
       (a missing test, an unmet acceptance item) rarely name one — a
@@ -988,16 +1006,21 @@ def apply_convergence(
             and finding.file is not None
             and finding.file not in delta_files
             and not (finding.missed_earlier or "").strip()
+            and not finding.sibling
         ):
-            # F-94: a sibling is outside the diff, so it is always outside
-            # the delta — the F-23 rule applies to it unchanged (a fix
-            # round re-litigates no old code without a why). The drop
-            # entry keeps it, marked sibling, and the F-41 final review
-            # (full diff, nothing out of delta) is the review whose
-            # siblings reach the publish's follow-up.
             # A named file the delta didn't touch, without a why. A
             # fileless finding is never dropped: it cannot be shown to
             # sit in unchanged code (round-1 finding 7).
+            # F-96 AC-5: a finding the PARENT ruled a sibling
+            # (:func:`mark_siblings` — the strict reviewer flag AND the
+            # parent's proof the file is outside the diff; it runs
+            # BEFORE this drop, see :func:`settle_review_verdict`) is
+            # exempt: it is not this round's work to re-litigate with a
+            # `missed_earlier` why, it rides the follow-up like any
+            # sibling. The flag ALONE is not enough — ``sibling`` is the
+            # parent's two-condition ruling, never the reviewer's claim
+            # — and an unflagged out-of-delta finding keeps this rule
+            # exactly.
             dropped.append(
                 {
                     "finding": dict(finding.__dict__),
@@ -1304,11 +1327,157 @@ class VerifierOutcome(NamedTuple):
     "reason": <the voter's reason>}``. ``error`` is set iff the output was
     not valid vote JSON, in which case ``kept`` is the whole union and
     ``dropped`` empty: an unverifiable vote may not remove a finding.
+
+    F-96 parses ONE session's vote over ONE finding (:func:`parse_verifier_vote`
+    with a one-finding list); :func:`combine_finding_votes` folds the
+    sessions into the one outcome :func:`apply_vote` consumes.
     """
 
     kept: list
     dropped: list
     error: str | None
+
+
+def verifier_sessions_for(findings: Sequence) -> list:
+    """F-96 AC-1/AC-2: the verifier session plan over the union — every
+    finding once, a ``blocking`` or ``major`` TWICE (two independent
+    verifier sessions; a drop needs both). The returned list is the
+    sessions' finding assignment, in fan-out order; the same finding
+    object appearing twice means two sessions, not a duplicate finding.
+    A serious sibling counts like any serious finding — the unanimous
+    rule (:func:`apply_vote`) and the sibling marking decide what its
+    survival means, not the vote count."""
+    sessions: list = []
+    for finding in findings:
+        if not isinstance(finding, L2Finding):
+            continue  # an invalid-verdict finding is never voted on
+        sessions.append(finding)
+        if finding.severity in _ROUND_FAILING_SEVERITIES:
+            sessions.append(finding)
+    return sessions
+
+
+def combine_finding_votes(
+    findings: Sequence,
+    session_votes: "Sequence[tuple[L2Finding, VerifierOutcome]]",
+) -> VerifierOutcome:
+    """F-96: fold the per-finding verifier sessions' votes into the ONE
+    :class:`VerifierOutcome` :func:`apply_vote` consumes.
+
+    ``session_votes`` is ``(finding, that session's parsed outcome)``
+    per session (:func:`verifier_sessions_for` order); each outcome was
+    parsed against that finding alone. The mechanical rules, enforced
+    here rather than trusted from the model:
+
+    * **A failed session keeps its finding.** Any outcome with ``error``
+      — a crashed, timed-out or shape-invalid session — keeps the
+      finding tagged ``important``, its ``verifier_reason`` naming why
+      the vote could not count. The fail-open direction is always
+      keeping, never dropping.
+    * **A serious finding needs two agreeing drops.** A ``blocking`` or
+      ``major`` drops only when EVERY session for it voted drop with a
+      reason; one keep — or one failed session — keeps it, carrying the
+      keep's tag and reason. The recorded drop reason carries both
+      sessions' reasons. The rule is enforced HERE, not trusted from
+      the session plan: a serious finding that arrives with fewer than
+      two outcomes keeps (tagged ``important``, the error naming the
+      missing second vote) — a caller bug must degrade to keeping, the
+      fail-open direction, never to a one-vote drop.
+    * **A minor or note follows its single vote**, drop or keep.
+    * The unanimous rule stays on top, in :func:`apply_vote`: it can
+      refuse a drop this function recorded. A finding with NO session
+      at all (a caller bug, not a script the factory runs) is kept
+      untagged — the unvoted rule.
+    """
+    grouped: dict[str, list[VerifierOutcome]] = {}
+    for finding, outcome in session_votes:
+        grouped.setdefault(finding.id, []).append(outcome)
+    all_ids = [f.id for f in findings if isinstance(f, L2Finding)]
+    # merge_reviews regenerates union ids, so a duplicate can only be a
+    # hand-built or corrupted union — and a drop keyed by an ambiguous id
+    # could hit the wrong finding. Fail open: duplicates never drop.
+    duplicates = {fid for fid in all_ids if all_ids.count(fid) > 1}
+    kept: list = []
+    dropped: list = []
+    errors: list[str] = []
+    for finding in findings:
+        if not isinstance(finding, L2Finding):
+            continue
+        if finding.id in duplicates:
+            kept.append(replace(
+                finding, tag="important",
+                verifier_reason=(
+                    f"kept: union id {finding.id} is ambiguous "
+                    "(two findings share it) — no drop may key on it"),
+            ))
+            errors.append(f"{finding.id}: duplicate union id")
+            continue
+        outcomes = grouped.get(finding.id, [])
+        failed = [o for o in outcomes if o.error is not None]
+        if failed:
+            reason = failed[0].error or "the verifier session failed"
+            kept.append(replace(
+                finding, tag="important",
+                verifier_reason=(
+                    f"kept: the verifier session failed ({reason})"),
+            ))
+            errors.append(f"{finding.id}: {reason}")
+            continue
+        drop_votes = [o for o in outcomes if o.dropped]
+        keep_votes = [o for o in outcomes if o.kept and not o.dropped]
+        serious = finding.severity in _ROUND_FAILING_SEVERITIES
+        if (outcomes and len(drop_votes) == len(outcomes)
+                and not (serious and len(outcomes) < 2)):
+            # Every session for this finding voted drop (each outcome
+            # parsed one finding, so one drop entry is that vote), and a
+            # serious one has the two sessions its drop requires — the
+            # count enforced here, never trusted from the plan (a
+            # serious finding with one drop outcome keeps, below).
+            reasons = [str(o.dropped[0].get("reason")) for o in outcomes]
+            dropped.append({
+                "finding": dict(finding.__dict__),
+                "reason": " | second vote: ".join(r for r in reasons),
+            })
+            continue
+        if outcomes and len(drop_votes) == len(outcomes) and serious:
+            # Round-2 finding 2: a serious finding whose session plan
+            # collapsed to one drop vote — the drop does not stand on
+            # one vote; keep it, tagged important, the fold's own
+            # record naming what was missing.
+            kept.append(replace(
+                finding, tag="important",
+                verifier_reason=(
+                    "kept: a blocking/major finding needs two verifier "
+                    f"drops — only {len(outcomes)} vote(s) arrived"),
+            ))
+            errors.append(
+                f"{finding.id}: {len(outcomes)} of 2 votes for a "
+                "blocking/major finding")
+            continue
+        if keep_votes:
+            survivor = keep_votes[0].kept[0]
+            reason = survivor.verifier_reason
+            if drop_votes:
+                # Round-4 fix 5: a split serious vote keeps the keep's
+                # tag and reason AND records the dissent — one
+                # independent session judged the finding not real, and
+                # the owner must see that on the finding.
+                dissent = str(drop_votes[0].dropped[0].get("reason"))
+                reason = (f"kept (split vote): {reason} | "
+                          f"dissent: {dissent}")
+            kept.append(replace(
+                finding,
+                verifier_reason=reason,
+                tag=survivor.tag,
+            ))
+            continue
+        kept.append(replace(finding))  # unvoted: kept, untagged
+    error = None
+    if errors:
+        shown = "; ".join(errors[:3])
+        more = "" if len(errors) <= 3 else f" (+{len(errors) - 3} more)"
+        error = f"verifier session failure(s) — {shown}{more}"
+    return VerifierOutcome(kept=kept, dropped=dropped, error=error)
 
 
 # F-72 AC-2: what one arbiter session's ruling did to the repeated

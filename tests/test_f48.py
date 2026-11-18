@@ -259,7 +259,9 @@ def test_review_verifier_quota_voids_the_review(tmp_path: Path):
         repo, seed_by_id("mocks-what-it-tests"),
         session_runner=QuotaVerifier(MOCK_SEED_FINDINGS),
     )
+    # F-96 round 6: the void names its reason now.
     assert record["layers"]["L2"] == {"quota_voided": True,
+                                      "void_reason": "verifier_quota",
                                       "review_retries": 0}
 
 
@@ -518,6 +520,7 @@ def test_review_quota_on_the_rerun_still_voids(tmp_path: Path):
                       session_runner=GarbageThenQuota(MOCK_SEED_FINDINGS),
                       reviewers=1)
     assert record["layers"]["L2"] == {"quota_voided": True,
+                                      "void_reason": "verifier_quota",
                                       "review_retries": 1}
 
 
