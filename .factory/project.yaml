@@ -412,6 +412,11 @@ paths:
     # support module carries the scripted seats those verdicts rest on.
     - "tests/test_f95.py"
     - "tests/_support/f95.py"
+    # F-99: the eval-contract tests judge what the eval's seats are
+    # prompted with (the contract_title leak check on captured prompts)
+    # and the drop-cost rendering — the numbers `factory eval` reports
+    # to the owner rest on them (the test_f95 precedent).
+    - "tests/test_f99.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 

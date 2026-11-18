@@ -32,6 +32,16 @@ from factory.eval import (
 from factory.l2 import parse_reviews_with_retry
 from factory.session import SessionRecord
 
+
+def _slot(spec_id: str) -> str:
+    """The spec's opaque contract slot (F-99 round 2: the seed id never
+    reaches a seat, so the seats route by slot)."""
+    for spec in SOLOADVENTURER_SEEDS + CLEAN_DIFFS:
+        if spec.id == spec_id:
+            return spec.slot
+    raise AssertionError(f"no spec named {spec_id!r}")
+
+
 GARBAGE = "Reviewer notes: the diff looks fine to me (no JSON)."
 VALID_PASS = json.dumps({"verdict": "pass", "findings": []})
 VALID_FAIL = json.dumps(
@@ -207,7 +217,7 @@ def _reviewer_calls(seats):
 
 def test_eval_review_retries_a_garbage_seat_once(tmp_path):
     repo = _repo(tmp_path)
-    seats = Seats(garbage_contracts={"EVAL-clean-docstring"})
+    seats = Seats(garbage_contracts={_slot("clean-docstring")})
     record = run_seed(
         repo, _clean_spec("clean-docstring"), session_runner=seats, reviewers=1
     )
@@ -222,7 +232,7 @@ def test_eval_review_retries_a_garbage_seat_once(tmp_path):
 
 def test_eval_review_garbage_twice_fails_closed(tmp_path):
     repo = _repo(tmp_path)
-    seats = Seats(always_garbage={"EVAL-clean-docstring"})
+    seats = Seats(always_garbage={_slot("clean-docstring")})
     record = run_seed(
         repo, _clean_spec("clean-docstring"), session_runner=seats, reviewers=1
     )
@@ -326,7 +336,7 @@ def test_eval_reports_a_quota_hit_review_as_void(tmp_path):
     denominators, counted on its own line — F-16's tick evidence must
     not carry quota noise."""
     repo = _repo(tmp_path)
-    seats = Seats(quota_contracts={"EVAL-clean-docstring"})
+    seats = Seats(quota_contracts={_slot("clean-docstring")})
     record = run_seed(
         repo, _clean_spec("clean-docstring"), session_runner=seats,
         reviewers=1,
@@ -370,7 +380,7 @@ def test_seeded_eval_excludes_quota_voids_from_its_rates(tmp_path):
     report = run_seeded_eval(
         repo,
         session_runner=Seats(quota_contracts={
-            "EVAL-tautological-test", "EVAL-clean-docstring"}),
+            _slot("tautological-test"), _slot("clean-docstring")}),
     )
     assert report["l2_quota_voided"] == 2
     text = render_report(report)
@@ -470,7 +480,7 @@ def test_render_false_fail_line_is_na_when_l2_skipped():
 def test_seeded_eval_json_counts_false_fails(tmp_path):
     repo = _repo(tmp_path)
     findings = {
-        "EVAL-clean-docstring": [
+        _slot("clean-docstring"): [
             {
                 "id": "R-1",
                 "axis": "standards",

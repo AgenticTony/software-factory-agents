@@ -103,19 +103,20 @@ def test_l2_catch_requires_a_finding_that_names_the_seed(tmp_path: Path):
     The same seed with a finding that names the defect IS caught."""
     repo = _fixture(tmp_path)
     seed = seed_by_id("mocks-what-it-tests")
+    slot = seed.slot  # F-99: seats route by the opaque slot
     unrelated = dict(
         _finding(), id="R-9", file="scripts/check_schema_refs.py",
         text="this script should use pathlib APIs consistently",
     )
     miss = run_seed(
         repo, seed,
-        session_runner=ScriptedSeats({"EVAL-mocks-what-it-tests": [unrelated]}),
+        session_runner=ScriptedSeats({slot: [unrelated]}),
     )
     assert miss["layers"]["L2"]["verdict"] == "fail"
     assert miss["caught_by"] == [], miss["caught_by"]
     hit = run_seed(
         repo, seed,
-        session_runner=ScriptedSeats({"EVAL-mocks-what-it-tests": [_finding()]}),
+        session_runner=ScriptedSeats({slot: [_finding()]}),
     )
     assert hit["caught_by"] == ["L2"]
 
@@ -239,7 +240,7 @@ def test_l2_runs_the_f38_fanout(tmp_path: Path):
     reviewers = [c for c in seats.calls if c[0] == "reviewer"]
     verifiers = [c for c in seats.calls if c[0] == "verifier"]
     assert len(reviewers) == 2 * (len(SOLOADVENTURER_SEEDS) + len(CLEAN_DIFFS))
-    assert ("verifier", "EVAL-mocks-what-it-tests") in verifiers
+    assert ("verifier", seed_by_id("mocks-what-it-tests").slot) in verifiers
 
 
 def test_render_report_shows_the_per_diff_table(tmp_path: Path):

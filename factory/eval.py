@@ -21,7 +21,13 @@ seed (one site of a defect class fixed, the second untouched — caught
 only by a PASSING L2 that reports the second site as a sibling), a
 caller-break seed (caught only on a failing round with a finding on
 the unchanged caller's file), and a clean diff beside an old site of
-the class.
+the class. F-99: every seed and clean diff also carries a
+``contract_title`` — the developer's task, stated as intent, never
+naming the defect — and that, not the eval's own description of the
+seeded bug, is the only title any seat is prompted with; the specs'
+ids name their bug classes, so the contract ids, branches and commit
+messages run on opaque ``slot`` handles instead. Every number measures
+the reviewers, never the eval's own text.
 
 Layers:
 
@@ -102,11 +108,28 @@ class SeedSpec:
     independent expectation the report is measured against — attribution
     never runs off a layer verdict alone (a layer that failed over
     findings unrelated to the seed caught nothing).
+
+    ``contract_title`` (F-99) is the task a developer would plausibly
+    have been given that produced this diff, stated as intent — never
+    naming the defect. ``title`` is the eval's own description of the
+    seeded bug: a REPORT label only (the per-diff lines), never a prompt
+    — a contract that told the reviewers the answer measured their
+    reading, not their reviewing (F-99).
+
+    ``slot`` (F-99 round 2) is the spec's opaque handle — a position
+    number (``EVAL-01`` …), carrying no part of the id. The id names
+    the bug class ("mocks-what-it-tests"), so it must never reach a
+    seat: the task's contract id, the ``eval/`` branch, the
+    ``eval-base/`` setup ref and the setup/seed commit messages all use
+    the slot (L1's red_reason echoes the branch name into the review
+    prompt); ``id`` stays on the record and in the report only.
     """
 
     id: str
+    slot: str
     layer: str
     title: str
+    contract_title: str
     markers: tuple[str, ...] = ()
     edits: tuple[tuple[str, str], ...] = ()
     files: dict[str, str] = field(default_factory=dict)
@@ -139,10 +162,17 @@ class SiblingSeed(SeedSpec):
 @dataclass(frozen=True)
 class CleanSpec:
     """A known-clean diff: the validator must pass it and L2 must draw
-    no blocking finding on it (AC-3's false-positive dial)."""
+    no blocking finding on it (AC-3's false-positive dial).
+
+    ``contract_title`` (F-99): as :class:`SeedSpec` — the developer's
+    task as intent, the only title any seat sees. ``title`` is the
+    eval's report label. ``slot`` (F-99 round 2): as :class:`SeedSpec`
+    — the opaque handle for the contract id, branch and commits."""
 
     id: str
+    slot: str
     title: str
+    contract_title: str
     edits: tuple[tuple[str, str], ...] = ()
     files: dict[str, str] = field(default_factory=dict)
     # F-95: as SeedSpec.setup_files — old code the clean diff sits next to.
@@ -326,7 +356,7 @@ def eval_profile(repo: Path, python: str | None = None) -> dict:
             "schema": [
                 {
                     "command": f"{quoted} scripts/check_schema_refs.py",
-                    "description": "phantom-table ratchet (schema refs)",
+                    "description": "schema-refs ratchet",
                 }
             ]
         },
@@ -427,8 +457,13 @@ REPORT_SOURCE = (
 SOLOADVENTURER_SEEDS = [
     SeedSpec(
         id="phantom-table",
+        slot="EVAL-01",
         layer="L0",
         title="a write path retargeted to a table the schema doesn't know",
+        # The developer's task (F-99): migrate the write to the new
+        # table — never the defect (the schema doesn't know it). The
+        # table name rides the diff itself.
+        contract_title="archive trips into the new archived_trips table",
         markers=("archived_trips",),
         edits=(
             ('store.insert("trip_archive", {"trip_id": trip_id})',
@@ -437,8 +472,14 @@ SOLOADVENTURER_SEEDS = [
     ),
     SeedSpec(
         id="removed-rls-filter",
+        slot="EVAL-02",
         layer="L0",
         title="the ownership filter dropped from an owner-scoped read",
+        # Round 2: "returns all trips" REQUESTED the security hole —
+        # a reviewer following that contract would pass it. Neutral
+        # intent the diff plausibly came from; the unscoped read is
+        # the defect they must find.
+        contract_title="simplify trips_for",
         markers=("owner", "trips_for", "rows"),
         edits=(
             ('    return [row for row in rows if row["owner_id"] == owner_id]',
@@ -447,8 +488,13 @@ SOLOADVENTURER_SEEDS = [
     ),
     SeedSpec(
         id="off-by-one",
+        slot="EVAL-03",
         layer="L0",
         title="the pack-list cap reads one item past the limit",
+        # Round 2: "include one item past the limit" REQUESTED the
+        # off-by-one. Neutral intent; the wrong bound is the defect
+        # they must find.
+        contract_title="simplify pack_list's slicing",
         markers=("pack_list", "limit"),
         edits=(
             ("    return items[:limit]", "    return items[: limit + 1]"),
@@ -456,8 +502,12 @@ SOLOADVENTURER_SEEDS = [
     ),
     SeedSpec(
         id="deleted-await",
+        slot="EVAL-04",
         layer="L0",
         title="the await dropped from the checkin-count fetch",
+        # The task: drop the async hop — the dangling coroutine is the
+        # defect; "coroutine" is a marker no seat may be handed.
+        contract_title="make the checkin-count fetch synchronous",
         markers=("checkin_count", "fetchone", "await", "coroutine"),
         edits=(
             ("    row = await store.fetchone(", "    row = store.fetchone("),
@@ -465,8 +515,12 @@ SOLOADVENTURER_SEEDS = [
     ),
     SeedSpec(
         id="mocks-what-it-tests",
+        slot="EVAL-05",
         layer="L2",
         title="a test that mocks the function it claims to test",
+        # The task: test isolation — not "the test mocks the function
+        # it claims to test", which IS the defect.
+        contract_title="isolate the checkin-count test from the store",
         markers=("mock", "checkin_count"),
         edits=(
             (
@@ -487,8 +541,12 @@ SOLOADVENTURER_SEEDS = [
     ),
     SeedSpec(
         id="tautological-test",
+        slot="EVAL-06",
         layer="L1",
         title="a contract test that already passes on base — it proves nothing",
+        # The task: add the contract test — not that it can never fail.
+        # The acceptance text below follows the same rule (intent).
+        contract_title="add a contract test for trip archiving",
         markers=("test_archive", "tautolog", "proves nothing", "already pass"),
         files={
             "tests/test_archive.py": (
@@ -512,9 +570,16 @@ SOLOADVENTURER_SEEDS = [
     # own setup commit, so the F-16 records above never move.
     SiblingSeed(
         id="sibling-second-site",
+        slot="EVAL-07",
         layer="L2",
         title="one site of a defect class fixed; the same defect at a "
               "second site, untouched (JobFinderOS run 4)",
+        # The task names the ONE function the diff touches and the
+        # hardening wanted — never the whitespace-only gap, never the
+        # untouched second site (the leaked label read as an unmet
+        # contract and the reviewers blocked on the site they had
+        # correctly found).
+        contract_title="harden require_owner against blank owner ids",
         markers=("gear_for_owner", "whitespace", "strip"),
         setup_files=OLD_SITES,
         edits=(
@@ -529,9 +594,13 @@ SOLOADVENTURER_SEEDS = [
     ),
     SeedSpec(
         id="caller-break",
+        slot="EVAL-08",
         layer="L2",
         title="pack_list returns plain names now; an unchanged caller "
               "in another file still reads dicts (#163 round 1)",
+        # The task names the API change only — the broken caller is the
+        # defect the reviewers must find (never "pack_summary").
+        contract_title="pack_list returns item names instead of item dicts",
         markers=("pack_summary",),
         setup_files={"app/report.py": REPORT_SOURCE},
         edits=(
@@ -547,7 +616,9 @@ SOLOADVENTURER_SEEDS = [
 CLEAN_DIFFS = [
     CleanSpec(
         id="clean-docstring",
+        slot="EVAL-09",
         title="a clearer docstring on an owner-scoped read",
+        contract_title="clarify the docstring on the owner-scoped trips read",
         edits=(
             (
                 '    """The owner\'s own trips. The RLS mirror of this read: an owner sees\n'
@@ -559,7 +630,9 @@ CLEAN_DIFFS = [
     ),
     CleanSpec(
         id="clean-new-helper",
+        slot="EVAL-10",
         title="a new pure helper with its own coverage",
+        contract_title="add a logbook line helper with its own test",
         files={
             "app/logbook.py": (
                 '"""Trip logbook helpers."""\n'
@@ -581,14 +654,24 @@ CLEAN_DIFFS = [
     # F-95: a clean diff next to old code of the sibling seed's class (the
     # unfixed whitespace-only owner check). A sibling finding on the old
     # site is allowed; it is never a blocking finding or a false fail.
+    # F-99: the docstring states what archive_trip does — the call its
+    # body makes (store.insert into trip_archive) — never a state change
+    # the fixture disproves (the old "its row moves to trip_archive"
+    # claimed a move store.insert never performs: it returns a dict and
+    # mutates nothing, and both of L2's clean-diff false fails came from
+    # reviewers rightly flagging that claim).
     CleanSpec(
         id="clean-beside-old-site",
+        slot="EVAL-11",
         title="a clearer docstring, next to an old whitespace-only "
               "owner check",
+        # The task names the one function whose docstring is being
+        # clarified — not the old site beside it.
+        contract_title="clarify archive_trip's docstring",
         setup_files=OLD_SITES,
         edits=(
             ('    """Archive a completed trip."""\n',
-             '    """Archive a completed trip: its row moves to '
+             '    """Archive a completed trip by inserting into '
              'trip_archive."""\n'),
         ),
     ),
@@ -619,14 +702,17 @@ def run_seed(
 ) -> dict:
     """Run the validator's layers over one seeded (or clean) diff.
 
-    Creates branch ``eval/<id>`` from ``base_ref`` in the fixture repo
-    (F-95: from the seed's own ``eval-base/<id>`` — ``base_ref`` plus
+    Creates branch ``eval/<slot>`` from ``base_ref`` in the fixture repo
+    (F-95: from the seed's own ``eval-base/<slot>`` — ``base_ref`` plus
     one setup commit — when the seed carries ``setup_files``; every
     layer then judges the diff against that base), applies the seed,
     and runs L0 and L1 — plus L2 as F-38's parallel
     reviewer and verifier when ``session_runner`` is given (the real
     runner drives real model sessions; tests script it). The repo is
-    left on the seed's branch.
+    left on the seed's branch. F-99 round 2: every ref and commit
+    message is slot-named — the id names the bug class and L1's
+    red_reason echoes the branch into the review prompt, so the git
+    surface must be as opaque as the contract.
 
     Returns the per-diff record: each layer's report dict and the layers
     that caught the seed (a failing layer whose own recorded evidence
@@ -641,30 +727,30 @@ def run_seed(
     task = _seed_task(seed)
     _git(repo, "checkout", "--force", base_ref)
     # F-95: a seed with setup code gets its OWN base — one setup commit
-    # on ``eval-base/<id>``, rebuilt from ``base_ref`` on every run (``-B``
-    # resets it, so repeats never stack) — and every layer judges the
-    # seed's diff against that base. ``base_ref`` itself never moves, so
-    # no other seed or clean diff can see the setup.
+    # on ``eval-base/<slot>``, rebuilt from ``base_ref`` on every run
+    # (``-B`` resets it, so repeats never stack) — and every layer judges
+    # the seed's diff against that base. ``base_ref`` itself never moves,
+    # so no other seed or clean diff can see the setup.
     seed_base = base_ref
     if seed.setup_files:
-        seed_base = f"eval-base/{seed.id}"
+        seed_base = f"eval-base/{seed.slot}"
         _git(repo, "checkout", "-B", seed_base, base_ref)
         _write_files(repo, seed.setup_files)
         _git(repo, "add", "-A")
-        _git(repo, "commit", "-m", f"setup: {seed.id}")
-    _git(repo, "checkout", "-B", f"eval/{seed.id}", seed_base)
+        _git(repo, "commit", "-m", f"setup: {seed.slot}")
+    _git(repo, "checkout", "-B", f"eval/{seed.slot}", seed_base)
     _apply_diff(repo, seed)
     _git(repo, "add", "-A")
-    _git(repo, "commit", "-m", f"seed: {seed.id}")
+    _git(repo, "commit", "-m", f"seed: {seed.slot}")
 
-    l0 = run_l0(profile, repo, seed_base, f"eval/{seed.id}", task=task,
+    l0 = run_l0(profile, repo, seed_base, f"eval/{seed.slot}", task=task,
                 runner=command_runner)
-    l1 = run_l1(profile, repo, seed_base, f"eval/{seed.id}", task=task,
+    l1 = run_l1(profile, repo, seed_base, f"eval/{seed.slot}", task=task,
                 runner=command_runner)
     layers = {"L0": l0.to_dict(), "L1": l1.to_dict()}
     if session_runner is not None:
         report, retries = run_l2_review(
-            repo, profile, seed_base, f"eval/{seed.id}", task,
+            repo, profile, seed_base, f"eval/{seed.slot}", task,
             session_runner=session_runner, reviewers=reviewers,
             l0=l0, l1=l1, factory_root=factory_root,
         )
@@ -893,7 +979,10 @@ def found_then_dropped(record: dict, seed: SeedSpec,
                        root: Path | None = None) -> list[dict]:
     """F-95 (F-96's baseline): on one seed run, the findings a seat
     reported that name the seeded defect and that the verifier then
-    voted out — today these read as a plain miss.
+    voted out — today these read as a plain miss. F-99: the report's
+    entries carry ``seed_caught`` beside these (whether that run was
+    still caught by any layer) so a harmless drop never reads as a lost
+    catch.
 
     "Names the seeded defect" is the seed's own catch evidence rule: a
     marker in the finding's file or text, on the seed's catch file when
@@ -936,11 +1025,18 @@ def _catch_evidence(report: dict, files: tuple[str, ...] = (),
 
 
 def _seed_task(seed: SeedSpec | CleanSpec) -> dict:
+    """The task dict the eval's seats are prompted with (F-99: the
+    contract's title is the developer's task, ``contract_title`` — never
+    ``seed.title``, the eval's own description of the seeded bug, which
+    stays a report label on the record; and its id is the opaque
+    ``slot`` — never ``EVAL-{seed.id}``, which names the bug class; a
+    contract that told the reviewers the answer measured their reading,
+    not their reviewing)."""
     contract = seed.contract if isinstance(seed, SeedSpec) else None
     acceptance = [contract] if contract else []
     return {
-        "id": f"EVAL-{seed.id}",
-        "title": seed.title,
+        "id": seed.slot,
+        "title": seed.contract_title,
         "acceptance": acceptance,
         "risk": [],
     }
@@ -1244,9 +1340,13 @@ def run_seeded_eval(
             seeds.append(record)
             # F-95: per seed and repeat (empty when nothing matched) — kept
             # beside the records, which stay byte-for-byte F-16's.
+            # F-99 (AC-3): seed_caught says whether that run was still
+            # caught by any layer — a drop on a caught run cost nothing,
+            # a drop on a missed run did.
             dropped.append({"id": seed.id, "repeat": repeat,
                             "dropped": found_then_dropped(record, seed,
-                                                          root=repo)})
+                                                          root=repo),
+                            "seed_caught": bool(record.get("caught_by"))})
         for diff in CLEAN_DIFFS:
             record = run_seed(repo, diff, **common)
             record["repeat"] = repeat
@@ -1625,8 +1725,22 @@ def _per_seed_lines(report: dict) -> list[str]:
             f"{d.get('id')} ({d.get('file')}) — {d.get('reason')}"
             for d in entry["dropped"]
         )
+        # F-99 (AC-3): whether the drop cost anything — the seed was
+        # still caught by any layer on that run, or this drop was the
+        # catch thrown away. Pre-F-99 entries carry no verdict and keep
+        # the old line shape.
+        cost = ""
+        if entry.get("seed_caught") is True:
+            cost = " (seed still caught)"
+        elif entry.get("seed_caught") is False:
+            cost = " (seed missed)"
         lines.append(f"- seed {entry.get('id')}{tag}: found, then dropped "
-                     f"by the verifier: {what}")
+                     f"by the verifier: {what}{cost}")
+    if any("seed_caught" in e for e in shown):
+        costly = sum(len(e["dropped"]) for e in shown
+                     if e.get("seed_caught") is False)
+        total = sum(len(e["dropped"]) for e in shown)
+        lines.append(f"Drops that cost a catch: {costly} of {total}")
     return lines
 
 

@@ -10,6 +10,7 @@ module is not collected by pytest and imports no test module.
 import json
 import re
 
+from factory.eval import seed_by_id
 from factory.session import SessionRecord
 
 _FINDINGS_ARRAY = re.compile(r"```json\n(\[\s*\{.*?\}\s*\])\n```", re.S)
@@ -27,9 +28,11 @@ def _finding():
 
 class ScriptedSeats:
     """Scripted reviewer/verifier seats, keyed by the eval contract id
-    in the prompt. Reviewers return the scripted findings for their diff
-    (an empty list is a declared pass); the verifier keeps every finding.
-    Same seat signature the F-38 fan-out calls the real runner with.
+    in the prompt — the spec's opaque SLOT (F-99 round 2: the seed id
+    never reaches a seat, so seats route by slot too). Reviewers return
+    the scripted findings for their diff (an empty list is a declared
+    pass); the verifier keeps every finding. Same seat signature the
+    F-38 fan-out calls the real runner with.
     """
 
     def __init__(self, findings_by_contract: dict[str, list] | None = None):
@@ -63,18 +66,18 @@ class ScriptedSeats:
 
 
 MOCK_SEED_FINDINGS = {
-    "EVAL-mocks-what-it-tests": [_finding()],
+    seed_by_id("mocks-what-it-tests").slot: [_finding()],
     # F-95: the reviewer that catches every L2 seed also reports the
     # sibling seed's untouched second site (flagged, so the round
     # passes) and the caller-break seed's broken caller (unflagged, so
     # it blocks).
-    "EVAL-sibling-second-site": [{
+    seed_by_id("sibling-second-site").slot: [{
         "id": "R-1", "axis": "spec", "severity": "major",
         "file": "app/gear.py", "sibling": True,
         "text": "gear_for_owner accepts a whitespace-only owner_id — the "
                 "same class the diff fixes in require_owner",
     }],
-    "EVAL-caller-break": [{
+    seed_by_id("caller-break").slot: [{
         "id": "R-1", "axis": "spec", "severity": "blocking",
         "file": "app/report.py",
         "text": "pack_summary still reads i['item'] but pack_list now "
