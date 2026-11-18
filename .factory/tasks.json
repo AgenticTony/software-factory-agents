@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-18T17:50:00Z",
+  "updated_at": "2026-11-18T20:24:16Z",
   "tasks": [
     {
       "id": "F-00",
@@ -6933,7 +6933,7 @@
       "source": "BUILD-ORDER.md#f-99--the-eval-stops-telling-the-reviewers-the-answer",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-95"
       ],
@@ -6996,7 +6996,10 @@
           ".factory/project.yaml",
           ".factory/BOOTSTRAP.md"
         ]
-      }
+      },
+      "acceptance_hash": "6cec22ca1fb9d7236a2ac9787bb44be6abce9a47193918701204686be4cb2f3a",
+      "approved_at": "2026-11-18T20:24:16Z",
+      "approved_by": "Anthony"
     }
   ]
 }
