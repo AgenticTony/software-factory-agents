@@ -350,20 +350,22 @@ def test_ac_3(tmp_path: Path):
         voided_line)
     assert "L0 pass" in voided_line and "L1 pass" in voided_line, voided_line
 
-    # The false-fail aggregate is per layer: L0's two failed clean runs
-    # are counted against L0, not folded into an L2-only number.
+    # The false-fail aggregate is per layer: L0's failed clean runs (every
+    # clean diff — F-95 re-seat: counted from the table, three now) are
+    # counted against L0, not folded into an L2-only number.
     report = run_seeded_eval(
         repo, command_runner=_failing_test_command_runner(),
         session_runner=ScriptedSeats(),
     )
+    n_clean = len(CLEAN_DIFFS)
     false_fail = report["false_fail_on_clean"]
-    assert false_fail["L0"] == {"failed": 2, "judged": 2}, false_fail
-    assert false_fail["L1"] == {"failed": 0, "judged": 2}, false_fail
-    assert false_fail["L2"] == {"failed": 0, "judged": 2}, false_fail
+    assert false_fail["L0"] == {"failed": n_clean, "judged": n_clean}, false_fail
+    assert false_fail["L1"] == {"failed": 0, "judged": n_clean}, false_fail
+    assert false_fail["L2"] == {"failed": 0, "judged": n_clean}, false_fail
     text = render_report(report)
     assert "False-fail on clean diffs" in text
     false_fail_section = text.split("False-fail on clean diffs", 1)[1]
-    assert "L0" in false_fail_section and "2" in false_fail_section
+    assert f"L0: {n_clean} of {n_clean} clean runs" in false_fail_section
 
 
 # --- AC-4 (I-12): repeats with spread ---------------------------------------
@@ -383,19 +385,24 @@ def test_ac_4(tmp_path: Path):
     assert flaky[0]["caught_by"] == ["L2"]
     assert flaky[1]["caught_by"] == []
 
-    # L2 caught 1/6 in repeat 1, 0/6 in repeat 2: mean 1/12, spread over
-    # exactly those two per-repeat rates.
+    # L2 caught every L2 seed in repeat 1 and none in repeat 2: spread
+    # over exactly those two per-repeat rates. (F-95 re-seat: the rates
+    # are counted from the seed table — 3 L2 and 4 L0 seeds of 8 now —
+    # instead of the 1/6 and 4/6 literals of the six-seed table.)
+    n_seeds = len(SOLOADVENTURER_SEEDS)
+    l2_rate = sum(s.layer == "L2" for s in SOLOADVENTURER_SEEDS) / n_seeds
+    l0_rate = sum(s.layer == "L0" for s in SOLOADVENTURER_SEEDS) / n_seeds
     assert report["catch_rate_by_repeat"]["L2"] == [
-        pytest.approx(1 / 6), pytest.approx(0.0),
+        pytest.approx(l2_rate), pytest.approx(0.0),
     ]
     stats = report["catch_rate_stats"]["L2"]
-    assert stats["mean"] == pytest.approx((1 / 6 + 0.0) / 2)
-    assert stats["stdev"] == pytest.approx(statistics.stdev([1 / 6, 0.0]))
+    assert stats["mean"] == pytest.approx((l2_rate + 0.0) / 2)
+    assert stats["stdev"] == pytest.approx(statistics.stdev([l2_rate, 0.0]))
     assert stats["min"] == pytest.approx(0.0)
-    assert stats["max"] == pytest.approx(1 / 6)
+    assert stats["max"] == pytest.approx(l2_rate)
     # A deterministic layer measures a real zero spread at N=2 — 0, not n/a.
     assert report["catch_rate_by_repeat"]["L0"] == [
-        pytest.approx(4 / 6), pytest.approx(4 / 6),
+        pytest.approx(l0_rate), pytest.approx(l0_rate),
     ]
     assert report["catch_rate_stats"]["L0"]["stdev"] == pytest.approx(0.0)
 
@@ -529,7 +536,9 @@ def test_review_every_repeat_quota_voided_renders_na(tmp_path: Path):
     text = render_report(report)
     assert "- L2: n/a (0 judged)" in text
     assert "L2: 0%" not in text  # a voided judge is never a 0% catch rate
-    assert "quota-voided: 16" in text
+    # F-95 re-seat: 2 repeats x (8 seeds + 3 clean), from the table.
+    assert (f"quota-voided: {2 * (len(SOLOADVENTURER_SEEDS) + len(CLEAN_DIFFS))}"
+            in text)
 
 
 def test_review_render_tolerates_a_pre_f48_report_json():

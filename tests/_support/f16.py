@@ -62,4 +62,22 @@ class ScriptedSeats:
         )
 
 
-MOCK_SEED_FINDINGS = {"EVAL-mocks-what-it-tests": [_finding()]}
+MOCK_SEED_FINDINGS = {
+    "EVAL-mocks-what-it-tests": [_finding()],
+    # F-95: the reviewer that catches every L2 seed also reports the
+    # sibling seed's untouched second site (flagged, so the round
+    # passes) and the caller-break seed's broken caller (unflagged, so
+    # it blocks).
+    "EVAL-sibling-second-site": [{
+        "id": "R-1", "axis": "spec", "severity": "major",
+        "file": "app/gear.py", "sibling": True,
+        "text": "gear_for_owner accepts a whitespace-only owner_id — the "
+                "same class the diff fixes in require_owner",
+    }],
+    "EVAL-caller-break": [{
+        "id": "R-1", "axis": "spec", "severity": "blocking",
+        "file": "app/report.py",
+        "text": "pack_summary still reads i['item'] but pack_list now "
+                "returns plain names",
+    }],
+}

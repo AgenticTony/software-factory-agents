@@ -11,11 +11,17 @@ The fixture set is the SoloAdventurer fixture (:func:`build_soloadventurer_fixtu
 — a small offline repo shaped like the real SoloAdventurer app: a
 Supabase-style store whose tables are named in a committed schema, a
 phantom-table ratchet script (the real repo's ``check-schema-refs.py``),
-and pytest coverage. Every seeded bug is one of the five classes
-VALIDATOR-SPEC names: a phantom table name, a removed ownership (RLS)
-filter, an off-by-one, a deleted ``await``, and a test that mocks the
-thing it claims to test — plus a contract test that can't fail (the
-class L1 exists for).
+and pytest coverage. Six seeded bugs are the classes VALIDATOR-SPEC
+names: a phantom table name, a removed ownership (RLS) filter, an
+off-by-one, a deleted ``await``, and a test that mocks the thing it
+claims to test — plus a contract test that can't fail (the class L1
+exists for). F-95 adds shapes of misses the factory actually had, each
+on its own base (a setup commit off the shared fixture): a sibling
+seed (one site of a defect class fixed, the second untouched — caught
+only by a PASSING L2 that reports the second site as a sibling), a
+caller-break seed (caught only on a failing round with a finding on
+the unchanged caller's file), and a clean diff beside an old site of
+the class.
 
 Layers:
 
@@ -53,12 +59,15 @@ from factory.gates import git as hardened_git
 from factory.l0 import run_l0
 from factory.l1 import run_l1
 from factory.l2 import (
+    L2Finding,
+    _fails_round,
     merge_reviews,
     parse_reviews_with_retry,
     parse_verifier_vote,
     settle_review_verdict,
 )
 from factory.session import run_session_sandboxed, run_sessions_parallel
+from factory.siblings import normalise_path
 
 # Per-session budgets for the eval's L2 seats. An eval diff is tiny
 # compared to a real attempt; the caps keep a confused session bounded.
@@ -102,6 +111,29 @@ class SeedSpec:
     edits: tuple[tuple[str, str], ...] = ()
     files: dict[str, str] = field(default_factory=dict)
     contract: dict = field(default_factory=dict)
+    # F-95: files committed on the seed's OWN base (``eval-base/<id>``,
+    # one setup commit off the shared fixture) before the seed's diff —
+    # the shared fixture and every other seed's base never see them.
+    setup_files: dict[str, str] = field(default_factory=dict)
+    # F-95: when set, an L2 finding is catch evidence only if its file is
+    # one of these (the caller-break seed: the catch is the CALLER's
+    # file, never the changed one). Empty keeps the F-16 rule.
+    finding_files: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SiblingSeed(SeedSpec):
+    """F-95: a seed whose catch is a REPORTED SIBLING, not a failed round.
+
+    The setup commit plants one defect class at two sites; the seed's
+    diff fixes one. L2 catches it only when ALL hold: its verdict is
+    ``pass`` (a sibling never blocks — a failed round is no sibling
+    catch, whatever it carried), a surviving finding is marked
+    ``sibling`` (the parent's two-condition ruling, F-94), that
+    finding's file is ``sibling_file`` (the untouched site), and its
+    text names one of ``markers``. L0 and L1 never catch this kind."""
+
+    sibling_file: str = ""
 
 
 @dataclass(frozen=True)
@@ -113,6 +145,8 @@ class CleanSpec:
     title: str
     edits: tuple[tuple[str, str], ...] = ()
     files: dict[str, str] = field(default_factory=dict)
+    # F-95: as SeedSpec.setup_files — old code the clean diff sits next to.
+    setup_files: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +377,53 @@ def _git(repo: Path, *args: str) -> str:
 # The seeds (VALIDATOR-SPEC's bug classes) and the known-clean diffs
 # ---------------------------------------------------------------------------
 
+# F-95 setup code (committed on a seed's own base, never on the shared
+# fixture). OLD_SITES: one defect class at two sites in two files — an
+# owner check written ``not owner_id``, which a whitespace-only id
+# passes (the JobFinderOS run-4 shape: a blank-but-not-empty value
+# accepted by two reads).
+OLD_SITES = {
+    "app/owners.py": (
+        '"""Owner-id guards for the trip reads."""\n'
+        "\n"
+        "\n"
+        "def require_owner(owner_id):\n"
+        '    """Refuse a read with no owner: an empty id would match every\n'
+        '    unowned row."""\n'
+        "    if not owner_id:\n"
+        '        raise ValueError("owner_id is required")\n'
+        "    return owner_id\n"
+    ),
+    "app/gear.py": (
+        '"""Gear reads, scoped to the owner of the trip."""\n'
+        "\n"
+        "from app import store\n"
+        "\n"
+        "\n"
+        "def gear_for_owner(owner_id):\n"
+        '    """Every gear item on the owner\'s own trips."""\n'
+        "    if not owner_id:\n"
+        '        raise ValueError("owner_id is required")\n'
+        '    trips = {t["id"] for t in store.query("trips")\n'
+        '             if t["owner_id"] == owner_id}\n'
+        '    return [g for g in store.query("gear") if g["trip_id"] in trips]\n'
+    ),
+}
+
+# F-95: an untested caller of pack_list in another file — the
+# caller-break seed changes pack_list's return shape and leaves this
+# file untouched (and broken).
+REPORT_SOURCE = (
+    '"""The trip report: a one-line pack summary."""\n'
+    "\n"
+    "from app.api import pack_list\n"
+    "\n"
+    "\n"
+    "def pack_summary(trip_id):\n"
+    '    """The first gear items on a trip, comma-separated."""\n'
+    '    return ", ".join(i["item"] for i in pack_list(trip_id))\n'
+)
+
 SOLOADVENTURER_SEEDS = [
     SeedSpec(
         id="phantom-table",
@@ -427,6 +508,40 @@ SOLOADVENTURER_SEEDS = [
             },
         },
     ),
+    # F-95: shaped like misses the factory actually had. Each carries its
+    # own setup commit, so the F-16 records above never move.
+    SiblingSeed(
+        id="sibling-second-site",
+        layer="L2",
+        title="one site of a defect class fixed; the same defect at a "
+              "second site, untouched (JobFinderOS run 4)",
+        markers=("gear_for_owner", "whitespace", "strip"),
+        setup_files=OLD_SITES,
+        edits=(
+            ("    if not owner_id:\n"
+             '        raise ValueError("owner_id is required")\n'
+             "    return owner_id\n",
+             "    if not owner_id or not owner_id.strip():\n"
+             '        raise ValueError("owner_id is required")\n'
+             "    return owner_id\n"),
+        ),
+        sibling_file="app/gear.py",
+    ),
+    SeedSpec(
+        id="caller-break",
+        layer="L2",
+        title="pack_list returns plain names now; an unchanged caller "
+              "in another file still reads dicts (#163 round 1)",
+        markers=("pack_summary",),
+        setup_files={"app/report.py": REPORT_SOURCE},
+        edits=(
+            ("    return items[:limit]",
+             '    return [i["item"] for i in items][:limit]'),
+            ('    items = [g["item"] for g in pack_list("t1", limit=2)]',
+             '    items = pack_list("t1", limit=2)'),
+        ),
+        finding_files=("app/report.py",),
+    ),
 ]
 
 CLEAN_DIFFS = [
@@ -463,6 +578,20 @@ CLEAN_DIFFS = [
             ),
         },
     ),
+    # F-95: a clean diff next to old code of the sibling seed's class (the
+    # unfixed whitespace-only owner check). A sibling finding on the old
+    # site is allowed; it is never a blocking finding or a false fail.
+    CleanSpec(
+        id="clean-beside-old-site",
+        title="a clearer docstring, next to an old whitespace-only "
+              "owner check",
+        setup_files=OLD_SITES,
+        edits=(
+            ('    """Archive a completed trip."""\n',
+             '    """Archive a completed trip: its row moves to '
+             'trip_archive."""\n'),
+        ),
+    ),
 ]
 
 
@@ -490,34 +619,52 @@ def run_seed(
 ) -> dict:
     """Run the validator's layers over one seeded (or clean) diff.
 
-    Creates branch ``eval/<id>`` from ``base_ref`` in the fixture repo,
-    applies the seed, and runs L0 and L1 — plus L2 as F-38's parallel
+    Creates branch ``eval/<id>`` from ``base_ref`` in the fixture repo
+    (F-95: from the seed's own ``eval-base/<id>`` — ``base_ref`` plus
+    one setup commit — when the seed carries ``setup_files``; every
+    layer then judges the diff against that base), applies the seed,
+    and runs L0 and L1 — plus L2 as F-38's parallel
     reviewer and verifier when ``session_runner`` is given (the real
     runner drives real model sessions; tests script it). The repo is
     left on the seed's branch.
 
     Returns the per-diff record: each layer's report dict and the layers
     that caught the seed (a failing layer whose own recorded evidence
-    names one of the seed's ``markers``); a clean diff carries the number
-    of blocking findings its review drew — ``None`` when L2 never ran.
+    names one of the seed's ``markers``; for a :class:`SiblingSeed`, a
+    PASSING L2 by :func:`_sibling_check`, whose verdict and reason ride
+    on ``sibling_check``); a clean diff carries the number of blocking
+    findings its review drew — ``None`` when L2 never ran. A seed with
+    setup code also carries its ``base``.
     """
     repo = Path(repo)
     profile = eval_profile(repo)
     task = _seed_task(seed)
     _git(repo, "checkout", "--force", base_ref)
-    _git(repo, "checkout", "-B", f"eval/{seed.id}", base_ref)
+    # F-95: a seed with setup code gets its OWN base — one setup commit
+    # on ``eval-base/<id>``, rebuilt from ``base_ref`` on every run (``-B``
+    # resets it, so repeats never stack) — and every layer judges the
+    # seed's diff against that base. ``base_ref`` itself never moves, so
+    # no other seed or clean diff can see the setup.
+    seed_base = base_ref
+    if seed.setup_files:
+        seed_base = f"eval-base/{seed.id}"
+        _git(repo, "checkout", "-B", seed_base, base_ref)
+        _write_files(repo, seed.setup_files)
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-m", f"setup: {seed.id}")
+    _git(repo, "checkout", "-B", f"eval/{seed.id}", seed_base)
     _apply_diff(repo, seed)
     _git(repo, "add", "-A")
     _git(repo, "commit", "-m", f"seed: {seed.id}")
 
-    l0 = run_l0(profile, repo, base_ref, f"eval/{seed.id}", task=task,
+    l0 = run_l0(profile, repo, seed_base, f"eval/{seed.id}", task=task,
                 runner=command_runner)
-    l1 = run_l1(profile, repo, base_ref, f"eval/{seed.id}", task=task,
+    l1 = run_l1(profile, repo, seed_base, f"eval/{seed.id}", task=task,
                 runner=command_runner)
     layers = {"L0": l0.to_dict(), "L1": l1.to_dict()}
     if session_runner is not None:
         report, retries = run_l2_review(
-            repo, profile, base_ref, f"eval/{seed.id}", task,
+            repo, profile, seed_base, f"eval/{seed.id}", task,
             session_runner=session_runner, reviewers=reviewers,
             l0=l0, l1=l1, factory_root=factory_root,
         )
@@ -538,11 +685,25 @@ def run_seed(
         "expected_layer": getattr(seed, "layer", None),
         "layers": layers,
     }
-    if isinstance(seed, SeedSpec):
+    if seed.setup_files:
+        # Only setup seeds carry it: the F-16 records stay byte-for-byte.
+        record["base"] = seed_base
+    if isinstance(seed, SiblingSeed):
+        check = _sibling_check(layers, seed, root=repo)
+        record["caught_by"] = ["L2"] if check["caught"] else []
+        record["sibling_check"] = check
+    elif isinstance(seed, SeedSpec):
         record["caught_by"] = [
             name for name, report in layers.items()
-            if _catches(report, seed.markers)
+            if _catches(report, seed.markers,
+                        files=seed.finding_files if name == "L2" else (),
+                        root=repo)
         ]
+        if seed.finding_files:
+            # F-95 R2-1: a caller-break miss says why (only seeds with a
+            # catch file carry it: the F-16 records stay byte-for-byte).
+            record["caller_check"] = _caller_check(
+                layers, seed, "L2" in record["caught_by"], root=repo)
     else:
         l2 = layers.get("L2") or {}
         record["blocking_findings"] = (
@@ -552,7 +713,8 @@ def run_seed(
     return record
 
 
-def _catches(report: dict, markers: tuple[str, ...]) -> bool:
+def _catches(report: dict, markers: tuple[str, ...],
+             files: tuple[str, ...] = (), root: Path | None = None) -> bool:
     """True when a layer's own recorded evidence names the seeded defect.
 
     The verdict alone is not the catch (a layer that failed over
@@ -561,18 +723,197 @@ def _catches(report: dict, markers: tuple[str, ...]) -> bool:
     the layer itself recorded: the output of the commands and sentinels
     that failed, L1's red-reason table, and — for L2 — the surviving
     findings (a finding the verifier dropped never survived, so it
-    never counts).
+    never counts). ``files`` (F-95), when given, admits only findings
+    filed on one of those paths that would THEMSELVES fail the round
+    (:func:`_blocks`, l2's own rule: not ruled sibling, a round-failing
+    severity): the caller-break catch is a blocking finding on the
+    caller — never one on the changed file that merely names it, and
+    never a non-blocking one (a sibling, a minor) in a round something
+    else failed (review round 3).
+    ``root`` is the fixture clone the reviewers read (an absolute path
+    inside it counts, as it does for the parent's sibling ruling).
     """
     if report.get("verdict") in (None, "pass") or not markers:
         return False
     evidence = "\n".join(
-        part for part in _catch_evidence(report) if part
+        part for part in _catch_evidence(report, files, root) if part
     ).lower()
     return any(marker.lower() in evidence for marker in markers)
 
 
-def _catch_evidence(report: dict) -> list[str]:
-    """The human-readable output a layer's failure is attributed to."""
+def _blocks(finding: dict) -> bool:
+    """Whether a STORED L2 finding would itself fail a round — l2's own
+    :func:`factory.l2._fails_round` (a round-failing severity, not ruled
+    sibling) applied to the stored dict, so the eval never re-types the
+    severity list."""
+    return _fails_round(L2Finding(
+        id=str(finding.get("id")), text=str(finding.get("text", "")),
+        severity=finding.get("severity"),
+        sibling=finding.get("sibling") is True,
+    ))
+
+
+def _on_files(finding: dict, files: tuple[str, ...],
+              root: Path | None = None) -> bool:
+    """Whether a stored finding is filed on one of ``files`` (its path
+    normalised the F-94 way, :func:`factory.siblings.normalise_path`:
+    ``./x`` and ``a/../x`` count, an absolute path only inside ``root``,
+    a climbing path never)."""
+    return normalise_path(finding.get("file"), root) in files
+
+
+def _names_marker(finding: dict, markers: tuple[str, ...]) -> bool:
+    text = f"{finding.get('file') or ''} {finding.get('text', '')}".lower()
+    return any(marker.lower() in text for marker in markers)
+
+
+def _sibling_check(layers: dict, seed: "SiblingSeed",
+                   root: Path | None = None) -> dict:
+    """F-95: the sibling kind's catch rule, with the reason on the record.
+
+    Caught only when the L2 verdict is ``pass`` AND a SURVIVING finding
+    is marked ``sibling`` (the parent's ruling, never the reviewer's
+    claim alone), is filed on ``seed.sibling_file`` and names a marker.
+    Every other shape scores zero, and ``reason`` says which rule it
+    failed — the first that applies, in this order: L2 never ran or was
+    quota-voided; the round FAILED (a sibling never blocks, so a blocked
+    round is no sibling catch, whatever it carried); then what the
+    surviving findings lacked; and when nothing survived but the
+    verifier dropped a matching finding, that it was found, then
+    dropped."""
+    l2 = layers.get("L2")
+    if not l2:
+        return {"caught": False, "reason": "L2 did not run"}
+    if l2.get("quota_voided"):
+        return {"caught": False, "reason": "L2 quota-voided (no verdict)"}
+    if l2.get("verdict") != "pass":
+        return {"caught": False,
+                "reason": f"the round failed (verdict {l2.get('verdict')}): "
+                          "a sibling must never block, so a blocked round "
+                          "is no sibling catch"}
+    findings = [f for f in l2.get("findings") or [] if isinstance(f, dict)]
+    site = (seed.sibling_file,)
+    on_site = [f for f in findings if _on_files(f, site, root)]
+    if any(f.get("sibling") is True and _names_marker(f, seed.markers)
+           for f in on_site):
+        return {"caught": True,
+                "reason": f"reported {seed.sibling_file} as a sibling; "
+                          "the round passed"}
+    if any(f.get("sibling") is True for f in on_site):
+        return {"caught": False,
+                "reason": f"the sibling on {seed.sibling_file} names no "
+                          f"marker ({', '.join(seed.markers)})"}
+    if any(_names_marker(f, seed.markers) for f in on_site):
+        return {"caught": False,
+                "reason": f"{seed.sibling_file} was reported but not "
+                          "marked sibling"}
+    if any(f.get("sibling") is True for f in findings):
+        return {"caught": False,
+                "reason": f"a sibling was reported on another file, not "
+                          f"{seed.sibling_file}"}
+    if _dropped_matches(l2, seed.markers, site, root):
+        return {"caught": False,
+                "reason": "found, then dropped by the verifier: no "
+                          f"surviving finding on {seed.sibling_file}"}
+    return {"caught": False,
+            "reason": f"no surviving finding on {seed.sibling_file}"}
+
+
+def _caller_check(layers: dict, seed: SeedSpec, caught: bool,
+                  root: Path | None = None) -> dict:
+    """F-95 R2-1: why a caller-break run was (not) caught — the live eval
+    must tell "the reviewers never saw the break" from "a seat found it
+    but marked it sibling" (F-94's named residual: flag + a file outside
+    the diff makes it non-blocking) and from "found, then dropped".
+
+    Reasons, the first that applies: L2 not run or quota-voided; caught;
+    a surviving finding on the caller's file naming a marker that the
+    parent ruled sibling (``residual: True`` — rendered in the per-seed
+    block); one naming a marker that did not block for another reason
+    (its severity); a caller finding that names no marker; a matching
+    finding the verifier voted out; no finding on the caller."""
+    l2 = layers.get("L2")
+    if not l2:
+        return {"caught": False, "reason": "L2 did not run"}
+    if l2.get("quota_voided"):
+        return {"caught": False, "reason": "L2 quota-voided (no verdict)"}
+    if caught:
+        return {"caught": True,
+                "reason": "the round failed on a finding on the caller"}
+    files = tuple(seed.finding_files)
+    on_caller = [f for f in l2.get("findings") or []
+                 if isinstance(f, dict) and _on_files(f, files, root)]
+    named = [f for f in on_caller if _names_marker(f, seed.markers)]
+    if any(f.get("sibling") is True for f in named):
+        return {"caught": False, "residual": True,
+                "reason": "reported on the caller but ruled sibling "
+                          "(non-blocking): the F-94 residual"}
+    if named:
+        return {"caught": False,
+                "reason": "reported on the caller but the round did not "
+                          f"fail (verdict {l2.get('verdict')}, severity "
+                          f"{named[0].get('severity')})"}
+    if on_caller:
+        return {"caught": False,
+                "reason": "a finding on the caller names no marker "
+                          f"({', '.join(seed.markers)})"}
+    if _dropped_matches(l2, seed.markers, files, root):
+        return {"caught": False,
+                "reason": "found, then dropped by the verifier"}
+    return {"caught": False,
+            "reason": f"no surviving finding on {', '.join(files)}"}
+
+
+def _dropped_matches(l2: dict, markers: tuple[str, ...],
+                     files: tuple[str, ...],
+                     root: Path | None = None) -> list[dict]:
+    """The verifier's VOTE drops of a finding that names the seeded
+    defect (a marker, and — when ``files`` — one of those files). A
+    refused drop (``override_refused``: the finding survived) and a nit
+    budget cut (not the verifier's judgment) are not counted."""
+    out = []
+    for entry in l2.get("verifier_dropped") or []:
+        if not isinstance(entry, dict):
+            continue
+        reason = str(entry.get("reason") or "")
+        if reason == "nit_budget" or reason.startswith("override_refused"):
+            continue
+        finding = entry.get("finding")
+        if not isinstance(finding, dict) or not _names_marker(finding,
+                                                              markers):
+            continue
+        if files and not _on_files(finding, files, root):
+            continue
+        out.append({"id": finding.get("id"), "file": finding.get("file"),
+                    "text": finding.get("text"), "reason": reason})
+    return out
+
+
+def found_then_dropped(record: dict, seed: SeedSpec,
+                       root: Path | None = None) -> list[dict]:
+    """F-95 (F-96's baseline): on one seed run, the findings a seat
+    reported that name the seeded defect and that the verifier then
+    voted out — today these read as a plain miss.
+
+    "Names the seeded defect" is the seed's own catch evidence rule: a
+    marker in the finding's file or text, on the seed's catch file when
+    it has one (the sibling seed's untouched site, the caller-break
+    seed's caller). Read only from the verifier's vote drops on the
+    stored L2 report — never from the surviving findings. Empty when L2
+    did not run or was quota-voided. ``root``: the fixture clone, so an
+    absolute path inside it counts."""
+    l2 = (record.get("layers") or {}).get("L2") or {}
+    if not l2 or l2.get("quota_voided"):
+        return []
+    files = ((seed.sibling_file,) if isinstance(seed, SiblingSeed)
+             else tuple(seed.finding_files))
+    return _dropped_matches(l2, seed.markers, files, root)
+
+
+def _catch_evidence(report: dict, files: tuple[str, ...] = (),
+                    root: Path | None = None) -> list[str]:
+    """The human-readable output a layer's failure is attributed to
+    (findings restricted to ``files`` when given)."""
     parts = []
     for command in report.get("commands") or []:
         if (isinstance(command, dict)
@@ -586,7 +927,9 @@ def _catch_evidence(report: dict) -> list[str]:
     if isinstance(red_reasons, dict):
         parts += [f"{ref} {reason or ''}" for ref, reason in red_reasons.items()]
     for finding in report.get("findings") or []:
-        if isinstance(finding, dict):
+        if isinstance(finding, dict) and (
+                not files
+                or (_on_files(finding, files, root) and _blocks(finding))):
             parts.append(f"{finding.get('file') or ''} "
                          f"{finding.get('text', '')}")
     return parts
@@ -603,11 +946,15 @@ def _seed_task(seed: SeedSpec | CleanSpec) -> dict:
     }
 
 
-def _apply_diff(repo: Path, seed: SeedSpec | CleanSpec) -> None:
-    for rel, text in seed.files.items():
+def _write_files(repo: Path, files: dict[str, str]) -> None:
+    for rel, text in files.items():
         target = repo / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text)
+
+
+def _apply_diff(repo: Path, seed: SeedSpec | CleanSpec) -> None:
+    _write_files(repo, seed.files)
     for old, new in seed.edits:
         for rel in _files_with(repo, old):
             path = repo / rel
@@ -889,11 +1236,17 @@ def run_seeded_eval(
     }
     seeds: list = []
     clean: list = []
+    dropped: list = []
     for repeat in range(1, repeats + 1):
         for seed in SOLOADVENTURER_SEEDS:
             record = run_seed(repo, seed, **common)
             record["repeat"] = repeat
             seeds.append(record)
+            # F-95: per seed and repeat (empty when nothing matched) — kept
+            # beside the records, which stay byte-for-byte F-16's.
+            dropped.append({"id": seed.id, "repeat": repeat,
+                            "dropped": found_then_dropped(record, seed,
+                                                          root=repo)})
         for diff in CLEAN_DIFFS:
             record = run_seed(repo, diff, **common)
             record["repeat"] = repeat
@@ -936,7 +1289,38 @@ def run_seeded_eval(
         "catch_rate_stats": {
             layer: _stats(values) for layer, values in catch_by_repeat.items()
         },
+        # F-95: per seed, caught k of N judged repeats (the pass^k and
+        # never-caught lines read it), and per seed and repeat the
+        # findings a seat reported and the verifier voted out.
+        "per_seed": per_seed_counts(seeds),
+        "found_then_dropped": dropped,
     }
+
+
+def per_seed_counts(seed_records: list) -> dict[str, dict]:
+    """F-95: per seed id, ``{"caught", "judged", "voided"}`` over its runs.
+
+    A run is caught when any layer caught it (``caught_by``). A run no
+    layer caught whose L2 was quota-voided produced no verdict that
+    could have caught it: it is ``voided`` and leaves ``judged`` — never
+    a miss (PR #90 round 4's rule; the per-diff line already renders it
+    "not judged"). A caught run counts as judged even when its L2 was
+    voided: another layer's catch stands. Insertion order is the
+    records' first-seen order."""
+    out: dict[str, dict] = {}
+    for record in seed_records:
+        counts = out.setdefault(str(record.get("id")),
+                                {"caught": 0, "judged": 0, "voided": 0})
+        voided = ((record.get("layers") or {}).get("L2") or {}).get(
+            "quota_voided")
+        if record.get("caught_by"):
+            counts["caught"] += 1
+            counts["judged"] += 1
+        elif voided:
+            counts["voided"] += 1
+        else:
+            counts["judged"] += 1
+    return out
 
 
 def _layer_ran(record: dict, layer: str) -> bool:
@@ -1054,7 +1438,9 @@ def render_report(report: dict) -> str:
     seeded bug (per repeat, when the report ran more than one), which
     layers caught it; per known-clean diff, EVERY layer's verdict with
     L2's blocking-finding count — a clean diff a layer wrongly failed
-    renders as that layer's false positive (F-48, m-11); then the catch
+    renders as that layer's false positive (F-48, m-11); then the
+    per-seed block (F-95: caught k/N repeats, pass^k, never caught,
+    found-then-dropped — :func:`_per_seed_lines`); then the catch
     rate per layer and the per-layer false-fail lines, each with its
     mean and spread over the repeats (F-48, I-12). The header names the
     repeat count and reviewer re-runs when any fired. Reports written
@@ -1101,6 +1487,7 @@ def render_report(report: dict) -> str:
             f"- clean {record['id']}{repeat}: {_clean_review_summary(record)} "
             f"— {record['title']}"
         )
+    lines += _per_seed_lines(report)
     lines += ["", "## Catch rate per layer", ""]
     counts = report["caught_counts"]
     totals = _layer_totals(report["seeds"])
@@ -1181,6 +1568,66 @@ def render_report(report: dict) -> str:
         lines.append(f"L2 quota-voided: {report.get('l2_quota_voided', 0)}")
     lines.append("")
     return "\n".join(lines)
+
+
+def _per_seed_lines(report: dict) -> list[str]:
+    """F-95: the per-seed reliability block — caught k/N repeats per
+    seed, the pass^k line (the seeds caught on EVERY judged repeat: the
+    reliability number, not "caught once in N"), the never-caught line
+    (a 0% seed is usually a broken seed or grader before it is a weak
+    model), and found-then-dropped per seed and repeat. Recomputed from
+    the records when the report predates F-95; found-then-dropped is
+    then "not recorded", never a claimed none."""
+    seeds = report.get("seeds") or []
+    counts = per_seed_counts(seeds)
+    expected = {str(r.get("id")): r.get("expected_layer") or "-"
+                for r in seeds}
+    lines = ["", "## Per seed over repeats", ""]
+    for seed_id, c in counts.items():
+        voided = (f" ({c['voided']} quota-voided)" if c["voided"] else "")
+        if c["judged"]:
+            body = f"caught {c['caught']}/{c['judged']} repeats{voided}"
+        else:
+            body = f"not judged ({c['voided']} quota-voided)"
+        lines.append(f"- seed {seed_id}: {body} "
+                     f"(expected {expected[seed_id]})")
+    judged = {k: c for k, c in counts.items() if c["judged"]}
+    every = [k for k, c in judged.items() if c["caught"] == c["judged"]]
+    never = [k for k, c in judged.items() if c["caught"] == 0]
+    lines.append(
+        f"pass^k (caught on every judged repeat): {len(every)} of "
+        f"{len(judged)} judged seeds"
+        + (f" — {', '.join(every)}" if every else "")
+    )
+    lines.append(
+        "Never caught: "
+        + (f"{', '.join(never)} — check the seed or grader first"
+           if never else "none")
+    )
+    multi = int(report.get("repeats") or 1) > 1
+    for record in seeds:
+        if ((record.get("caller_check") or {}).get("residual")):
+            tag = f" [r{_repeat_of(record)}]" if multi else ""
+            lines.append(f"- seed {record.get('id')}{tag}: reported as "
+                         "sibling, did not block (the F-94 residual)")
+    entries = report.get("found_then_dropped")
+    lines += ["", "## Found, then dropped by the verifier", ""]
+    if entries is None:
+        lines.append("- not recorded (the report predates F-95)")
+        return lines
+    shown = [e for e in entries if e.get("dropped")]
+    if not shown:
+        lines.append("- found, then dropped by the verifier: none")
+    for entry in shown:
+        tag = (f" [r{entry.get('repeat')}]"
+               if int(report.get("repeats") or 1) > 1 else "")
+        what = "; ".join(
+            f"{d.get('id')} ({d.get('file')}) — {d.get('reason')}"
+            for d in entry["dropped"]
+        )
+        lines.append(f"- seed {entry.get('id')}{tag}: found, then dropped "
+                     f"by the verifier: {what}")
+    return lines
 
 
 def _repeat_tag(report: dict, record: dict) -> str:

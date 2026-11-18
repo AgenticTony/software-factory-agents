@@ -316,7 +316,8 @@ def build_parser() -> argparse.ArgumentParser:
     eval_cmd.add_argument(
         "--repeats", type=int, default=None,
         help="run each seed N times; the report carries mean and spread "
-             "per metric (default: 3; F-48 — cost scales with N)")
+             "per metric, and per seed caught k/N and the pass^k line "
+             "(default: 3; F-48/F-95 — cost scales with N)")
     eval_cmd.add_argument(
         "--keep-fixture", action="store_true",
         help="keep the fixture repo after the run for inspection")

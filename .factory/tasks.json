@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-17T21:00:00Z",
+  "updated_at": "2026-11-18T10:00:00Z",
   "tasks": [
     {
       "id": "F-00",
@@ -6843,6 +6843,77 @@
           "TASK-CONTRACT.md",
           "VALIDATOR-SPEC.md",
           "README.md",
+          "BUILD-ORDER.md",
+          ".factory/tasks.json",
+          ".factory/project.yaml",
+          ".factory/BOOTSTRAP.md"
+        ]
+      }
+    },
+    {
+      "id": "F-95",
+      "title": "The eval measures what F-94 added, and the misses the factory actually had",
+      "source": "BUILD-ORDER.md#f-95--the-eval-measures-what-f-94-added-and-the-misses-the-factory-actually-had",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-94"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "A sibling seed, run-4 shaped (`sibling-second-site`, kind `SiblingSeed`): a setup commit on the seed's own base (`eval-base/<id>`, rebuilt from the shared base each run) plants one defect class at two sites in two files and the seed's diff fixes one. Caught only when the L2 verdict is `pass` AND a surviving finding is marked `sibling` AND its file is the untouched site's AND its text names a marker; every other shape (a failed round, the flag missing, the fixed site's file, no marker, a verifier drop, no finding, no L2) scores zero and `sibling_check.reason` says why. The shared fixture is unchanged and every F-16 record is identical in any order of execution.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f95.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "A caller-break seed (`caller-break`): the diff changes `pack_list`'s return shape and leaves an unchanged, untested caller in another file broken (setup commit on its own base). An ordinary `SeedSpec` at layer `L2` whose `finding_files` restrict the L2 catch to the caller's file: caught only on a failing round with a surviving finding on the caller's file naming a marker that itself fails the round (l2's `_fails_round`: not ruled sibling, a round-failing severity) — a non-blocking caller finding in a round something else failed is never the catch; a finding on the changed file is not the catch; a forged `\"sibling\": true` on an in-diff finding still fails the round; every run records why on `caller_check` — caught, reported on the caller but ruled sibling (F-94's residual, rendered in the per-seed block), a caller finding naming no marker, found then dropped, or no finding on the caller.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f95.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "A clean diff beside an old same-class site (`clean-beside-old-site`) whose sibling finding is no blocking finding and no false fail; the report shows per seed `caught k/N repeats` (a quota-voided repeat leaves N, never a miss), a pass^k line (seeds caught on every judged repeat), `Never caught: … — check the seed or grader first`, and per seed and repeat `found, then dropped by the verifier` (vote drops of a finding naming the seeded defect; refused drops and nit-budget cuts excluded) — F-96's baseline.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f95.py::test_ac_3"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 150,
+        "wall_clock_min": 120
+      },
+      "scope": {
+        "paths": [
+          "factory/eval.py",
+          "tests/test_f95.py",
+          "tests/_support/f95.py",
+          "tests/_support/f16.py",
+          "tests/test_f16.py",
+          "tests/test_f48.py",
+          "tests/test_l2_review_fanout.py",
+          "VALIDATOR-SPEC.md",
+          "README.md",
+          "factory/cli.py",
           "BUILD-ORDER.md",
           ".factory/tasks.json",
           ".factory/project.yaml",
