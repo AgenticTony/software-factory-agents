@@ -16,9 +16,8 @@ agents do the volume. Architecture and reasoning: `DESIGN-LOCAL-FACTORY.md`.
 
 - **Never hand-edit `.factory/tasks.json`.** The orchestrator (F-03+) is its only
   writer. Changes go through a PR a human reviews.
-- **Bootstrap (until F-04 lands):** record each finished work order in
-  `.factory/BOOTSTRAP.md`, with evidence per acceptance criterion. F-04 reconciles
-  it into `tasks.json`.
+- **Record each finished work order** in `.factory/BOOTSTRAP.md`, with evidence
+  per acceptance criterion. After merge, the owner reconciles it into `tasks.json`.
 - **Contract test names are exact:** an acceptance ref `tests/test_fNN.py::test_ac_N`
   means a test function with exactly that name.
 - **Schema-validate on load.** Code touching `tasks.json` or `project.yaml`
@@ -27,7 +26,8 @@ agents do the volume. Architecture and reasoning: `DESIGN-LOCAL-FACTORY.md`.
   VALIDATOR-SPEC L1). A work-order session writes the tests first.
 - **Mechanical rules are linters/tests, not prose.** If a rule can be checked,
   check it in CI instead of writing it here.
-- `ruff check .` and `pytest -q` must pass before any commit.
+- `ruff check .`, `pyright` and `pytest -q -n auto` must pass before any commit
+  (CI runs all three, pyright with `--warnings`).
 - **Git:** never commit to `main`. One branch + PR per work order
   (`feat/fNN-<slug>`). Conventional commits (`feat:` / `fix:` / `chore:` / `docs:`),
   with the WO id in the subject, e.g. `feat: contract loading (F-02)`. **Never add
@@ -53,5 +53,6 @@ agents do the volume. Architecture and reasoning: `DESIGN-LOCAL-FACTORY.md`.
   Ubuntu 26.04 is NOT supported (srt nested-userns failure, PR #97) — deferred
   to the proposed F-61 work order (`.factory/BOOTSTRAP.md` §F-58). Without the
   deps the F-05 sandbox tests fail (never skip) — see README "Setup".
-- Bootstrap phase: one work order per session (F-01 to F-11, BUILD-ORDER.md).
-- CI (`.github/workflows/ci.yml`) runs ruff + pytest on every PR.
+- One work order per session (BUILD-ORDER.md).
+- CI (`.github/workflows/ci.yml`) runs ruff, pyright, pytest, a wheel build and the
+  live-network tests on every PR.
