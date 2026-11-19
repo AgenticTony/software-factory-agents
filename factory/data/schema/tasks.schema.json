@@ -7,7 +7,7 @@
   "required": ["version", "project", "tasks"],
   "additionalProperties": false,
   "properties": {
-    "version": { "const": 1 },
+    "version": { "type": "integer", "minimum": 1, "description": "The contract epoch this queue was last written under (factory/data/schema/epochs.json — the register's current epoch, stamped on every factory write; F-66). Older epochs load — stale, reported by `factory doctor` — and a NEWER epoch than the factory's register refuses at load (the semantic layer's ceiling, never reinterpreted by a downgrade)." },
     "project": { "type": "string", "pattern": "^[a-z0-9-]+$", "minLength": 1, "description": "Matches project.yaml `name`; the slug every factory-root path component is built from (F-62)." },
     "updated_at": { "type": "string", "format": "date-time" },
     "tasks": { "type": "array", "items": { "$ref": "#/$defs/task" } }

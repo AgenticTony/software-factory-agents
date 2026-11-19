@@ -8,6 +8,17 @@ Companion docs: [TASK-CONTRACT.md](TASK-CONTRACT.md) (what a contract is), [DESI
 
 ---
 
+## Contract epochs (F-66) — declared rule changes, checked before anything runs
+
+The rules a project loads under (both schema files and the semantic-check functions in `factory/contract.py`) change only through work orders, and every change is DECLARED in [`factory/data/schema/epochs.json`](factory/data/schema/epochs.json): the epoch it raised (a change that tightens — refuses something that loaded before — raises the epoch by one; a refactor, addition or loosening records `tightens: false` and leaves it), the date, the WO, the surfaces, what changed, the violation tags it introduced, and its migration (an owner action with the exact command, or a named automatic rewrite — only `restamp-version`, which re-stamps the queue's top-level `version` on every factory write and touches nothing else, so no approved contract's hash covers it).
+
+Two mechanisms keep the register honest:
+
+- **The CI fingerprint** (`tests/test_f66.py::test_ac_1`): sha256 of each schema file's raw bytes (whitespace included — they ship verbatim) and of every rule-bearing top-level binding of `factory/contract.py` (functions and constants matched by name pattern: `_check*`, `_validate*`, `validate_*`, `load_*`, `scope_*`, `budget_*`, `iter_schema*`, `_provider*`, `_allowlist*`, `apply_profile*`, and the rule constants). The live fingerprint must equal the register's LATEST entry's. A change with no entry fails CI with the instruction to add one. **Coverage bound (residual, stated):** moving a check into a NEW top-level helper matching the pattern is caught (an unlisted rule binding fails); moving it into a helper named outside the pattern (e.g. `_fmt`) is not — the pattern is the fingerprint's declared reach.
+- **`factory doctor`**: a read-only pass over every repo the approval ledger records (each profile approval carries `repo_path`) plus `--repo`, collecting ALL violations through all-errors modes of the real loaders, each with its epoch, WO and fix; any finding exits non-zero. `run`/`loop`/`import` run the same checks first and refuse with the full report. Non-fatal findings (a stale-but-valid epoch, draft tasks approval would refuse) are reported, never run-refusing; profile-approval keeps its own enforcement (`require_profile_approval`).
+
+A draft-only stale queue is re-proposed by `factory import` and reviewed as a first import; a task past `draft`, or an unparseable queue, refuses with the tasks named. Nothing ever migrates an approved task's contract.
+
 ## The five layers
 
 Each layer catches what the others can't. L0–L3 run before a PR opens; L4 runs after deploy. Any FAIL stops the line for that slice.

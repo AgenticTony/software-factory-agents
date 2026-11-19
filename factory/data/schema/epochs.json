@@ -1,0 +1,148 @@
+{
+  "entries": [
+    {
+      "epoch": 1,
+      "date": "2026-11-05",
+      "wo": "F-02",
+      "surfaces": [
+        "queue",
+        "profile"
+      ],
+      "change": "genesis: the queue/profile schemas and semantic checks as the F-13 pilot met them — the baseline JobFinderOS's 5 Nov queue was written under (registered retroactively by F-66)",
+      "tightens": true,
+      "migration": {
+        "kind": "none",
+        "note": "the starting rules; nothing predates them"
+      }
+    },
+    {
+      "epoch": 2,
+      "date": "2026-11-10",
+      "wo": "F-64",
+      "surfaces": [
+        "queue"
+      ],
+      "change": "budget caps: budget.max_turns <= 200 and wall_clock_min <= 150 (owner-confirmed) — work that needs more must be sliced",
+      "tightens": true,
+      "checks": [
+        "budget"
+      ],
+      "migration": {
+        "kind": "owner_action",
+        "command": "factory import",
+        "note": "a draft-only stale queue is re-proposed under the current caps; a task past draft needs its budget edited per task and the contract re-approved (`factory approve <task>`)"
+      }
+    },
+    {
+      "epoch": 3,
+      "date": "2026-11-10",
+      "wo": "F-65",
+      "surfaces": [
+        "queue",
+        "profile"
+      ],
+      "change": "declared file scope: scope.paths is a precondition of approval for build/docs tasks; malformed scope patterns (absolute, .., catch-all, character classes) refuse the load; profile paths.generated obeys the same rules",
+      "tightens": true,
+      "checks": [
+        "scope"
+      ],
+      "migration": {
+        "kind": "owner_action",
+        "command": "factory import",
+        "note": "the re-proposal drafts scope.paths for every task; review the globs, then approve per task (`factory approve <task>`)"
+      }
+    },
+    {
+      "epoch": 4,
+      "date": "2026-11-11",
+      "wo": "F-59",
+      "surfaces": [
+        "profile"
+      ],
+      "change": "model-provider rules: a client project refuses without an explicit non-zai provider block; region/base_url presence and shapes per kind; an egress allowlist entry naming a model-provider host that is not the project's own inference host refuses (JobFinderOS's profile refused on docs.z.ai)",
+      "tightens": true,
+      "checks": [
+        "provider",
+        "allowlist"
+      ],
+      "migration": {
+        "kind": "owner_action",
+        "command": "factory approve --profile",
+        "note": "edit project.yaml first (remove or replace the refused host, kind or region), then re-approve the profile"
+      }
+    },
+    {
+      "epoch": 4,
+      "date": "2026-11-18",
+      "wo": "F-96",
+      "surfaces": [
+        "profile"
+      ],
+      "change": "project.schema.json gains the verification block (one verifier per finding) — additive: nothing that loaded before refuses",
+      "tightens": false,
+      "migration": {
+        "kind": "none",
+        "note": "an addition that tightens nothing; no project needs to act"
+      }
+    },
+    {
+      "epoch": 4,
+      "date": "2026-11-19",
+      "wo": "F-66",
+      "surfaces": [
+        "queue",
+        "profile"
+      ],
+      "change": "epochs themselves: tasks.schema.json's version loosened from const 1 to integer >= 1 (the semantic layer bounds the ceiling at the current epoch); the approval ledger gains the optional repo_path field on profile entries; factory doctor reports every check through all-errors loaders",
+      "tightens": false,
+      "migration": {
+        "kind": "automatic",
+        "name": "restamp-version",
+        "note": "TaskQueue.save and the import write path re-stamp the queue's top-level version to the current epoch; it runs only on queues that already validate under the current rules (the loaders refuse anything else) and never touches a task field, so no approved contract's hash covers it"
+      },
+      "fingerprint": {
+        "schemas": {
+          "tasks.schema.json": "37489435a199517d79ebd9bf498f2b1ab73d94314f625b991116f507fb748822",
+          "project.schema.json": "e280ebc1ff31972977f498711186c413d94c9809abaec16b78ce8a97914aa9a1"
+        },
+        "functions": {
+          "NON_EXECUTABLE_KINDS": "754109e838ef8dde8d170cbb6743eda5288735c39ebc908a134c4f4b93ba5b7d",
+          "NON_EXECUTABLE_STATUSES": "3baa72dbac0f12ef77aba40c2c21aae08c758e13516675cf673e3f22803523ca",
+          "POST_APPROVAL_STATUSES": "71f899e13161676b32f3b40644515286b4071945ea8fbb2331173fbeef278de1",
+          "CONTRACT_HASH_EXCLUDED_FIELDS": "ee6c5026b6d826ab7139780af523242acc5512aa69a7369801587900ff24ec84",
+          "OWNER_STEP_HASH_EXCLUDED_FIELDS": "32be14173f7dbe2e93174cbf1f0ac0f4847bee7513c6631616230c722376f06e",
+          "_SCOPE_FORBIDDEN_CHARS": "3d21098b3b0186e87871755683febe34f45288956cafa19c6d047e736715b362",
+          "_WILDONLY_RE": "c7867982011eec4cc28b9da225f8ba13444d41d3ed72843398648821cea2d309",
+          "scope_pattern_error": "c4b73912f217a92e1d6857d6a4fc92d9bd4386ab6e874636f7fe4f3831f0d75d",
+          "_check_task_scope": "1bdaf88c96e77677775879763ef319336db804e9e7cee5bf9412fa0a3591c82d",
+          "_DISALLOWED_CONTROL_RE": "a553d028cf8f16e220bdc748caf6a809d8c7e46aacf297dcb0ed0462917ed035",
+          "_TASK_FREE_TEXT_KEYS": "134635132980fb1b1c85490b45e0f10cfced957a43fbd2211c2b96f9783d39d9",
+          "_check_control_strings": "8c90ef1775db852d7e362b4c7f40c2337e071bbb7fca7124b3740962ba073bef",
+          "_check_semantics": "7c2ce0783a68fc56045908710d015743e01dd55883b2b96d685a0eab294adcde",
+          "_validate": "c992146f4378b6bee6d78a69969a7e8cdf09ae5b46adc198fd552eb0447ee2bb",
+          "validate_against_schema": "bcd10d776424d8289af9e679f24b6207b94f6f0849492be99d0f8f497a2ef881",
+          "iter_schema_violations": "6c514012703179bcb0dd1049cb3acccda1541c9520446ef317330a776a82bbb0",
+          "validate_queue": "383cfef7d2c2b9f2fa76df44195f6c8017a0e0370dd96132d9f81e12f0a7d603",
+          "load_tasks": "b609680d3bc5833d207a85df7ea92e798f7f09ce6bcc001ac066e69ed039ef90",
+          "_ALLOWLIST_LABEL": "277e1faca5211762df92091f3203774da950e683ddc7c266ec38dcd229380554",
+          "_ALLOWLIST_HOST_RE": "f3128bcd6050f1b76f4faec43482addd9dfff56c9fa73d3418a5ddde847ff847",
+          "_PROVIDER_REGION_RES": "9c30e18a1e881f8c811f528c4e5fca5d743d15916c47e0a5b61df7407a27a01e",
+          "_REGION_KINDS": "14592a73d8f0f516056391f4cad1204f20dbac88e47ad31ce80686f84995ed09",
+          "_BASE_URL_KIND": "5ee64ade3cf4888e40a2301770e60c30f6b68d47e0cc7cbfe8287fa445977954",
+          "_provider_field_error": "6a98a7a4bbd4c3104b157771b85d72154ed2258c93239100dd945b5afb5b11b1",
+          "_provider_base_url_error": "0c99d55db336cfb8f8a618e89ed2de2f8761c08594d321c83774214223bc9e4a",
+          "_check_provider_semantics": "e1016dadbe85e152295066c70b1be19d05f7a97e22374ffae8aa61d773296875",
+          "_provider_semantic_violations": "09cc233cbe1b3359d39a38a8d39e28ff6745d977bb624794cbfbdc5bb3dbc8fd",
+          "_check_allowlist_hosts": "2852dc82b524bc31be8d895a2f295bf070f0b8d2ef22c1d06cba34d6691c50e2",
+          "_allowlist_host_violations": "f50ee8b0fbd95ff962f2271b96a1a7f7558c2e100e1c7fd782fd5661cb424aaa",
+          "_check_profile_semantics": "f9234e8a3985e7da039c014389bb4466825027788d1597ebae543e8ef1802816",
+          "budget_caps": "9c2e3f99b1ccb9645235b156a1eadec15be45681dd7fa54138b5b47c68e041ca",
+          "budget_floor": "b678df03283a3569f397c88a233aa95f115dd56b15f5f7402d8b07c19d9c0959",
+          "apply_profile_defaults": "4e7185a84bd5780e9c5719a211805b4bf2511f4b04ddce9fd9372cbe16bc8eef",
+          "_check_profile_toolkit": "1d939efc9897cd18f90b4c0990bdcd506d909e4cb8c92818784288bfc3a24ed2",
+          "load_profile": "8a4d17380860cc647d1830f5203b502c511de495e1ea584bc7c98b70490afd19"
+        }
+      }
+    }
+  ]
+}

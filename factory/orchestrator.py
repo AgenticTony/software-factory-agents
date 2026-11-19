@@ -2849,6 +2849,16 @@ def run_once(
     """
     queue_path = Path(queue_path)
     profile_path = Path(profile_path) if profile_path else queue_path.parent / "project.yaml"
+    # F-66 AC-2/AC-3: the doctor preflight — every rule this repo must
+    # meet, reported together, BEFORE any single loader's first-error
+    # refusal buries the rest (the F-13 pilot met three rule changes as
+    # one bare schema error). Read-only and gh-free, so the peak-window
+    # and red-CI orderings below are untouched (both loaders already
+    # refused before the window return today). Profile-approval keeps
+    # its own enforcement just below, whose message already names the
+    # changed groups and the fix command.
+    from factory.doctor import preflight_run
+    preflight_run(queue_path, profile_path, factory_root=factory_root)
     profile = load_profile(profile_path)
     factory_root = Path(factory_root) if factory_root else FACTORY_ROOT_DEFAULT
     config = config if config is not None else load_config(factory_root / CONFIG_FILE)

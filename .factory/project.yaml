@@ -425,6 +425,15 @@ paths:
     # and the drop-cost rendering — the numbers `factory eval` reports
     # to the owner rest on them (the test_f95 precedent).
     - "tests/test_f99.py"
+    # F-66: the contract-epoch tests judge the epoch register itself
+    # (the fingerprint CI compares the live rule surfaces against), the
+    # doctor report and the re-proposal gate — the declaration layer
+    # every later rule change rides on. The register and its schema are
+    # listed explicitly beside the factory/data/** glob (the F-84
+    # precedent for judge-surface schemas).
+    - "tests/test_f66.py"
+    - "factory/data/schema/epochs.json"
+    - "factory/data/schema/epochs.schema.json"
     # F-101: the accept-path contract tests judge what `recover
     # --accept` validates (the real ref, the reachability proof, the
     # unfiltered work clone, the by-ref clean clone) — the tests that

@@ -2,6 +2,8 @@
 
 The factory never reads a project's planning prose to decide what to do. It reads **`.factory/tasks.json`** (the queue) and **`.factory/project.yaml`** (how to build, check, and ship the project). Both live in the target repo. Schemas: [`factory/data/schema/tasks.schema.json`](factory/data/schema/tasks.schema.json), [`factory/data/schema/project.schema.json`](factory/data/schema/project.schema.json) (shipped in the package, F-51). Draft profiles: [`projects/`](projects/).
 
+The queue's top-level `version` is the **contract epoch** it was last written under (F-66): every factory write stamps the current epoch from [`factory/data/schema/epochs.json`](factory/data/schema/epochs.json), the register that declares each rule change (which WO, what changed, its migration). A queue older than the current epoch loads — `factory doctor` reports it, and the next write re-stamps it (the one registered automatic rewrite; it never touches a task, so no approved contract's hash covers it). A queue naming a newer epoch than the factory's register refuses to load. `factory run`/`loop`/`import` refuse with doctor's full report — every violation, each with its epoch, the WO that introduced it and the exact fix — instead of one bare schema error; `factory import` re-proposes a draft-only stale queue under the current rules (you review the whole diff as a first import) and refuses, naming the tasks, when any task is past `draft`.
+
 Companion docs: [DESIGN-LOCAL-FACTORY.md](DESIGN-LOCAL-FACTORY.md) (architecture + decisions), [VALIDATOR-SPEC.md](VALIDATOR-SPEC.md) (how "done" is proven).
 
 ---
