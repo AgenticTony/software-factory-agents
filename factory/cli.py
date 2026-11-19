@@ -207,8 +207,12 @@ def build_parser() -> argparse.ArgumentParser:
              "waiver (task, escalation, PR head SHA, evidence, who, "
              "when), re-runs L0 on that exact head with only that class "
              "waived, continues L1 and review, and on pass marks the PR "
-             "ready and moves the task to in_review. new_dependency/"
-             "risk_path_touched only; interactive, no --yes",
+             "ready and moves the task to in_review. The branch is "
+             "fetched from the remote (a remote-only branch works, "
+             "F-101) and the head must still be reachable on it — a "
+             "force-push past the reviewed SHA refuses before any gate "
+             "runs. new_dependency/risk_path_touched only; interactive, "
+             "no --yes",
     )
     recover.add_argument(
         "--reject", action="store_true",

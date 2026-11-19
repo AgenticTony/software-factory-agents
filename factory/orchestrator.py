@@ -7672,18 +7672,28 @@ def _recover_accept_leased(
 ) -> str:
     """The accept round's body, already under the queue's idle lease."""
     project = profile["name"]
+    # F-101: the accept's work clone is FULL, never blobless. It is the
+    # one local store the clean clone below lazily fetches blobs from —
+    # a blobless clone cannot serve them (a partial clone of a partial
+    # clone dies on ``git upload-pack``), and the accept is a rare,
+    # owner-driven path where correctness buys the local copy.
     work = create_run(project, source, factory_root=factory_root,
-                      ref=repo_cfg["default_branch"])
+                      ref=repo_cfg["default_branch"], full=True)
     try:
-        # Bring the PR branch's objects into the run clone and verify the
-        # exact SHA is present — the validation judges that commit, never
-        # whatever the branch points at now.
+        # Bring the PR branch's objects into the run clone under a REAL
+        # ref and verify the exact SHA is REACHABLE from it — the
+        # validation judges that commit, never whatever the branch
+        # points at now, and never a commit that merely rode along in
+        # the object store (F-101: presence is not reachability).
         branch = (task.get("links") or {}).get("branch")
+        accept_ref = f"refs/factory/accept/{branch}"
         try:
             fetch = remote_call(
                 ["git", *GIT_HARDENING, "-C", str(work.root), "fetch",
                  "--quiet", "--no-tags", repo_cfg["remote"],
-                 f"refs/heads/{branch}"],
+                 # forced: a stale refs/factory/accept/<branch> from an
+                 # earlier accept is overwritten, never trusted
+                 f"+refs/heads/{branch}:{accept_ref}"],
                 what=f"fetch of the escalation branch {branch!r}",
             )
         except RemoteCallTimeout as exc:
@@ -7693,12 +7703,7 @@ def _recover_accept_leased(
                 f"cannot fetch the escalation branch {branch!r} from "
                 f"{repo_cfg['remote']}: {fetch.stderr.strip()[:300]}"
             )
-        have = subprocess.run(
-            ["git", *GIT_HARDENING, "-C", str(work.root), "cat-file", "-e",
-             f"{sha}^{{commit}}"],
-            capture_output=True,
-        )
-        if have.returncode != 0:
+        if not _is_ancestor(work.root, f"{sha}^{{commit}}", accept_ref):
             raise RunError(
                 f"the PR head {sha[:12]} is not reachable on "
                 f"{branch!r} — a force-push moved the branch; re-read the "
@@ -7712,8 +7717,14 @@ def _recover_accept_leased(
                 f"the PR head {sha[:12]} shares no history with "
                 f"{repo_cfg['default_branch']} — refusing to judge it"
             )
+        # F-101: a clone carries only the source's refs/heads, so the
+        # accept ref is fetched into the clean clone explicitly — the
+        # sha resolves BY REF and the checkout's blob backfills go to
+        # the work clone (full, local), never to the network and never
+        # to a blobless partial-of-partial.
         clean = create_run(project, work.root, factory_root=factory_root,
-                           ref=sha)
+                           ref=sha,
+                           local_fetch=[(work.root, f"+{accept_ref}:{accept_ref}")])
         accept_reports: dict = {"L0": None, "L1": None, "L2": None}
 
         def accept_fail(message: str) -> RunError:

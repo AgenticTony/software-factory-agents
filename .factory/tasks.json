@@ -7090,6 +7090,74 @@
       "acceptance_hash": "6cec22ca1fb9d7236a2ac9787bb44be6abce9a47193918701204686be4cb2f3a",
       "approved_at": "2026-11-18T20:24:16Z",
       "approved_by": "Anthony"
+    },
+    {
+      "id": "F-101",
+      "title": "Accepting an escalated PR works when its branch exists only on GitHub",
+      "source": "BUILD-ORDER.md#f-101--accepting-an-escalated-pr-works-when-its-branch-exists-only-on-github",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-96"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "The accept fetch lands the escalation branch as a real ref in the work clone (+refs/heads/<branch>:refs/factory/accept/<branch>) and the reviewed sha is proven REACHABLE from that ref (merge-base --is-ancestor): a force-push past the sha, and a sha that only rode along in the object store, refuse with today's message before any gate session runs.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f101.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "The clean clone checks out the exact sha with its file contents by construction: the work clone is made without the blob filter (never a partial clone of a partial clone) and the accept ref is fetched into the clean clone explicitly, so the sha resolves by ref, never by lazy-fetch luck, with no network after the initial fetch.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f101.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "The full leased accept round, end to end through factory recover --accept against a real bare remote with scripted L2 seats, reaches its verdict and the task advances on pass.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f101.py::test_ac_3"
+          }
+        }
+      ],
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 80,
+        "wall_clock_min": 60
+      },
+      "scope": {
+        "paths": [
+          "factory/orchestrator.py",
+          "factory/runs.py",
+          "factory/cli.py",
+          "tests/test_f101.py",
+          "tests/_support/f101.py",
+          "TASK-CONTRACT.md",
+          "VALIDATOR-SPEC.md",
+          "BUILD-ORDER.md",
+          ".factory/tasks.json",
+          ".factory/project.yaml",
+          ".factory/BOOTSTRAP.md"
+        ]
+      },
+      "attempts": [],
+      "links": {}
     }
   ]
 }

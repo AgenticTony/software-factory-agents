@@ -434,6 +434,13 @@ paths:
     - "tests/test_f66.py"
     - "factory/data/schema/epochs.json"
     - "factory/data/schema/epochs.schema.json"
+    # F-101: the accept-path contract tests judge what `recover
+    # --accept` validates (the real ref, the reachability proof, the
+    # unfiltered work clone, the by-ref clean clone) — the tests that
+    # keep the accept from ever judging a commit the owner did not
+    # review (same precedent).
+    - "tests/test_f101.py"
+    - "tests/_support/f101.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 
