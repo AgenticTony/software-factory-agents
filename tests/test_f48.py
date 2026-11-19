@@ -445,7 +445,8 @@ def test_review_cli_repeats_flag_reaches_the_runner(tmp_path, monkeypatch):
     root.mkdir()
     seen: list[int] = []
 
-    def fake_run(factory_root, out_path, *, reviewers, repeats, keep_fixture):
+    def fake_run(factory_root, out_path, *, reviewers, repeats,
+                 keep_fixture, config=None):  # F-100: the eval's registry
         seen.append(repeats)
         rendered = tmp_path / "rendered.md"
         rendered.write_text("report")

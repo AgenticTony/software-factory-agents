@@ -166,10 +166,11 @@ def test_ac_1():
     """Epochs are declared, CI fingerprints the rule surfaces, the
     current epoch is stamped on every factory write."""
     reg = load_register()
-    # Epochs 1-4: baseline plus the three retroactive WOs the pilot hit.
+    # Epochs 1-5: baseline, the three retroactive WOs the pilot hit,
+    # and F-100's model-registry tightening (epoch 5).
     by_wo = {e.wo: e for e in reg.entries}
-    assert {e.epoch for e in reg.entries} >= {1, 2, 3, 4}
-    assert current_epoch() == 4
+    assert {e.epoch for e in reg.entries} >= {1, 2, 3, 4, 5}
+    assert current_epoch() == 5
     assert by_wo["F-64"].epoch == 2 and "queue" in by_wo["F-64"].surfaces
     assert by_wo["F-65"].epoch == 3
     assert by_wo["F-59"].epoch == 4 and "profile" in by_wo["F-59"].surfaces
@@ -638,6 +639,27 @@ PROFILES_TOTAL = [
     ),
     (
         {"docs_allowlist": ["docs.z.ai"], "name": 7},
+        "docs.z.ai",
+    ),
+    # F-100 (epoch 5): model_restrictions malformed shapes — a list, a
+    # string, and a dict with a non-string value — the collector stays
+    # total and the client-without-answer rule still fires.
+    (
+        {"docs_allowlist": ["docs.z.ai"], "data_owner": "client",
+         "model_restrictions": ["none"]},
+        "model_restrictions answer",
+    ),
+    (
+        {"docs_allowlist": ["docs.z.ai"], "data_owner": "client",
+         "model_restrictions": "none"},
+        "model_restrictions answer",
+    ),
+    # A DICT with a malformed value is not the missing answer — the
+    # schema check owns it; the collector stays total either way.
+    (
+        {"docs_allowlist": ["docs.z.ai"], "data_owner": "client",
+         "model_restrictions": {"value": 7, "answered_by": "o",
+                                "answered_at": "t"}},
         "docs.z.ai",
     ),
 ]

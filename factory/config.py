@@ -2,12 +2,17 @@
 
 Settings that belong to the factory, not to any one project: today, the
 peak window during which ``factory loop`` starts no session, how many
-reviewer sessions L2 fans out to (F-38), and how many times a failed
-final full review may repeat (F-41). The Z.ai Coding Plan's quota is
-shared with the owner's own interactive use, and the owner works
-08:00–12:00 Mon–Fri Swedish time, so that is the default window.
+reviewer sessions L2 fans out to (F-38), how many times a failed final
+full review may repeat (F-41), and — F-100 — the one model registry
+every seat resolves through. The Z.ai Coding Plan's quota is shared
+with the owner's own interactive use, and the owner works 08:00–12:00
+Mon–Fri Swedish time, so that is the default window.
 
-The file is YAML at ``<factory_root>/config.yaml`` (absent = defaults)::
+The file is YAML at ``<factory_root>/config.yaml`` (absent = defaults).
+The ``models`` block (F-100) is the owner-maintained registry — the
+documented example here is the shipped default (``factory.models.
+DEFAULT_REGISTRY``); the owner's file is theirs, never written by the
+factory::
 
     peak_window:
       timezone: Europe/Stockholm
@@ -18,16 +23,51 @@ The file is YAML at ``<factory_root>/config.yaml`` (absent = defaults)::
     final_review_repeats: 1   # failed final review repeats (F-41), >= 0
     ci_wait_min: 30    # F-75: minutes a run waits for its PR's CI, >= 0
                        # (0 = don't wait — the pre-F-75 behaviour)
-    prices:            # F-59: per kind+model USD per MILLION tokens;
-                      # input / cache_read / cache_write / output. A
-                      # missing (kind, model) renders n/a in factory
-                      # status, never 0. Owner-maintained.
-      bedrock:
-        claude-sonnet-5-5: {input: 3.0, cache_read: 0.3, cache_write: 3.75, output: 15.0}
+    models:            # F-100: the one model registry (owner-maintained)
+      aliases:
+        glm-latest: glm-5.3      # bumping the alias moves every role
+      providers:
+        zai: {origin: cn}        # the no_china restriction reads this
+        anthropic: {origin: us}
+        bedrock: {origin: us}
+      stacks:
+        standard:                # zai-ONLY (owner decision 2026-11-19):
+          contained: false       # every role on the GLM workhorse
+          roles:
+            implementer: {kind: zai, model: glm-latest}
+            reviewer.conformance: {kind: zai, model: glm-latest}
+            reviewer.hunt: {kind: zai, model: glm-latest}
+            verifier: {kind: zai, model: glm-latest}
+            importer: {kind: zai, model: glm-latest}
+            final_review.fix: {kind: zai, model: glm-latest}
+            final_review.strong: {kind: zai, model: glm-latest}
+        standard-plus:           # the opt-in: zai seats plus the
+          contained: false       # cross-family hunt and final review
+          roles:                 # (anthropic admitted at re-approval)
+            implementer: {kind: zai, model: glm-latest}
+            reviewer.conformance: {kind: zai, model: glm-latest}
+            reviewer.hunt: {kind: anthropic, model: claude-sonnet-5-5}
+            verifier: {kind: zai, model: glm-latest}
+            importer: {kind: zai, model: glm-latest}
+            final_review.fix: {kind: anthropic, model: claude-opus-5-5}
+            final_review.strong: {kind: anthropic, model: claude-fable-5-2}
+        no-china: {contained: false, roles: {…}}   # anthropic-only seats
+        contained: {contained: true, roles: {…}}   # bedrock, client region
+      prices:          # per kind+model USD per MILLION tokens; input /
+                      # cache_read / cache_write / output. A missing
+                      # (kind, model) renders n/a in factory status,
+                      # never 0. Moved here from the top-level prices
+                      # block (F-100), which still loads for one
+                      # release with a deprecation note.
+        anthropic:
+          claude-sonnet-5-5: {input: 3.0, cache_read: 0.3, cache_write: 3.75, output: 15.0}
 
 Anything malformed is refused with :class:`ConfigError` — a window that
 silently failed to parse would let the factory spend the quota at the
-exact hours the owner needs it.
+exact hours the owner needs it, and a malformed registry (an unknown
+role, an alias cycle, a dangling alias, an unknown provider kind, a
+stack missing a required role) refuses with the reason named rather
+than silently falling back to defaults.
 """
 
 from __future__ import annotations
@@ -35,9 +75,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, time
 from pathlib import Path
+from typing import Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
+
+from factory.models import (
+    DEFAULT_REGISTRY,
+    ModelRegistry,
+    RegistryError,
+    prices_from_raw,
+    registry_from_raw,
+)
 
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 CONFIG_FILE = "config.yaml"
@@ -91,12 +140,27 @@ class FactoryConfig:
     reviewers: int = DEFAULT_REVIEWERS
     final_review_repeats: int = DEFAULT_FINAL_REVIEW_REPEATS
     ci_wait_min: int = DEFAULT_CI_WAIT_MIN
-    # F-59 AC-4: the owner-maintained price table — kind -> model ->
-    # {input, cache_read, cache_write, output} in USD per million
+    # F-100 AC-1: the one model registry — aliases, stacks (each marked
+    # contained or not), provider origins and the prices. The default
+    # is the documented example (factory.models.DEFAULT_REGISTRY); a
+    # config file's ``models`` block replaces it wholesale, with every
+    # malformed shape refused by :func:`factory.models.registry_from_raw`.
+    models: ModelRegistry = field(default=DEFAULT_REGISTRY)
+    # F-59 AC-4 → F-100: the owner-maintained price table, now read
+    # from the registry's ``models.prices`` (the top-level ``prices``
+    # block still loads for one release, with a deprecation note; both
+    # at once refuse). Kind -> model -> rates in USD per million
     # tokens. Missing entries are n/a in status, never 0; the table is
     # display-only (estimates), never gate state.
     prices: "dict[str, dict[str, dict[str, float]]]" = field(
-        default_factory=dict)
+        default_factory=lambda: dict(DEFAULT_REGISTRY.prices))
+    # F-100 AC-5: the eval's per-run role overrides (``factory eval
+    # --role <role>=<model>``) — role -> model-or-alias. NEVER loaded
+    # from the file (an unknown key there refuses, exactly like every
+    # other key this dataclass does not read); only ``factory eval``
+    # sets it, in memory, on the config object it passes down, so an
+    # override is never written to any profile or registry.
+    role_overrides: Mapping[str, str] = field(default_factory=dict)
 
 
 def _clock(value, key: str) -> time:
@@ -173,38 +237,14 @@ def _ci_wait_min(raw) -> int:
     return raw
 
 
-_PRICE_FIELDS = ("input", "cache_read", "cache_write", "output")
-
-
 def _prices(raw) -> "dict[str, dict[str, dict[str, float]]]":
-    """Validate the ``prices`` table (F-59): kind -> model -> the four
-    per-million rates, each a finite number >= 0. A malformed table is a
-    ConfigError — a wrong price silently applied to every status page is
-    worse than a loud refusal."""
-    if not isinstance(raw, dict):
-        raise ConfigError(f"prices must be a mapping, got {raw!r}")
-    table: "dict[str, dict[str, dict[str, float]]]" = {}
-    for kind, models in raw.items():
-        if not isinstance(models, dict):
-            raise ConfigError(f"prices.{kind} must be a mapping, got {models!r}")
-        for model, rates in models.items():
-            if not isinstance(rates, dict) or set(rates) != set(_PRICE_FIELDS):
-                raise ConfigError(
-                    f"prices.{kind}.{model} needs exactly "
-                    f"{list(_PRICE_FIELDS)}, got "
-                    f"{sorted(rates) if isinstance(rates, dict) else rates!r}"
-                )
-            for field_name, value in rates.items():
-                if isinstance(value, bool) or not isinstance(value, (int, float)) \
-                        or value < 0:
-                    raise ConfigError(
-                        f"prices.{kind}.{model}.{field_name} must be a "
-                        f"number >= 0, got {value!r}"
-                    )
-            table.setdefault(str(kind), {})[str(model)] = {
-                name: float(rates[name]) for name in _PRICE_FIELDS
-            }
-    return table
+    """Validate the (deprecated, top-level) ``prices`` table: the same
+    rules :func:`factory.models.prices_from_raw` enforces on the
+    registry's own table, wrapped in :class:`ConfigError`."""
+    try:
+        return prices_from_raw(raw)
+    except RegistryError as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def load_config(path: Path | str | None) -> FactoryConfig:
@@ -219,7 +259,11 @@ def load_config(path: Path | str | None) -> FactoryConfig:
     Raises:
         ConfigError: The file is unreadable, not a mapping, has unknown
             keys, or carries a malformed ``peak_window``, ``reviewers``,
-            ``final_review_repeats`` or ``ci_wait_min``.
+            ``final_review_repeats``, ``ci_wait_min``, ``models`` (the
+            registry — every malformed shape names its reason) or
+            ``prices``; or names BOTH ``models.prices`` and the
+            top-level ``prices`` (one release of overlap, then the old
+            block goes — refusing beats picking silently).
     """
     if path is None or not Path(path).exists():
         return FactoryConfig()
@@ -233,9 +277,33 @@ def load_config(path: Path | str | None) -> FactoryConfig:
         raise ConfigError(f"factory config {path} must be a mapping")
     unknown = sorted(set(raw) - {"peak_window", "reviewers",
                                   "final_review_repeats", "ci_wait_min",
-                                  "prices"})
+                                  "prices", "models"})
     if unknown:
         raise ConfigError(f"factory config {path}: unknown keys {unknown}")
+    models = DEFAULT_REGISTRY
+    if "models" in raw:
+        try:
+            models = registry_from_raw(raw["models"])
+        except RegistryError as exc:
+            raise ConfigError(
+                f"factory config {path}: models: {exc}") from exc
+    prices: "dict[str, dict[str, dict[str, float]]]"
+    if "prices" in raw and "models" in raw and (
+            isinstance(raw["models"], dict)
+            and "prices" in (raw["models"] or {})):
+        raise ConfigError(
+            f"factory config {path}: prices appears both top-level "
+            "(deprecated) and under models — keep one (models.prices is "
+            "the F-100 home; the top-level block loads for one release)"
+        )
+    if "models" in raw:
+        prices = dict(models.prices)
+        if "prices" in raw:
+            prices = _prices(raw["prices"])  # the deprecated block still wins
+    elif "prices" in raw:
+        prices = _prices(raw["prices"])
+    else:
+        prices = dict(DEFAULT_REGISTRY.prices)
     return FactoryConfig(
         peak_window=_peak_window(raw["peak_window"]) if "peak_window" in raw
         else DEFAULT_PEAK_WINDOW,
@@ -249,7 +317,8 @@ def load_config(path: Path | str | None) -> FactoryConfig:
             _ci_wait_min(raw["ci_wait_min"])
             if "ci_wait_min" in raw else DEFAULT_CI_WAIT_MIN
         ),
-        prices=_prices(raw["prices"]) if "prices" in raw else {},
+        models=models,
+        prices=prices,
     )
 
 

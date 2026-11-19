@@ -77,6 +77,12 @@ PROFILE_SECURITY_GROUPS: dict[str, tuple[str, ...]] = {
     "provider": ("provider",),
     "providers_allowed": ("providers_allowed",),
     "seat_providers": ("seat_providers",),
+    # F-100 AC-3: the stack a project runs and the client's recorded
+    # restriction answer are owner-approved security content — a client
+    # repo moving itself to a freer stack (or editing its recorded
+    # answer) re-approval-gates the profile.
+    "model_stack": ("model_stack",),
+    "model_restrictions": ("model_restrictions",),
     "repo.remote": ("repo", "remote"),
     # R1 fix 1: repo.path decides WHICH checkout every run clones
     # (orchestrator → create_run's source). Unapproved, an approved

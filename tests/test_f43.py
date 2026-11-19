@@ -29,6 +29,7 @@ import pytest
 from _support.f63 import importer_fixture_approve, ledger_approve
 from _support.tokens import fake_jwt, fake_token, fake_zai_key
 
+from factory.config import FactoryConfig
 from factory.contract import acceptance_hash, load_profile
 from factory.gates import FileChange
 from factory.importer import ImportRefused, run_import
@@ -106,6 +107,8 @@ class _Env:
         )
         profile = {
             "name": "fixture",
+            # F-100: the standard stack's anthropic seats are admitted.
+            "providers_allowed": ["anthropic"],
             "repo": {"path": str(self.repo), "default_branch": "main",
                      "remote": str(self.remote), "merge_method": "squash"},
             "commands": {"setup": "true",
@@ -817,6 +820,9 @@ def _import_repo(tmp_path: Path) -> Path:
     factory_dir.mkdir()
     (factory_dir / "project.yaml").write_text(
         "name: jobfinderos\n"
+        # F-100: the standard stack's anthropic seats are admitted.
+        "providers_allowed:\n"
+        "  - anthropic\n"
         "repo:\n"
         "  path: .\n"
         "  default_branch: main\n"
@@ -1025,7 +1031,9 @@ def test_review3():
     # round 2's shape: the F-59 line indexed to a bare string.
     round2 = _secrets_shape_offenders(
         "factory/cli.py",
-        cli.replace("secrets=run_secrets(_keep_path_profile(args)),",
+        cli.replace("secrets=run_secrets(\n"
+                    "                    _keep_path_profile(args), "
+                    "config=_keep_config(args)),",
                     "secrets=run_secrets(_keep_path_profile(args))[0],"),
     )
     assert round2 and "factory/cli.py" in round2[0], round2
@@ -1033,7 +1041,9 @@ def test_review3():
     # pass the round-2 subtree rule).
     ifexp = _secrets_shape_offenders(
         "factory/cli.py",
-        cli.replace("secrets=run_secrets(_keep_path_profile(args)),",
+        cli.replace("secrets=run_secrets(\n"
+                    "                    _keep_path_profile(args), "
+                    "config=_keep_config(args)),",
                     "secrets=(run_secrets(_keep_path_profile(args))[0]"
                     " if True else ()),"),
     )
@@ -1051,8 +1061,9 @@ def test_review3():
     orch = (REPO_ROOT / "factory" / "orchestrator.py").read_text()
     comma_drop = _secrets_shape_offenders(
         "factory/orchestrator.py",
-        orch.replace("egress_secrets = run_secrets(profile)",
-                     "egress_secrets = run_secrets(profile)[0]"),
+        orch.replace(
+            "egress_secrets = run_secrets(profile, config=ctx.config)",
+            "egress_secrets = run_secrets(profile, config=ctx.config)[0]"),
     )
     assert comma_drop and "orchestrator.py" in comma_drop[0], (
         "the orchestrator indexing mutation did not trip, named"
@@ -1116,6 +1127,7 @@ def test_review5(tmp_path, monkeypatch):
     with pytest.raises(SessionConfigError) as exc:
         session_mod._run_prepared(
             "reviewer", "do it", run_dir, {"name": "fixture"}, settings,
+            config=FactoryConfig(),
             max_turns=2, timeout_min=1, cli_path=cli)
     message = str(exc.value)
     assert SEAT_TOKEN not in message, "the literal token reached the error"

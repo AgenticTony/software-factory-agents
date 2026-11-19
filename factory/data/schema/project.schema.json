@@ -70,7 +70,7 @@
     },
     "providerModels": {
       "type": "object",
-      "description": "One model id per seat role (arbiter optional — it defaults to the reviewer's model, F-72). The seats' CLI model override comes from this map (F-59); a seat may only run a model of its resolved provider.",
+      "description": "One model id per seat role (arbiter optional — it defaults to the reviewer's model, F-72). DEPRECATED by F-100: still accepted for one release as a project-level override that beats the stack, with a deprecation note in factory doctor (factory.models.deprecation_notes) — a registry edit cannot reach a seat pinned here, so move to model_stack.",
       "required": ["implementer", "reviewer", "verifier", "importer"],
       "additionalProperties": false,
       "properties": {
@@ -83,8 +83,8 @@
     },
     "providerBlock": {
       "type": "object",
-      "description": "The project's model provider (F-59). Owner-approved profile security content: data_owner, provider, providers_allowed and seat_providers are hashed as F-63 security groups, so a client repo cannot change its provider (or flip itself to self) without re-approval. region is required for bedrock/vertex and refused for the others; base_url is required for and allowed only with anthropic_compatible (https, exact host, no userinfo/query/fragment, no IP literal or localhost — refused at load).",
-      "required": ["kind", "models"],
+      "description": "The project's model provider (F-59). Owner-approved profile security content: data_owner, provider, providers_allowed and seat_providers are hashed as F-63 security groups, so a client repo cannot change its provider (or flip itself to self) without re-approval. region is required for bedrock/vertex and refused for the others; base_url is required for and allowed only with anthropic_compatible (https, exact host, no userinfo/query/fragment, no IP literal or localhost — refused at load). F-100: models is optional (the deprecated project-level override); a block with neither models nor a profile model_stack leaves every seat to the registry's stack.",
+      "required": ["kind"],
       "additionalProperties": false,
       "properties": {
         "kind": { "$ref": "#/$defs/providerKind" },
@@ -121,9 +121,25 @@
     },
     "seat_providers": {
       "type": "object",
-      "description": "Seat role -> provider override (F-59 AC-5). Every kind must come from providers_allowed; the override's host joins only that seat's sandbox egress, never the implementer's. F-72: the arbiter seat may be overridden here; without an override it resolves to the reviewer's provider and model. F-80: the contract_reviewer seat (the pre-approval contract review) on the same terms.",
-      "propertyNames": { "enum": ["implementer", "reviewer", "verifier", "importer", "arbiter", "contract_reviewer"] },
+      "description": "Seat role -> provider override (F-59 AC-5). Every kind must come from providers_allowed; the override's host joins only that seat's sandbox egress, never the implementer's. F-72: the arbiter seat may be overridden here; without an override it resolves to the reviewer's provider and model. F-80: the contract_reviewer seat (the pre-approval contract review) on the same terms. F-100: a reviewer pin covers both lens roles; final_review.fix/.strong pin F-97's final-review tiers.",
+      "propertyNames": { "enum": ["implementer", "reviewer", "verifier", "importer", "arbiter", "contract_reviewer", "final_review.fix", "final_review.strong"] },
       "additionalProperties": { "$ref": "#/$defs/seatProviderBlock" }
+    },
+    "model_stack": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The registry stack this project runs (F-100 AC-3): a name from the factory config's models.stacks. Owner-approved profile security content (F-63 group model_stack — changing it re-approval-gates the profile). Absent: the stack the recorded model_restrictions answer picks, else 'standard'. A stack whose roles fall outside the project's provider.kind/providers_allowed refuses at load, named — a stack edit can never move a project outside what it approved."
+    },
+    "model_restrictions": {
+      "type": "object",
+      "description": "The client's recorded onboarding answer (F-100 AC-3/AC-6): 'does the client restrict which AI models may process the code, or where it runs?'. REQUIRED for a client project (data_owner: client) — the question is always asked, never assumed; absent refuses the load naming the missing answer. none allows every stack (standard, GLM included — F-59's blanket client/zai refusal is replaced by this answer); no_china refuses any provider the registry marks origin cn; contained refuses any stack not marked contained. Owner-approved profile security content (F-63 group model_restrictions).",
+      "required": ["value", "answered_by", "answered_at"],
+      "additionalProperties": false,
+      "properties": {
+        "value": { "enum": ["none", "no_china", "contained"] },
+        "answered_by": { "type": "string", "minLength": 1 },
+        "answered_at": { "type": "string", "minLength": 1 }
+      }
     },
     "repo": {
       "type": "object",

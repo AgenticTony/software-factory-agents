@@ -30,6 +30,7 @@ import pytest
 from _support import live_session_gate
 from claude_agent_sdk import CLINotFoundError, ResultMessage
 
+from factory.config import FactoryConfig
 from factory.provider import ZAI_BASE_URL as DEFAULT_BASE_URL
 from factory.session import (
     SEATS,
@@ -222,6 +223,7 @@ def test_ac_3(tmp_path: Path, monkeypatch):
                         lambda service: None)
     with pytest.raises(SessionConfigError, match="factory-zai"):
         run_session_sandboxed(
+            config=FactoryConfig(),
             seat="implementer",
             prompt="blocked",
             run_dir=tmp_path,
@@ -271,6 +273,7 @@ def test_ac_3(tmp_path: Path, monkeypatch):
         try:
             events: list[dict] = []
             record = run_session_sandboxed(
+                config=FactoryConfig(),
                 seat="implementer",
                 prompt=(
                     "Create a file named protected.md in the working "
@@ -649,6 +652,7 @@ def test_ac_4(tmp_path: Path, monkeypatch):
                         lambda service: None)
     with pytest.raises(SessionConfigError, match="factory-zai"):
         run_session_sandboxed(
+            config=FactoryConfig(),
             seat="implementer",
             prompt="ok",
             run_dir=tmp_path,
@@ -675,6 +679,7 @@ def test_ac_4(tmp_path: Path, monkeypatch):
     run = create_run("f06-ac4", REPO, factory_root=tmp_path)
     try:
         record = run_session_sandboxed(
+            config=FactoryConfig(),
             seat="implementer",
             prompt="Reply with exactly the word ok and nothing else.",
             run_dir=run.root,
@@ -1113,6 +1118,7 @@ def test_review2_default_settings_path_uses_the_factory_root(tmp_path: Path):
     with _pytest.MonkeyPatch.context() as mp:
         _sandbox_stub(mp, captured)
         session_mod.run_session_sandboxed(
+            config=FactoryConfig(),
             seat="implementer",
             prompt="p",
             run_dir=run_root,
@@ -1140,6 +1146,7 @@ def test_review2_settings_and_runner_are_cleaned_up(tmp_path: Path):
     with _pytest.MonkeyPatch.context() as mp:
         _sandbox_stub(mp, captured)
         session_mod.run_session_sandboxed(
+            config=FactoryConfig(),
             seat="implementer",
             prompt="p",
             run_dir=run.root,
@@ -1276,6 +1283,7 @@ def test_review5_sandboxed_sessions_use_the_sdk_bundled_cli(tmp_path: Path, monk
         _sandbox_stub(mp, captured)
         mp.setattr(session_mod, "build_settings", capture_settings)
         session_mod.run_session_sandboxed(
+            config=FactoryConfig(),
             seat="implementer",
             prompt="p",
             run_dir=run_root,
@@ -1312,6 +1320,7 @@ def test_review6_spec_never_lands_in_the_clone(tmp_path: Path, monkeypatch):
     with _pytest.MonkeyPatch.context() as mp:
         _sandbox_stub(mp, captured)
         session_mod.run_session_sandboxed(
+            config=FactoryConfig(),
             seat="implementer",
             prompt="p",
             run_dir=run.root,

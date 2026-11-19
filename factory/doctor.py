@@ -57,6 +57,7 @@ CHECKS = (
     "profile-parse",        # the profile reads and is a YAML mapping
     "profile-schema",       # project.schema.json, all violations
     "profile-semantics",    # the F-59/F-63/F-65/F-71 semantic rules
+    "model-deprecation",    # F-100: provider.models still pins seats
     "profile-approval",     # the F-63 ledger's group hashes still match
     "queue-parse",          # the queue reads and is JSON
     "queue-schema",         # tasks.schema.json, all violations
@@ -218,6 +219,19 @@ def project_report(
                 for tag, message in _profile_semantic_violations(
                         data, origin):
                     add(_finding(repo, "profile-semantics", message, tag=tag))
+                # F-100: the provider.models deprecation note —
+                # informational (never fatal): the block still overrides
+                # the stack for one release, but a registry edit cannot
+                # reach a seat pinned there.
+                from factory.models import deprecation_notes
+
+                for note in deprecation_notes(data):
+                    add(_finding(repo, "model-deprecation", note,
+                                 tag="model_deprecation", fatal=False,
+                                 fix="move the project to model_stack and "
+                                 "re-approve (`factory approve --profile`) "
+                                 "— a registry edit cannot reach a seat "
+                                 "pinned by provider.models"))
                 if not [f for f in report.findings
                         if f.check.startswith("profile-")]:
                     profile = apply_profile_defaults(data)

@@ -49,7 +49,11 @@ BASE_FILES = {
 
 _PROFILE = """\
 # The F-71 fixture project: the pilot's risk/protected shapes.
+# F-100: the standard stack's anthropic seats are admitted.
 name: prespend-demo
+
+providers_allowed:
+  - anthropic
 
 repo:
   path: {repo}
@@ -104,7 +108,11 @@ docs_allowlist: []
 # generated paths as candidates exactly as L0's allowance does.
 PROFILE_WITH_GENERATED = """\
 # The F-71 fixture project with a generated-path allowance (R1-7).
+# F-100: the standard stack's anthropic seats are admitted.
 name: prespend-demo
+
+providers_allowed:
+  - anthropic
 
 repo:
   path: {repo}

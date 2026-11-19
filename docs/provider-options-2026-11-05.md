@@ -2,9 +2,11 @@
 
 **Status:** research note, not a decision. Prices were collected from the web on 2026-11-05 and many come from aggregators. Verify each one on the provider's own pricing page before quoting it.
 
+**Amended 2026-11-19 (F-100):** the opening rule below ("client repos can't go to the Z.ai endpoint") was F-59's blanket refusal, replaced by the onboarding restriction answer — a client whose recorded answer is `none` runs the `standard` stack, GLM included (owner decision 2026-11-18, clients open by default). What this note's comparison is FOR is unchanged: a client whose answer is `no_china` or `contained` runs the `no-china` or `contained` registry stack, and this note is the cost/origin homework behind those stacks' choices. The DPA and terms question for client code on the GLM plan stays the owner's business call, on the client-only prerequisites list.
+
 ## The question
 
-Client repos can't go to the Z.ai endpoint. This note looks at which models and hosts could run client work through this factory, and what each would cost.
+Client repos can't go to the Z.ai endpoint (pre-F-100 wording — see the amendment above; today it is the recorded restriction answer that decides). This note looks at which models and hosts could run client work through this factory, and what each would cost.
 
 Today's own-repo work stays on the Z.ai GLM plan, which has a flat price and carries only our own data.
 

@@ -293,6 +293,9 @@ def _profile(repo: Path, remote: Path) -> dict:
     unioned in here too."""
     return apply_profile_defaults({
         "name": "rehearsal-fixture",
+        # F-100: the standard stack's anthropic seats are admitted
+        # (the rehearsal measures the standard review path).
+        "providers_allowed": ["anthropic"],
         "repo": {
             "path": str(repo),
             "default_branch": "main",

@@ -39,6 +39,7 @@ from _support.f22 import (
 )
 
 import factory.sandbox as sandbox_module
+from factory.config import FactoryConfig
 from factory.runs import create_run
 from factory.sandbox import (
     SRT_PIN,
@@ -591,7 +592,8 @@ def test_session_escapee_reaches_the_trace_sink(tmp_path: Path, monkeypatch):
     cli.chmod(0o755)
     session_module._run_prepared(
         "implementer", "p", run.root, {}, run.settings_path,
-        factory_root=root, max_turns=1, timeout_min=1,
+        factory_root=root, config=FactoryConfig(), max_turns=1,
+        timeout_min=1,
         cli_path=cli, trace_sink=events.append, run_id=run.run_id)
     assert [e["type"] for e in events] == ["sandbox_escapee"], events
     assert events[0]["label"] == "session:implementer"
@@ -610,7 +612,8 @@ def test_session_escapee_reaches_the_trace_sink(tmp_path: Path, monkeypatch):
     with pytest.raises(subprocess.TimeoutExpired):
         session_module._run_prepared(
             "implementer", "p", run.root, {}, run.settings_path,
-            factory_root=root, max_turns=1, timeout_min=1,
+            factory_root=root, config=FactoryConfig(), max_turns=1,
+            timeout_min=1,
             cli_path=cli, trace_sink=events.append, run_id=run.run_id,
         )
     assert [(e["type"], e["timed_out"]) for e in events] == [

@@ -337,6 +337,12 @@ def eval_profile(repo: Path, python: str | None = None) -> dict:
     quoted = shlex.quote(python)
     return apply_profile_defaults({
         "name": "soloadventurer",
+        # F-100: the fixture runs the standard stack and admits both of
+        # its provider kinds (zai workhorse, anthropic hunt/final) — an
+        # eval --role override naming either kind stays inside AC-3's
+        # guard, exactly as a real project's would.
+        "model_stack": "standard",
+        "providers_allowed": ["zai", "anthropic"],
         "repo": {
             "path": str(repo),
             "default_branch": "main",
@@ -702,6 +708,7 @@ def run_seed(
     session_runner=None,
     reviewers: int = DEFAULT_REVIEWERS,
     factory_root: Path | None = None,
+    config=None,
 ) -> dict:
     """Run the validator's layers over one seeded (or clean) diff.
 
@@ -757,7 +764,7 @@ def run_seed(
             repo, profile, seed_base, f"eval/{seed.slot}", task,
             session_runner=session_runner, reviewers=reviewers,
             l0=l0, l1=l1, factory_root=factory_root,
-            void_reason=void_reason,
+            config=config, void_reason=void_reason,
         )
         if report is None:
             # Voided (PR #90 round 4): never a verdict — excluded from
@@ -1165,6 +1172,7 @@ def run_l2_review(
     l0=None,
     l1=None,
     factory_root: Path | None = None,
+    config=None,
     void_reason: "list[str] | None" = None,
 ):
     """L2 as F-38's parallel reviewer and verifier over one diff.
@@ -1216,6 +1224,7 @@ def run_l2_review(
         verdict failed to parse.
     """
     from factory import orchestrator
+    from factory.models import reviewer_seat_role
     from factory.prompts import assemble_verifier_prompt, reviewer_seat_prompts
 
     diff = _git(repo, "diff", "--no-color", "--no-ext-diff",
@@ -1241,10 +1250,12 @@ def run_l2_review(
             repo, profile,
             runner=session_runner,
             factory_root=factory_root,
+            config=config,
             max_turns=SEAT_MAX_TURNS,
             timeout_min=SEAT_TIMEOUT_MIN,
             protected=list((profile.get("paths") or {}).get("protected") or []),
             system_prompt=seat_systems[(seat_no or 1) - 1],
+            seat_roles=[reviewer_seat_role(seat_no or 1, reviewers)],
         ))[0]
         retry_records.append(record)
         return record
@@ -1254,11 +1265,14 @@ def run_l2_review(
         repo, profile,
         runner=session_runner,
         factory_root=factory_root,
+        config=config,
         max_turns=SEAT_MAX_TURNS,
         timeout_min=SEAT_TIMEOUT_MIN,
         protected=list((profile.get("paths") or {}).get("protected") or []),
         system_prompt=seat_systems[0],
         seat_system_prompts=seat_systems,
+        seat_roles=[reviewer_seat_role(n, reviewers)
+                    for n in range(1, reviewers + 1)],
     ))
     # m-12: quota BEFORE parsing, production's order — a quota-hit
     # first-run seat is never parsed, never re-run (no tokens burned
@@ -1291,7 +1305,7 @@ def run_l2_review(
         fanout = orchestrator.run_verifier_fanout(
             task, diff, union.findings,
             runner=session_runner, run_dir=repo, profile=profile,
-            factory_root=factory_root,
+            factory_root=factory_root, config=config,
             protected=list((profile.get("paths") or {}).get("protected") or []),
             system_prompt=assemble_verifier_prompt(profile),
             srt_bin_path=None, run_id=None, task_id=None, toolkit=None,
@@ -1440,6 +1454,7 @@ def run_seeded_eval(
     reviewers: int = DEFAULT_REVIEWERS,
     factory_root: Path | None = None,
     repeats: int = 1,
+    config=None,
 ) -> dict:
     """Run the whole eval over the fixture set and return its report.
 
@@ -1468,6 +1483,7 @@ def run_seeded_eval(
         "session_runner": session_runner,
         "reviewers": reviewers,
         "factory_root": factory_root,
+        "config": config,
     }
     seeds: list = []
     clean: list = []
@@ -1496,11 +1512,16 @@ def run_seeded_eval(
     )
     catch_by_repeat = _catch_rate_by_repeat(seeds)
     ff_by_repeat = _false_fail_by_repeat(clean)
+    overrides = dict(getattr(config, "role_overrides", None) or {})
     return {
         "fixture": "soloadventurer",
         "base_ref": base_ref,
         "l2": "sessions" if session_runner is not None else "skipped",
         "repeats": repeats,
+        # F-100 AC-5: every --role override this eval ran with, named —
+        # a before/after pair of reports is the evidence for a registry
+        # change. Never written to any profile or to the registry.
+        "role_overrides": overrides,
         "seeds": seeds,
         "clean": clean,
         # Per layer: how many clean diffs that layer failed over how
@@ -1704,6 +1725,16 @@ def render_report(report: dict) -> str:
     lines = [
         header + ")",
         "",
+    ]
+    # F-100 AC-5: the eval's --role overrides, named — the report is the
+    # evidence for a registry change, so it says which roles it pinned.
+    overrides = report.get("role_overrides") or {}
+    if overrides:
+        lines.append("Role overrides (this eval only, never written): "
+                     + ", ".join(f"{role}=`{model}`" for role, model
+                                 in sorted(overrides.items())))
+        lines.append("")
+    lines += [
         "## Per diff",
         "",
     ]
@@ -1934,6 +1965,7 @@ def run_on_demand_eval(
     session_runner=None,
     command_runner=None,
     keep_fixture: bool = False,
+    config=None,
 ) -> dict:
     """One on-demand (or monthly) eval run — the AC-3 owner step.
 
@@ -2003,6 +2035,10 @@ def run_on_demand_eval(
         _gate_settings(profile, RunDir(fixture_project, stamp, fixture,
                                        settings_path), factory_root)
         command_runner = sandboxed_runner(fixture, settings_path)
+    if config is None:
+        from factory.config import CONFIG_FILE, load_config
+
+        config = load_config(factory_root / CONFIG_FILE)
     try:
         report = run_seeded_eval(
             fixture,
@@ -2012,6 +2048,7 @@ def run_on_demand_eval(
             reviewers=reviewers,
             factory_root=factory_root,
             repeats=repeats,
+            config=config,
         )
         out_path = Path(out_path) if out_path else (
             eval_root / f"seeded-eval-{stamp}.json"

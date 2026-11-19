@@ -119,6 +119,8 @@ class Env:
             repo_cfg["branch_protection"] = "unavailable"
         self.profile = {
             "name": "fixture",
+            # F-100: the standard stack's anthropic seats are admitted.
+            "providers_allowed": ["anthropic"],
             "repo": repo_cfg,
             "commands": {
                 "setup": "true",

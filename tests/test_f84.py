@@ -45,6 +45,7 @@ from _support.f72 import _task
 from _support.f73 import Env73, GitSeats
 from claude_agent_sdk import ResultMessage
 
+from factory.config import FactoryConfig
 from factory.mergeorder import CIState
 from factory.sandbox import build_settings, write_settings
 
@@ -312,6 +313,7 @@ def test_ac_2_session_seam(tmp_path, monkeypatch):
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         run_session_sandboxed(
             "implementer", "work", repo, profile,
+            config=FactoryConfig(),
             factory_root=settings_path.parent,
             settings_path=settings_path,
             max_turns=5, timeout_min=1, cli_path=Path("/bin/echo"),

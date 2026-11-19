@@ -323,6 +323,13 @@ def build_parser() -> argparse.ArgumentParser:
              "per metric, and per seed caught k/N and the pass^k line "
              "(default: 3; F-48/F-95 — cost scales with N)")
     eval_cmd.add_argument(
+        "--role", action="append", default=None, metavar="ROLE=MODEL",
+        help="run this eval with one registry role overridden (repeatable, "
+             "e.g. --role reviewer.hunt=claude-sonnet-5-5 or an alias). "
+             "That eval only: never written to any profile or to the "
+             "registry, named in the report, still inside the project's "
+             "providers_allowed (F-100 AC-5)")
+    eval_cmd.add_argument(
         "--keep-fixture", action="store_true",
         help="keep the fixture repo after the run for inspection")
     eval_cmd.add_argument(
@@ -678,8 +685,18 @@ def _run_status(args: argparse.Namespace) -> int:
             print(render_task_status(queue, args.task_id,
                                      project=queue["project"]))
             return 0
+        # F-100 AC-4: the model-stack section — the profile next to the
+        # queue, best-effort (a page for a profile that cannot load
+        # still renders everything else).
+        profile = None
+        profile_path = Path(args.queue).parent / "project.yaml"
+        try:
+            if profile_path.is_file():
+                profile = load_profile(profile_path)
+        except ContractError:
+            profile = None
         print(render_status(queue, project=queue["project"], factory_root=root,
-                            repo=Path(args.repo)))
+                            repo=Path(args.repo), profile=profile))
         return 0
     except (ContractError, StatusError, KeyError, OSError) as exc:
         print(f"factory status: {exc}", file=sys.stderr)
@@ -687,6 +704,14 @@ def _run_status(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("factory status: interrupted", file=sys.stderr)
         return 130
+
+
+def _keep_config(args: argparse.Namespace):
+    """The keep path's registry config (F-100 R1): the owner's config,
+    so the scrub list resolves the same registry the sessions did."""
+    return load_config(
+        (Path(args.factory_root) if getattr(args, "factory_root", None)
+         else FACTORY_ROOT_DEFAULT) / CONFIG_FILE)
 
 
 def _keep_path_profile(args: argparse.Namespace) -> dict:
@@ -803,8 +828,10 @@ def _run_import(args: argparse.Namespace) -> int:
                 # F-59: every provider token the project's profile
                 # resolves to (best effort here — the import already
                 # refused; a profile that cannot load contributes no
-                # secrets, and the seam still pattern-redacts).
-                secrets=run_secrets(_keep_path_profile(args)),
+                # secrets, and the seam still pattern-redacts). F-100
+                # R1: through the OWNER's registry, not the defaults.
+                secrets=run_secrets(
+                    _keep_path_profile(args), config=_keep_config(args)),
             )
             if kept is not exc:
                 raise kept from exc
@@ -840,6 +867,46 @@ def _run_sentinels_replay(args: argparse.Namespace) -> int:
         return 1
 
 
+def parse_role_overrides(pairs: "list[str] | None", config):
+    """Parse ``--role ROLE=MODEL`` pairs into the eval's override map
+    (F-100 AC-5).
+
+    Each value must name a registry role (``implementer``,
+    ``reviewer.hunt``, …) and a model id or alias; a pair without ``=``,
+    a role the registry does not know, or an empty model refuses with
+    the role named (SystemExit 2 — the CLI's refusal shape). The result
+    rides the config object in memory ONLY.
+    """
+    overrides: dict[str, str] = {}
+    for pair in pairs or []:
+        role, sep, model = pair.partition("=")
+        role = role.strip()
+        model = model.strip()
+        from factory.models import MODEL_ROLES, RegistryError, expand_alias
+
+        if not sep or role not in MODEL_ROLES or not model:
+            print(
+                f"factory eval: --role needs ROLE=MODEL with ROLE one of "
+                f"{list(MODEL_ROLES)} (e.g. --role reviewer.hunt="
+                "claude-sonnet-5-5); "
+                f"got {pair!r}",
+                file=sys.stderr)
+            raise SystemExit(2)
+        if role in overrides:
+            print(f"factory eval: --role names {role!r} twice",
+                  file=sys.stderr)
+            raise SystemExit(2)
+        try:
+            # The model must be a literal id or a declared alias — a
+            # typo'd alias refuses here, named, not at session time.
+            expand_alias(config.models, model)
+        except RegistryError as exc:
+            print(f"factory eval: --role {role!r}: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        overrides[role] = model
+    return overrides
+
+
 def _run_eval(args: argparse.Namespace) -> int:
     """Dispatch the seeded-bug validator eval (F-16 AC-3's owner step),
     or — with ``--importer`` (F-57 AC-4) — the one real import against
@@ -855,7 +922,10 @@ def _run_eval(args: argparse.Namespace) -> int:
     actually runs); ``--reviewers`` overrides it. ``--repeats`` (F-48)
     runs each seed N times — default 3 — so the report carries each
     metric's mean and spread; a repeats below 1 is refused here, exit 2.
-    Known failures exit 2 with a message, not a traceback."""
+    ``--role`` (F-100 AC-5) overrides registry roles for THIS eval only
+    — never written anywhere, named in the report, still under the
+    AC-3 provider guard. Known failures exit 2 with a message, not a
+    traceback."""
     if args.importer:
         return _run_importer_eval(args)
     factory_root = (Path(args.factory_root) if args.factory_root
@@ -866,15 +936,20 @@ def _run_eval(args: argparse.Namespace) -> int:
               f"got {repeats}", file=sys.stderr)
         return 2
     try:
-        reviewers = args.reviewers or load_config(
-            factory_root / CONFIG_FILE
-        ).reviewers
+        import dataclasses
+
+        loaded = load_config(factory_root / CONFIG_FILE)
+        reviewers = args.reviewers or loaded.reviewers
+        overrides = parse_role_overrides(args.role, loaded)
+        config = (dataclasses.replace(loaded, role_overrides=overrides)
+                  if overrides else loaded)
         result = run_on_demand_eval(
             factory_root if args.factory_root else None,
             Path(args.out) if args.out else None,
             reviewers=reviewers,
             repeats=repeats,
             keep_fixture=args.keep_fixture,
+            config=config,
         )
     except (ConfigError, EvalError, GateError, RunError, SandboxError,
             SessionConfigError) as exc:

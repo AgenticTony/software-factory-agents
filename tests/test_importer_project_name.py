@@ -69,6 +69,9 @@ def _profile_yaml(name: str) -> str:
     """The smallest profile the project schema accepts, named ``name``."""
     return (
         f"name: {name}\n"
+        # F-100: the standard stack's anthropic seats are admitted.
+        "providers_allowed:\n"
+        "  - anthropic\n"
         "repo:\n"
         "  path: .\n"
         "  default_branch: main\n"

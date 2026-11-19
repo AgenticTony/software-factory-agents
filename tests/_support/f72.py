@@ -154,6 +154,10 @@ class Env72:
 
         self.profile = {
             "name": "fixture",
+            # F-100: the standard stack's anthropic seats (hunt, final
+            # review) are admitted — every Env72-descended fixture runs
+            # the default registry through run_once's config load.
+            "providers_allowed": ["anthropic"],
             "repo": {
                 "path": str(self.repo),
                 "default_branch": "main",

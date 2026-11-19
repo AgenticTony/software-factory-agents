@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from factory.config import load_config
+from factory.config import FactoryConfig, load_config
 from factory.contract import ContractError, load_profile
 from factory.sandbox import build_settings, sandbox_env
 
@@ -45,7 +45,10 @@ COMPAT_HOST = "eu-model-host.example"
 
 
 def _profile_dict(tmp_path: Path, name: str = "clientproj", **extra) -> dict:
-    """A minimal loadable profile dict (the F-38 fixture shape)."""
+    """A minimal loadable profile dict (the F-38 fixture shape). A
+    client profile gets a recorded restriction answer (F-100: the
+    answer gate replaced F-59's blanket client/zai refusal) unless the
+    caller passes its own — the no-answer refusal has its own arm."""
     profile = {
         "name": name,
         "repo": {
@@ -62,6 +65,11 @@ def _profile_dict(tmp_path: Path, name: str = "clientproj", **extra) -> dict:
         "docs_allowlist": [],
     }
     profile.update(extra)
+    if (profile.get("data_owner") == "client"
+            and "model_restrictions" not in profile):
+        profile["model_restrictions"] = {
+            "value": "none", "answered_by": "owner",
+            "answered_at": "2026-11-19T08:00:00Z"}
     return profile
 
 
@@ -91,9 +99,16 @@ def _load(tmp_path: Path, profile: dict) -> dict:
 
 
 def _client_bedrock(tmp_path: Path, **extra) -> dict:
+    # F-100: a client profile carries its recorded restriction answer
+    # (open by default — the answer replaced F-59's blanket client/zai
+    # refusal). Round 2: standard is zai-only, so a none-answer client
+    # with a non-zai own kind admits the stack's zai seats.
     return _profile_dict(
         tmp_path,
         data_owner="client",
+        model_restrictions={"value": "none", "answered_by": "owner",
+                            "answered_at": "2026-11-19T08:00:00Z"},
+        providers_allowed=["zai"],
         provider=_provider_block("bedrock", region=BEDROCK_EU),
         **extra,
     )
@@ -139,10 +154,14 @@ def test_ac_1(tmp_path: Path, monkeypatch):
         _load(tmp_path / "no-base-url", _profile_dict(
             tmp_path, data_owner="client",
             provider=_provider_block("anthropic_compatible")))
-    with pytest.raises(ContractError, match="models"):
-        _load(tmp_path / "no-models", _profile_dict(
-            tmp_path, data_owner="client",
-            provider={"kind": "anthropic"}))
+    # F-100 amended 2026-11-19: a provider block without models LOADS —
+    # every seat takes the registry's stack (provider.models is the
+    # deprecated project-level override, optional for one release).
+    no_models = _load(tmp_path / "no-models", _profile_dict(
+        tmp_path, data_owner="client",
+        providers_allowed=["zai", "anthropic"],
+        provider={"kind": "anthropic"}))
+    assert "models" not in no_models["provider"]
     with pytest.raises(ContractError, match="model"):
         _load(tmp_path / "missing-seat-model", _profile_dict(
             tmp_path, data_owner="client",
@@ -205,13 +224,39 @@ def test_ac_1(tmp_path: Path, monkeypatch):
             tmp_path, data_owner="client",
             provider=_provider_block("bedrock", region="eu-north-1.evil.com")))
 
-    # (e) Both client refusals.
-    with pytest.raises(ContractError, match="client"):
-        _load(tmp_path / "client-no-provider",
-              _profile_dict(tmp_path, data_owner="client"))
-    with pytest.raises(ContractError, match="zai"):
-        _load(tmp_path / "client-zai", _profile_dict(
-            tmp_path, data_owner="client", provider=_provider_block("zai")))
+    # (e) F-100 amended 2026-11-19: the client gate is the recorded
+    # model_restrictions answer, not a blanket provider refusal. A
+    # client with no recorded answer refuses, naming the missing answer
+    # (the question is always asked; the default ANSWER is none).
+    silent = _profile_dict(tmp_path, data_owner="client")
+    del silent["model_restrictions"]  # the helper's default answer, removed
+    with pytest.raises(ContractError, match="model_restrictions"):
+        _load(tmp_path / "client-no-answer", silent)
+    # A client whose recorded answer is none runs the standard stack —
+    # GLM included: kind zai, zai in providers_allowed, both load (the
+    # two F-59 refusals this replaces).
+    open_client = _load(tmp_path / "client-open", _profile_dict(
+        tmp_path, data_owner="client",
+        model_restrictions={"value": "none", "answered_by": "owner",
+                            "answered_at": "2026-11-19T08:00:00Z"},
+        provider=_provider_block("zai"),
+        providers_allowed=["zai", "anthropic"]))
+    assert open_client["model_restrictions"]["value"] == "none"
+    # A no_china answer still refuses a cn-origin provider (F-100 AC-3's
+    # restriction check — the registry-aware sweep; a config-less load
+    # checks only the answer's presence, the origins being registry
+    # content).
+    from factory.models import check_profile_stack
+    from factory.provider import ProviderError as _ProviderError
+    nochina = _load(tmp_path / "client-nochina", _profile_dict(
+        tmp_path, data_owner="client",
+        model_restrictions={"value": "no_china", "answered_by": "owner",
+                            "answered_at": "2026-11-19T08:00:00Z"},
+        model_stack="standard",
+        provider=_provider_block("zai"),
+        providers_allowed=["zai", "anthropic"]))
+    with pytest.raises(_ProviderError, match="no_china"):
+        check_profile_stack(nochina, FactoryConfig())
 
     # (f) A self project with no block keeps Z.ai (the missing data_owner
     # is self by default — the schema description states it).
@@ -419,6 +464,7 @@ def test_ac_2(tmp_path: Path, monkeypatch):
     from factory.session import run_session_sandboxed as _rss
     with pytest.raises(_SCE, match="factory-bedrock"):
         _rss("implementer", "p", tmp_path, _client_bedrock(tmp_path),
+             config=FactoryConfig(),
              factory_root=tmp_path, settings_path=tmp_path / "s.json",
              max_turns=1, timeout_min=1, srt_bin_path=None)
 
@@ -443,7 +489,7 @@ def test_ac_2(tmp_path: Path, monkeypatch):
     fake_keychain["factory-bedrock"] = "bed-secret"
     monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
     profile = _load(tmp_path / "run", _client_bedrock(tmp_path))
-    secrets = run_secrets(profile)
+    secrets = run_secrets(profile, FactoryConfig())
     assert "bed-secret" in secrets
     from factory.egress import scrub_session_text
     body = "review note: AWS_BEARER_TOKEN_BEDROCK=bed-secret tail"
@@ -464,10 +510,10 @@ def test_ac_2(tmp_path: Path, monkeypatch):
         seat_providers={"reviewer": {"kind": "anthropic_compatible",
                                      "model": "m",
                                      "base_url": override_url}}))
-    secrets = run_secrets(override_profile)
+    secrets = run_secrets(override_profile, FactoryConfig())
     assert "compat-ambient-token" in secrets, secrets
     # And it is exactly what the seat's own resolution would send:
-    seat_spec = resolve_provider(override_profile, "reviewer")
+    seat_spec = resolve_provider(override_profile, "reviewer", config=FactoryConfig())
     assert provider_token(seat_spec.kind,
                           base_url=seat_spec.base_url) == "compat-ambient-token"
 
@@ -491,7 +537,8 @@ def test_ac_3(tmp_path: Path):
     run_dir.mkdir(parents=True)
 
     def settings_for(profile: dict, seat: str | None = None) -> dict:
-        spec = resolve_provider(profile, seat)
+        spec = resolve_provider(profile, seat,
+                                 config=FactoryConfig())
         return build_settings(
             profile, run_dir, model_endpoint=spec.egress_hosts,
             factory_root=tmp_path,
@@ -620,7 +667,7 @@ def test_ac_4(tmp_path: Path, monkeypatch):
     # nothing the parent writes.
     forged = json.loads(json.dumps(record.to_dict()))
     forged["provider"] = {"kind": "zai", "model": "x"}
-    parent_spec = resolve_provider(_client_bedrock(tmp_path), "implementer")
+    parent_spec = resolve_provider(_client_bedrock(tmp_path), "implementer", config=FactoryConfig())
     parent_record = parent_spec.provider_record()
     assert parent_record["kind"] == "bedrock"
     assert parent_record != forged["provider"]
@@ -760,11 +807,15 @@ def test_ac_4(tmp_path: Path, monkeypatch):
     env2 = Env(tmp_path / "split-run")
     split = dict(env2.profile)
     split["data_owner"] = "client"
+    # F-100: the client's recorded answer (none — open by default).
+    split["model_restrictions"] = {
+        "value": "none", "answered_by": "owner",
+        "answered_at": "2026-11-19T08:00:00Z"}
     split["provider"] = {
         "kind": "bedrock", "region": BEDROCK_EU,
         "models": {"implementer": "impl-model", "reviewer": "rev-model",
                    "verifier": "ver-model", "importer": "imp-model"}}
-    split["providers_allowed"] = ["anthropic"]
+    split["providers_allowed"] = ["anthropic", "zai"]  # F-100 r2: zai seats
     split["seat_providers"] = {"reviewer": {"kind": "anthropic",
                                             "model": "anth-rev-model"}}
     (env2.repo / ".factory" / "project.yaml").write_text(
@@ -823,6 +874,10 @@ def test_ac_4(tmp_path: Path, monkeypatch):
     env3 = Env(tmp_path / "unknown-run")
     same = dict(env3.profile)
     same["data_owner"] = "client"
+    same["model_restrictions"] = {  # F-100: the recorded answer
+        "value": "none", "answered_by": "owner",
+        "answered_at": "2026-11-19T08:00:00Z"}
+    same["providers_allowed"] = ["zai"]  # F-100 r2: standard's zai seats
     same["provider"] = {
         "kind": "bedrock", "region": BEDROCK_EU,
         "models": {r: "same-model" for r in
@@ -917,6 +972,10 @@ def test_ac_4(tmp_path: Path, monkeypatch):
     env = Env(tmp_path / "client-run")
     client = dict(env.profile)
     client["data_owner"] = "client"
+    client["model_restrictions"] = {  # F-100: the recorded answer
+        "value": "none", "answered_by": "owner",
+        "answered_at": "2026-11-19T08:00:00Z"}
+    client["providers_allowed"] = ["zai"]  # F-100 r2: standard's zai seats
     client["provider"] = _provider_block("bedrock", region=BEDROCK_EU)
     (env.repo / ".factory" / "project.yaml").write_text(
         _yaml.safe_dump(client))
@@ -1002,8 +1061,8 @@ def test_ac_5(tmp_path: Path, monkeypatch):
         providers_allowed=["anthropic"],
         seat_providers={"reviewer": {"kind": "anthropic",
                                      "model": "rev-model"}}))
-    impl = resolve_provider(profile, "implementer")
-    rev = resolve_provider(profile, "reviewer")
+    impl = resolve_provider(profile, "implementer", config=FactoryConfig())
+    rev = resolve_provider(profile, "reviewer", config=FactoryConfig())
     assert impl.kind == "bedrock" and rev.kind == "anthropic"
     assert impl.endpoint_host == BEDROCK_EU_HOST
     assert rev.endpoint_host == ANTHROPIC_HOST
@@ -1015,7 +1074,8 @@ def test_ac_5(tmp_path: Path, monkeypatch):
     run_dir.mkdir(parents=True)
     for seat, expect in (("implementer", [BEDROCK_EU_HOST]),
                          ("reviewer", [ANTHROPIC_HOST])):
-        spec = resolve_provider(profile, seat)
+        spec = resolve_provider(profile, seat,
+                                 config=FactoryConfig())
         settings = build_settings(
             profile, run_dir, model_endpoint=spec.egress_hosts,
             factory_root=tmp_path)
@@ -1045,13 +1105,16 @@ def test_ac_5(tmp_path: Path, monkeypatch):
             "provider": _provider_block("bedrock", region=BEDROCK_EU),
             "seat_providers": {"reviewer": {"kind": "anthropic",
                                             "model": "m"}},
-        }, "reviewer")
-    # A client project may not allow or override to zai at all.
-    with pytest.raises(ContractError, match="zai"):
-        _load(tmp_path / "allow-zai", _profile_dict(
-            tmp_path, data_owner="client",
-            provider=_provider_block("bedrock", region=BEDROCK_EU),
-            providers_allowed=["zai"]))
+        }, "reviewer", config=FactoryConfig())
+    # F-100 amended 2026-11-19: a client MAY allow zai when its recorded
+    # answer is none (clients are open by default; the restriction
+    # answer, not the kind name, is the gate). What still refuses is a
+    # no_china answer reaching a cn-origin provider through that list.
+    allow_zai = _load(tmp_path / "allow-zai", _profile_dict(
+        tmp_path, data_owner="client",
+        provider=_provider_block("bedrock", region=BEDROCK_EU),
+        providers_allowed=["zai"]))
+    assert allow_zai["providers_allowed"] == ["zai"]
 
     # (c) No fallback — each trigger fails closed with the reason named,
     # and no Z.ai env or host exists anywhere on the retry.
@@ -1066,6 +1129,7 @@ def test_ac_5(tmp_path: Path, monkeypatch):
     with pytest.raises(SessionConfigError, match="factory-bedrock"):
         run_session_sandboxed(
             "implementer", "p", tmp_path, client_profile,
+            config=FactoryConfig(),
             factory_root=tmp_path, settings_path=tmp_path / "s.json",
             max_turns=2, timeout_min=1,
             srt_bin_path=None,
@@ -1083,7 +1147,8 @@ def test_ac_5(tmp_path: Path, monkeypatch):
             seat="implementer", status="failed", reason=reason)), reason
     for spec_seat in (None, "implementer", "reviewer", "verifier",
                       "importer"):
-        again = resolve_provider(client_profile, spec_seat)
+        again = resolve_provider(client_profile, spec_seat,
+                                  config=FactoryConfig())
         assert again.kind == "bedrock", spec_seat
         assert ZAI_HOST not in again.egress_hosts
 
@@ -1091,11 +1156,11 @@ def test_ac_5(tmp_path: Path, monkeypatch):
     failing = SessionRecord(seat="implementer", status="failed",
                             reason="api_error_500")
     assert not _is_quota(failing)
-    after_error = resolve_provider(client_profile, "implementer")
+    after_error = resolve_provider(client_profile, "implementer", config=FactoryConfig())
     assert after_error.kind == "bedrock"
 
     # And the env a retried session would build has no Z.ai trace.
-    spec = resolve_provider(client_profile, "implementer")
+    spec = resolve_provider(client_profile, "implementer", config=FactoryConfig())
     env = spec.env("a-bedrock-token", 600_000)
     assert "api.z.ai" not in json.dumps(env)
     assert env["CLAUDE_CODE_USE_BEDROCK"] == "1"
@@ -1103,7 +1168,7 @@ def test_ac_5(tmp_path: Path, monkeypatch):
     # (d) A self project keeps today's behaviour exactly: the factory's
     # own queue/profile runs on zai (F-64's quota requeue unchanged).
     self_profile = _profile_dict(tmp_path)
-    self_spec = resolve_provider(self_profile, "implementer")
+    self_spec = resolve_provider(self_profile, "implementer", config=FactoryConfig())
     assert self_spec.kind == "zai"
     assert self_spec.endpoint_host == ZAI_HOST
     monkeypatch.setattr(provider, "_keychain_token",
@@ -1228,6 +1293,7 @@ def test_ac_6(tmp_path: Path, monkeypatch):
     run_dir.mkdir(parents=True)
     run_session_sandboxed(
         "implementer", "p", run_dir, profile,
+        config=FactoryConfig(),
         factory_root=tmp_path, max_turns=2, timeout_min=1,
         srt_bin_path=None,
     )
@@ -1275,7 +1341,8 @@ def test_ac_6(tmp_path: Path, monkeypatch):
                        "reviewer": "rev-model",
                        "verifier": "ver-model",
                        "importer": "IMPORTER-MODEL"}},
-        providers_allowed=["anthropic", "bedrock"],
+        providers_allowed=["anthropic", "bedrock", "zai"],
+        # F-100 r2: standard's zai seats (the unpinned roles fall to it)
         seat_providers={"reviewer": {"kind": "bedrock",
                                      "model": "rev-model",
                                      "region": BEDROCK_EU}}))
@@ -1399,6 +1466,7 @@ def test_ac_6(tmp_path: Path, monkeypatch):
         # Single session (implementer seat).
         run_session_sandboxed(
             "implementer", "p", r25_dir, r25_profile,
+            config=FactoryConfig(),
             factory_root=tmp_path, max_turns=1, timeout_min=1,
             srt_bin_path=None)
         # Real fan-out (reviewer seat, same profile/kind).
@@ -1415,6 +1483,7 @@ def test_ac_6(tmp_path: Path, monkeypatch):
         subprocess.run(["git", "-C", str(r25_dir), "commit", "-qm", "b"],
                        check=True, capture_output=True)
         run_sessions_parallel([("reviewer", "r")], r25_dir, r25_profile,
+                              config=FactoryConfig(),
                               factory_root=tmp_path, max_turns=1,
                               timeout_min=1)
         assert len(captures_r25) == 2, (kind, len(captures_r25))
@@ -1462,10 +1531,15 @@ def test_ac_6(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("factory.session.run_sandboxed", forge_provider)
     returned = run_session_sandboxed(
         "implementer", "p", z21_dir, _client_bedrock(tmp_path),
+        config=FactoryConfig(),
         factory_root=tmp_path, max_turns=1, timeout_min=1,
         srt_bin_path=None)
+    # F-100: the record carries role and stack beside the F-59 shape
+    # (AC-4's facts ride the same parent-stamped block).
     assert returned.provider == {"kind": "bedrock", "model": "model-impl",
-                                 "region": BEDROCK_EU}, returned.provider
+                                 "region": BEDROCK_EU,
+                                 "role": "implementer",
+                                 "stack": "standard"}, returned.provider
     # The TIMEOUT path re-stamps too: a runner that hung AFTER the entry
     # wrote its (forged) record returns the record with the PARENT's
     # provider.
@@ -1481,10 +1555,12 @@ def test_ac_6(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("factory.session.run_sandboxed", hang_after_write)
     hung = run_session_sandboxed(
         "implementer", "p", z21_dir, _client_bedrock(tmp_path),
+        config=FactoryConfig(),
         factory_root=tmp_path, max_turns=1, timeout_min=1,
         srt_bin_path=None)
     assert hung.provider == {"kind": "bedrock", "model": "model-impl",
-                             "region": BEDROCK_EU}, hung.provider
+                             "region": BEDROCK_EU, "role": "implementer",
+                             "stack": "standard"}, hung.provider
     monkeypatch.undo()
 
     # Z15 (round-1 addendum): the in-sandbox entry reads ONLY the
@@ -1543,8 +1619,8 @@ def test_ac_6(tmp_path: Path, monkeypatch):
                         lambda service: "zai-key"
                         if service == "factory-zai" else None)
     eprofile = eval_profile(tmp_path)
-    espec = resolve_provider(eprofile, "reviewer")
-    zspec = resolve_provider(_profile_dict(tmp_path), "reviewer")
+    espec = resolve_provider(eprofile, "reviewer", config=FactoryConfig())
+    zspec = resolve_provider(_profile_dict(tmp_path), "reviewer", config=FactoryConfig())
     assert espec.kind == zspec.kind == "zai"
     assert espec.env_keys == zspec.env_keys
     assert espec.egress_hosts == zspec.egress_hosts == (ZAI_HOST,)
@@ -1564,6 +1640,7 @@ def test_ac_7(tmp_path: Path):
     profile = _profile_dict(
         tmp_path, name="rehearsal",
         data_owner="client",
+        providers_allowed=["zai"],  # F-100 r2: standard's zai seats
         provider={
             "kind": "bedrock",
             "region": "eu-north-1",
@@ -1576,7 +1653,7 @@ def test_ac_7(tmp_path: Path):
         },
     )
     spec = resolve_provider(load_profile(_write_profile(tmp_path, profile)),
-                            "implementer")
+                            "implementer", config=FactoryConfig())
     assert spec.kind == "bedrock"
     assert spec.region == "eu-north-1"
     assert spec.endpoint_host == "bedrock-runtime.eu-north-1.amazonaws.com"

@@ -522,6 +522,7 @@ def test_fanout_sessions_run_concurrently(tmp_path: Path):
     records = run_sessions_parallel(
         [("reviewer", "one"), ("reviewer", "two")],
         tmp_path, {}, runner=session, max_turns=5, timeout_min=1,
+        config=FactoryConfig(),
     )
     assert [r.status for r in records] == ["completed", "completed"]
     assert [r.seat for r in records] == ["reviewer", "reviewer"]
@@ -560,6 +561,7 @@ def test_fanout_guard_covers_every_reviewer_session(tmp_path, monkeypatch):
         repo, profile,
         factory_root=tmp_path, settings_path=tmp_path / "base.json",
         max_turns=5, timeout_min=1, cli_path=Path("/bin/echo"),
+        config=FactoryConfig(),
     )
     assert calls["n"] == 2
     assert all(r.status == "failed" for r in records)
@@ -832,6 +834,7 @@ def test_review1_fanout_scratch_is_per_session(tmp_path, monkeypatch):
         repo, profile,
         factory_root=tmp_path / "repo-root", settings_path=tmp_path / "base.json",
         max_turns=5, timeout_min=1, cli_path=Path("/bin/echo"),
+        config=FactoryConfig(),
     )
     assert len(captured) == 2
     scratches = [scratch for scratch, _ in captured]
@@ -1185,6 +1188,7 @@ def test_review5_fanout_forwards_per_session_kwargs(tmp_path: Path):
         [("reviewer", "one")], tmp_path, {},
         runner=runner, max_turns=5, timeout_min=1,
         toolkit={"staged": "/tmp/fake-toolkit", "items": []},
+        config=FactoryConfig(),
     )
     assert seen[0].get("toolkit") == {"staged": "/tmp/fake-toolkit", "items": []}
 
@@ -1250,6 +1254,7 @@ def test_review6_fanout_sessions_carry_the_toolkit(tmp_path, monkeypatch):
         factory_root=tmp_path / "repo-root", settings_path=tmp_path / "base.json",
         max_turns=5, timeout_min=1, cli_path=Path("/bin/echo"),
         toolkit=resolved,
+        config=FactoryConfig(),
     )
     assert len(specs_seen) == 2
     staged_roots = []
@@ -1344,6 +1349,7 @@ def test_review7_toolkit_dirs_torn_down_even_on_exception(tmp_path, monkeypatch)
                 factory_root=tmp_path, settings_path=base,
                 max_turns=5, timeout_min=1,
                 cli_path=Path("/bin/echo"), toolkit=resolved,
+                config=FactoryConfig(),
             )
         except RuntimeError:
             pass

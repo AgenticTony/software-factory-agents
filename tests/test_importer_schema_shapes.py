@@ -29,6 +29,7 @@ from _support.f63 import importer_fixture_approve
 from jsonschema import Draft202012Validator
 
 from factory.cli import main
+from factory.config import FactoryConfig
 from factory.importer import (
     FORBIDDEN_FIELDS,
     SPEC_FIELDS,
@@ -78,6 +79,7 @@ def _wo(tid: str = "WO-1", **overrides) -> dict:
 _PROFILE_YAML = textwrap.dedent(
     """\
     name: proj
+    providers_allowed: [anthropic]  # F-100: the stack's anthropic seats
     repo:
       path: /tmp/proj
       default_branch: main
@@ -366,6 +368,7 @@ def test_unparsable_record_saves_full_stdout(tmp_path: Path, monkeypatch):
         run_session_sandboxed(
             "reviewer", "the prompt", run_dir,
             {"docs_allowlist": [], "network_allowlist": []},
+            config=FactoryConfig(),
             factory_root=factory_root, settings_path=settings_path,
             max_turns=1, timeout_min=0.05,
             cli_path=tmp_path / "claude", protected=())
@@ -550,6 +553,7 @@ def test_scratch_files_land_in_the_session_tmp(tmp_path: Path, monkeypatch):
     run_session_sandboxed(
         "reviewer", "the prompt", run_dir,
         {"docs_allowlist": [], "network_allowlist": []},
+        config=FactoryConfig(),
         factory_root=tmp_path / "root", settings_path=settings_path,
         max_turns=1, timeout_min=0.05,
         cli_path=tmp_path / "claude", protected=(),
@@ -570,6 +574,7 @@ def test_scratch_file_names_must_be_bare(tmp_path: Path, monkeypatch):
         run_session_sandboxed(
             "reviewer", "p", run_dir,
             {"docs_allowlist": [], "network_allowlist": []},
+            config=FactoryConfig(),
             factory_root=tmp_path / "root",
             settings_path=tmp_path / "sandbox" / "s.json",
             max_turns=1, timeout_min=0.05,
@@ -737,6 +742,7 @@ def test_scratch_files_refuse_without_the_review_guard(
         run_session_sandboxed(
             "implementer", "p", run_dir,
             {"docs_allowlist": [], "network_allowlist": []},
+            config=FactoryConfig(),
             factory_root=tmp_path / "root",
             settings_path=tmp_path / "sandbox" / "s.json",
             max_turns=1, timeout_min=0.05,

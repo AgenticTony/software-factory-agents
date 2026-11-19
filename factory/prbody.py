@@ -235,6 +235,7 @@ def build_pr_body(
     implementer_notes: str | None = None,
     attempt: int,
     implementer_turns: int | None = None,
+    implementer_model: str | None = None,
 ) -> str:
     """Assemble the full PR body from validator facts.
 
@@ -253,6 +254,9 @@ def build_pr_body(
             number ``budget.max_turns`` bounds), shown against the cap on
             the attempt line. None (a pre-F-83 caller) keeps the line
             without the turns clause.
+        implementer_model: F-100 AC-4 — the implementer's model, from the
+            parent's resolver record (alias-expanded). None (a pre-F-100
+            caller) keeps the line without the model clause.
     """
     budget = task.get("budget") or {}
     attempt_line = f"- Attempt {attempt} of {budget.get('max_attempts', '?')}"
@@ -263,6 +267,8 @@ def build_pr_body(
         attempt_line += (f"; implementer turns {implementer_turns}"
                          f" of {budget.get('max_turns', '?')}")
     attempt_line += "; L0, L1 and L2 passed"
+    model_line = (f"- Implementer model: `{implementer_model}`"
+                  if implementer_model else None)
     summary = [
         f"Task **{task['id']}** — {task.get('title', '')}".rstrip(),
         "",
@@ -270,6 +276,10 @@ def build_pr_body(
         f"- Base `{base_sha[:12]}`, head `{head_sha[:12]}`",
         attempt_line,
         f"- Source: `{task.get('source', '')}`",
+    ]
+    if model_line:
+        summary.append(model_line)
+    summary += [
         "",
         "Changed files:",
         "",

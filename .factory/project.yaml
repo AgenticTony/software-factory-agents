@@ -2,6 +2,15 @@
 # the repo is built interactively, one work order per session.
 name: software-factory
 
+# F-100: the registry stack this project runs (owner-maintained factory
+# config ~/factory/config.yaml `models`), and the seats the standard
+# stack names beyond the project's own zai (the defect-hunt reviewer and
+# the final-review tiers run anthropic; model_stack and
+# providers_allowed are F-63 security groups — re-approval owed).
+model_stack: standard
+providers_allowed:
+  - anthropic
+
 repo:
   path: ~/Developer/Software_Factory_Agents
   default_branch: main
@@ -448,6 +457,15 @@ paths:
     # verifier-session cap — same precedent, protected from the day
     # they exist.
     - "tests/test_f102.py"
+    # F-100: the model-registry contract tests judge the protected
+    # provider/config/schema/orchestrator resolution path (the one role
+    # resolver, the stack guard, the restriction answers, the eval
+    # override and the no-model-id-outside-the-registry grep);
+    # factory/models.py IS the registry resolver, and the F-100 support
+    # module carries the scripted seats those verdicts rest on.
+    - "tests/test_f100.py"
+    - "tests/_support/f100.py"
+    - "factory/models.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 

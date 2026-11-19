@@ -47,6 +47,7 @@ from factory.approvals import (
     ApprovalLedger,
     ApprovalLedgerError,
 )
+from factory.config import CONFIG_FILE, load_config
 from factory.contract import (
     NON_EXECUTABLE_KINDS,
     ContractError,
@@ -1077,7 +1078,8 @@ def _recover_revalidate_task(
             rv = revalidate_stale_pr(
                 queue, task_id, profile, factory_root=factory_root,
                 srt_bin_path=srt_bin_path,
-                gate_timeout_sec=gate_timeout_sec, ledger=ledger)
+                gate_timeout_sec=gate_timeout_sec, ledger=ledger,
+                config=load_config(factory_root / CONFIG_FILE))
             if rv.note is not None:
                 raise ApprovalError(
                     f"{task_id}: --revalidate failed — {rv.note}; "

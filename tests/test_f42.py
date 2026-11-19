@@ -64,6 +64,8 @@ REVIEW_PASS = json.dumps({"verdict": "pass", "findings": []})
 
 BASE_PROFILE = {
     "name": "fixture",
+    # F-100: the standard stack's anthropic seats are admitted.
+    "providers_allowed": ["anthropic"],
     "repo": {"path": ".", "default_branch": "main", "remote": "nowhere"},
     "commands": {"setup": "true", "test": "true"},
     "paths": {"risk": {}, "protected": []},
@@ -438,6 +440,8 @@ class _Env:
         (self.repo / "tests" / "test_base.py").write_text("def test_base():\n    assert True\n")
         profile = {
             "name": "fixture",
+            # F-100: the standard stack's anthropic seats are admitted.
+            "providers_allowed": ["anthropic"],
             "repo": {"path": str(self.repo), "default_branch": "main",
                      "remote": str(self.remote), "merge_method": "squash"},
             "commands": {"setup": "true",

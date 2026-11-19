@@ -242,6 +242,11 @@ class ProviderSpec:
     NEVER holds a credential VALUE (``repr`` is safe): the token is
     looked up per session by :func:`provider_token` or passed by a
     caller that already holds it.
+
+    F-100 adds ``role`` and ``stack``: the registry role and stack this
+    resolution came from, carried onto the session record and trace
+    (AC-4). None on every resolution that is not a seat role (the
+    project's own provider, the pre-F-100 call sites).
     """
 
     kind: str
@@ -252,6 +257,8 @@ class ProviderSpec:
     credential_key: str
     region: str | None = None
     base_url: str | None = None
+    role: str | None = None
+    stack: str | None = None
 
     def env(self, credential: str, timeout_ms: int) -> dict[str, str]:
         """The literal session env for this provider (exactly the names
@@ -270,8 +277,10 @@ class ProviderSpec:
         return built
 
     def provider_record(self) -> dict[str, Any]:
-        """The run-record block: kind, model, region or endpoint host.
-        NEVER a credential (asserted by tests/test_f59.py::test_ac_4)."""
+        """The run-record block: kind, model, region or endpoint host —
+        and, when this is a seat-role resolution, the role and stack it
+        came from (F-100 AC-4). NEVER a credential (asserted by
+        tests/test_f59.py::test_ac_4)."""
         record: dict[str, Any] = {"kind": self.kind}
         if self.model is not None:
             record["model"] = self.model
@@ -279,12 +288,16 @@ class ProviderSpec:
             record["region"] = self.region
         else:
             record["endpoint_host"] = self.endpoint_host
+        if self.role is not None:
+            record["role"] = self.role
+        if self.stack is not None:
+            record["stack"] = self.stack
         return record
 
 
 # ------------------------------------------------------------ resolution --
 
-def _own_specs(profile: Mapping[str, Any]) -> "list[ProviderSpec]":
+def _own_specs(profile: Mapping[str, Any], config) -> "list[ProviderSpec]":
     """Every provider spec this project's seats resolve to: the
     project's own (``seat=None``) plus one per seat role. The ONE
     source for both the egress-allowlist rule and
@@ -292,91 +305,45 @@ def _own_specs(profile: Mapping[str, Any]) -> "list[ProviderSpec]":
     come from one resolution by construction (R1-3). A role whose
     override cannot resolve (vertex today) is skipped here: it has no
     literal credential to hold, and the session seam refuses it by
-    name."""
+    name. F-100: seat roles resolve through the registry's default
+    stack (a stack's other provider's token is a run secret exactly
+    like a seat override's)."""
+    from factory.models import MODEL_ROLES
+
+    # R5 (review round 5): an explicit None config refuses UP FRONT —
+    # inside the per-role try below, the same refusal would be swallowed
+    # and the stack-role tokens would silently vanish from the scrub
+    # list (the exact hole this closes; never a quiet defaults read).
+    if config is None:
+        raise ProviderError(
+            "run_secrets needs the factory config (the registry the run "
+            "carries) — a None config is a missed call site, not the "
+            "default registry")
     specs: "list[ProviderSpec]" = []
-    for role in (None, *SEAT_ROLES):
+    try:
+        specs.append(resolve_provider(profile, None))
+    except ProviderError:
+        pass
+    for role in MODEL_ROLES:
         try:
-            specs.append(resolve_provider(profile, role))
+            specs.append(_resolve_role(profile, config, role))
         except ProviderError:
             continue
     return specs
 
 
-def _own_kinds(profile: Mapping[str, Any]) -> set[str]:
-    """The provider kinds this project may reach: its own provider plus
-    every seat override's kind (each already validated against
-    providers_allowed at load). Used by the egress-allowlist rule."""
-    kinds = set()
-    block = profile.get("provider")
-    if isinstance(block, Mapping) and block.get("kind"):
-        kinds.add(str(block["kind"]))
-    seats = profile.get("seat_providers")
-    if isinstance(seats, Mapping):
-        for entry in seats.values():
-            if isinstance(entry, Mapping) and entry.get("kind"):
-                kinds.add(str(entry["kind"]))
-    return kinds
-
-
-def resolve_provider(profile: Mapping[str, Any],
-                     seat: str | None = None) -> ProviderSpec:
-    """Resolve the provider for ``profile`` (and one seat model role).
-
-    Args:
-        profile: The loaded, defaulted profile mapping — the SAME dict
-            the run builds settings from (hash-once, never re-read).
-        seat: The seat model role (implementer/reviewer/verifier/
-            importer); None resolves the project's own provider (the
-            gate runner's settings and the SDK probe — no seat model).
-
-    Returns:
-        The :class:`ProviderSpec`. No credential is looked up here.
+def _build_spec(*, kind: str, model: str | None, region: str | None,
+                base_url: str | None, role: str | None = None,
+                stack: str | None = None) -> ProviderSpec:
+    """The kind → spec tail every resolver shares (F-100: ``resolve_role``
+    and ``resolve_provider`` build their specs here, so the env names,
+    hosts and credential keys of a kind exist in ONE place).
 
     Raises:
-        ProviderError: The seat names an override outside
-            ``providers_allowed`` (load also refuses it — this is the
-            backstop for hand-built dicts), or the kind is ``vertex``
-            (no literal-credential path exists: it needs a credentials
-            FILE or ambient ADC, which this factory never passes —
-            refusing is the rule, not a gap to patch around).
+        ProviderError: As :func:`resolve_provider` — vertex refuses, a
+            bedrock region is required, anthropic_compatible needs its
+            base_url, an unknown kind is named.
     """
-    block = profile.get("provider")
-    kind = str(block.get("kind")) if isinstance(block, Mapping) else "zai"
-    model = None
-    region = None
-    base_url = None
-    if isinstance(block, Mapping):
-        models = block.get("models") or {}
-        region = block.get("region")
-        base_url = block.get("base_url")
-    else:
-        models = {}
-
-    if seat is not None:
-        override = (profile.get("seat_providers") or {}).get(seat)
-        if isinstance(override, Mapping) and override:
-            allowed = profile.get("providers_allowed") or []
-            if override.get("kind") not in allowed:
-                raise ProviderError(
-                    f"seat {seat!r} names provider {override.get('kind')!r} "
-                    f"which is not in the project's providers_allowed "
-                    f"{allowed!r} — a seat runs the project's provider or "
-                    "one the owner allowed (F-59 AC-5)"
-                )
-            kind = str(override.get("kind"))
-            model = override.get("model")
-            region = override.get("region")
-            base_url = override.get("base_url")
-        elif seat in SEAT_DEFAULTS:
-            # F-72 AC-2: an un-overridden arbiter IS the reviewer's seat
-            # (F-80: the contract reviewer likewise) —
-            # the reviewer's provider override (if any) and the reviewer's
-            # model. The owner's pending decision is the override hook;
-            # the default picks nothing new.
-            return resolve_provider(profile, SEAT_DEFAULTS[seat])
-        else:
-            model = models.get(seat)
-
     if kind == "vertex":
         # The spec mismatch, named (see the module docstring): Vertex
         # authenticates through google-auth-library ADC — a credentials
@@ -409,6 +376,7 @@ def resolve_provider(profile: Mapping[str, Any],
             env_keys=("CLAUDE_CODE_USE_BEDROCK", "AWS_BEARER_TOKEN_BEDROCK",
                       "AWS_REGION", "API_TIMEOUT_MS"),
             credential_key="AWS_BEARER_TOKEN_BEDROCK",
+            role=role, stack=stack,
         )
 
     if kind == "anthropic_compatible":
@@ -424,6 +392,7 @@ def resolve_provider(profile: Mapping[str, Any],
             env_keys=("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
                       "API_TIMEOUT_MS"),
             credential_key="ANTHROPIC_AUTH_TOKEN",
+            role=role, stack=stack,
         )
 
     if kind == "anthropic":
@@ -434,6 +403,7 @@ def resolve_provider(profile: Mapping[str, Any],
             env_keys=("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
                       "API_TIMEOUT_MS"),
             credential_key="ANTHROPIC_AUTH_TOKEN",
+            role=role, stack=stack,
         )
 
     if kind == "zai":
@@ -443,12 +413,86 @@ def resolve_provider(profile: Mapping[str, Any],
             env_keys=("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
                       "API_TIMEOUT_MS"),
             credential_key="ANTHROPIC_AUTH_TOKEN",
+            role=role, stack=stack,
         )
 
     raise ProviderError(
         f"unknown provider kind {kind!r}: expected one of "
         f"{list(PROVIDER_KINDS)}"
     )
+
+
+def _resolve_role(profile: Mapping[str, Any], config, role: str) -> ProviderSpec:
+    """:func:`factory.models.resolve_role` behind a local name (the
+    lazy import keeps the module graph acyclic: models imports this
+    module for the spec builder, so this module reaches models only at
+    call time)."""
+    from factory.models import resolve_role
+
+    return resolve_role(profile, config, role)
+
+
+def resolve_provider(profile: Mapping[str, Any],
+                     seat: str | None = None, *,
+                     config: "Any" = None) -> ProviderSpec:
+    """Resolve the provider for ``profile`` (and one seat model role).
+
+    Args:
+        profile: The loaded, defaulted profile mapping — the SAME dict
+            the run builds settings from (hash-once, never re-read).
+        seat: The seat model role (implementer/reviewer/verifier/
+            importer); None resolves the project's own provider (the
+            gate runner's settings and the SDK probe — no seat model).
+
+    Returns:
+        The :class:`ProviderSpec`. No credential is looked up here.
+
+    Raises:
+        ProviderError: The seat names an override outside
+            ``providers_allowed`` (load also refuses it — this is the
+            backstop for hand-built dicts), or the kind is ``vertex``
+            (no literal-credential path exists: it needs a credentials
+            FILE or ambient ADC, which this factory never passes —
+            refusing is the rule, not a gap to patch around).
+
+    F-100: a SEAT resolution delegates to :func:`factory.models.
+    resolve_role` (the ONE role resolver — the registry's stack, the
+    F-100 guard and restrictions, the deprecated provider.models
+    override) over the DEFAULT registry; every session-starting call
+    site passes the owner's config explicitly.
+    """
+    block = profile.get("provider")
+    kind = str(block.get("kind")) if isinstance(block, Mapping) else "zai"
+    model = None
+    region = None
+    base_url = None
+    if isinstance(block, Mapping):
+        region = block.get("region")
+        base_url = block.get("base_url")
+
+    if seat is not None:
+        # R3 (review round 4): the seat path resolves through the
+        # registry the run carries; without a config it REFUSES (the
+        # old silent DEFAULT_REGISTRY default scrubbed the wrong token
+        # set whenever the owner's registry differed).
+        if config is None:
+            raise ProviderError(
+                "resolve_provider's seat path needs the factory config "
+                "(the registry the run carries) — pass it, or use "
+                "factory.models.resolve_role directly")
+        return _resolve_role(profile, config, _seat_role_name(seat))
+
+    return _build_spec(kind=kind, model=model, region=region,
+                       base_url=base_url)
+
+
+def _seat_role_name(seat: str) -> str:
+    """The default registry role a seat name carries (the reviewer seat
+    without its lens named is the conformance review; every fan-out
+    passes each seat's own role)."""
+    from factory.models import seat_role
+
+    return seat_role(seat)
 
 
 # ------------------------------------------------------------ credentials --
@@ -515,7 +559,7 @@ def provider_token(kind: str, *, base_url: str | None = None) -> str | None:
     return os.environ.get("ANTHROPIC_AUTH_TOKEN") or None
 
 
-def run_secrets(profile: Mapping[str, Any]) -> tuple[str, ...]:
+def run_secrets(profile: Mapping[str, Any], config) -> tuple[str, ...]:
     """Every provider token this run holds, deduplicated, empty strings
     dropped: one lookup per provider SPEC the seats resolve to (R1-3 —
     each with its own base_url, so an anthropic_compatible seat override
@@ -528,7 +572,7 @@ def run_secrets(profile: Mapping[str, Any]) -> tuple[str, ...]:
     five copies. A spec with no credential contributes nothing (the run
     will refuse at its own session seam with the kind named)."""
     tokens: list[str] = []
-    for spec in _own_specs(profile):
+    for spec in _own_specs(profile, config):
         token = provider_token(spec.kind, base_url=spec.base_url)
         if token and token not in tokens:
             tokens.append(token)

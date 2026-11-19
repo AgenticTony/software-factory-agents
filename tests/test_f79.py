@@ -205,7 +205,7 @@ def test_ac_1(tmp_path: Path, monkeypatch):
     # round removes it from the tree and review passes, but the fence
     # scans every object in the range. Refused, nothing pushed, and the
     # kept commit is gone (resuming from it could never publish).
-    monkeypatch.setattr(orch, "run_secrets", lambda profile: (SEAT_TOKEN,))
+    monkeypatch.setattr(orch, "run_secrets", lambda profile, config=None: (SEAT_TOKEN,))
     leaky = f"def answer():\n    return 42  # ref {SEAT_TOKEN}\n"
     p = Parked(tmp_path / "fence", monkeypatch, seats=ObservingSeats(
         impl_files=[{}, {"impl.py": leaky}, {"impl.py": IMPL_WIP}],

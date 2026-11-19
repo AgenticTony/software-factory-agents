@@ -966,6 +966,8 @@ def test_ac_4():
     def write_profile(generated):
         doc = {
             "name": "fixture",
+            # F-100: the standard stack's anthropic seats are admitted.
+            "providers_allowed": ["anthropic"],
             "repo": {"path": str(tmp / "repo"), "default_branch": "main",
                      "remote": str(tmp / "remote.git")},
             "commands": {"setup": "true", "test": "true"},

@@ -45,6 +45,7 @@ from _support.f22 import (
 )
 from _support.f63 import ledger_approve
 
+from factory.config import FactoryConfig
 from factory.contract import SCHEMA_DIR, ContractError, acceptance_hash, load_profile
 from factory.mergeorder import Protection
 from factory.orchestrator import run_once
@@ -82,6 +83,8 @@ DEMO_HASH_PLACEHOLDER = "0" * 64  # replaced by _make_skill at runtime
 
 PROFILE_EXTRA_BASE = {
     "name": "demo",
+    # F-100: the standard stack's anthropic seats are admitted.
+    "providers_allowed": ["anthropic"],
     "repo": {
         "path": "/tmp/demo-repo",
         "default_branch": "main",
@@ -675,6 +678,7 @@ def test_ac_7(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr(session_mod, "run_sandboxed", fake_run_sandboxed)
     session_mod.run_session_sandboxed(
+        config=FactoryConfig(),
         seat="implementer", prompt="p", run_dir=run_dir, profile=profile,
         max_turns=1, timeout_min=1,
         toolkit=resolved, factory_root=tmp_path)
@@ -899,6 +903,7 @@ def test_staged_toolkit_is_cleaned_up(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr(session_mod, "run_sandboxed", fake_run_sandboxed)
     session_mod.run_session_sandboxed(
+        config=FactoryConfig(),
         seat="implementer", prompt="p", run_dir=run_root, profile={},
         max_turns=1, timeout_min=1,
         toolkit=resolved, factory_root=tmp_path,

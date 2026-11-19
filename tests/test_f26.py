@@ -124,6 +124,8 @@ class Env:
         (self.repo / "tests" / "test_base.py").write_text("def test_base():\n    assert True\n")
         self.profile = {
             "name": "fixture",
+            # F-100: the standard stack's anthropic seats are admitted.
+            "providers_allowed": ["anthropic"],
             "repo": {
                 "path": str(self.repo),
                 "default_branch": "main",
@@ -291,6 +293,8 @@ def test_ac_1(tmp_path: Path):
     # Schema (red-first: both keys were unknown to repo's closed object).
     base = {
         "name": "fixture",
+        # F-100: the standard stack's anthropic seats are admitted.
+        "providers_allowed": ["anthropic"],
         "repo": {"path": "/tmp/x", "default_branch": "main",
                  "remote": "https://github.com/o/r.git",
                  "branch_protection": "unavailable", "concurrency": 2},
