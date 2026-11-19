@@ -115,6 +115,8 @@ def create_run(
     factory_root: Path | None = None,
     ref: str | None = None,
     warm_cache: Path | None = None,
+    full: bool = False,
+    local_fetch: list[tuple[Path | str, str]] | None = None,
 ) -> RunDir:
     """Clone ``source`` into a fresh run dir and return its :class:`RunDir`.
 
@@ -127,6 +129,17 @@ def create_run(
         ref: Optional branch/tag/commit to detach-checkout after cloning.
         warm_cache: Optional directory copied into the run dir verbatim
             (prebuilt venv, ``node_modules``) so sessions start warm.
+        full: Clone WITHOUT the blob filter (F-101). For a run dir that a
+            SECOND run dir is cloned from — the accept round's work clone:
+            a blobless clone cannot serve the clone's lazy blob fetches
+            (a partial clone of a partial clone), so the source of a
+            clone must hold its blobs. Local-only cost, owner-driven path.
+        local_fetch: Optional ``(source, refspec)`` pairs fetched from a
+            LOCAL repo into the fresh clone before ``ref`` resolves
+            (F-101): a clone carries only the source's ``refs/heads``, so
+            a commit reached only through another ref (the accept round's
+            ``refs/factory/accept/<branch>``) must be fetched explicitly —
+            then it resolves by ref, never by lazy-fetch luck.
 
     Returns:
         The created run: its ``root`` is the clone, ``settings_path`` is where
@@ -154,21 +167,40 @@ def create_run(
     # and silently does a full clone — every run would copy all blobs of all
     # history, defeating D3's "clones are cheap". Overriding the upload-pack
     # command turns the filter on for the local source too.
-    result = subprocess.run(
-        [
-            "git", *GIT_HARDENING, "clone", "--filter=blob:none",
+    clone_cmd = ["git", *GIT_HARDENING, "clone"]
+    if not full:
+        clone_cmd += [
+            "--filter=blob:none",
             "--upload-pack", "git -c uploadpack.allowFilter=true upload-pack",
-            source.as_uri(), str(dest),
-        ],
+        ]
+    result = subprocess.run(
+        [*clone_cmd, source.as_uri(), str(dest)],
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
         shutil.rmtree(dest, ignore_errors=True)
+        shape = " (unfiltered)" if full else " --filter=blob:none"
         raise RunError(
-            f"git clone --filter=blob:none failed for {project!r} "
+            f"git clone{shape} failed for {project!r} "
             f"from {source}: {result.stderr.strip()}"
         )
+
+    for fetch_src, refspec in local_fetch or ():
+        # F-101: local only, no timeout wrapper — a path the caller owns
+        # (the work clone this run dir was just cloned from).
+        result = subprocess.run(
+            ["git", *GIT_HARDENING, "-C", str(dest), "fetch", "--quiet",
+             "--no-tags", str(Path(fetch_src).resolve()), refspec],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            shutil.rmtree(dest, ignore_errors=True)
+            raise RunError(
+                f"git fetch of {refspec!r} from {fetch_src} failed for "
+                f"{project!r} run {dest}: {result.stderr.strip()}"
+            )
 
     if ref is not None:
         # A branch name usually exists in the clone only as origin/<name>;
