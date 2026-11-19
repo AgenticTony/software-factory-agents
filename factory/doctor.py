@@ -132,9 +132,24 @@ def _epoch_context(tag: str, *, wo: str | None = None
     return epoch, entry.wo, entry.change, fix
 
 
+# The action that clears a ledger repo-path finding: a profile approval
+# run from the project's own repo records its real path.
+REAPPROVE_FIX = ("`factory approve --profile`, run in the project's repo "
+                 "(records its real path)")
+
+
 def _finding(repo: str, check: str, message: str, *, tag: str = "baseline",
-             fatal: bool = True, wo: str | None = None) -> Finding:
-    epoch, wo_resolved, change, fix = _epoch_context(tag, wo=wo)
+             fatal: bool = True, wo: str | None = None,
+             fix: str | None = None) -> Finding:
+    """One finding, its rule line from the epoch register. A finding
+    attributed to a named work order (``wo``) belongs to that work
+    order, not to a rule epoch's migration: its fix line is ``fix`` or
+    none — never the attributed epoch's migration, which clears
+    nothing here (F-66's automatic re-stamp printed as the fix for a
+    missing ledger repo path)."""
+    epoch, wo_resolved, change, epoch_fix = _epoch_context(tag, wo=wo)
+    if fix is None and wo is None:
+        fix = epoch_fix
     return Finding(repo=repo, check=check, message=message, tag=tag,
                    fatal=fatal, epoch=epoch, wo=wo_resolved, change=change,
                    fix=fix)
@@ -309,7 +324,9 @@ def project_report(
                         repo, "queue-epoch",
                         f"{origin}: "
                         f"{version_ceiling_error(version)}",
-                        tag="baseline", fatal=True, wo="F-66"))
+                        tag="baseline", fatal=True, wo="F-66",
+                        fix="upgrade the factory (git pull), or restore "
+                            "the queue this factory wrote"))
             # What approval would refuse (reported; an owner decision):
             caps = budget_caps()
             for task in doc.get("tasks") or []:
@@ -321,7 +338,11 @@ def project_report(
                 scope_paths = ((task.get("scope") or {}).get("paths")
                                if isinstance(task.get("scope"), dict)
                                else None) or []
-                if (kind in _eligible_kinds() and not scope_paths):
+                # Only a draft can be approved (approve refuses any other
+                # status), so only a draft's missing scope is an approval
+                # the owner still owes; a task past draft is history.
+                if (kind in _eligible_kinds() and not scope_paths
+                        and task.get("status") == "draft"):
                     add(_finding(
                         repo, "task-approvability",
                         f"{origin}: task {tid} is a {kind} contract with no "
@@ -381,7 +402,10 @@ def factory_report(
                 report.findings.append(_finding(
                     project, "ledger-repo-path",
                     f"{ledger_file}: the approval ledger refused to load — "
-                    f"{exc}", wo="F-66"))
+                    f"{exc}", wo="F-66",
+                    fix=f"inspect {ledger_file} (append-only, hash-chained): "
+                        "restore it from a backup, then "
+                        + REAPPROVE_FIX))
             if repo_path is None:
                 report.findings.append(_finding(
                     project, "ledger-repo-path",
@@ -389,7 +413,7 @@ def factory_report(
                     "repo path — approvals from before F-66 lack the field; "
                     "re-approve the profile so doctor can check this "
                     "project's repo (`factory approve --profile`)",
-                    fatal=False, wo="F-66"))
+                    fatal=False, wo="F-66", fix=REAPPROVE_FIX))
                 reports.append(report)
                 continue
             resolved = _resolve_repo(repo_path)
@@ -400,7 +424,7 @@ def factory_report(
                     "not exist (moved or cloned elsewhere?) — re-approve "
                     "the profile from its new location "
                     "(`factory approve --profile`)",
-                    fatal=False, wo="F-66"))
+                    fatal=False, wo="F-66", fix=REAPPROVE_FIX))
                 reports.append(report)
                 continue
             if Path(repo_path).is_symlink():
@@ -409,7 +433,7 @@ def factory_report(
                     f"{project}: the recorded repo path {repo_path!r} is a "
                     f"symlink to {str(resolved)!r} — checking the target; "
                     "record the real path at the next profile approval",
-                    fatal=False, wo="F-66"))
+                    fatal=False, wo="F-66", fix=REAPPROVE_FIX))
             if resolved in seen:
                 continue
             seen.add(resolved)
@@ -426,12 +450,12 @@ def factory_report(
                 f"{label}: the repo path is a symlink to "
                 f"{str(resolved)!r} — checking the target; record the "
                 "real path at the next profile approval",
-                fatal=False, wo="F-66"))
+                fatal=False, wo="F-66", fix=REAPPROVE_FIX))
         if resolved is None:
             findings.append(_finding(
                 label, "ledger-repo-path",
                 f"{label}: the repo path does not exist", fatal=False,
-                wo="F-66"))
+                wo="F-66", fix="check the --repo path"))
             reports.append(Report(repo=label, findings=findings))
             continue
         if resolved in seen:

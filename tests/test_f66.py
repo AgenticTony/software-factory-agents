@@ -390,6 +390,59 @@ def test_ac_2_ledger_repo_path_recorded(tmp_path):
     )
 
 
+def test_doctor_scope_finding_names_drafts_only(tmp_path):
+    """Only a draft can be approved (approve refuses anything else), so
+    'approving it would refuse' is true of drafts alone. A scope-less
+    task already past draft — done, ready, needs_human — is history,
+    not an approval the owner still owes: reporting it buried the real
+    findings and made doctor exit non-zero on every pre-F-65 queue."""
+    root = tmp_path / "froot"
+    root.mkdir()
+    repo, qp, pp = _write_repo(tmp_path / "r", tasks=[
+        _task("t-draft", scope=False),
+        _task("t-done", scope=False, status="done", approved=True),
+        _task("t-ready", scope=False, status="ready", approved=True),
+        _task("t-human", scope=False, status="needs_human", approved=True),
+    ])
+    findings = doctor.project_report(pp, qp, factory_root=root).findings
+    scope = [f for f in findings if f.check == "task-approvability"]
+    named = sorted(re.search(r"task (t-[a-z]+)", f.message).group(1)
+                   for f in scope)
+    assert named == ["t-draft"], named
+
+    # A queue whose only scope-less tasks are past draft owes no
+    # approval (the fixture's older-epoch note is a separate finding).
+    repo2, qp2, pp2 = _write_repo(tmp_path / "r2", tasks=[
+        _task("t-done", scope=False, status="done", approved=True),
+    ])
+    rest = doctor.project_report(pp2, qp2, factory_root=root).findings
+    assert [f for f in rest if f.check == "task-approvability"] == []
+
+
+def test_doctor_repo_path_finding_names_its_own_fix(tmp_path):
+    """A ledger finding's fix line is the action that clears it (a
+    profile re-approval from the project's repo), never the migration
+    of the epoch the finding is attributed to (F-66's automatic
+    re-stamp, which clears nothing here)."""
+    from factory.approvals import profile_group_hashes
+    fresh = tmp_path / "froot"
+    (fresh / "approvals").mkdir(parents=True)
+    profile = apply_profile_defaults(_profile(tmp_path / "r"))
+    (fresh / "approvals" / f"{PROJECT}.jsonl").write_text(json.dumps({
+        "kind": "profile", "project": PROJECT,
+        "groups": profile_group_hashes(profile),
+        "approved_by": "owner", "approved_at": "2026-11-01T00:00:00Z",
+        "n": 1, "prev": "0" * 64,
+    }) + "\n")
+    ledger = [f for report in doctor.factory_report(fresh, extra_repos=[])
+              for f in report.findings if f.check == "ledger-repo-path"]
+    assert ledger, "the pre-F-66 approval is reported"
+    for finding in ledger:
+        assert finding.fix and "factory approve --profile" in finding.fix, \
+            finding.fix
+        assert "restamp" not in finding.fix, finding.fix
+
+
 # --------------------------------------------------------------------- AC-3 --
 
 def test_ac_3(tmp_path):
