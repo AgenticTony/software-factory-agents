@@ -1,7 +1,7 @@
 {
   "version": 1,
   "project": "software-factory",
-  "updated_at": "2026-11-18T20:24:16Z",
+  "updated_at": "2026-11-19T06:52:20Z",
   "tasks": [
     {
       "id": "F-00",
@@ -6933,7 +6933,7 @@
       "source": "BUILD-ORDER.md#f-96--every-finding-gets-its-own-verifier-a-serious-one-needs-two-to-drop-it-every-seat-knows-the-sibling-rule",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-95"
       ],
@@ -7015,7 +7015,10 @@
           ".factory/project.yaml",
           ".factory/BOOTSTRAP.md"
         ]
-      }
+      },
+      "acceptance_hash": "ae2edd95222b792455cbac07d893f71cd19d0fe7cbe962a78af5e531e6ee00e1",
+      "approved_at": "2026-11-19T06:52:20Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-99",
