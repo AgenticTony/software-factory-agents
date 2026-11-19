@@ -253,3 +253,59 @@ def test_prompt_names_setup_and_identity():
                                   setup_command=None)
     assert "Setup has already run" not in without
     assert f"{FACTORY_NAME} <{FACTORY_EMAIL}>" in without
+
+
+def test_setup_sees_the_gate_settings_on_every_attempt(tmp_path, monkeypatch):
+    """Setup runs before EVERY attempt, through the run clone's gate
+    settings — the package registries allowed. A session of the same
+    run writes its own settings to the same file without them (F-84:
+    sessions install nothing), so a later attempt's setup must get the
+    gate settings back: JobFinderOS J-1's attempt 2 died on an npm 403
+    because its setup ran under the implementer's settings."""
+    import json
+    from pathlib import Path
+
+    from factory import orchestrator
+    from factory.runs import sandbox_settings_path
+    from factory.session import SessionRecord
+
+    registry = "registry.example.org"
+    env = Env73(tmp_path / "env", profile_extra={
+        "commands": {"setup": "true"},
+        "network_allowlist": [registry],
+    })
+    seen: list[list[str]] = []
+    original = orchestrator._ready_clone
+
+    def ready_clone(work, runner, command, timeout_sec):
+        doc = json.loads(work.settings_path.read_text())
+        seen.append(list(doc["network"]["allowedDomains"]))
+        return original(work, runner, command, timeout_sec)
+
+    monkeypatch.setattr(orchestrator, "_ready_clone", ready_clone)
+    seats = GitSeats(git_commands=[PLAIN_COMMIT])
+    first = {"done": False}
+
+    def runner(seat, prompt, run_dir, profile, **kwargs):
+        if seat == "implementer" and not first["done"]:
+            first["done"] = True
+            # What a real session does to the shared file: its own
+            # settings, the registries dropped.
+            settings = sandbox_settings_path(
+                env.root, Path(run_dir).parent.name, Path(run_dir).name)
+            doc = json.loads(settings.read_text())
+            doc["network"]["allowedDomains"] = [
+                host for host in doc["network"]["allowedDomains"]
+                if host != registry]
+            settings.write_text(json.dumps(doc))
+            return SessionRecord(
+                seat=seat, status="failed", num_turns=20,
+                model="stub-model", reason="error_max_turns")
+        return seats(seat, prompt, run_dir, profile, **kwargs)
+
+    env.run(runner, ci_state=GREEN_CI)
+    assert len(seen) >= 2, f"expected a second attempt, saw {len(seen)}"
+    for attempt_no, domains in enumerate(seen, start=1):
+        assert registry in domains, (
+            f"attempt {attempt_no}'s setup ran without the gate settings' "
+            f"package registry: {domains}")

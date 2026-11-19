@@ -5731,6 +5731,11 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
             # broken setup fails every task the same way, so like an
             # orchestrator error it stops the loop; but no session ran,
             # so it spends no attempt budget.
+            if setup_runner is not None:
+                # The gate settings again, every attempt: a session of
+                # this run wrote ITS settings (no package registries,
+                # F-84) to the same file, and setup installs packages.
+                _gate_settings(profile, work, ctx.factory_root)
             setup_refusal = _ready_clone(work, setup_runner, setup_command,
                                          ctx.gate_timeout_sec)
             if setup_refusal is not None:
