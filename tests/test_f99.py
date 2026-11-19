@@ -42,6 +42,7 @@ from factory.eval import (
     SCHEMA_TABLES,
     SOLOADVENTURER_SEEDS,
     build_soloadventurer_fixture,
+    dropped_entry,
     render_report,
     run_seed,
     run_seeded_eval,
@@ -68,9 +69,10 @@ ALL_TITLES = tuple(spec.title for spec in ALL_SPECS)
 
 
 def _contract_key(spec) -> str:
-    """The contract id a seat's prompt carries for this spec: the
-    opaque slot (post-fix), or whatever the current code routes on."""
-    return str(getattr(spec, "slot", "") or f"EVAL-{spec.id}")
+    """The contract id a seat's prompt carries for this spec — the
+    opaque slot (required at construction since round 2; the old
+    ``EVAL-{id}`` fallback was dead code and is gone, F-102)."""
+    return str(spec.slot)
 
 
 def _fixture(tmp_path: Path, name: str = "soloadventurer") -> Path:
@@ -383,6 +385,11 @@ def test_ac_3(tmp_path: Path):
     "(seed missed)" and counts the drops that cost a catch. A drop on a
     caught run is not costly; a drop on a missed run is. Old reports
     without the field still render, with no verdict and no count.
+    (F-102 rework: only the two contracts MixedSeats splits run — the
+    entries come from ``dropped_entry``, the same writer
+    ``run_seeded_eval`` uses — and the count line is F-102's: N counts
+    only drops whose restore would have caught the seed, M only the
+    missed runs' drops.)
     """
     from _support.f95 import finding
 
@@ -395,19 +402,16 @@ def test_ac_3(tmp_path: Path):
     sibling = finding("R-3", "app/gear.py",
                       "gear_for_owner accepts a whitespace-only owner_id",
                       severity="minor", sibling=True)
-    caller = finding("R-4", "app/report.py",
-                     "pack_summary still reads i['item'] but pack_list "
-                     "now returns plain names", severity="blocking")
 
     class MixedSeats(ScriptedSeats):
         """Per-contract split seats (the SplitSeats pattern, for two
         contracts at once): the first reviewer call on a split contract
         returns ``first``, later calls ``rest``; the verifier drops the
         listed UNION ids (a finding one seat reported is not unanimous,
-        so the drop stands). Other contracts use the scripted table."""
+        so the drop stands)."""
 
         def __init__(self, split: dict, drops: dict):
-            super().__init__({seed_by_id("caller-break").slot: [caller]})
+            super().__init__()
             self._split = split
             self._drops = drops
             self._lock = threading.Lock()
@@ -455,25 +459,41 @@ def test_ac_3(tmp_path: Path):
         drops={seed_by_id(MOCKS).slot: {"U-2"},
                seed_by_id(SIBLING).slot: {"U-1"}},
     )
-    report = run_seeded_eval(repo, session_runner=seats, reviewers=2)
+    # Only the two contracts the split covers run (F-102): the whole
+    # eval added nothing to what these two seeds prove.
+    mocks_seed, sib_seed = seed_by_id(MOCKS), seed_by_id(SIBLING)
+    mocks_record = run_seed(repo, mocks_seed, session_runner=seats,
+                            reviewers=2)
+    sib_record = run_seed(repo, sib_seed, session_runner=seats, reviewers=2)
 
     # The runs themselves: the mocks seed caught by its kept finding and
     # still carrying a dropped duplicate; the sibling seed missed with
     # its only matching finding dropped.
-    seeds = {r["id"]: r for r in report["seeds"]}
-    assert seeds[MOCKS]["caught_by"] == ["L2"]
-    assert seeds[SIBLING]["caught_by"] == []
-    entries = {(e["id"], e["repeat"]): e
-               for e in report["found_then_dropped"]}
-    mocks_entry = entries[(MOCKS, 1)]
-    sib_entry = entries[(SIBLING, 1)]
+    assert mocks_record["caught_by"] == ["L2"]
+    assert sib_record["caught_by"] == []
+    entries = []
+    for record, seed in ((mocks_record, mocks_seed),
+                         (sib_record, sib_seed)):
+        entry = dropped_entry(record, seed, root=repo)
+        entry["repeat"] = 1
+        entries.append(entry)
+    mocks_entry, sib_entry = entries
     assert mocks_entry["dropped"], mocks_entry
     assert mocks_entry["seed_caught"] is True
     assert sib_entry["dropped"], sib_entry
     assert sib_entry["seed_caught"] is False
 
     # The rendered report: the parenthetical per entry, the count line
-    # below them — a caught run's drop is not costly, a missed run's is.
+    # below them — a caught run's drop is not costly (and from F-102 is
+    # not even in the line), a missed run's is.
+    report = {
+        "fixture": "soloadventurer", "base_ref": "main", "l2": "sessions",
+        "repeats": 1, "seeds": [mocks_record, sib_record], "clean": [],
+        "l2_quota_voided": 0,
+        "catch_rate": {"L0": 0.0, "L1": 0.0, "L2": 0.5},
+        "caught_counts": {"L0": 0, "L1": 0, "L2": 1},
+        "found_then_dropped": entries,
+    }
     text = render_report(report)
     mocks_line = next(line for line in text.splitlines()
                       if line.startswith(f"- seed {MOCKS}:")
@@ -483,7 +503,11 @@ def test_ac_3(tmp_path: Path):
                     and "found, then dropped" in line)
     assert mocks_line.endswith("(seed still caught)"), mocks_line
     assert sib_line.endswith("(seed missed)"), sib_line
-    assert "Drops that cost a catch: 1 of 2" in text
+    # F-102: the count line counts only drops that would have caught
+    # the seed, over the MISSED runs' drops only — the caught run's
+    # dropped duplicate is not in the line at all (F-99's line said
+    # "1 of 2"; the honest number is 1 of 1).
+    assert "Drops that cost a catch: 1 of 1" in text
 
     # An old report (pre-F-99, no seed_caught on the entries) renders
     # the old line shape — no parenthetical, no count line, no crash.

@@ -505,9 +505,12 @@ SOLOADVENTURER_SEEDS = [
         slot="EVAL-04",
         layer="L0",
         title="the await dropped from the checkin-count fetch",
-        # The task: drop the async hop — the dangling coroutine is the
-        # defect; "coroutine" is a marker no seat may be handed.
-        contract_title="make the checkin-count fetch synchronous",
+        # F-102 (AC-3): round 1's "make the checkin-count fetch
+        # synchronous" REQUESTED the change that carries the defect.
+        # Neutral intent — the tidy-up a developer would plausibly have
+        # been booked for; the dangling coroutine is the defect they
+        # must find ("coroutine" stays a marker no seat may be handed).
+        contract_title="tidy the checkin-count fetch",
         markers=("checkin_count", "fetchone", "await", "coroutine"),
         edits=(
             ("    row = await store.fetchone(", "    row = store.fetchone("),
@@ -903,7 +906,7 @@ def _sibling_check(layers: dict, seed: "SiblingSeed",
         return {"caught": False,
                 "reason": f"a sibling was reported on another file, not "
                           f"{seed.sibling_file}"}
-    if _dropped_matches(l2, seed.markers, site, root):
+    if _dropped_matches(l2, seed, root):
         return {"caught": False,
                 "reason": "found, then dropped by the verifier: no "
                           f"surviving finding on {seed.sibling_file}"}
@@ -949,20 +952,28 @@ def _caller_check(layers: dict, seed: SeedSpec, caught: bool,
         return {"caught": False,
                 "reason": "a finding on the caller names no marker "
                           f"({', '.join(seed.markers)})"}
-    if _dropped_matches(l2, seed.markers, files, root):
+    if _dropped_matches(l2, seed, root):
         return {"caught": False,
                 "reason": "found, then dropped by the verifier"}
     return {"caught": False,
             "reason": f"no surviving finding on {', '.join(files)}"}
 
 
-def _dropped_matches(l2: dict, markers: tuple[str, ...],
-                     files: tuple[str, ...],
+def _dropped_matches(l2: dict, seed: SeedSpec,
                      root: Path | None = None) -> list[dict]:
     """The verifier's VOTE drops of a finding that names the seeded
-    defect (a marker, and — when ``files`` — one of those files). A
-    refused drop (``override_refused``: the finding survived) and a nit
-    budget cut (not the verifier's judgment) are not counted."""
+    defect (a marker, and — when the seed has catch files — one of
+    those files). A refused drop (``override_refused``: the finding
+    survived) and a nit budget cut (not the verifier's judgment) are
+    not counted. F-102: each drop carries ``would_have_caught`` — the
+    seed's own catch rule re-applied to the run with that ONE finding
+    restored (:func:`_would_have_caught`) — so a drop that could never
+    have produced the catch never reads as a lost one. A drop whose
+    finding names no file on a seed with catch files rides the entry
+    counted-undecidable (it cannot be judged; excluding it would
+    flatter the verifier)."""
+    files = ((seed.sibling_file,) if isinstance(seed, SiblingSeed)
+             else tuple(seed.finding_files))
     out = []
     for entry in l2.get("verifier_dropped") or []:
         if not isinstance(entry, dict):
@@ -972,13 +983,82 @@ def _dropped_matches(l2: dict, markers: tuple[str, ...],
             continue
         finding = entry.get("finding")
         if not isinstance(finding, dict) or not _names_marker(finding,
-                                                              markers):
+                                                              seed.markers):
             continue
-        if files and not _on_files(finding, files, root):
+        if files and finding.get("file") is not None \
+                and not _on_files(finding, files, root):
             continue
-        out.append({"id": finding.get("id"), "file": finding.get("file"),
-                    "text": finding.get("text"), "reason": reason})
+        caught, undecidable = _would_have_caught(seed, finding, l2, root)
+        row = {"id": finding.get("id"), "file": finding.get("file"),
+               "text": finding.get("text"), "reason": reason,
+               "would_have_caught": caught}
+        if undecidable:
+            row["undecidable"] = undecidable
+        out.append(row)
     return out
+
+
+def _restored_l2(l2: dict, finding: dict) -> dict:
+    """The stored L2 report with ONE dropped finding put back among the
+    survivors (F-102): the counterfactual the drop-cost rule judges.
+    The round's verdict is re-settled the stored findings settle it —
+    the restored finding itself fails the round exactly when
+    :func:`_blocks` says (l2's own rule), so a restored minor flips
+    nothing and a restored blocking finding fails the round."""
+    findings = [f for f in l2.get("findings") or [] if isinstance(f, dict)]
+    restored: dict = dict(l2, findings=[*findings, finding])
+    if _blocks(finding):
+        restored["verdict"] = "fail"
+    return restored
+
+
+def _would_have_caught(seed: SeedSpec, finding: dict, l2: dict,
+                       root: Path | None = None) -> "tuple[bool, str | None]":
+    """F-102: whether keeping this one dropped finding would have
+    caught the seed — the seed's OWN catch rule re-applied to the run
+    with the finding restored (:func:`_restored_l2`): :func:`_blocks`
+    for caller-break, the sibling rule (:func:`_sibling_check`) for the
+    sibling seed, F-16's marker rule (:func:`_catches`, which needs a
+    failing verdict) for the rest. Returns ``(caught, reason)``, the
+    reason set only when the restore could not be judged — and an
+    undecidable restore COUNTS as caught: the costlier error is a
+    drop-cost number that flatters the review pipeline (a minor drop
+    read as harmless because its severity was missing)."""
+    files = ((seed.sibling_file,) if isinstance(seed, SiblingSeed)
+             else tuple(seed.finding_files))
+    if files and finding.get("file") is None:
+        return True, "the dropped finding names no file"
+    verdict = l2.get("verdict")
+    if verdict not in ("pass", "fail"):
+        return True, f"no verdict on the record ({verdict!r})"
+    if (files and finding.get("sibling") is not True
+            and finding.get("sibling_claim") is True
+            and _on_files(finding, files, root)):
+        # The drop is stored PRE-ruling: settle marks the union, and a
+        # dropped finding never survives to be marked (its ``sibling``
+        # reads false beside its ``sibling_claim``). The restore
+        # re-applies the parent's two-condition rule where the seed's
+        # own rule can decide it — the claim, on a catch file the
+        # seed's diff never touches (outside it by construction). A
+        # plain seed's drop is unfiltered by file, so its diff
+        # membership is unknowable from the record: the claim is left
+        # undecided there and a blocking restore COUNTS (the costly
+        # side, never the flattering one).
+        finding = dict(finding, sibling=True)
+    if isinstance(seed, SiblingSeed):
+        check = _sibling_check({"L2": _restored_l2(l2, finding)}, seed,
+                               root=root)
+        return check["caught"], None
+    # The marker rule needs a FAILING round; a passing one flips only
+    # when the restored finding itself fails it — which a missing or
+    # blank severity cannot decide (and with catch files, the rule
+    # admits only findings that block: undecidable the same way).
+    severity = finding.get("severity")
+    if (files or verdict == "pass") and (
+            not isinstance(severity, str) or not severity.strip()):
+        return True, "the restored finding carries no severity"
+    return _catches(_restored_l2(l2, finding), seed.markers,
+                    files=files, root=root), None
 
 
 def found_then_dropped(record: dict, seed: SeedSpec,
@@ -988,7 +1068,8 @@ def found_then_dropped(record: dict, seed: SeedSpec,
     voted out — today these read as a plain miss. F-99: the report's
     entries carry ``seed_caught`` beside these (whether that run was
     still caught by any layer) so a harmless drop never reads as a lost
-    catch.
+    catch. F-102: each drop carries ``would_have_caught`` (with
+    ``undecidable`` named when the restore could not be judged).
 
     "Names the seeded defect" is the seed's own catch evidence rule: a
     marker in the finding's file or text, on the seed's catch file when
@@ -1000,9 +1081,7 @@ def found_then_dropped(record: dict, seed: SeedSpec,
     l2 = (record.get("layers") or {}).get("L2") or {}
     if not l2 or l2.get("quota_voided"):
         return []
-    files = ((seed.sibling_file,) if isinstance(seed, SiblingSeed)
-             else tuple(seed.finding_files))
-    return _dropped_matches(l2, seed.markers, files, root)
+    return _dropped_matches(l2, seed, root)
 
 
 def _catch_evidence(report: dict, files: tuple[str, ...] = (),
@@ -1203,6 +1282,10 @@ def run_l2_review(
         # SEAT_TIMEOUT_MIN whatever order the sliding pool admits it
         # in, so a normal pool neither starves nor hands a late session
         # a shrunken window (round 5's flat window did both).
+        # F-102 (AC-5): the WINDOW stays the admission check, but each
+        # session's own timeout is CAPPED at SEAT_TIMEOUT_MIN — one
+        # hung eval session can no longer run the whole window (the
+        # turn cap still bounds spend; this bounds wall clock).
         session_count = len(
             orchestrator.verifier_sessions_for(union.findings))
         fanout = orchestrator.run_verifier_fanout(
@@ -1214,6 +1297,7 @@ def run_l2_review(
             srt_bin_path=None, run_id=None, task_id=None, toolkit=None,
             parallel=orchestrator._verifier_parallel(profile),
             remaining_min=lambda: SEAT_TIMEOUT_MIN * max(1, session_count),
+            timeout_cap_min=SEAT_TIMEOUT_MIN,
             max_turns=SEAT_MAX_TURNS,
         )
         if fanout.quota is not None:
@@ -1285,7 +1369,8 @@ def _clean_review_summary(record: dict) -> str:
     happened to pass), then L2's blocking count — a fail, above all an
     invalid_verdict_json fail (whose lone finding carries no severity,
     so it counts 0 blocking), must never read as a clean review. A
-    quota-voided review says so: it produced no verdict at all."""
+    voided review says so (F-102: with its reason — quota, or a starved
+    verifier window): it produced no verdict at all."""
     layers = record.get("layers") or {}
     parts: list[str] = []
     for name in ("L0", "L1"):
@@ -1296,8 +1381,11 @@ def _clean_review_summary(record: dict) -> str:
             parts.append(f"{name} {verdict}")
     l2 = layers.get("L2") or {}
     if l2.get("quota_voided"):
+        # F-102 (AC-5): the line names the VOID, never its most common
+        # cause — a starved verifier window is as voided as a quota
+        # hit, and the reason says which.
         reason = f" ({l2['void_reason']})" if l2.get("void_reason") else ""
-        parts.append(f"L2 quota-voided (no verdict){reason}")
+        parts.append(f"L2 voided (no verdict){reason}")
         return ", ".join(parts)
     blocking = record.get("blocking_findings")
     if blocking is None or "L2" not in layers:
@@ -1328,6 +1416,19 @@ def _reviewer_retries(report: dict) -> int:
 
 
 LAYERS = ("L0", "L1", "L2")
+
+
+def dropped_entry(record: dict, seed: SeedSpec,
+                  root: Path | None = None) -> dict:
+    """One found-then-dropped entry exactly as the report carries it:
+    the seed's id, its verifier-vote drops (each judged F-102's
+    would-have-caught rule) and whether the run was still caught by any
+    layer (F-99). ``run_seeded_eval`` stamps the repeat beside it; a
+    single-seed caller (tests, a future per-seed rerun) reuses this
+    instead of re-deriving the shape."""
+    return {"id": seed.id,
+            "dropped": found_then_dropped(record, seed, root=root),
+            "seed_caught": bool(record.get("caught_by"))}
 
 
 def run_seeded_eval(
@@ -1379,12 +1480,12 @@ def run_seeded_eval(
             # F-95: per seed and repeat (empty when nothing matched) — kept
             # beside the records, which stay byte-for-byte F-16's.
             # F-99 (AC-3): seed_caught says whether that run was still
-            # caught by any layer — a drop on a caught run cost nothing,
-            # a drop on a missed run did.
-            dropped.append({"id": seed.id, "repeat": repeat,
-                            "dropped": found_then_dropped(record, seed,
-                                                          root=repo),
-                            "seed_caught": bool(record.get("caught_by"))})
+            # caught by any layer. F-102 (AC-1): each drop inside is
+            # judged — restoring it would / would not have caught the
+            # seed — so the count line counts real losses only.
+            entry = dropped_entry(record, seed, root=repo)
+            entry["repeat"] = repeat
+            dropped.append(entry)
         for diff in CLEAN_DIFFS:
             record = run_seed(repo, diff, **common)
             record["repeat"] = repeat
@@ -1432,6 +1533,13 @@ def run_seeded_eval(
         # findings a seat reported and the verifier voted out.
         "per_seed": per_seed_counts(seeds),
         "found_then_dropped": dropped,
+        # F-102 (AC-2): the slot → seed id table, OUTSIDE the pinned
+        # F-16 record shape (one top-level key; the per-diff records
+        # never move) — a slot in a session trace resolves without
+        # reading this module. Reports written before F-102 carry no
+        # key and render without the section.
+        "slots": {spec.slot: spec.id
+                  for spec in [*SOLOADVENTURER_SEEDS, *CLEAN_DIFFS]},
     }
 
 
@@ -1704,6 +1812,13 @@ def render_report(report: dict) -> str:
         )
     else:
         lines.append(f"L2 quota-voided: {report.get('l2_quota_voided', 0)}")
+    # F-102 (AC-2): the slot → seed id table, only on reports that
+    # carry it (a top-level key outside the pinned record shape) —
+    # reports written before F-102 render exactly as they did.
+    slots = report.get("slots")
+    if slots:
+        lines += ["", "## Slot → seed", ""]
+        lines += [f"- {slot} → {seed_id}" for slot, seed_id in slots.items()]
     lines.append("")
     return "\n".join(lines)
 
@@ -1761,6 +1876,8 @@ def _per_seed_lines(report: dict) -> list[str]:
                if int(report.get("repeats") or 1) > 1 else "")
         what = "; ".join(
             f"{d.get('id')} ({d.get('file')}) — {d.get('reason')}"
+            + (f" [counted undecidable: {d['undecidable']}]"
+               if d.get("undecidable") else "")
             for d in entry["dropped"]
         )
         # F-99 (AC-3): whether the drop cost anything — the seed was
@@ -1774,7 +1891,24 @@ def _per_seed_lines(report: dict) -> list[str]:
             cost = " (seed missed)"
         lines.append(f"- seed {entry.get('id')}{tag}: found, then dropped "
                      f"by the verifier: {what}{cost}")
-    if any("seed_caught" in e for e in shown):
+    # F-102 (AC-1): the count line means what it says. A drop costs a
+    # catch only when the seed's own rule, re-applied with that ONE
+    # finding restored, would have caught it — so N counts only
+    # ``would_have_caught`` and M is the MISSED runs' drops (a drop on
+    # a caught run cost nothing whatever it was). Reports written
+    # before F-102 (no field on the drops) keep the F-99 line over all
+    # shown drops, and pre-F-99 reports keep no line at all.
+    if any("would_have_caught" in d
+           for e in shown for d in e["dropped"]):
+        missed_drops = [d for e in shown if e.get("seed_caught") is False
+                        for d in e["dropped"]]
+        # A missed-run drop with no verdict (a hand-edited mixed report)
+        # counts: undecided is the costly side, same as the rule below.
+        costly = sum(1 for d in missed_drops
+                     if "would_have_caught" not in d or d["would_have_caught"])
+        lines.append(f"Drops that cost a catch: {costly} of "
+                     f"{len(missed_drops)}")
+    elif any("seed_caught" in e for e in shown):
         costly = sum(len(e["dropped"]) for e in shown
                      if e.get("seed_caught") is False)
         total = sum(len(e["dropped"]) for e in shown)

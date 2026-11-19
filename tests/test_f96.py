@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from pathlib import Path
 
 from _support.f72 import IMPL_GOOD
@@ -615,6 +616,17 @@ def test_ac_5(tmp_path: Path, monkeypatch):
 # ------------------------------------------------- round 2 (review fixes) --
 
 
+def _stagger_second_session(number: int) -> None:
+    """Hold the SECOND verifier call (one of A's pair) briefly, so A's
+    sessions free their pool slots in turn and B's specs are admitted
+    one at a time, in spec order. Without it both B sessions can start
+    at once, and which of them enters the stub's call lock first (and
+    plays B's first script, the invalid vote) is a thread race — the
+    -v3 assertion below then failed on CI whenever spec 4 won it."""
+    if number == 2:
+        time.sleep(0.3)
+
+
 def test_repair_resumes_in_the_sessions_own_home(tmp_path: Path,
                                                  monkeypatch):
     """Round-2 finding 1 (the round review): a malformed vote from a
@@ -632,6 +644,7 @@ def test_repair_resumes_in_the_sessions_own_home(tmp_path: Path,
         hunt=_verdict(declared="pass"),
         script={"R2-B": ["invalid_resumable",
                          {"tag": "important", "reason": "confirmed"}]},
+        on_verifier_call=_stagger_second_session,
     )
     repairs: list[dict] = []
 
@@ -706,6 +719,7 @@ def test_accept_round_repairs_in_the_sessions_own_home(tmp_path: Path):
         conformance=_verdict(), hunt=_verdict(),
         script={"R2C-B": ["invalid_resumable",
                           {"tag": "important", "reason": "confirmed"}]},
+        on_verifier_call=_stagger_second_session,
     )
     repairs: list[dict] = []
 
@@ -1201,7 +1215,7 @@ def test_on_record_fires_as_each_session_ends(tmp_path: Path):
 # ------------------------------------------------- round 6 (final review) --
 
 
-def test_eval_starved_pool_venes_the_review(tmp_path: Path, monkeypatch):
+def test_eval_starved_pool_voids_the_review(tmp_path: Path, monkeypatch):
     """Round-6 A: a starved verifier pool voids the EVAL review exactly
     like quota — no verdict is scored over findings that were not all
     voted, and the void's reason is visible on the record."""

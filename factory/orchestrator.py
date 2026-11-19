@@ -1999,6 +1999,7 @@ def run_verifier_fanout(
     parallel: int,
     remaining_min: "Callable[[], float]",
     max_turns: int = VERIFIER_TURN_CAP,
+    timeout_cap_min: "float | None" = None,
     add_elapsed=None,
     on_record=None,
     collect_vote=None,
@@ -2023,6 +2024,11 @@ def run_verifier_fanout(
     session runs at the fixed parent-granted ``max_turns`` cap
     (F-64: never a remainder, never a record-funded number).
     ``add_elapsed`` books the pool's wall time on the caller's budget.
+    ``timeout_cap_min`` (F-102) caps each session's own timeout while
+    the WINDOW — ``remaining_min`` — stays the admission check: the
+    eval passes its per-seat budget so one hung session can never run
+    the whole multi-session window. ``None`` (every production caller)
+    keeps the window as each session's timeout, unchanged.
     A quota record stops all NEW admissions and returns in ``quota`` —
     the caller aborts on it exactly like the single verifier's quota
     branch. One honestly-named subtlety: each session's own timeout is
@@ -2084,6 +2090,19 @@ def run_verifier_fanout(
             design caught between waves must not slip)."""
             return (time.monotonic() - t0) / 60.0
 
+        def _session_window_min() -> float:
+            """The window one NEW session gets (round 5: read at ITS
+            admission): what is left of the caller's wall — capped at
+            ``timeout_cap_min`` when the caller set one (F-102: the
+            eval caps every session at its own per-seat budget while
+            the uncapped window stays the admission check, so a hung
+            session cannot run the whole multi-session window and a
+            starved pool still refuses)."""
+            window = remaining_min() - _pool_elapsed_min()
+            if timeout_cap_min is not None:
+                return min(window, timeout_cap_min)
+            return window
+
         # Round 4 fix 3: ONE sliding pool over every spec, capped at
         # `parallel` — a freed worker takes the next session at once
         # (barrier waves idled up to parallel-1 slots on the run's wall
@@ -2109,8 +2128,7 @@ def run_verifier_fanout(
             # whole window read at pool start), and on_record fires in
             # the worker as each record arrives — trace and spend stay
             # live through a long pool instead of flushing at the end.
-            timeout_for=lambda _i: (
-                remaining_min() - _pool_elapsed_min()),
+            timeout_for=lambda _i: _session_window_min(),
             on_record=on_record,
         )
         if add_elapsed is not None:
