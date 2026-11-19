@@ -35,7 +35,10 @@ __all__ = [
 
 # The defect-hunt lens block, exactly as the seat receives it (appended
 # to the base reviewer prompt). Pinned by literal: editing the block in
-# factory/prompts.py without this pin fails test_ac_2.
+# factory/prompts.py without this pin fails test_ac_2. F-96 moved the
+# "Draw the line" sibling paragraph out of the lens into the base
+# reviewer prompt (pinned in tests/_support/f96.py) — the lens keeps the
+# hunt and a pointer, never a second copy of the rule.
 HUNT_PIN = (
     "## Your lens: hunt the defect beyond the hunk\n"
     "\n"
@@ -51,15 +54,8 @@ HUNT_PIN = (
     "Report each other site as its own finding with `\"sibling\": true`, "
     "its `file` and `line`, and the defect class named in its `text`.\n"
     "\n"
-    "Draw the line exactly. A defect this diff CAUSES — including a break "
-    "at an unchanged caller, test or config — is reported WITHOUT "
-    "`sibling` and judged by its severity like any finding. "
-    "`\"sibling\": true` is only for an older site of the same class that "
-    "this diff neither causes nor touches: the orchestrator records it for "
-    "a follow-up task and it does not fail this round, whatever its "
-    "severity — rate it by what the defect costs, and judge your verdict "
-    "on the diff alone. `sibling: true` on a file the diff changes lowers "
-    "nothing: a defect inside the diff is judged by the diff's rules.\n"
+    "Draw each site's line by the sibling rule in the base prompt above — "
+    "it applies to every site you report, this lens or not.\n"
 )
 # What the scripted runner looks for to tell the two lenses apart.
 HUNT_MARK = "## Your lens: hunt the defect beyond the hunk"

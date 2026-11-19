@@ -89,6 +89,18 @@ missing, not that behaviour was checked):
   internal collaborators, private methods or call counts? Mocks belong
   only at system boundaries (external APIs, time, randomness).
 
+## Sibling sites: draw the line exactly
+
+A defect this diff CAUSES — including a break at an unchanged caller,
+test or config — is reported WITHOUT `"sibling"` and judged by its
+severity like any finding. `"sibling": true` is only for an older site
+of the same class that this diff neither causes nor touches: the
+orchestrator records it for a follow-up task and it does not fail this
+round, whatever its severity — rate it by what the defect costs, and
+judge your verdict on the diff alone. `"sibling": true` on a file the
+diff changes lowers nothing: a defect inside the diff is judged by the
+diff's rules.
+
 ## Fix rounds: review the delta
 
 After the first round, the prompt hands you three scope sections instead
@@ -102,15 +114,19 @@ of one diff:
   you last reviewed. New findings belong here. A new finding on a file
   outside the delta must carry a `missed_earlier` field saying why the
   earlier round missed it; without that, the orchestrator drops it as
-  out of scope. A finding that names no file is never dropped — it
-  cannot be shown to sit in unchanged code.
+  out of scope — unless it is the sibling site of a defect class this
+  diff fixes: an older site outside the diff needs no `missed_earlier`
+  when you flag it `"sibling": true`; it goes to the follow-up. A
+  finding that names no file is never dropped — it cannot be shown to
+  sit in unchanged code.
 - **Full diff (reference only)** — context for judging the delta, not a
   licence to re-open settled code.
 
 The implementer was told to fix each finding's defect class, not just the
-named instance. Explicitly check for sibling sites: where the delta fixed
-one site of a class, look for the same defect elsewhere and raise what
-survives.
+named instance. Where the delta fixed one site of a class, look for the
+same defect elsewhere and raise what survives: an older site outside the
+diff with `"sibling": true`; a site inside the delta, or a break the
+delta causes anywhere, normally — the line above, exactly.
 
 ## Verdict
 
@@ -128,7 +144,8 @@ for one:
       "file": "path/from/the/diff",
       "line": 12,
       "text": "what is wrong, with the evidence",
-      "missed_earlier": "only on fix rounds: why round one missed a finding outside the delta"
+      "missed_earlier": "only on fix rounds: why round one missed a finding outside the delta",
+      "sibling": true
     }
   ]
 }
@@ -141,9 +158,16 @@ for one:
   FAIL.
 - A `blocking` or `major` finding on **either** axis means FAIL, whatever
   the other axis says — and whatever the declared verdict says: a
-  declared pass does not override a surviving `major`. `minor` and
+  declared pass does not override a surviving `major`. The one
+  exception: a finding the orchestrator rules a sibling — your
+  `"sibling": true` on a file the diff does not change — never fails the
+  round; it is recorded for a follow-up task. `minor` and
   `note` never fail a round; rate a real defect `major` or `blocking`,
   not an inflated `minor`.
 - `verdict: "fail"` stands even without a blocking finding — use it when
   the evidence for an acceptance item simply isn't there.
+- `"sibling"` is optional and only ever the JSON literal `true`
+  (anything else, or absent, reads as false). It claims an older site of
+  a defect class — never a defect this diff causes; draw the line as the
+  sibling section above says.
 - Findings are not re-ranked across axes; the axes stay separate.

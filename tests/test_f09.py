@@ -57,11 +57,11 @@ PROMPT_PINS = {
     # re-pinned for F-65 (the declared-file-scope / request_scope rule);
     # re-pinned for F-87 (a registry network refusal = the install
     # refusal: report it as a finding).
-    IMPLEMENTER_FILE: "2e5f49ceda29965e8cde446c1634acc19c9218f630e99574d8191064dfeedac8",
+    IMPLEMENTER_FILE: "6cce5ef8e41d576cb46672690ee82f4b22f3bc9017fd92ad91f21402a2679fe5",
     # F-41; re-pinned for AC-6 (a surviving major fails the round).
-    REVIEWER_FILE: "1306ee568d0f09b02aef2c34694d61e343163a1abde54d19001fba9f55acba22",
+    REVIEWER_FILE: "9787ab3630bfc3a8a815386600fe4f7eb78b5e9292996510cd6e27218ef0f0e1",
     # F-38; re-pinned in its review round (the unanimous-rule paragraph).
-    VERIFIER_FILE: "d7e5db822401e928ef64d8c032a34b66c3505f0f0fc115ca67fd0d8ea92c694b",
+    VERIFIER_FILE: "9f9423ffe7d165dc04f6af3448f83e999c4e9ac9d4659e2c52fd4e15c4ee7f4b",
 }
 
 

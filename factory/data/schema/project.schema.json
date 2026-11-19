@@ -269,6 +269,19 @@
           "additionalProperties": { "$ref": "#/$defs/toolkitChoice" }
         }
       }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "F-96: the per-finding verifier fan-out's knobs. Every review finding gets its own verifier session (a blocking or major finding two); this block tunes how those sessions run, never whether they run.",
+      "properties": {
+        "parallel": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 6,
+          "description": "F-96: the cap on CONCURRENT verifier sessions during one review's per-finding fan-out (default 6; sessions beyond it queue in later waves). A wall-clock shape knob, not a spend cap: every session still runs at its fixed parent-granted turn cap, and a run whose remaining wall clock cannot fund the fan-out escalates budget_exhausted rather than skipping verification."
+        }
+      }
     }
   }
 }

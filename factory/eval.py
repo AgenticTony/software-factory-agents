@@ -34,7 +34,8 @@ Layers:
 * **L0** (:func:`factory.l0.run_l0`) — commands, diff policy, sentinels.
 * **L1** (:func:`factory.l1.run_l1`) — the red-first proof of the seed's
   contract tests.
-* **L2** — F-38's parallel reviewer and verifier over the seeded diff
+* **L2** — F-38's parallel reviewer fan-out and F-96's per-finding
+  verifier fan-out over the seeded diff
   (:func:`run_l2_review`), rendering its verdict through the SAME shared
   post-review chain the orchestrator runs
   (:func:`factory.l2.settle_review_verdict`, F-48): union, verifier
@@ -69,10 +70,9 @@ from factory.l2 import (
     _fails_round,
     merge_reviews,
     parse_reviews_with_retry,
-    parse_verifier_vote,
     settle_review_verdict,
 )
-from factory.session import run_session_sandboxed, run_sessions_parallel
+from factory.session import complete_records, run_session_sandboxed, run_sessions_parallel
 from factory.siblings import normalise_path
 
 # Per-session budgets for the eval's L2 seats. An eval diff is tiny
@@ -749,16 +749,22 @@ def run_seed(
                 runner=command_runner)
     layers = {"L0": l0.to_dict(), "L1": l1.to_dict()}
     if session_runner is not None:
+        void_reason: list[str] = []
         report, retries = run_l2_review(
             repo, profile, seed_base, f"eval/{seed.slot}", task,
             session_runner=session_runner, reviewers=reviewers,
             l0=l0, l1=l1, factory_root=factory_root,
+            void_reason=void_reason,
         )
         if report is None:
-            # Quota-voided (PR #90 round 4): never a verdict — excluded
-            # from the catch and false-fail denominators, counted on
-            # the report's own quota-voided line instead.
+            # Voided (PR #90 round 4): never a verdict — excluded from
+            # the catch and false-fail denominators, counted on the
+            # report's own voided line instead. F-96 round 6: the
+            # reason is NAMED (verifier quota, or a verifier window
+            # that starved before every finding was voted).
             layers["L2"] = {"quota_voided": True,
+                            "void_reason": void_reason[0]
+                            if void_reason else "verifier_quota",
                             "review_retries": retries}
         else:
             layers["L2"] = report.to_dict()
@@ -1080,14 +1086,19 @@ def run_l2_review(
     l0=None,
     l1=None,
     factory_root: Path | None = None,
+    void_reason: "list[str] | None" = None,
 ):
     """L2 as F-38's parallel reviewer and verifier over one diff.
 
     The orchestrator's pipeline: N reviewer sessions over the same diff
     (a fresh context each, run concurrently through
     :func:`factory.session.run_sessions_parallel`), the verdicts merged
-    into a union, and — when the union carries findings — one verifier
-    session voting the union down. The verdict is settled through the
+    into a union, and — when the union carries findings — the F-96
+    per-finding verifier fan-out: one fresh verifier session per finding
+    (a ``blocking`` or ``major`` two), run through the SAME
+    :func:`factory.orchestrator.run_verifier_fanout` the queue's own
+    reviews use, so the prompts and the vote fold cannot drift (F-48
+    parity, one layer down). The verdict is settled through the
     SAME shared post-review chain production renders (F-48, M-3:
     :func:`factory.l2.settle_review_verdict`) in the FIRST-ROUND mode a
     single-round review is: empty prior, no delta, ``delta_mode=False``,
@@ -1096,8 +1107,9 @@ def run_l2_review(
     passed, which a one-round task never has).
 
     Quota is checked exactly where production checks it (F-48, m-12):
-    BEFORE any parse or re-run on the fan-out's own records, and before
-    the verifier's output is parsed as a vote. A seat whose first run
+    BEFORE any parse or re-run on the fan-out's own records, and a
+    quota-hit verifier session stops the fan-out before its vote is
+    parsed. A seat whose first run
     died on quota is never parsed, never re-run and never counted as a
     retry; one quota hit anywhere voids the diff's review (PR #90 round
     4): the report is ``None`` — quota noise never becomes a verdict, a
@@ -1111,10 +1123,18 @@ def run_l2_review(
             (the orchestrator hands its reviewers the same). Defaults to
             the report dicts already on the record when re-reviewing.
 
+    Args:
+        void_reason: F-96 round 6 — an out-list; when the review is
+            voided (quota, or a verifier pool whose window ran out
+            before every finding was voted), the reason string is
+            appended so the caller's record can NAME it instead of
+            scoring or silently passing an unverified verdict.
+
     Returns:
         ``(report, retries)`` — the L2 report (``None`` when the review
-        was quota-voided), and how many reviewer re-runs the retry
-        policy spent on seats whose first verdict failed to parse.
+        was voided: quota, or a starved verifier window), and how many
+        reviewer re-runs the retry policy spent on seats whose first
+        verdict failed to parse.
     """
     from factory import orchestrator
     from factory.prompts import assemble_verifier_prompt, reviewer_seat_prompts
@@ -1137,7 +1157,7 @@ def run_l2_review(
         the eval does not need: it has no attempt budget to fit and no
         trace to name the seat) and decides whether the retry's verdict
         is used."""
-        record = run_sessions_parallel(
+        record = complete_records(run_sessions_parallel(
             [("reviewer", review_prompt)],
             repo, profile,
             runner=session_runner,
@@ -1146,11 +1166,11 @@ def run_l2_review(
             timeout_min=SEAT_TIMEOUT_MIN,
             protected=list((profile.get("paths") or {}).get("protected") or []),
             system_prompt=seat_systems[(seat_no or 1) - 1],
-        )[0]
+        ))[0]
         retry_records.append(record)
         return record
 
-    reviews = run_sessions_parallel(
+    reviews = complete_records(run_sessions_parallel(
         [("reviewer", review_prompt)] * reviewers,
         repo, profile,
         runner=session_runner,
@@ -1160,7 +1180,7 @@ def run_l2_review(
         protected=list((profile.get("paths") or {}).get("protected") or []),
         system_prompt=seat_systems[0],
         seat_system_prompts=seat_systems,
-    )
+    ))
     # m-12: quota BEFORE parsing, production's order — a quota-hit
     # first-run seat is never parsed, never re-run (no tokens burned
     # against a dead quota), never counted as a retry.
@@ -1173,24 +1193,41 @@ def run_l2_review(
     union = merge_reviews(reports)
     vote = None
     if union.parse_error is None and union.findings:
-        verifier_prompt = orchestrator._verifier_prompt(task, diff, union.findings)
-        verifier = session_runner(
-            "verifier", verifier_prompt, repo, profile,
+        # F-96 (F-48 parity): the SAME per-finding verifier fan-out the
+        # run uses — one session per finding (a serious one two), the
+        # same prompts, the same vote fold — through the ONE shared
+        # implementation. A quota hit anywhere voids the review exactly
+        # as before (m-12): never parsed into a verdict.
+        # F-96 round 6: the pool's window is the per-seat budget TIMES
+        # the session count — every session is owed its own full
+        # SEAT_TIMEOUT_MIN whatever order the sliding pool admits it
+        # in, so a normal pool neither starves nor hands a late session
+        # a shrunken window (round 5's flat window did both).
+        session_count = len(
+            orchestrator.verifier_sessions_for(union.findings))
+        fanout = orchestrator.run_verifier_fanout(
+            task, diff, union.findings,
+            runner=session_runner, run_dir=repo, profile=profile,
             factory_root=factory_root,
-            max_turns=SEAT_MAX_TURNS,
-            timeout_min=SEAT_TIMEOUT_MIN,
             protected=list((profile.get("paths") or {}).get("protected") or []),
             system_prompt=assemble_verifier_prompt(profile),
+            srt_bin_path=None, run_id=None, task_id=None, toolkit=None,
+            parallel=orchestrator._verifier_parallel(profile),
+            remaining_min=lambda: SEAT_TIMEOUT_MIN * max(1, session_count),
+            max_turns=SEAT_MAX_TURNS,
         )
-        # The same class on the verifier: production aborts on a
-        # quota-hit verifier before parsing its output — the dead
-        # session is never read as a no-vote that keeps every finding.
-        if orchestrator._is_quota(verifier):
+        if fanout.quota is not None:
+            if void_reason is not None:
+                void_reason.append("verifier_quota")
             return None, retries
-        vote = parse_verifier_vote(
-            verifier.result if verifier.status == "completed" else None,
-            union.findings,
-        )
+        if fanout.starved:
+            # Round 6 A: a pool whose window ran out before every
+            # finding was voted voids the review EXACTLY like quota —
+            # never a verdict scored over unverified findings.
+            if void_reason is not None:
+                void_reason.append("verifier_window_starved")
+            return None, retries
+        vote = fanout.vote
     # M-3: the ONE shared chain, first-round mode (empty prior, no
     # delta) — the verdict the queue would render for this review.
     return settle_review_verdict(
@@ -1259,7 +1296,8 @@ def _clean_review_summary(record: dict) -> str:
             parts.append(f"{name} {verdict}")
     l2 = layers.get("L2") or {}
     if l2.get("quota_voided"):
-        parts.append("L2 quota-voided (no verdict)")
+        reason = f" ({l2['void_reason']})" if l2.get("void_reason") else ""
+        parts.append(f"L2 quota-voided (no verdict){reason}")
         return ", ".join(parts)
     blocking = record.get("blocking_findings")
     if blocking is None or "L2" not in layers:
@@ -1799,7 +1837,7 @@ def run_on_demand_eval(
     from factory.orchestrator import _gate_settings, sandboxed_runner
     from factory.runs import FACTORY_ROOT_DEFAULT, RunDir, project_component
     # The reach-ins above (with run_l2_review's _review_prompt /
-    # _verifier_prompt) are deliberate: AC-3 measures the pipeline the
+    # run_verifier_fanout) are deliberate: AC-3 measures the pipeline the
     # queue actually runs, so the eval calls the orchestrator's own
     # prompt builders and gate settings rather than a copy that could
     # drift. Promoting them to public entry points means editing

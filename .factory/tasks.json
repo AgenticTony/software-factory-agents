@@ -6928,6 +6928,96 @@
       "approved_by": "Anthony"
     },
     {
+      "id": "F-96",
+      "title": "Every finding gets its own verifier; a serious one needs two to drop it; every seat knows the sibling rule",
+      "source": "BUILD-ORDER.md#f-96--every-finding-gets-its-own-verifier-a-serious-one-needs-two-to-drop-it-every-seat-knows-the-sibling-rule",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-95"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "One fresh verifier per finding: after merge_reviews every union finding gets its own verifier session — the contract, the diff, read access to the clone and that one finding only, never another finding's text. Sessions run in parallel, one vote per session; verifier.md is reworded for a single finding and its unanimous-rule paragraph corrected for F-94 siblings.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f96.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Two verifiers to drop a serious finding: a blocking/major (sibling or not) gets two independent verifier sessions and drops only if both vote drop with a reason — one keep, one failed session or one invalid vote keeps it. minor/note get one session. The unanimous rule stays on top (a unanimous serious finding survives two drops, recorded override_refused); a surviving sibling still never blocks and still reaches the follow-up.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f96.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "Failure keeps findings: a verifier session that crashes, times out, hits quota or returns an invalid shape drops nothing for its finding — it survives tagged important with the failure named on the finding and in verifier_error, the other findings' votes stand, and a quota failure still aborts and requeues the task as today.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f96.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "Budget and parity: the fan-out runs in waves capped by the profile's verification.parallel (default 6, queued beyond it), every session at VERIFIER_TURN_CAP; a wave the remaining wall clock cannot fund escalates budget_exhausted and never publishes unverified; the round review, final review, accept path and eval all run the ONE shared fan-out (orchestrator.run_verifier_fanout — same prompts, same fold) and prompt_versions records the verifier hash.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f96.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "Every seat knows the sibling rule: the Draw-the-line paragraph moves from DEFECT_HUNT_LENS into the base reviewer prompt (word for word, exactly once, one seat or three); the fix-round paragraph raises an older site outside the diff with sibling: true and everything else normally; the FAIL rule names the sibling exception; a parent-ruled sibling in a fix round is never dropped as out_of_delta_without_missed_earlier (marking before drop — the exemption reads the parent's two-condition ruling, never the claim alone) and reaches the follow-up from the final review or the stored delta review; every other out-of-delta finding keeps F-23's rule exactly; the implementer prompt stops claiming the reviewer reads its summary.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f96.py::test_ac_5"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 150,
+        "wall_clock_min": 120
+      },
+      "scope": {
+        "paths": [
+          "factory/l2.py",
+          "factory/orchestrator.py",
+          "factory/session.py",
+          "factory/prompts.py",
+          "factory/eval.py",
+          "factory/data/prompts/verifier.md",
+          "factory/data/prompts/reviewer.md",
+          "factory/data/prompts/implementer.md",
+          "factory/data/schema/project.schema.json",
+          "tests/test_f96.py",
+          "tests/_support/f96.py",
+          "VALIDATOR-SPEC.md",
+          "README.md",
+          "BUILD-ORDER.md",
+          ".factory/tasks.json",
+          ".factory/project.yaml",
+          ".factory/BOOTSTRAP.md"
+        ]
+      }
+    },
+    {
       "id": "F-99",
       "title": "The eval stops telling the reviewers the answer",
       "source": "BUILD-ORDER.md#f-99--the-eval-stops-telling-the-reviewers-the-answer",

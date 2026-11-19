@@ -205,6 +205,11 @@ def assemble_reviewer_prompt(profile: dict | None = None) -> str:
 # prompt, so the second mostly duplicated the first, and neither looked
 # for the fixed defect's other sites). Pinned by literal in
 # tests/test_f94.py — editing it here without the pin fails the test.
+# F-96 moved the "Draw the line" sibling paragraph out of the lens and
+# into the base reviewer prompt (reviewer.md), so EVERY seat carries it
+# word for word — the lens keeps only the hunt itself, plus the pointer
+# to the rule it must not restate (a second copy in the hunt seat is
+# exactly the drift the move removes).
 DEFECT_HUNT_LENS = (
     "## Your lens: hunt the defect beyond the hunk\n"
     "\n"
@@ -220,15 +225,8 @@ DEFECT_HUNT_LENS = (
     "Report each other site as its own finding with `\"sibling\": true`, "
     "its `file` and `line`, and the defect class named in its `text`.\n"
     "\n"
-    "Draw the line exactly. A defect this diff CAUSES — including a break "
-    "at an unchanged caller, test or config — is reported WITHOUT "
-    "`sibling` and judged by its severity like any finding. "
-    "`\"sibling\": true` is only for an older site of the same class that "
-    "this diff neither causes nor touches: the orchestrator records it for "
-    "a follow-up task and it does not fail this round, whatever its "
-    "severity — rate it by what the defect costs, and judge your verdict "
-    "on the diff alone. `sibling: true` on a file the diff changes lowers "
-    "nothing: a defect inside the diff is judged by the diff's rules.\n"
+    "Draw each site's line by the sibling rule in the base prompt above — "
+    "it applies to every site you report, this lens or not.\n"
 )
 
 

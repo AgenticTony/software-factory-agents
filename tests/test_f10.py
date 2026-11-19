@@ -415,8 +415,10 @@ def test_reviewer_fail_is_retried_then_exhausted(tmp_path: Path):
 
     result = env.run(varying)
     assert result.outcome == "needs_human"
+    # F-96: the round's blocking finding gets TWO verifier sessions
+    # (one per finding, a serious one twice).
     assert [c[0] for c in seats.calls] == (
-        ["implementer", "reviewer", "reviewer", "verifier"] * 3
+        ["implementer", "reviewer", "reviewer", "verifier", "verifier"] * 3
     )
     assert "scope creep 1" in seats.prompts("implementer")[1]
     assert env.task()["attempts"][-1]["escalation"] == "attempts_exhausted"

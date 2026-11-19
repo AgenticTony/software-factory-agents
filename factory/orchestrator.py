@@ -102,6 +102,8 @@ from factory.l0 import run_l0
 from factory.l1 import run_l1
 from factory.l2 import (
     L2Finding,
+    VerifierOutcome,
+    combine_finding_votes,
     extract_verdict_marks,
     extract_vote_marks,
     merge_reviews,
@@ -110,6 +112,7 @@ from factory.l2 import (
     parse_verdict,
     parse_verifier_vote,
     settle_review_verdict,
+    verifier_sessions_for,
 )
 from factory.mergeorder import (
     CIState,
@@ -166,7 +169,9 @@ from factory.sandbox import (
     write_settings,
 )
 from factory.session import (
+    SessionConfigError,
     SessionRecord,
+    complete_records,
     fanout_seat_settings,
     parse_scope_requests,
     probe_session_interpreter,
@@ -752,7 +757,9 @@ def _progress_best_effort(log: ProgressLog, entry: dict, task_id: str) -> None:
 
 def _record_publish_followup(queue: TaskQueue, task_id: str, l2, profile: dict,
                              log: ProgressLog, trace_append, egress_secrets,
-                             run_id: str, *, repo: Path, base_ref: str
+                             run_id: str, *, repo: Path, base_ref: str,
+                             carried_siblings: "list[dict] | None" = None,
+                             outside_diff=None,
                              ) -> "tuple[str, int] | None":
     """F-82 AC-2/AC-3: write the publish's follow-up draft — or remove,
     or keep, the one an earlier round left — then narrate it in the
@@ -779,6 +786,26 @@ def _record_publish_followup(queue: TaskQueue, task_id: str, l2, profile: dict,
     admits its file (tracked on ``base_ref`` in ``repo``, no protected
     or risk glob), ``scope_refusal`` (the reason) otherwise.
 
+    F-96 AC-5, round 4: ``carried_siblings`` is the attempt-wide pool of
+    parent-ruled siblings every settled review kept (key-deduped stored
+    finding dicts, harvested round by round) — not only the last
+    round's report, which the next round overwrites. Since F-96 each
+    delta review KEEPS a parent-ruled sibling instead of dropping it as
+    out of delta; carrying only the latest report would lose every
+    sibling an earlier round kept and later ones never re-raised (the
+    final is authoritative for BLOCKING; a sibling blocks nothing, so
+    carrying them adds follow-up work, never verdict weight). Deduped
+    by finding key against the authoritative findings.
+
+    Round 5: ``outside_diff`` (the parent's ruling for the FINAL
+    ``base...head`` diff) re-rules every pool entry at publish — a
+    sibling whose file a later round's fix went on to EDIT is no
+    longer outside the diff the final review judged, so it is dropped
+    from the carry and the drop is traced (``followup_sibling_stale``).
+    ``None`` (or a git failure upstream) re-rules nothing: the entry
+    rides the follow-up draft, which costs a draft criterion, never a
+    verdict.
+
     Returns the RunResult's follow-up
     field: ``(followup_id, findings)`` when a draft the owner can act
     on now exists, None otherwise.
@@ -787,9 +814,42 @@ def _record_publish_followup(queue: TaskQueue, task_id: str, l2, profile: dict,
         return escape_approval_text(
             scrub_session_text(value, egress_secrets))
 
+    carried: list = list(l2.findings if l2 is not None else [])
+    seen = {f.key for f in carried
+            if isinstance(f, L2Finding) and f.key}
+    stale: list[dict] = []
+    for stored in carried_siblings or []:
+        if (isinstance(stored, dict) and stored.get("sibling") is True
+                and stored.get("key") and stored["key"] not in seen):
+            if (outside_diff is not None
+                    and not outside_diff(stored.get("file"))):
+                # Round 5: the final diff now changes this file — the
+                # old ruling is stale, the final review judged the file
+                # as diff, and the follow-up must not carry it.
+                stale.append({"id": stored.get("id"),
+                              "file": stored.get("file"),
+                              "key": stored.get("key")})
+                continue
+            carried.append(L2Finding(
+                id=str(stored.get("id") or ""),
+                text=str(stored.get("text") or ""),
+                severity=stored.get("severity"),
+                file=stored.get("file"),
+                line=stored.get("line") if isinstance(
+                    stored.get("line"), int) else None,
+                key=stored.get("key"),
+                sibling=True,
+            ))
+    if stale:
+        trace_append({
+            "type": "followup_sibling_stale",
+            "reason": "the final diff now changes the file — the old "
+                      "sibling ruling does not hold at publish",
+            "stale": stale,
+        })
     findings: list = []
     base_tracked: "frozenset | None" = None
-    for finding in (l2.findings if l2 is not None else []):
+    for finding in carried:
         if not isinstance(finding, L2Finding):
             continue
         entry: dict[str, Any] = {
@@ -1662,50 +1722,43 @@ def _review_prompt(task: dict, diff: str, l0: dict, l1: dict, delta: str | None 
     return "\n".join(parts)
 
 
-def _verifier_prompt(task: dict, diff: str, union: list, delta: str | None = None) -> str:
-    """The verifier session's user prompt (F-38): the contract, the diff
-    the reviewers saw, and the union of their findings — one entry per
-    merged finding, carrying which reviewers reported it. The verifier
-    reads the code itself (its seat is read-only in the same clone); this
-    prompt hands it the claims to check, nothing else."""
+def _verifier_finding_prompts(task: dict, diff: str, sessions: list,
+                              delta: str | None = None) -> list[str]:
+    """F-96 AC-1: the per-finding verifier prompts, one per session of
+    the ONE session plan (round 4 fix 6: the caller's
+    :func:`factory.l2.verifier_sessions_for` list — a ``blocking`` or
+    ``major`` finding appears in it twice, its two sessions get the
+    SAME prompt, fresh contexts; the plan is derived once, never
+    twice).
+
+    Each prompt carries the contract, the diff the reviewers saw (and
+    the delta, on a fix round), and exactly ONE finding of the merged
+    list — never another finding's text, so a mistake on one finding
+    cannot spill onto the others and a hostile finding cannot point its
+    verifier at a sibling finding. The verifier reads the code itself
+    (read-only in the same clone); the prompt hands it the one claim to
+    check, nothing else."""
     contract = {
         "id": task["id"],
         "title": task.get("title"),
         "acceptance": task.get("acceptance", []),
         "out_of_scope": task.get("out_of_scope", []),
     }
-    findings = [
-        {
-            "id": f.id,
-            "axis": f.axis,
-            "severity": f.severity,
-            "file": f.file,
-            "line": f.line,
-            "text": f.text,
-            "reported_by": f.reported_by,
-        }
-        for f in union
-        if isinstance(f, L2Finding)
-    ]
     if len(diff) > _REVIEW_DIFF_CAP:
         diff = diff[:_REVIEW_DIFF_CAP] + f"\n[... diff cut at {_REVIEW_DIFF_CAP} chars ...]\n"
-    parts = [
-        "Vote on these review findings. Return only the vote JSON your "
-        "instructions define.",
-        "",
-        "## Contract",
-        "",
-        "```json",
-        json.dumps(contract, indent=2, ensure_ascii=False),
-        "```",
-    ]
+    # Parity (F-48/F-96): the run's diff comes raw from git (trailing
+    # newline included), the eval's stripped — the builder normalises so
+    # every caller's prompts are byte-identical.
+    diff = diff.rstrip("\n")
+    delta_section: list[str] = []
     if delta is not None:
         if len(delta) > _REVIEW_DIFF_CAP:
             delta = (
                 delta[:_REVIEW_DIFF_CAP]
                 + f"\n[... delta cut at {_REVIEW_DIFF_CAP} chars ...]\n"
             )
-        parts += [
+        delta = delta.rstrip("\n")
+        delta_section = [
             "",
             "## Delta since the last review (what changed since the "
             "reviewers looked)",
@@ -1714,22 +1767,403 @@ def _verifier_prompt(task: dict, diff: str, union: list, delta: str | None = Non
             delta,
             "```",
         ]
-    parts += [
-        "",
-        "## Full diff (base...head)",
-        "",
-        "```diff",
-        diff,
-        "```",
-        "",
-        "## Findings to verify (merged across the reviewer fan-out)",
-        "",
-        "```json",
-        json.dumps(findings, indent=2, ensure_ascii=False),
-        "```",
-        "",
-    ]
-    return "\n".join(parts)
+    prompts = []
+    for finding in sessions:
+        entry = {
+            "id": finding.id,
+            "axis": finding.axis,
+            "severity": finding.severity,
+            "file": finding.file,
+            "line": finding.line,
+            "text": finding.text,
+            "reported_by": finding.reported_by,
+        }
+        parts = [
+            "Vote on this ONE review finding. Return only the vote JSON "
+            "your instructions define.",
+            "",
+            "## Contract",
+            "",
+            "```json",
+            json.dumps(contract, indent=2, ensure_ascii=False),
+            "```",
+            *delta_section,
+            "",
+            "## Full diff (base...head)",
+            "",
+            "```diff",
+            diff,
+            "```",
+            "",
+            "## The finding to verify (one of the merged list)",
+            "",
+            "```json",
+            json.dumps([entry], indent=2, ensure_ascii=False),
+            "```",
+            "",
+            f"This session verifies exactly finding `{finding.id}`. A "
+            "vote for any other id, or a second vote, invalidates the "
+            "whole vote.",
+            "",
+        ]
+        prompts.append("\n".join(parts))
+    return prompts
+
+
+def _verifier_parallel(profile: dict) -> int:
+    """F-96 AC-4: the profile's cap on CONCURRENT verifier sessions
+    (``verification.parallel``, default 6). The schema guarantees a
+    whole number >= 1; this stays total for hand-built profiles (never
+    below 1 — a cap of zero would be a refusal to verify, not a cap)."""
+    raw = (profile.get("verification") or {}).get("parallel")
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        return 6
+    return raw
+
+
+# F-96 round-2 finding 3: the accept path's verifier fan-out runs inside
+# ONE 30-minute window — every wave, repair included, draws on the same
+# deadline (a per-wave 30 minutes would let a wide fan-out run
+# waves x 30).
+_ACCEPT_WINDOW_MIN = 30.0
+
+
+def run_accept_verifier_fanout(
+    live: dict,
+    diff: str,
+    findings: list,
+    *,
+    runner,
+    run_dir,
+    profile: dict,
+    factory_root,
+    protected,
+    system_prompt,
+    srt_bin_path,
+    run_id,
+    task_id,
+    toolkit,
+    base: Path,
+):
+    """F-96: the accept path's verifier fan-out — the ONE shared
+    :func:`run_verifier_fanout` with the accept round's own shapes: no
+    trace, no attempt budget, ONE ``_ACCEPT_WINDOW_MIN`` window across
+    every wave (round-2 finding 3), and F-85 repairs through
+    :func:`accept_collect_vote` (round-2 finding 1: the repair resumes
+    in its own session's ``-vN`` settings).
+
+    Round-2 finding 4: a fan-out that did not finish — a quota-dead
+    session or a starved wave — is VISIBLE, never a silent no-vote:
+    every finding is kept with a ``verifier_error`` naming why (the
+    conservative direction for an accept either way: a failed
+    revalidation fails the accept).
+    """
+    deadline = time.monotonic() + _ACCEPT_WINDOW_MIN * 60.0
+    fanout = run_verifier_fanout(
+        live, diff, findings,
+        runner=runner, run_dir=run_dir, profile=profile,
+        factory_root=factory_root, protected=protected,
+        system_prompt=system_prompt, srt_bin_path=srt_bin_path,
+        run_id=run_id, task_id=task_id, toolkit=toolkit,
+        parallel=_verifier_parallel(profile),
+        remaining_min=lambda: (deadline - time.monotonic()) / 60.0,
+        # Round 3: the repair draws on the SAME window the waves did.
+        collect_vote=lambda session, one, ordinal: accept_collect_vote(
+            session, one, ordinal, runner=runner, run_dir=run_dir,
+            profile=profile, factory_root=factory_root, base=base,
+            protected=protected, system_prompt=system_prompt,
+            srt_bin_path=srt_bin_path, run_id=run_id, task_id=task_id,
+            toolkit=toolkit,
+            remaining_min=lambda: (
+                deadline - time.monotonic()) / 60.0),
+    )
+    if fanout.vote is not None:
+        return fanout.vote
+    why = ("a verifier session died on quota" if fanout.quota is not None
+           else f"the verifier window ran out before verifier session "
+                f"{fanout.starved} could start")
+    return VerifierOutcome(
+        kept=[f for f in findings if isinstance(f, L2Finding)],
+        dropped=[],
+        error=f"the verifier fan-out did not finish: {why}")
+
+
+def accept_collect_vote(
+    session,
+    one: list,
+    ordinal: int,
+    *,
+    runner,
+    run_dir,
+    profile: dict,
+    factory_root,
+    base: Path,
+    protected,
+    system_prompt,
+    srt_bin_path,
+    run_id,
+    task_id,
+    toolkit,
+    remaining_min=None,
+):
+    """F-85's ONE repair turn for a malformed verifier vote, the accept
+    path's untraced shape (:func:`run_verifier_fanout`'s ``collect_vote``
+    for `_recover_accept_leased`): same-session resume, no shrink, else
+    today's invalid-vote outcome.
+
+    ``ordinal`` is the session's 1-based global fan-out ordinal: the
+    repair resumes in exactly the ``-vN`` settings whose scratch HOME
+    holds that session's transcript (round-2 finding 1 — resuming in
+    the base settings' HOME lands where the transcript does not exist).
+    Module-level so the accept path's repair is testable without
+    driving the whole leased accept round.
+
+    ``remaining_min`` (round 3) is the accept window's clock, the SAME
+    one the waves drew on: the repair runs on what is left of it — a
+    spent window funds no repair turn, and the invalid-vote outcome
+    stands (the finding kept), exactly as a repair that cannot be
+    afforded anywhere else.
+    """
+    one_vote = parse_verifier_vote(
+        session.result if session.status == "completed" else None, one)
+    if (one_vote.error is None or session.status != "completed"
+            or not session.session_id):
+        return one_vote, None
+    remaining = remaining_min() if remaining_min is not None else 30.0
+    if remaining <= 0:
+        return one_vote, None
+    try:
+        repaired = runner(
+            "verifier", _repair_verifier_prompt(one_vote.error),
+            run_dir, profile,
+            factory_root=factory_root,
+            settings_path=fanout_seat_settings(base, "verifier", ordinal),
+            resume=session.session_id,
+            max_turns=REPAIR_TURN_CAP, timeout_min=remaining,
+            protected=protected,
+            system_prompt=system_prompt,
+            srt_bin_path=srt_bin_path,
+            run_id=run_id, task_id=task_id,
+            toolkit=toolkit,
+        )
+    except Exception:  # noqa: BLE001 — keep today's outcome
+        return one_vote, None
+    if (repaired is not None and repaired.status == "completed"
+            and not _is_quota(repaired)):
+        candidate = parse_verifier_vote(repaired.result, one)
+        if (candidate.error is None
+                and _repair_vote_usable(session.result or "", candidate)):
+            return candidate, None
+    return one_vote, None
+
+
+class VerifierFanout(NamedTuple):
+    """F-96: what one review's per-finding verifier fan-out produced.
+
+    ``vote`` is the combined outcome (:func:`factory.l2.combine_finding_votes`)
+    — ``None`` when the fan-out did not finish (starved or quota), in
+    which case the caller escalates/aborts and never settles a verdict
+    over unverified findings. ``records`` are the session records that
+    ran. ``notes`` are owner-facing lines for the round's record (a
+    session that ended without completing names its finding and why
+    nothing dropped). ``quota`` is the first quota-classified record,
+    the caller's to abort on (the accept path reads it as a failed
+    session instead). ``starved`` is 0 when every session ran, else the
+    1-based session that could not start — the wall backstop, which the
+    caller escalates as ``budget_exhausted`` (never a publish over
+    unverified findings)."""
+
+    vote: "Any | None"
+    records: list
+    notes: list
+    quota: "SessionRecord | None"
+    starved: int
+
+
+def run_verifier_fanout(
+    task: dict,
+    diff: str,
+    findings: list,
+    *,
+    delta: str | None = None,
+    runner,
+    run_dir,
+    profile: dict,
+    factory_root,
+    protected,
+    system_prompt,
+    srt_bin_path,
+    run_id,
+    task_id,
+    toolkit,
+    parallel: int,
+    remaining_min: "Callable[[], float]",
+    max_turns: int = VERIFIER_TURN_CAP,
+    add_elapsed=None,
+    on_record=None,
+    collect_vote=None,
+    trace_sink=None,
+    declared_dependencies: bool = False,
+) -> VerifierFanout:
+    """F-96 AC-1–AC-4: run ONE verifier session per finding (a serious
+    finding two), in ONE sliding pool capped at ``parallel``
+    concurrent sessions, and fold the votes.
+
+    The ONE fan-out implementation every verifier site shares — the
+    round review, the final review, the accept-path revalidation and
+    the seeded eval (``run_l2_review``) — so the
+    per-finding prompts, the wave backstop and the vote fold cannot
+    drift between them (the F-48 parity rule, one layer down).
+
+    The caller's ``remaining_min`` is the wall backstop, checked before
+    each session STARTS (the admission gate of the sliding pool, round
+    4): a session that cannot start leaves its slot refused, the fan-out
+    returns ``starved`` (the 1-based session that could not start) and
+    the CALLER escalates; a run never skips verification to fit. Every
+    session runs at the fixed parent-granted ``max_turns`` cap
+    (F-64: never a remainder, never a record-funded number).
+    ``add_elapsed`` books the pool's wall time on the caller's budget.
+    A quota record stops all NEW admissions and returns in ``quota`` —
+    the caller aborts on it exactly like the single verifier's quota
+    branch. One honestly-named subtlety: each session's own timeout is
+    the remaining wall read ONCE at pool start — sessions admitted
+    later in the pool may run past the caller's deadline by up to their
+    own (stale) window; the escalation on return is unchanged, so
+    nothing publishes unverified either way.
+
+    After the waves, each session's vote is parsed — through
+    ``collect_vote`` when the caller has F-85 repair turns (the round
+    and final reviews), else a plain parse (the eval) — against THAT
+    ONE finding: a vote naming any other id is invalid and keeps the
+    finding. ``collect_vote(record, [finding], ordinal)`` receives the
+    session's 1-based GLOBAL ordinal (wave offset included) so a repair
+    turn can resume in exactly the ``-vN`` settings whose scratch HOME
+    holds that session's transcript — the same derivation
+    :func:`factory.session._fanout_sandboxed` named the session by, one
+    layer down (round-2 finding 1: resuming without the per-session
+    settings lands in the BASE run settings' HOME, where the transcript
+    does not exist, and every real verifier repair dies). The votes
+    fold into one :class:`~factory.l2.VerifierOutcome`
+    (:func:`factory.l2.combine_finding_votes`): a failed session keeps
+    its finding, a serious finding drops only on two agreeing drops,
+    the unanimous rule stays on top in apply_vote. The fan-out's kept
+    scratch (repair resumes) is swept at the end, every exit path.
+    """
+    # Round 4 fix 6: ONE session plan — the prompts are built from the
+    # same sessions list the ordinals and the vote collection walk.
+    sessions = verifier_sessions_for(findings)
+    prompts = _verifier_finding_prompts(task, diff, sessions, delta=delta)
+    specs = [("verifier", prompt) for prompt in prompts]
+    notes: list[str] = []
+    quota_hit: list = []
+
+    def admit(_index: int) -> bool:
+        # The wall backstop before each submission (round 4 fix 3): a
+        # session that cannot start refuses, and no new session starts
+        # once one died on quota. The pool's own elapsed time counts
+        # against the window — the caller's ledger lags until the pool
+        # returns.
+        return (not quota_hit
+                and remaining_min() - _pool_elapsed_min() > 0)
+
+    def stop_on(record) -> bool:
+        if _is_quota(record):
+            quota_hit.append(record)
+            return True
+        return False
+
+    try:
+        t0 = time.monotonic()
+
+        def _pool_elapsed_min() -> float:
+            """The pool's own consumption, measured here: the caller's
+            ``remaining_min`` reads bookkeeping that only updates AFTER
+            the pool (``add_elapsed``), so without this the admission
+            gate would let a long pool spend wall the caller has not
+            seen yet (round 4: the mid-pool starvation the barrier
+            design caught between waves must not slip)."""
+            return (time.monotonic() - t0) / 60.0
+
+        # Round 4 fix 3: ONE sliding pool over every spec, capped at
+        # `parallel` — a freed worker takes the next session at once
+        # (barrier waves idled up to parallel-1 slots on the run's wall
+        # budget waiting for each wave's slowest session). Admission
+        # and the quota stop run at each session's start; refused slots
+        # come back None positionally. Settings/scratch are derived
+        # v1..vN for the whole call — globally unique by construction.
+        records = run_sessions_parallel(
+            specs, run_dir, profile,
+            runner=runner, factory_root=factory_root,
+            max_turns=max_turns,
+            protected=protected, system_prompt=system_prompt,
+            srt_bin_path=srt_bin_path, run_id=run_id,
+            task_id=task_id, trace_sink=trace_sink,
+            toolkit=toolkit,
+            declared_dependencies=declared_dependencies,
+            # F-85: the votes parse after the pool — a repair turn
+            # resumes a session in its own scratch HOME.
+            keep_scratch=True,
+            max_workers=max(1, parallel), admit=admit, stop_on=stop_on,
+            # Round 5: each session's timeout is the window at ITS
+            # admission (a late session gets what is left, never the
+            # whole window read at pool start), and on_record fires in
+            # the worker as each record arrives — trace and spend stay
+            # live through a long pool instead of flushing at the end.
+            timeout_for=lambda _i: (
+                remaining_min() - _pool_elapsed_min()),
+            on_record=on_record,
+        )
+        if add_elapsed is not None:
+            add_elapsed(time.monotonic() - t0)
+        if quota_hit:
+            return VerifierFanout(
+                vote=None, records=[r for r in records if r],
+                notes=notes, quota=quota_hit[0], starved=0)
+        refused = [i for i, r in enumerate(records) if r is None]
+        if refused:
+            # The wall backstop fired at a session's start: the 1-based
+            # session that could not start (the starved wave of the
+            # barrier era, same escalation at the caller).
+            return VerifierFanout(
+                vote=None, records=[r for r in records if r],
+                notes=notes, quota=None, starved=refused[0] + 1)
+        session_votes: list = []
+        for ordinal, (finding, record) in enumerate(zip(sessions, records),
+                                                    start=1):
+            if collect_vote is not None:
+                vote, repair = collect_vote(record, [finding], ordinal)
+            else:
+                vote = parse_verifier_vote(
+                    record.result if record is not None
+                    and record.status == "completed" else None, [finding])
+                repair = None
+            if repair is not None:
+                return VerifierFanout(
+                    vote=None, records=[r for r in records if r],
+                    notes=notes, quota=repair, starved=0)
+            if (record is not None and record.status != "completed"
+                    and record.seat == "verifier"):
+                notes.append(
+                    f"[session {record.status}] the verifier session for "
+                    f"{finding.id} ended: {record.reason} — nothing "
+                    f"dropped for it; the finding stands"
+                )
+            session_votes.append((finding, vote))
+        return VerifierFanout(
+            vote=combine_finding_votes(findings, session_votes),
+            records=[r for r in records if r], notes=notes,
+            quota=None, starved=0)
+    finally:
+        # F-85: every vote parsed and every repair run that will — the
+        # fan-out's scratch (each session's HOME) goes; cleanup_run
+        # stays the crash backstop. Best-effort by the same rule: a
+        # run_dir with no derivable settings base (the eval's fixture
+        # repo, run without a factory root) kept no scratch to sweep.
+        try:
+            sweep_fanout_scratch(run_settings_base(Path(run_dir),
+                                                   factory_root))
+        except SessionConfigError:
+            pass
 
 
 def _repair_reviewer_prompt(parse_error: str) -> str:
@@ -4306,6 +4740,12 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
     raised: list[dict] = []  # this run's findings, for the next round's prompt
     last_reviewed: str | None = None  # the head sha L2 last saw
     last_valid_l2: dict | None = None  # the last parseable verdict's report
+    # F-96 round 4: every parent-ruled sibling ANY settled review of
+    # this attempt kept (key -> stored finding dict), deduped by key —
+    # the publish's follow-up carries them all, not only the last
+    # round's (a sibling kept by round 2 and never re-raised must not
+    # vanish with round 3's report).
+    sibling_pool: dict = {}
     prev_findings: list[str] | None = None  # the failed round's fix list
     # F-41: the final full review's state. ``final_repeats_left`` bounds
     # how often a failed final review may send its findings to one more
@@ -4924,7 +5364,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
             retry_turns, retry_wall = fit.turns, fit.wall
             base = run_settings_base(clean.root, ctx.factory_root)
             t0 = time.monotonic()
-            record = run_sessions_parallel(
+            record = complete_records(run_sessions_parallel(
                 [("reviewer", prompt)], clean.root, profile,
                 runner=ctx.session_runner, factory_root=ctx.factory_root,
                 settings_path=base.with_name(
@@ -4937,7 +5377,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                 run_id=work.run_id, task_id=task_id,
                 trace_sink=trace.append, toolkit=toolkit_reviewer,
                 declared_dependencies=declared_deps,
-            )[0]
+            ))[0]
             session_seconds += time.monotonic() - t0
             retry_records.append(record)
             outcomes[seat_no] = {"retry": record}
@@ -5026,7 +5466,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                     f"[L2 {label} seat {seat_no}] {original}; {reran}")
             return verdicts, None
 
-        def _collect_vote(session, findings, spend):
+        def _collect_vote(session, findings, spend, ordinal=1):
             """F-85 AC-1 for the verifier seat: parse the vote, and when
             the session COMPLETED but the vote failed to parse, ONE
             follow-up turn on the SAME session (the SDK's resume — the
@@ -5034,13 +5474,22 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
             error, the vote schema and "re-emit the vote only; do not
             change any vote".
 
+            ``ordinal`` is the session's 1-based global fan-out ordinal
+            (F-96 round-2 finding 1): the repair resumes in exactly the
+            ``-vN`` settings whose ``-vN-scratch`` HOME holds this
+            session's transcript — resuming in the base run settings
+            would land in a HOME the session never wrote, and the
+            repair would die under the real runner.
+
             A repaired vote that parses and changes no ``(id, keep)``
             mark the malformed text carried (:func:`_repair_vote_usable`)
             IS the vote; anything else — prose, a dead repair session, a
             changed vote, no wall clock left, no resumable id — is
-            today's outcome exactly: an invalid vote drops nothing, and
-            :attr:`L2Report.verifier_error` names why. There is no
-            verifier re-run to fall back to (there never was one).
+            today's outcome exactly: an invalid vote keeps THIS
+            finding (the other findings' votes stand), and
+            :attr:`L2Report.verifier_error` names the failed sessions.
+            There is no verifier re-run to fall back to (there never
+            was one).
 
             Returns ``(vote, repair_record)`` — the repair's record only
             when it died on quota, so the caller aborts the attempt on
@@ -5062,6 +5511,9 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                     "verifier", _repair_verifier_prompt(error),
                     clean.root, profile,
                     factory_root=ctx.factory_root,
+                    settings_path=fanout_seat_settings(
+                        run_settings_base(clean.root, ctx.factory_root),
+                        "verifier", ordinal),
                     resume=session.session_id,
                     max_turns=REPAIR_TURN_CAP, timeout_min=remaining,
                     protected=protected, system_prompt=verifier_system,
@@ -5073,7 +5525,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
             except Exception as exc:  # noqa: BLE001 — never fails the round
                 trace.append({
                     "type": "reviewer_repair", "seat": "verifier",
-                    "seat_no": 1, "status": "error",
+                    "seat_no": ordinal, "status": "error",
                     "reason": f"{type(exc).__name__}: {exc}"[:300],
                     "original_status": session.status,
                     "original_reason": error, "outcome": "fell_back",
@@ -5088,7 +5540,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
             if _is_quota(record):
                 trace.append({
                     "type": "reviewer_repair", "seat": "verifier",
-                    "seat_no": 1, "status": record.status,
+                    "seat_no": ordinal, "status": record.status,
                     "reason": record.reason,
                     "original_status": session.status,
                     "original_reason": error, "outcome": "quota",
@@ -5104,7 +5556,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                         vote = repaired
             trace.append({
                 "type": "reviewer_repair", "seat": "verifier",
-                "seat_no": 1, "status": record.status,
+                "seat_no": ordinal, "status": record.status,
                 "reason": record.reason,
                 "original_status": session.status,
                 "original_reason": error,
@@ -5767,7 +6219,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                 # (F-38 review finding 3's remainder sharing
                                 # is superseded by this; the wall-clock
                                 # backstop above stays the total bound.)
-                                reviews = run_sessions_parallel(
+                                reviews = complete_records(run_sessions_parallel(
                                     [("reviewer", review_prompt)]
                                     * ctx.config.reviewers,
                                     clean.root, profile,
@@ -5791,7 +6243,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                     # parsed (a repair turn resumes a seat
                                     # in its own HOME); swept below.
                                     keep_scratch=True,
-                                )
+                                ))
                                 session_seconds += time.monotonic() - t0
                                 records.extend(reviews)
                                 for review in reviews:
@@ -5824,24 +6276,76 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                 union = merge_reviews(verdicts)
                                 vote = None
                                 if union.parse_error is None and union.findings:
-                                    remaining_verifier = (
-                                        budget["wall_clock_min"]
-                                        - session_seconds / 60.0
+                                    # F-96: ONE verifier session per
+                                    # finding (a serious one two), in
+                                    # waves capped by the profile —
+                                    # run_verifier_fanout is the ONE
+                                    # implementation every verifier site
+                                    # shares (eval parity, F-48 one layer
+                                    # down). The wall backstop and the
+                                    # quota branch keep their shapes:
+                                    # a starved wave escalates, a quota
+                                    # record aborts and requeues.
+                                    def _verifier_record(record) -> None:
+                                        records.append(record)
+                                        review_spend.add(record)
+                                        _log_vents(  # F-27
+                                            log, record, "verifier",
+                                            work.run_id, task_id,
+                                            egress_secrets)
+                                        trace.session_end(record, "verifier")  # F-30
+
+                                    def _book_verifier_wall(
+                                            seconds: float) -> None:
+                                        nonlocal session_seconds
+                                        session_seconds += seconds
+
+                                    fanout = run_verifier_fanout(
+                                        task, diff, union.findings,
+                                        delta=delta,
+                                        runner=ctx.session_runner,
+                                        run_dir=clean.root, profile=profile,
+                                        factory_root=ctx.factory_root,
+                                        protected=protected,
+                                        system_prompt=verifier_system,
+                                        srt_bin_path=ctx.srt_bin_path,
+                                        run_id=work.run_id, task_id=task_id,
+                                        # F-22 x F-38: the verifier gets
+                                        # the REVIEWER's narrowed toolkit
+                                        # — the same read-only evidence
+                                        # surface the reviewers had.
+                                        toolkit=toolkit_reviewer,
+                                        parallel=_verifier_parallel(profile),
+                                        remaining_min=lambda: (
+                                            budget["wall_clock_min"]
+                                            - session_seconds / 60.0),
+                                        add_elapsed=_book_verifier_wall,
+                                        on_record=_verifier_record,
+                                        collect_vote=lambda session, one, ordinal: (
+                                            _collect_vote(
+                                                session, one, review_spend,
+                                                ordinal)),
+                                        trace_sink=trace.append,  # F-30
+                                        declared_dependencies=declared_deps,
                                     )
-                                    # F-64 AC-1: the verifier runs at its
-                                    # FIXED parent-granted cap — never
-                                    # refused on turns, only by the wall
-                                    # clock (the parent-measured total
-                                    # bound, a backstop the reserved
-                                    # implementer window keeps unloaded).
-                                    verifier_turns = VERIFIER_TURN_CAP
-                                    if remaining_verifier <= 0:
+                                    if fanout.quota is not None:
+                                        return _quota_exhausted(fanout.quota)
+                                    if fanout.starved:
+                                        # A run never skips verification to
+                                        # fit (F-41 AC-4's rule): the wave
+                                        # that cannot start ends the task.
+                                        where = (
+                                            "before the verifier pass"
+                                            if fanout.starved == 1 else
+                                            f"mid-verifier-pass (wave "
+                                            f"{fanout.starved} could not "
+                                            "start)")
                                         path = _store(reports_dir, work.run_id,
                                                       attempt_no, reports)
                                         url, escalation, note = _keep_work(
                                             "budget_exhausted",
-                                            "wall-clock budget spent before "
-                                            "the verifier pass")
+                                            f"wall-clock budget spent "
+                                            f"{where}")
                                         attempt = attempt_record(
                                             attempt_no, started, "escalated", records,
                                             path, escalation=escalation,
@@ -5849,8 +6353,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                             pr=url,
                                         )
                                         finish(attempt, "needs_human", [
-                                            "1. wall-clock budget spent before "
-                                            "the verifier pass",
+                                            f"1. wall-clock budget spent "
+                                            f"{where}",
                                         ])
                                         return RunResult(
                                             "needs_human", task_id,
@@ -5858,71 +6362,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                             pr=url,
                                             reports=reports,
                                         )
-                                    verifier_prompt = _verifier_prompt(
-                                        task, diff, union.findings, delta=delta)
-                                    t0 = time.monotonic()
-                                    verifier = ctx.session_runner(
-                                        "verifier", verifier_prompt,
-                                        clean.root, profile,
-                                        factory_root=ctx.factory_root,
-                                        max_turns=verifier_turns,
-                                        timeout_min=remaining_verifier,
-                                        protected=protected,
-                                        system_prompt=verifier_system,
-                                        srt_bin_path=ctx.srt_bin_path,
-                                        run_id=work.run_id, task_id=task_id,
-                                        trace_sink=trace.append,  # F-30
-                                        declared_dependencies=declared_deps,
-                                        # F-22 × F-38: the verifier gets the
-                                        # REVIEWER's narrowed toolkit, not the
-                                        # implementer's — it judges the
-                                        # reviewers' findings against the same
-                                        # read-only evidence surface they had
-                                        # (docs lookups, vetted skills); there
-                                        # is no "verifier" seat in the toolkit
-                                        # config, and giving it none would let
-                                        # reviewers cite evidence the verifier
-                                        # cannot open.
-                                        toolkit=toolkit_reviewer,
-                                    )
-                                    session_seconds += time.monotonic() - t0
-                                    records.append(verifier)
-                                    review_spend.add(verifier)
-                                    _log_vents(log, verifier, "verifier",  # F-27
-                                               work.run_id, task_id, egress_secrets)
-                                    trace.session_end(verifier, "verifier")  # F-30
-                                    if _is_quota(verifier):
-                                        attempt = attempt_record(
-                                            attempt_no, started, "aborted", records,
-                                            None, escalation="quota_exhausted",
-                                            note=verifier.reason,
-                                        )
-                                        finish(attempt,
-                                               _abort_requeue_status(
-                                                   queue.get(task_id)),
-                                               [f"1. quota: {verifier.reason}"])
-                                        return RunResult(
-                                            "quota_exhausted", task_id,
-                                            escalation="quota_exhausted",
-                                            reports=reports,
-                                        )
-                                    if verifier.status != "completed":
-                                        extra_findings.append(
-                                            f"[session {verifier.status}] the "
-                                            f"verifier session ended: "
-                                            f"{verifier.reason} — nothing was "
-                                            "dropped; every finding stands"
-                                        )
-                                    # F-85: a completed verifier whose vote
-                                    # failed to parse gets ONE repair turn
-                                    # on its own session before the
-                                    # invalid-vote fallback.
-                                    vote, verifier_repair = _collect_vote(
-                                        verifier, union.findings,
-                                        review_spend)
-                                    if verifier_repair is not None:
-                                        return _quota_exhausted(
-                                            verifier_repair)
+                                    extra_findings.extend(fanout.notes)
+                                    vote = fanout.vote
                                 # F-48 (M-3): the post-review chain — union,
                                 # vote, convergence — is ONE shared function
                                 # (factory.l2.settle_review_verdict), so the
@@ -5940,6 +6381,12 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                         cast(str, head_sha)),
                                 )
                                 reports["L2"] = l2.to_dict()
+                                # F-96 round 4: harvest the kept siblings
+                                # into the attempt-wide pool.
+                                for _f in l2.findings:
+                                    if (isinstance(_f, L2Finding)
+                                            and _f.sibling and _f.key):
+                                        sibling_pool[_f.key] = _f.__dict__
                                 trace.gate_checks(reports["L2"])  # F-30 AC-3
                                 # Only a review where every reviewer session
                                 # completed and the merged verdict parsed moves
@@ -5948,9 +6395,9 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                 # delta must still cover this head, or code no
                                 # reviewer ever saw would become "outside the
                                 # delta" and its findings dropped. (A failed
-                                # verifier session doesn't un-review the round:
-                                # its vote dropped nothing, every finding
-                                # stands.)
+                                # verifier session keeps ITS finding — the
+                                # other findings' votes stand; it un-reviews
+                                # nothing.)
                                 reviewed = (
                                     all(r.status == "completed" for r in reviews)
                                     and l2.parse_error is None
@@ -6064,7 +6511,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                 # holds on turns absolutely; the wall clock
                                 # backstop above stays).
                                 t0 = time.monotonic()
-                                final_reviews = run_sessions_parallel(
+                                final_reviews = complete_records(run_sessions_parallel(
                                     [("reviewer", final_prompt)]
                                     * ctx.config.reviewers,
                                     clean.root, profile,
@@ -6084,7 +6531,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                     # F-85: kept for this review's repair
                                     # turns, swept below.
                                     keep_scratch=True,
-                                )
+                                ))
                                 session_seconds += time.monotonic() - t0
                                 records.extend(final_reviews)
                                 for review in final_reviews:
@@ -6110,21 +6557,64 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                 union = merge_reviews(verdicts)
                                 vote = None
                                 if union.parse_error is None and union.findings:
-                                    remaining_verifier = (
-                                        budget["wall_clock_min"]
-                                        - session_seconds / 60.0
+                                    # F-96: the final review's verifier
+                                    # fan-out — the same ONE
+                                    # implementation as the round's (no
+                                    # delta: the complete diff is the
+                                    # scope).
+                                    def _final_verifier_record(record) -> None:
+                                        records.append(record)
+                                        final_spend.add(record)
+                                        _log_vents(  # F-27
+                                            log, record, "verifier",
+                                            work.run_id, task_id,
+                                            egress_secrets)
+                                        trace.session_end(record, "verifier")  # F-30
+
+                                    def _book_final_verifier_wall(
+                                            seconds: float) -> None:
+                                        nonlocal session_seconds
+                                        session_seconds += seconds
+
+                                    fanout = run_verifier_fanout(
+                                        task, diff, union.findings,
+                                        runner=ctx.session_runner,
+                                        run_dir=clean.root, profile=profile,
+                                        factory_root=ctx.factory_root,
+                                        protected=protected,
+                                        system_prompt=verifier_system,
+                                        srt_bin_path=ctx.srt_bin_path,
+                                        run_id=work.run_id, task_id=task_id,
+                                        toolkit=toolkit_reviewer,
+                                        parallel=_verifier_parallel(profile),
+                                        remaining_min=lambda: (
+                                            budget["wall_clock_min"]
+                                            - session_seconds / 60.0),
+                                        add_elapsed=_book_final_verifier_wall,
+                                        on_record=_final_verifier_record,
+                                        collect_vote=lambda session, one, ordinal: (
+                                            _collect_vote(
+                                                session, one, final_spend,
+                                                ordinal)),
+                                        trace_sink=trace.append,  # F-30
+                                        declared_dependencies=declared_deps,
                                     )
-                                    # F-64 AC-1: the final verifier, like
-                                    # every review seat, at its fixed cap —
-                                    # wall clock is the only refusal.
-                                    verifier_turns = VERIFIER_TURN_CAP
-                                    if remaining_verifier <= 0:
+                                    if fanout.quota is not None:
+                                        return _quota_exhausted(fanout.quota)
+                                    if fanout.starved:
+                                        where = (
+                                            "before the final review's "
+                                            "verifier pass"
+                                            if fanout.starved == 1 else
+                                            f"mid-verifier-pass (wave "
+                                            f"{fanout.starved} could not "
+                                            "start)")
                                         path = _store(reports_dir, work.run_id,
                                                       attempt_no, reports)
                                         url, escalation, note = _keep_work(
                                             "budget_exhausted",
-                                            "wall-clock budget spent before the "
-                                            "final review's verifier pass")
+                                            f"wall-clock budget spent "
+                                            f"{where}")
                                         attempt = attempt_record(
                                             attempt_no, started, "escalated", records,
                                             path, escalation=escalation,
@@ -6132,8 +6622,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                             pr=url,
                                         )
                                         finish(attempt, "needs_human", [
-                                            "1. wall-clock budget spent before the "
-                                            "final review's verifier pass",
+                                            f"1. wall-clock budget spent "
+                                            f"{where}",
                                         ])
                                         return RunResult(
                                             "needs_human", task_id,
@@ -6141,63 +6631,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                             pr=url,
                                             reports=reports,
                                         )
-                                    verifier_prompt = _verifier_prompt(
-                                        task, diff, union.findings)
-                                    t0 = time.monotonic()
-                                    verifier = ctx.session_runner(
-                                        "verifier", verifier_prompt,
-                                        clean.root, profile,
-                                        factory_root=ctx.factory_root,
-                                        max_turns=verifier_turns,
-                                        timeout_min=remaining_verifier,
-                                        protected=protected,
-                                        system_prompt=verifier_system,
-                                        srt_bin_path=ctx.srt_bin_path,
-                                        run_id=work.run_id, task_id=task_id,
-                                        trace_sink=trace.append,  # F-30
-                                        declared_dependencies=declared_deps,
-                                        # The verifier judges the reviewers'
-                                        # findings against the same read-only
-                                        # evidence surface they had (F-22 x
-                                        # F-38): the reviewer's narrowed
-                                        # toolkit, never the implementer's.
-                                        toolkit=toolkit_reviewer,
-                                    )
-                                    session_seconds += time.monotonic() - t0
-                                    records.append(verifier)
-                                    final_spend.add(verifier)
-                                    _log_vents(log, verifier, "verifier",  # F-27
-                                               work.run_id, task_id, egress_secrets)
-                                    trace.session_end(verifier, "verifier")  # F-30
-                                    if _is_quota(verifier):
-                                        attempt = attempt_record(
-                                            attempt_no, started, "aborted", records,
-                                            None, escalation="quota_exhausted",
-                                            note=verifier.reason,
-                                        )
-                                        finish(attempt,
-                                               _abort_requeue_status(
-                                                   queue.get(task_id)),
-                                               [f"1. quota: {verifier.reason}"])
-                                        return RunResult(
-                                            "quota_exhausted", task_id,
-                                            escalation="quota_exhausted",
-                                            reports=reports,
-                                        )
-                                    if verifier.status != "completed":
-                                        extra_findings.append(
-                                            f"[session {verifier.status}] the "
-                                            f"final review's verifier session ended: "
-                                            f"{verifier.reason} — nothing was "
-                                            "dropped; every finding stands"
-                                        )
-                                    # F-85: one repair turn for a malformed
-                                    # vote, before the invalid-vote fallback.
-                                    vote, verifier_repair = _collect_vote(
-                                        verifier, union.findings, final_spend)
-                                    if verifier_repair is not None:
-                                        return _quota_exhausted(
-                                            verifier_repair)
+                                    extra_findings.extend(fanout.notes)
+                                    vote = fanout.vote
                                 # AC-2: the F-23 delta rules do not apply —
                                 # the full diff is the scope, nothing is out
                                 # of it and no missed_earlier is owed — so
@@ -6222,6 +6657,12 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                     # authoritative L2 from here (AC-5).
                                     reports["L2-delta"] = reports["L2"]
                                 reports["L2"] = l2.to_dict()
+                                # F-96 round 4: the final review's kept
+                                # siblings join the pool too.
+                                for _f in l2.findings:
+                                    if (isinstance(_f, L2Finding)
+                                            and _f.sibling and _f.key):
+                                        sibling_pool[_f.key] = _f.__dict__
                                 trace.gate_checks(reports["L2"])  # F-30 AC-3
                                 reviewed = (
                                     all(r.status == "completed"
@@ -6729,7 +7170,20 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                         followup_out = _record_publish_followup(
                             queue, task_id, l2, profile, log, trace.append,
                             egress_secrets, work.run_id,
-                            repo=work.root, base_ref=base_sha)
+                            repo=work.root, base_ref=base_sha,
+                            carried_siblings=list(sibling_pool.values()),
+                            # Round 5: re-rule every pool entry against
+                            # the FINAL diff — a sibling whose file a
+                            # later round edited is stale, not carried.
+                            # work.root, not the gate clone: by publish
+                            # time the publish path itself has run git
+                            # in clean.root and its diff can refuse —
+                            # the run clone holds the same two refs in a
+                            # quiet state (the same repo the push
+                            # leaves from).
+                            outside_diff=_outside_diff(
+                                work.root, base_sha,
+                                cast(str, head_sha)))
                         wipstore.discard(ctx.factory_root, project, task_id)
                         # ---- F-75 AC-1/AC-2: CI is part of done ----
                         # The bookkeeping above is durable (attempt,
@@ -7347,7 +7801,7 @@ def _recover_accept_leased(
                     return record
                 base_settings = accept_base.with_name(
                     accept_base.name + f"-retry{seat_no}")
-                record = run_sessions_parallel(
+                record = complete_records(run_sessions_parallel(
                     [("reviewer", prompt)], clean.root, profile,
                     runner=runner, factory_root=factory_root,
                     settings_path=base_settings,
@@ -7358,10 +7812,10 @@ def _recover_accept_leased(
                     run_id=work.run_id, task_id=task_id,
                     toolkit=toolkit_reviewer,
                     declared_dependencies=bool(task.get("dependencies")),
-                )[0]
+                ))[0]
                 return record
 
-            reviews = run_sessions_parallel(
+            reviews = complete_records(run_sessions_parallel(
                 [("reviewer", prompt)] * config.reviewers, clean.root, profile,
                 runner=runner, factory_root=factory_root,
                 max_turns=REVIEWER_TURN_CAP, timeout_min=60.0,
@@ -7372,55 +7826,31 @@ def _recover_accept_leased(
                 toolkit=toolkit_reviewer,
                 declared_dependencies=bool(task.get("dependencies")),
                 keep_scratch=True,  # F-85: repairs resume in-seat
-            )
+            ))
             verdicts, _ = parse_reviews_with_retry(reviews, rerun, stop=_is_quota)
             sweep_fanout_scratch(accept_base)  # F-85: repairs are done
             union = merge_reviews(verdicts)
             vote = None
             if union.parse_error is None and union.findings:
-                verifier_prompt = _verifier_prompt(live, diff, union.findings)
-                verifier = runner(
-                    "verifier", verifier_prompt, clean.root, profile,
-                    factory_root=factory_root, max_turns=VERIFIER_TURN_CAP,
-                    timeout_min=30.0, protected=protected,
-                    system_prompt=verifier_system, srt_bin_path=srt_bin_path,
+                # F-96: the same per-finding verifier fan-out as the
+                # round review (the ONE shared implementation), with the
+                # accept path's own budget shapes: a fixed 30-minute
+                # window, no trace, no attempt budget to book. A quota
+                # record here reads as a failed session — its finding
+                # stands — exactly like today's invalid vote (the accept
+                # path never requeued on the verifier's quota).
+                # F-96: the accept path's verifier fan-out, extracted
+                # whole (one window, per-session repairs, a visible
+                # did-not-finish) — see run_accept_verifier_fanout.
+                vote = run_accept_verifier_fanout(
+                    live, diff, union.findings,
+                    runner=runner, run_dir=clean.root, profile=profile,
+                    factory_root=factory_root, protected=protected,
+                    system_prompt=verifier_system,
+                    srt_bin_path=srt_bin_path,
                     run_id=work.run_id, task_id=task_id,
                     toolkit=toolkit_reviewer,
-                )
-                vote = parse_verifier_vote(
-                    verifier.result if verifier.status == "completed" else None,
-                    union.findings,
-                )
-                # F-85: a malformed vote from a completed verifier gets
-                # its ONE repair turn here too — no trace on this path,
-                # the same as every other session it runs.
-                if (vote.error is not None
-                        and verifier.status == "completed"
-                        and verifier.session_id):
-                    try:
-                        repaired = runner(
-                            "verifier", _repair_verifier_prompt(vote.error),
-                            clean.root, profile,
-                            factory_root=factory_root,
-                            resume=verifier.session_id,
-                            max_turns=REPAIR_TURN_CAP, timeout_min=30.0,
-                            protected=protected,
-                            system_prompt=verifier_system,
-                            srt_bin_path=srt_bin_path,
-                            run_id=work.run_id, task_id=task_id,
-                            toolkit=toolkit_reviewer,
-                        )
-                    except Exception:  # noqa: BLE001 — keep today's outcome
-                        repaired = None
-                    if (repaired is not None
-                            and repaired.status == "completed"
-                            and not _is_quota(repaired)):
-                        candidate = parse_verifier_vote(
-                            repaired.result, union.findings)
-                        if (candidate.error is None
-                                and _repair_vote_usable(
-                                    verifier.result or "", candidate)):
-                            vote = candidate
+                    base=run_settings_base(clean.root, factory_root))
             l2 = settle_review_verdict(
                 union, {}, frozenset(), delta_mode=False, vote=vote,
                 reviewers=config.reviewers, final=True,

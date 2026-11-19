@@ -252,13 +252,14 @@ def test_ac_4(tmp_path: Path):
     result = env.run(seats)
     assert result.outcome == "needs_human"
     assert result.escalation == "review_not_converging"
-    # F-38: each review round is a two-session fan-out plus a verifier
-    # (the repeat finding needs voting) — 2 rounds, not 3. F-72: the
-    # round-2 stop runs ONE arbiter seat first (this Scripted's arbiter
-    # answers unparseably, so the arbiter failed and the escalation the
-    # test pinned still fires).
+    # F-38: each review round is a two-session fan-out plus the verifier
+    # vote (the repeat finding needs voting) — 2 rounds, not 3. F-96: the
+    # repeat finding is blocking, so its vote is TWO verifier sessions.
+    # F-72: the round-2 stop runs ONE arbiter seat first (this Scripted's
+    # arbiter answers unparseably, so the arbiter failed and the
+    # escalation the test pinned still fires).
     assert [c[0] for c in seats.calls] == [
-        "implementer", "reviewer", "reviewer", "verifier",
+        "implementer", "reviewer", "reviewer", "verifier", "verifier",
     ] * 2 + ["arbiter"]
     task = env.task()
     assert task["status"] == "needs_human"
