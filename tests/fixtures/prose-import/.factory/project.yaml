@@ -5,6 +5,10 @@
 # large for a single mid-size task (offline mode, eight deliverables).
 name: prose-demo
 
+# F-100: the standard stack's anthropic seats are admitted.
+providers_allowed:
+  - anthropic
+
 repo:
   path: .
   default_branch: main

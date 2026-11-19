@@ -29,7 +29,7 @@ from _support.f63 import ledger_approve
 
 from factory.approvals import ApprovalLedger
 from factory.approve import render_contract
-from factory.config import DEFAULT_REVIEWERS
+from factory.config import DEFAULT_REVIEWERS, FactoryConfig
 from factory.contract import ContractError, contract_hash, load_tasks
 from factory.mergeorder import Protection
 from factory.orchestrator import run_loop
@@ -234,6 +234,7 @@ def test_ac_1(tmp_path: Path, monkeypatch):
             return base(seat, prompt, run_dir, profile, **kwargs)
         return run_session_sandboxed(
             seat, prompt, Path(run_dir), profile,
+            config=FactoryConfig(),
             factory_root=env.root, max_turns=kwargs["max_turns"],
             timeout_min=kwargs["timeout_min"],
             protected=kwargs.get("protected", ()),

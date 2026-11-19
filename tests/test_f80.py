@@ -143,15 +143,15 @@ def test_ac_1(tmp_path: Path, monkeypatch, capsys):
     base = {"name": "p", "provider": {"kind": "anthropic", "models": {
         "implementer": "m-i", "reviewer": "m-r", "verifier": "m-v",
         "importer": "m-imp"}}}
-    assert resolve_provider(base, "contract_reviewer").model == "m-r"
-    assert resolve_provider(base, "contract_reviewer").kind == "anthropic"
+    assert resolve_provider(base, "contract_reviewer", config=FactoryConfig()).model == "m-r"
+    assert resolve_provider(base, "contract_reviewer", config=FactoryConfig()).kind == "anthropic"
     override = {**base, "providers_allowed": ["bedrock"], "seat_providers": {
         "contract_reviewer": {"kind": "bedrock", "model": "m-b",
                               "region": "eu-north-1"}}}
-    assert resolve_provider(override, "contract_reviewer").kind == "bedrock"
+    assert resolve_provider(override, "contract_reviewer", config=FactoryConfig()).kind == "bedrock"
     with pytest.raises(ProviderError):  # F-59: outside providers_allowed
         resolve_provider({**override, "providers_allowed": []},
-                         "contract_reviewer")
+                         "contract_reviewer", config=FactoryConfig())
 
     # (2) one session, the stored review, the byte-identical queue.
     env = Env80(tmp_path / "happy", task=None)
@@ -515,7 +515,8 @@ def test_ac_1(tmp_path: Path, monkeypatch, capsys):
         "kind": "anthropic", "model": "m-cr"}}
     profile_path.write_text(yaml.safe_dump(profile))
     assert resolve_provider(load_profile(profile_path),
-                            "contract_reviewer").model == "m-cr"
+                            "contract_reviewer",
+                            config=FactoryConfig()).model == "m-cr"
 
 
 # --------------------------------------------------------------------------

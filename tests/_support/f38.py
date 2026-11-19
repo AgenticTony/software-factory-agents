@@ -104,6 +104,10 @@ class Env:
 
         self.profile = {
             "name": "fixture",
+            # F-100: the fixture runs the default standard stack, whose
+            # hunt/final seats are anthropic — admitted here like every
+            # real project's profile admits them at re-approval.
+            "providers_allowed": ["anthropic"],
             "repo": {
                 "path": str(self.repo),
                 "default_branch": "main",

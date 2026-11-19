@@ -92,12 +92,14 @@
         "output_tokens": { "type": "integer", "minimum": 0 },
         "provider": {
           "type": "object",
-          "description": "F-59: the attempt's provider record — kind, model (when the profile names one; absent for a self project with no provider block, whose seats run the CLI default), region or endpoint host, from the PARENT's resolver (never the session's claim, never a credential). Absent on every attempt recorded before F-59.",
+          "description": "F-59/F-100: the attempt's provider record — kind, model (when the profile names one; absent for a self project with no provider block, whose seats run the CLI default), region or endpoint host, and F-100's role and stack, from the PARENT's resolver (never the session's claim, never a credential). Absent on every attempt recorded before F-59.",
           "additionalProperties": false,
           "required": ["kind"],
           "properties": {
             "kind": { "enum": ["zai", "anthropic", "bedrock", "vertex", "anthropic_compatible"] },
             "model": { "type": "string" },
+            "role": { "type": "string", "description": "F-100: the registry role this attempt\u2019s implementer seat resolved (e.g. implementer), from the parent\u2019s resolver. Absent on every attempt recorded before F-100." },
+            "stack": { "type": "string", "description": "F-100: the registry stack the project ran (e.g. standard), from the parent\u2019s resolver. Absent on every attempt recorded before F-100." },
             "region": { "type": "string" },
             "endpoint_host": { "type": "string" }
           }

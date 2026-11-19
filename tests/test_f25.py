@@ -182,6 +182,8 @@ def test_ac_1(tmp_path):
 
 _MIN_PROFILE = {
     "name": "fixture",
+    # F-100: the standard stack's anthropic seats are admitted.
+    "providers_allowed": ["anthropic"],
     "repo": {
         "path": "/tmp/proj",
         "default_branch": "main",
@@ -504,6 +506,8 @@ class Env:
         (self.repo / "tests" / "test_base.py").write_text("def test_base():\n    assert True\n")
         profile = {
             "name": "fixture",
+            # F-100: the standard stack's anthropic seats are admitted.
+            "providers_allowed": ["anthropic"],
             "repo": {
                 "path": str(self.repo),
                 "default_branch": "main",

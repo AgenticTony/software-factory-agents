@@ -99,11 +99,29 @@
         "kind": "automatic",
         "name": "restamp-version",
         "note": "TaskQueue.save and the import write path re-stamp the queue's top-level version to the current epoch; it runs only on queues that already validate under the current rules (the loaders refuse anything else) and never touches a task field, so no approved contract's hash covers it"
+      }
+    },
+    {
+      "epoch": 5,
+      "date": "2026-11-19",
+      "wo": "F-100",
+      "surfaces": [
+        "profile"
+      ],
+      "change": "model registry: a client project with no recorded model_restrictions answer (none | no_china | contained, with who answered and when) refuses the load; the profile gains model_stack and model_restrictions (F-63 security groups) and seat_providers admits final_review.fix/.strong; provider.models becomes the deprecated optional override (the registry stack fills every seat the block does not pin)",
+      "tightens": true,
+      "checks": [
+        "model_restrictions"
+      ],
+      "migration": {
+        "kind": "owner_action",
+        "command": "factory approve --profile",
+        "note": "record the client's onboarding answer in the profile's model_restrictions block (the default answer is none — clients are open by default, F-59's blanket client/zai refusal is replaced by that answer) and re-approve the profile"
       },
       "fingerprint": {
         "schemas": {
-          "tasks.schema.json": "37489435a199517d79ebd9bf498f2b1ab73d94314f625b991116f507fb748822",
-          "project.schema.json": "e280ebc1ff31972977f498711186c413d94c9809abaec16b78ce8a97914aa9a1"
+          "tasks.schema.json": "b80198f679024fc14acf308882d7ad5beae13f4956f4e6b9b5192de746d58add",
+          "project.schema.json": "9fdf5d92ec0dcdff03fbf47f0959ce47e598665b311dbf5bebd7b104455a873d"
         },
         "functions": {
           "NON_EXECUTABLE_KINDS": "754109e838ef8dde8d170cbb6743eda5288735c39ebc908a134c4f4b93ba5b7d",
@@ -131,8 +149,8 @@
           "_BASE_URL_KIND": "5ee64ade3cf4888e40a2301770e60c30f6b68d47e0cc7cbfe8287fa445977954",
           "_provider_field_error": "6a98a7a4bbd4c3104b157771b85d72154ed2258c93239100dd945b5afb5b11b1",
           "_provider_base_url_error": "0c99d55db336cfb8f8a618e89ed2de2f8761c08594d321c83774214223bc9e4a",
-          "_check_provider_semantics": "e1016dadbe85e152295066c70b1be19d05f7a97e22374ffae8aa61d773296875",
-          "_provider_semantic_violations": "09cc233cbe1b3359d39a38a8d39e28ff6745d977bb624794cbfbdc5bb3dbc8fd",
+          "_check_provider_semantics": "19185dedfe0065d06ab4e3dd3f0f9a2b2479e32e1f132cea98c1c6eb2952bb81",
+          "_provider_semantic_violations": "e0bf3088adb6c9a568cee46200836245c0d5bcfad9e7aacf218798b5de9ffda5",
           "_check_allowlist_hosts": "2852dc82b524bc31be8d895a2f295bf070f0b8d2ef22c1d06cba34d6691c50e2",
           "_allowlist_host_violations": "f50ee8b0fbd95ff962f2271b96a1a7f7558c2e100e1c7fd782fd5661cb424aaa",
           "_check_profile_semantics": "f9234e8a3985e7da039c014389bb4466825027788d1597ebae543e8ef1802816",
@@ -140,7 +158,7 @@
           "budget_floor": "b678df03283a3569f397c88a233aa95f115dd56b15f5f7402d8b07c19d9c0959",
           "apply_profile_defaults": "4e7185a84bd5780e9c5719a211805b4bf2511f4b04ddce9fd9372cbe16bc8eef",
           "_check_profile_toolkit": "1d939efc9897cd18f90b4c0990bdcd506d909e4cb8c92818784288bfc3a24ed2",
-          "load_profile": "8a4d17380860cc647d1830f5203b502c511de495e1ea584bc7c98b70490afd19"
+          "load_profile": "0c5addc68f346f9ce466cca8d9c4ebc23ae85196ee5e20bc1a97f08eaa44cef7"
         }
       }
     }

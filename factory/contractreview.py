@@ -73,7 +73,7 @@ from factory.l2 import (
     validate_contract_findings,
 )
 from factory.prbody import fence
-from factory.provider import ProviderError, resolve_provider, run_secrets
+from factory.provider import ProviderError, run_secrets
 from factory.runs import RunError, cleanup_run, create_run, project_component
 from factory.sandbox import preflight_host
 from factory.session import (
@@ -722,9 +722,10 @@ def review_contract(
     factory_root = Path(factory_root)
     profile_path = (Path(profile_path) if profile_path
                     else queue_path.parent / "project.yaml")
-    profile = load_profile(profile_path)
     config = config if config is not None else load_config(
         factory_root / CONFIG_FILE)
+    # F-100: the profile loads WITH the registry (the stack guard).
+    profile = load_profile(profile_path, config=config)
     now = now or (lambda: datetime.now(timezone.utc))
     # F-63 AC-2: a session runs under the profile's sandbox, network and
     # provider settings — the owner must have approved exactly this
@@ -748,7 +749,11 @@ def review_contract(
             "contract review refused: inside the peak window no session "
             "starts — run it again outside the window")
     try:
-        spec = resolve_provider(profile, "contract_reviewer")
+        # F-100: the ONE role resolver (the stack's
+        # reviewer.conformance default for the contract reviewer).
+        from factory.models import resolve_role
+
+        spec = resolve_role(profile, config, "contract_reviewer")
     except ProviderError as exc:
         raise ContractReviewError(f"contract review refused: {exc}") from exc
     real = session_runner is None
@@ -760,7 +765,7 @@ def review_contract(
     if sdk_probe is not None:
         sdk_probe(profile, srt_bin_path=srt_bin_path)
 
-    secrets = run_secrets(profile)
+    secrets = run_secrets(profile, config=config)
     repo_cfg = profile["repo"]
     # The run lease: the review creates a run dir, which only a lease
     # holder may (a concurrent run's reclaim would delete it mid-session),
@@ -789,6 +794,7 @@ def review_contract(
             record = runner(
                 "contract_reviewer", prompt, work.root, profile,
                 factory_root=factory_root,
+                role="contract_reviewer", config=config,
                 max_turns=CONTRACT_REVIEWER_TURN_CAP,
                 timeout_min=REVIEW_WALL_CLOCK_MIN,
                 protected=list((profile.get("paths") or {}).get("protected")

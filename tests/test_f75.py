@@ -392,7 +392,7 @@ def test_ac_2(tmp_path: Path, monkeypatch):
                    "re" + BIDI + secret) + "\n"
     )
     env = Env75(tmp_path / "hostile")
-    monkeypatch.setattr(orch, "run_secrets", lambda profile: (secret,))
+    monkeypatch.setattr(orch, "run_secrets", lambda profile, config=None: (secret,))
     actions = Actions(failed_default=[FAILED_RUN], logs={101: hostile})
     _seams(monkeypatch, env, actions)
     ci = CI(default=[ci_state("failed", checks=((CHECK_NAME, "failure"),)),
@@ -471,7 +471,7 @@ def test_ac_2(tmp_path: Path, monkeypatch):
     # (8) the update push goes through the same content fence: a fix
     # round whose new commit carries the run's secret is refused.
     env = Env75(tmp_path / "fence")
-    monkeypatch.setattr(orch, "run_secrets", lambda profile: (SEAT_TOKEN,))
+    monkeypatch.setattr(orch, "run_secrets", lambda profile, config=None: (SEAT_TOKEN,))
     actions = Actions(failed_default=[FAILED_RUN], logs={101: LOG_TAIL})
     _seams(monkeypatch, env, actions)
     ci = CI(default=[ci_state("failed", checks=((CHECK_NAME, "failure"),)),

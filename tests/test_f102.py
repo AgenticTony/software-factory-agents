@@ -310,8 +310,9 @@ def test_ac_2(tmp_path: Path):
                 for spec in [*SOLOADVENTURER_SEEDS, *CLEAN_DIFFS]}
     assert len(expected) == 11, expected
     assert report["slots"] == expected
-    # The ONLY new top-level key: everything else is the F-99 shape.
-    assert set(report) - {"slots"} == {
+    # The new top-level keys: F-102's slots and F-100's role_overrides
+    # (the eval's --role record); everything else is the F-99 shape.
+    assert set(report) - {"slots", "role_overrides"} == {
         "fixture", "base_ref", "l2", "repeats", "seeds", "clean",
         "false_fail_on_clean", "false_fail_by_repeat", "false_fail_stats",
         "l2_quota_voided", "catch_rate", "caught_counts",

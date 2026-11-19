@@ -18,6 +18,7 @@ from pathlib import Path
 
 from _support.f23 import Env, Scripted, _finding, _verdict
 
+from factory.config import FactoryConfig
 from factory.l2 import L2Finding, parse_verdict, parse_verifier_vote
 from factory.session import SessionRecord
 
@@ -484,6 +485,8 @@ def _sandbox_repo(tmp_path: Path):
                    check=True, capture_output=True)
     profile = {
         "name": "p",
+        # F-100: the standard stack's anthropic seats are admitted.
+        "providers_allowed": ["anthropic"],
         "repo": {"path": str(repo), "default_branch": "main",
                  "remote": str(tmp_path / "r.git")},
         "commands": {"setup": "true", "test": "true"},
@@ -543,6 +546,7 @@ def test_repair_resumes_the_seats_own_home(tmp_path, monkeypatch):
         factory_root=tmp_path, settings_path=seat_settings,
         resume="sid-original", max_turns=4, timeout_min=1,
         cli_path=Path("/bin/echo"),
+        config=FactoryConfig(),
     )
     assert record.status == "completed"
     assert len(specs) == 1
@@ -612,6 +616,7 @@ def test_fanout_keeps_scratch_only_when_asked(tmp_path, monkeypatch):
             repo, profile, factory_root=tmp_path, settings_path=base,
             max_turns=2, timeout_min=1, cli_path=Path("/bin/echo"),
             keep_scratch=keep,
+            config=FactoryConfig(),
         )
 
     records = run_fanout(True)

@@ -116,6 +116,8 @@ class Env:
         )
         profile = {
             "name": "fixture",
+            # F-100: the standard stack's anthropic seats are admitted.
+            "providers_allowed": ["anthropic"],
             "repo": {
                 "path": str(self.repo),
                 "default_branch": "main",
@@ -621,6 +623,8 @@ _GOOD_HOSTS = [
 def _profile_with_allowlist(key: str, entries: list) -> dict:
     profile = {
         "name": "fixture",
+        # F-100: the standard stack's anthropic seats are admitted.
+        "providers_allowed": ["anthropic"],
         "repo": {"path": "/tmp/x", "default_branch": "main", "remote": "origin"},
         "commands": {"setup": "true", "test": "true"},
         "paths": {"risk": {}, "protected": []},
@@ -712,6 +716,8 @@ def test_ac_3_pins_srt_bare_host_is_exact_match():
 def _minimal_profile() -> dict:
     return {
         "name": "fixture",
+        # F-100: the standard stack's anthropic seats are admitted.
+        "providers_allowed": ["anthropic"],
         "repo": {"path": "/tmp/x", "default_branch": "main", "remote": "origin"},
         "commands": {"setup": "true", "test": "true"},
         "paths": {"risk": {}, "protected": []},  # no .factory glob at all

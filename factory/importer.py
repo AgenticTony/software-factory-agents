@@ -137,6 +137,7 @@ from typing import Any, Callable, NamedTuple, Sequence
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from factory.approvals import require_profile_approval
+from factory.config import CONFIG_FILE, ConfigError, load_config
 from factory.contract import (
     SCHEMA_DIR,
     ContractError,
@@ -165,7 +166,6 @@ from factory.provider import (
     ProviderError,
     keychain_service,
     provider_token,
-    resolve_provider,
     run_secrets,
 )
 from factory.runs import (
@@ -3291,9 +3291,17 @@ def _write_session_record(
         return None
     provider: dict[str, Any]
     try:
-        provider = resolve_provider(
-            profile or {}, "importer").provider_record()
-    except ProviderError:
+        # F-100: the ONE role resolver — the importer's role and stack
+        # ride the record like every seat's (registry from the factory
+        # root this record is written under).
+        from factory.models import resolve_role
+
+        provider = resolve_role(
+            profile or {},
+            load_config((Path(factory_root) if factory_root is not None
+                         else FACTORY_ROOT_DEFAULT) / CONFIG_FILE),
+            "importer").provider_record()
+    except (ProviderError, ConfigError):
         provider = {"kind": "unknown"}
     model = getattr(record, "model", None) if record is not None else None
     payload = {
@@ -3633,6 +3641,7 @@ def _repair_refused_proposal(
     import_turns: int,
     import_timeout: float,
     secrets: "Sequence[str]",
+    config=None,
     reference: dict | None = None,
     doc_texts: dict[str, str] | None = None,
     stale_base: bool = False,
@@ -3739,7 +3748,8 @@ def _repair_refused_proposal(
                 # ROLE's provider + model; the credential is looked up
                 # by the resolver for THAT spec inside the constructor —
                 # never passed raw, never crossed between kinds.
-                role="importer",
+                # F-100: the registry config.
+                role="importer", config=config,
                 protected=list(
                     (profile.get("paths") or {}).get("protected") or []
                 ),
@@ -4193,20 +4203,29 @@ def run_import(
     existing_doc, stale_base, stale_report_text = (
         _load_existing_queue_for_import(queue_path, repo, factory_root))
     profile: dict | None = None
+    # F-100: the registry the importer's seats resolve through (the
+    # same read the orchestrator does); the profile loads WITH it where
+    # one exists — the stack guard refuses an uncovered project at
+    # import, before any session runs.
+    config = load_config(
+        (Path(factory_root) if factory_root is not None
+         else FACTORY_ROOT_DEFAULT) / CONFIG_FILE)
     if existing_doc is not None:
         project = existing_doc["project"]
         # The profile is the provider truth even when the queue exists
         # (F-59): load it for the resolver; a missing profile keeps the
         # pre-F-59 zai default via run_secrets({}).
-        profile = (load_profile(repo / ".factory" / "project.yaml")
+        profile = (load_profile(repo / ".factory" / "project.yaml",
+                                config=config)
                    if (repo / ".factory" / "project.yaml").is_file() else {})
     else:
-        profile = load_profile(repo / ".factory" / "project.yaml")
+        profile = load_profile(repo / ".factory" / "project.yaml",
+                               config=config)
         project = profile["name"]
     # F-59: every provider token the profile's seats resolve to (the
     # project's kind plus seat overrides) — a Bedrock project's importer
     # scrubs its own token, not only the Z.ai one.
-    egress_secrets = run_secrets(profile)
+    egress_secrets = run_secrets(profile, config=config)
     # The ONE listing for the whole run (F-49 review round 1, finding 3):
     # the prompt, the scaled budget and the summary's truncated-doc names
     # all describe the same docs — computed before the session runs, so
@@ -4325,7 +4344,7 @@ def run_import(
         try:
             text = sdk_import_session(
                 prompt, repo, profile=profile, queue_path=queue_path,
-                factory_root=factory_root,
+                factory_root=factory_root, config=config,
                 max_turns=effective_turns, timeout_min=effective_timeout,
                 docs_dir=docs_dir,
                 # F-57 AC-1: the real session gets the per-task tool, built
@@ -4427,6 +4446,7 @@ def run_import(
                 import_turns=effective_turns,
                 import_timeout=effective_timeout,
                 secrets=egress_secrets,
+                config=config,
                 reference=reference, doc_texts=doc_texts,
                 stale_base=stale_base,
             )
@@ -4539,6 +4559,7 @@ def sdk_import_session(
     profile: dict,
     queue_path: Path | str | None = None,
     factory_root: Path | str | None = None,
+    config=None,
     max_turns: int = DEFAULT_MAX_TURNS,
     timeout_min: float = DEFAULT_TIMEOUT_MIN,
     docs_dir: str = DEFAULT_DOCS_DIR,
@@ -4622,8 +4643,18 @@ def sdk_import_session(
     # profile's own block; the importer ROLE's model), the per-kind
     # credential, the named refusal. Never a fallback: a client project
     # whose provider has no credential refuses here.
+    if config is None:
+        # F-100 R3: no silent default registry — load the
+        # owner's config from the root this session runs under.
+        config = load_config(
+            (Path(factory_root) if factory_root is not None
+             else FACTORY_ROOT_DEFAULT) / CONFIG_FILE)
     try:
-        spec = resolve_provider(profile, "importer")
+        # F-100: the ONE role resolver — the registry's importer role
+        # through the caller's config (None: the default registry).
+        from factory.models import resolve_role
+
+        spec = resolve_role(profile, config, "importer")
     except ProviderError as exc:
         raise ImportRefused(f"the importer session cannot run: {exc}") \
             from exc
@@ -4702,8 +4733,8 @@ def sdk_import_session(
                 # provider + model (the resolver's seat is the role).
                 # R1-2: no raw token — the constructor resolves the
                 # credential for the spec (the refusal above already
-                # named a missing one).
-                role="importer",
+                # named a missing one). F-100: the registry config.
+                role="importer", config=config,
                 protected=list((profile.get("paths") or {}).get("protected") or []),
                 run_id=run.run_id,
                 scratch_files={

@@ -401,10 +401,13 @@ class Dashboard:
         except ContractError as exc:
             return self._contract_error(exc)
         # The F-11 render, verbatim — the numbers ARE `factory status`
-        # output, one implementation, no second one here (AC-5).
+        # output, one implementation, no second one here (AC-5). F-100:
+        # the profile rides along exactly as the CLI's status passes it
+        # (the model-stack section is part of the page).
         text = render_status(queue, project=project,
                              factory_root=self.factory_root,
-                             repo=Path(profile["repo"]["path"]))
+                             repo=Path(profile["repo"]["path"]),
+                             profile=profile)
         return Response(200, text.encode(), "text/plain; charset=utf-8")
 
     def static_file(self, name: str) -> Response:

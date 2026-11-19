@@ -123,4 +123,53 @@ width is the `reviewers` knob in `<factory-root>/config.yaml` (override
 per run with `--reviewers`), so the eval always measures the review
 pipeline the queue actually runs.
 
+## Operating: the model registry and stacks (F-100)
+
+Every model the factory uses is set in one place — the `models` block of
+`<factory-root>/config.yaml` (owner-maintained; the factory never writes
+it) — and each project names the stack it runs in its `project.yaml`
+(`model_stack`, an owner-approved security field). The block ships three
+documented stacks as the default (`factory/models.py`'s
+`DEFAULT_REGISTRY`, mirrored in the config docstring):
+
+- `standard` — **zai-only** (owner decision 2026-11-19): every role on
+  the GLM workhorse `glm-latest`, so an existing zai profile loads and
+  runs with no new credential. Own projects and every client whose
+  onboarding answer is "no restriction".
+- `standard-plus` — the opt-in: standard's zai seats plus the
+  cross-family defect-hunt seat (anthropic `claude-sonnet-5-5`) and the
+  final-review tiers (anthropic `claude-opus-5-5`/`claude-fable-5-2`,
+  F-97 reads them). A project reaches it only through `model_stack`
+  (re-approval) with anthropic in its `providers_allowed`.
+- `no-china` — a client whose answer forbids Chinese-provider models:
+  anthropic seats only.
+- `contained` — the code may not leave a named environment: bedrock in
+  the client's region (the `region` of the project's own provider
+  block).
+
+Bumping a model is one line: `aliases: {glm-latest: glm-5.4}` moves
+every role that uses the alias, with no re-approval — a project's
+`providers_allowed` list and its recorded `model_restrictions` answer
+stay the authority, and a stack edit that would move a project outside
+them refuses at load, naming the project, the role and the kind (never a
+fallback). A client's restriction answer (`none` | `no_china` |
+`contained`, with who answered and when) is asked at onboarding and
+recorded in the profile — clients are open by default, and a client with
+no recorded answer refuses to load. A profile's legacy
+`provider.models` block (F-59) still overrides the stack for one
+release, but a registry edit cannot reach a seat pinned there — move to
+`model_stack`. Every run records what actually ran: each session's
+record and trace carry the role, the stack, the requested model (alias
+expanded) and the model the API reported (`factory status` shows the
+stack, the model per role, and any requested-vs-reported mismatch), and
+the PR body names the implementer's model.
+
+Try a model before switching: `factory eval --role
+reviewer.hunt=claude-sonnet-5-5` (repeatable) runs the seeded eval with
+those roles overridden for that eval only — never written to any profile
+or to the registry, named in the report, still inside the fixture's
+allowed providers. A before/after pair of reports is the evidence for a
+registry change.
+
+
 Private by design. Nothing here deploys anywhere; it's a CLI.

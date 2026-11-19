@@ -158,7 +158,7 @@ def test_factory_eval_runs_at_the_configured_reviewer_width(tmp_path, monkeypatc
     (root / "config.yaml").write_text("reviewers: 3\n")
     seen = {}
 
-    def fake_run(factory_root, out_path, *, reviewers, repeats, keep_fixture):
+    def fake_run(factory_root, out_path, *, reviewers, repeats, keep_fixture, config=None):
         seen["factory_root"] = factory_root
         seen["reviewers"] = reviewers
         rendered = tmp_path / "rendered.md"
@@ -183,7 +183,7 @@ def test_factory_eval_config_default_and_flag_override(tmp_path, monkeypatch):
     root.mkdir()
     seen = []
 
-    def fake_run(factory_root, out_path, *, reviewers, repeats, keep_fixture):
+    def fake_run(factory_root, out_path, *, reviewers, repeats, keep_fixture, config=None):
         seen.append(reviewers)
         rendered = tmp_path / "rendered.md"
         rendered.write_text("report")

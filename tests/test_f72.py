@@ -45,6 +45,7 @@ from _support.f72 import (
 
 from factory.approvals import ApprovalLedger
 from factory.approve import ApprovalError, recover_task
+from factory.config import FactoryConfig
 from factory.contract import contract_hash, load_profile
 from factory.orchestrator import LoopResult, run_loop
 from factory.provider import resolve_provider
@@ -415,12 +416,13 @@ def test_ac_2(tmp_path: Path):
                      "models": {"implementer": "m-i", "reviewer": "m-r",
                                 "verifier": "m-v", "importer": "m-m"}},
     }
-    assert resolve_provider(base, "arbiter").model == "m-r"  # reviewer default
-    assert resolve_provider(base, "arbiter").kind == "anthropic"
+    arb = resolve_provider(base, "arbiter", config=FactoryConfig())
+    assert arb.model == "m-r"  # reviewer default
+    assert arb.kind == "anthropic"
     override = {**base, "providers_allowed": ["bedrock"],
                 "seat_providers": {"arbiter": {"kind": "bedrock",
                                                "model": "arn:x", "region": "us-east-1"}}}
-    spec = resolve_provider(override, "arbiter")
+    spec = resolve_provider(override, "arbiter", config=FactoryConfig())
     assert (spec.kind, spec.model) == ("bedrock", "arn:x")
     # The override is loadable profile content (the schema admits the seat).
     import yaml
@@ -428,7 +430,7 @@ def test_ac_2(tmp_path: Path):
     profile_path = tmp_path / "project.yaml"
     profile_path.write_text(yaml.safe_dump(override))
     loaded = load_profile(profile_path)
-    assert resolve_provider(loaded, "arbiter").kind == "bedrock"
+    assert resolve_provider(loaded, "arbiter", config=FactoryConfig()).kind == "bedrock"
 
 
 # --------------------------------------------------------------------------
@@ -639,7 +641,7 @@ def test_ac_3(tmp_path: Path, monkeypatch):
     # with the original escalation in the note.
     import factory.orchestrator as orch
 
-    monkeypatch.setattr(orch, "run_secrets", lambda profile: (SEAT_TOKEN,))
+    monkeypatch.setattr(orch, "run_secrets", lambda profile, config=None: (SEAT_TOKEN,))
     env = Env72(tmp_path / "history-secret", tasks=[_dependency_task()])
     seats = Seats(impl_files=[
         {"notes.txt": f"build ref {SEAT_TOKEN}\n",

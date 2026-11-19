@@ -43,6 +43,7 @@ from _support.f63 import ledger_approve
 from _support.tokens import fake_token
 from claude_agent_sdk import AssistantMessage
 
+from factory.config import FactoryConfig
 from factory.contract import acceptance_hash
 from factory.mergeorder import Protection
 from factory.orchestrator import run_once
@@ -186,6 +187,8 @@ class Env:
         (self.repo / "tests" / "test_base.py").write_text("def test_base():\n    assert True\n")
         profile = {
             "name": "fixture",
+            # F-100: the standard stack's anthropic seats are admitted.
+            "providers_allowed": ["anthropic"],
             "repo": {
                 "path": str(self.repo),
                 "default_branch": "main",
@@ -511,6 +514,7 @@ def test_sandboxed_spec_carries_run_and_task_ids(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr(session_mod, "run_sandboxed", fake_run_sandboxed)
     session_mod.run_session_sandboxed(
+        config=FactoryConfig(),
         seat="implementer", prompt="p", run_dir=run.root, profile={},
         max_turns=1, timeout_min=1,
         run_id=run.run_id, task_id="T-9")

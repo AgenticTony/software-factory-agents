@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 5,
   "project": "software-factory",
   "updated_at": "2026-11-19T13:00:21Z",
   "tasks": [
@@ -7251,6 +7251,149 @@
       "acceptance_hash": "4f6547537a03fa036ed5070be669cca1542fc88a5d3fffb3249764f0363b5358",
       "approved_at": "2026-11-19T13:00:21Z",
       "approved_by": "Anthony"
+    },
+    {
+      "id": "F-100",
+      "title": "Every model the factory uses is set in one place, and each project picks a stack",
+      "source": "BUILD-ORDER.md#f-100--every-model-the-factory-uses-is-set-in-one-place-and-each-project-picks-a-stack",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-96"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "One registry: the factory config's models block (aliases, stacks with contained marks, provider origins, prices — the top-level prices block keeps loading for one release, both at once refuse). A malformed registry raises ConfigError naming the reason: unknown role, alias cycle, dangling alias, unknown provider kind, stack missing a required role, or an alias pointing a kind's role at another provider's model family. Test tests/test_f100.py::test_ac_1.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f100.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Roles are fine enough to swap any area on its own (implementer, reviewer.conformance/.hunt by lens, verifier, arbiter, contract_reviewer, importer, final_review.fix/.strong; arbiter and contract_reviewer default to reviewer.conformance). Every seat resolves through ONE function resolve_role(profile, config, role); a grep test fails on any model id in factory/**/*.py outside the registry defaults. Test ::test_ac_2.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f100.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "A project names its stack inside what it approved: model_stack and model_restrictions (none|no_china|contained with who and when) are F-63 security groups; seat_providers wins per role, F-59 provider.models still works for one release (deprecated, noted for the health-check command F-66 adds), else the stack; every resolved kind must be the project's own or in providers_allowed — refused at load where the registry is known and at every seat resolution, never falling back; no_china refuses origin-cn providers, contained refuses uncontained stacks, a client with no recorded answer refuses naming the missing answer (F-59's blanket client/zai refusal replaced; its spec and tests amended). Test ::test_ac_3.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f100.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "What ran is on the record: each session's record and trace carry role, stack, requested model (alias expanded) and the API-reported model; a mismatch is recorded and shown by factory status (Model stack section: stack, model per role), never refused; the PR body names the implementer's model; cost uses the registry prices, missing renders n/a. Test ::test_ac_4.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f100.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "factory eval --role <role>=<model-or-alias> (repeatable) overrides registry roles for that eval only — never written to any profile or the registry (role_overrides rides the config object in memory; refused as a file key), named in the report, still under the AC-3 guard with a named refusal. Test ::test_ac_5.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f100.py::test_ac_5"
+          }
+        },
+        {
+          "id": "AC-6",
+          "text": "stack_for(answers) maps the one onboarding restriction answer to model_restrictions and a stack with the reason; contained wins when both are given; a skipped question is never mapped; an unknown answer key refuses. Test ::test_ac_6.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f100.py::test_ac_6"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 80,
+        "wall_clock_min": 90
+      },
+      "scope": {
+        "paths": [
+          "factory/models.py",
+          "factory/config.py",
+          "factory/provider.py",
+          "factory/contract.py",
+          "factory/session.py",
+          "factory/orchestrator.py",
+          "factory/eval.py",
+          "factory/cli.py",
+          "factory/status.py",
+          "factory/prbody.py",
+          "factory/trace.py",
+          "factory/importer.py",
+          "factory/contractreview.py",
+          "factory/approvals.py",
+          "factory/approve.py",
+          "factory/dashboard.py",
+          "factory/rehearsal.py",
+          "factory/data/schema/project.schema.json",
+          "factory/data/schema/tasks.schema.json",
+          "tests/test_f100.py",
+          "tests/_support/f100.py",
+          "tests/test_f59.py",
+          "tests/test_f48.py",
+          "tests/test_f16.py",
+          "tests/_support/f38.py",
+          "tests/_support/f72.py",
+          "tests/_support/f07.py",
+          "tests/_support/f12.py",
+          "tests/_support/f23.py",
+          "tests/_support/f30.py",
+          "tests/_support/f67.py",
+          "tests/_support/f71.py",
+          "tests/fixtures/prose-import/.factory/project.yaml",
+          "tests/test_f10.py",
+          "tests/test_f22.py",
+          "tests/test_f25.py",
+          "tests/test_f26.py",
+          "tests/test_f27.py",
+          "tests/test_f41.py",
+          "tests/test_f42.py",
+          "tests/test_f43.py",
+          "tests/test_f45.py",
+          "tests/test_f49.py",
+          "tests/test_f58.py",
+          "tests/test_f62.py",
+          "tests/test_f63.py",
+          "tests/test_f65.py",
+          "tests/test_f72.py",
+          "tests/test_f75.py",
+          "tests/test_f76.py",
+          "tests/test_f79.py",
+          "tests/test_f85.py",
+          "tests/test_importer_limits.py",
+          "tests/test_importer_project_name.py",
+          "tests/test_importer_schema_shapes.py",
+          ".factory/project.yaml",
+          ".factory/tasks.json",
+          "BUILD-ORDER.md",
+          ".factory/BOOTSTRAP.md",
+          "README.md",
+          "VALIDATOR-SPEC.md",
+          "docs/provider-options-2026-11-05.md"
+        ]
+      }
     }
   ]
 }

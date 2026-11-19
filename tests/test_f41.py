@@ -144,6 +144,8 @@ class Env:
 
         self.profile = {
             "name": "fixture",
+            # F-100: the standard stack's anthropic seats are admitted.
+            "providers_allowed": ["anthropic"],
             "repo": {
                 "path": str(self.repo),
                 "default_branch": "main",

@@ -737,7 +737,9 @@ def _render_providers(
             f"| {_estimate_cost(rates, row)} |")
     lines.append("")
     lines.append("Estimates from the owner-maintained price table "
-                 "(config.yaml `prices`); a missing price shows n/a.")
+                 "(config.yaml `models.prices`; the top-level `prices` "
+                 "block still loads for one release); a missing price "
+                 "shows n/a.")
     lines.extend(_render_import_sessions(factory_root, project, config))
     return lines
 
@@ -784,6 +786,62 @@ def dependency_line(task: dict, tasks: list) -> str:
     return "; ".join(parts)
 
 
+def _render_model_stack(profile: "dict | None", config, queue: dict) -> list[str]:
+    """The F-100 AC-4 model-stack section: the project's stack, the
+    resolved model per role (through the ONE resolver, against the same
+    config the page renders), and the recorded requested-vs-reported
+    model mismatches off the attempts — a mismatch is a fact (providers
+    rename models), never a refusal. None profile (the caller could not
+    load one) renders nothing: this section never crashes the page."""
+    if not profile or config is None:
+        return []
+
+    lines = ["## Model stack", ""]
+    stack = (profile.get("model_stack")
+             or ("(from the recorded restriction)" if profile.get(
+                 "model_restrictions") else "standard"))
+    lines.append(f"Stack: `{stack}`")
+    lines.append("")
+    lines.append("| role | provider | model |")
+    lines.append("|---|---|---|")
+    for role, spec in _resolved_roles(profile, config):
+        lines.append(f"| {role} | {spec.kind} | {spec.model} |")
+    mismatches: list[str] = []
+    for task in queue.get("tasks") or []:
+        for attempt in task.get("attempts") or []:
+            provider = attempt.get("provider") or {}
+            requested = provider.get("model")
+            if not requested:
+                continue
+            reported = None
+            for token in str(attempt.get("model") or "").split():
+                seat, _, model = token.partition("=")
+                if seat == "implementer":
+                    reported = model
+            if reported and reported != requested:
+                mismatches.append(
+                    f"{task.get('id', '?')}/{attempt.get('run_id', '?')}: "
+                    f"requested `{requested}`, the API reported "
+                    f"`{reported}` (mismatch recorded, not refused)")
+    if mismatches:
+        lines.append("")
+        lines += [f"- {m}" for m in mismatches]
+    return lines
+
+
+def _resolved_roles(profile: dict, config):
+    """Every registry role this project's seats resolve, with its spec —
+    the resolver's own order, failures skipped (the run refuses them
+    elsewhere; the status page renders what resolves)."""
+    from factory.models import MODEL_ROLES, resolve_role
+
+    for role in MODEL_ROLES:
+        try:
+            yield role, resolve_role(profile, config, role)
+        except Exception:
+            continue
+
+
 def render_status(
     queue: dict,
     *,
@@ -792,6 +850,7 @@ def render_status(
     now: datetime | None = None,
     repo: Path | str | None = None,
     config: "FactoryConfig | None" = None,
+    profile: "dict | None" = None,
 ) -> str:
     """Render the status page for one project.
 
@@ -806,6 +865,9 @@ def render_status(
         config: The factory config (F-59). None loads it from
             ``<factory_root>/config.yaml``; a caller that already holds
             one passes it through.
+        profile: The loaded project profile (F-100 AC-4). None skips the
+            model-stack section (a page for an unreadable profile still
+            renders everything else).
 
     Returns:
         The markdown page. Read-only: nothing under ``factory_root`` or
@@ -982,6 +1044,7 @@ def render_status(
             config = None
     lines += [""] + _render_providers(
         queue, config, factory_root=factory_root, project=project)
+    lines += [""] + _render_model_stack(profile, config, queue)
     if notes:
         lines += ["", "## Notes", ""]
         lines += [f"- {note}" for note in notes]

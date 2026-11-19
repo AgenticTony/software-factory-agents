@@ -1083,25 +1083,29 @@ def _provider_base_url_error(base_url: str) -> str | None:
 
 
 def _check_provider_semantics(data: dict, origin: str) -> None:
-    """F-59: the provider choice is load-refused prose-and-steel (the
-    first refusal; :func:`_provider_semantic_violations` collects them
-    all for ``factory doctor``, F-66)."""
+    """F-59 → F-100: the provider choice is load-refused prose-and-steel
+    (the first refusal; :func:`_provider_semantic_violations` collects
+    them all for ``factory doctor``, F-66)."""
     for message in _provider_semantic_violations(data, origin):
         raise ContractError(message)
 
 
 def _provider_semantic_violations(data: dict, origin: str) -> list[str]:
-    """Every F-59 provider refusal, same messages, same order.
+    """Every F-59/F-100 provider refusal, same messages, same order.
 
     Every rule here is the front half of the WO's goal — the owner
     approves the provider — made mechanical at load: a client project
-    with no provider, or with zai, refuses; region/base_url presence and
-    shapes are per kind; a seat override only from providers_allowed;
-    and no allowlist entry names another provider's model host (or a
-    client repo's network_allowlist would reopen Z.ai). The approval
-    half is the F-63 group hash (data_owner / provider /
-    providers_allowed / seat_providers); this check only decides
-    whether the content can stand at all."""
+    with no recorded ``model_restrictions`` answer refuses (the question
+    is always asked, never assumed — F-100 replaced F-59's blanket
+    client/zai refusal with that answer; a client whose answer is
+    ``none`` runs the standard stack, GLM included); region/base_url
+    presence and shapes are per kind; a seat override only from
+    providers_allowed; and no allowlist entry names another provider's
+    model host (or a client repo's network_allowlist would reopen Z.ai).
+    The approval half is the F-63 group hash (data_owner / provider /
+    providers_allowed / seat_providers, and F-100's model_stack /
+    model_restrictions); this check only decides whether the content
+    can stand at all."""
     from factory.provider import (
         bedrock_runtime_host,
         model_host_owner,
@@ -1109,7 +1113,6 @@ def _provider_semantic_violations(data: dict, origin: str) -> list[str]:
     )
 
     out: list[str] = []
-    owner = data.get("data_owner", "self")
     block = data.get("provider")
     allowed = data.get("providers_allowed") or []
     # Total over malformed shapes (F-66 R2): the schema types these
@@ -1118,39 +1121,16 @@ def _provider_semantic_violations(data: dict, origin: str) -> list[str]:
     seats_value = data.get("seat_providers")
     seats = seats_value if isinstance(seats_value, dict) else {}
 
-    if owner == "client" and not isinstance(block, dict):
-        out.append(
-            f"{origin}: a client project (data_owner: client) must "
-            "declare an explicit provider block — client source may not "
-            "reach the default Z.ai endpoint (F-59); name the owner-"
-            "approved provider in project.yaml"
-        )
     if isinstance(block, dict):
         kind = block.get("kind")
-        if owner == "client" and kind == "zai":
-            out.append(
-                f"{origin}: provider.kind is zai on a client project — "
-                "client source may not go to the Z.ai endpoint (no DPA, "
-                "processing outside the EU, a consumer plan); F-59 "
-                "refuses the load"
-            )
         error = _provider_field_error(str(kind), block, seat=None,
                                       origin=origin)
         if error is not None:
             out.append(f"{origin}: {error} (F-59)")
-        models = block.get("models")
-        if not isinstance(models, dict) or not models:
-            out.append(
-                f"{origin}: provider.models is required — one model id "
-                "per seat (implementer, reviewer, verifier, importer); "
-                "the schema types the map"
-            )
-    if owner == "client" and "zai" in allowed:
-        out.append(
-            f"{origin}: providers_allowed names zai on a client project "
-            "— no seat of a client project may reach the Z.ai endpoint "
-            "(F-59)"
-        )
+        # F-100: provider.models is the deprecated project-level
+        # override (one release); a provider block that names NEITHER it
+        # nor a model_stack leaves every seat to the stack, which is the
+        # migration path. The map, when present, stays complete.
     for seat, entry in seats.items():
         if not isinstance(entry, dict):
             continue  # the schema types the block
@@ -1261,6 +1241,23 @@ def _profile_semantic_violations(data: dict, origin: str, *,
     is baseline.
     """
     out: "list[tuple[str, str]]" = []
+    # F-100 AC-3 (epoch 5): a client project with no recorded
+    # restriction answer refuses to load, naming the missing answer —
+    # the onboarding question is always asked, never assumed. Total over
+    # malformed shapes: a non-dict model_restrictions IS the missing
+    # answer, and a dict with a bad value still fails the schema check
+    # above, so this arm cannot crash on any shape.
+    if data.get("data_owner", "self") == "client" and not isinstance(
+            data.get("model_restrictions"), dict):
+        out.append(("model_restrictions", (
+            f"{origin}: a client project (data_owner: client) carries no "
+            "model_restrictions answer — the onboarding question (does "
+            "the client restrict which AI models may process the code, "
+            "or where it runs?) is always asked, never assumed; record "
+            "the answer (none | no_china | contained, with who answered "
+            "and when) and re-approve the profile (F-100 AC-3, replacing "
+            "F-59's blanket client/zai refusal)"
+        )))
     out.extend(("provider", message)
                for message in _provider_semantic_violations(data, origin))
     # F-71 AC-3: a budget floor above the task schema's F-64 caps would
@@ -1557,7 +1554,8 @@ def _check_profile_toolkit(section: Any, origin: str, *,
 
 
 def load_profile(path: Path | str, schema_path: Path | None = None, *,
-                 toolkit_root: Path | str | None = None) -> dict:
+                 toolkit_root: Path | str | None = None,
+                 config: object = None) -> dict:
     """Load and fully validate a project.yaml profile.
 
     Args:
@@ -1566,6 +1564,14 @@ def load_profile(path: Path | str, schema_path: Path | None = None, *,
         toolkit_root: Optional override for the toolkit index root
             (F-22's ``toolkit:`` names check; default this checkout's
             ``toolkit/`` dir).
+        config: The factory config (F-100). When given, the profile's
+            model stack is checked against the registry it carries —
+            every role resolves inside what the project approved, so a
+            stack edit that would move it outside refuses AT LOAD
+            (project, role and kind named). None (read-only callers:
+            approve, the dashboard) skips that check; the run, import
+            and eval loaders pass the config, and every seat resolution
+            enforces the same guard anyway (fail-closed, no fallback).
 
     Returns:
         The parsed profile mapping, with the schema-level runner-config
@@ -1577,7 +1583,9 @@ def load_profile(path: Path | str, schema_path: Path | None = None, *,
             schema-invalid, or semantically inconsistent (F-25: a
             ``sentinels.<flag>`` whose flag has no ``paths.risk`` globs;
             F-22: a toolkit name that is not an admitted index entry, or
-            a seat section that widens the project's toolkit).
+            a seat section that widens the project's toolkit; F-100: a
+            client project with no recorded model_restrictions answer,
+            or a stack the project's approval does not cover).
     """
     path = Path(path)
     origin = str(path)
@@ -1591,4 +1599,12 @@ def load_profile(path: Path | str, schema_path: Path | None = None, *,
         )
     _validate(data, schema_path or SCHEMA_DIR / "project.schema.json", origin)
     _check_profile_semantics(data, origin, toolkit_root=toolkit_root)
+    if config is not None:
+        from factory.models import check_profile_stack
+        from factory.provider import ProviderError
+
+        try:
+            check_profile_stack(data, config)
+        except ProviderError as exc:
+            raise ContractError(f"{origin}: {exc}") from exc
     return apply_profile_defaults(data, schema_path)

@@ -49,6 +49,7 @@ from _support.f63 import importer_fixture_approve
 from _support.tokens import fake_token
 
 import factory.importer as importer
+from factory.config import FactoryConfig
 from factory.contract import load_tasks
 from factory.importer import (
     FORBIDDEN_FIELDS,
@@ -1968,6 +1969,7 @@ def _planted_timeout_run(monkeypatch, tmp_path, record_doc):
         run_session_sandboxed(
             "reviewer", "import", repo,
             {"docs_allowlist": [], "network_allowlist": []},
+            config=FactoryConfig(),
             factory_root=tmp_path, settings_path=tmp_path / "s.json",
             max_turns=2, timeout_min=0.05,
         )

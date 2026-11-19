@@ -14,6 +14,8 @@ from factory.l0 import run_l0
 
 BASE_PROFILE = {
     "name": "fixture",
+    # F-100: the standard stack's anthropic seats are admitted.
+    "providers_allowed": ["anthropic"],
     "commands": {"setup": "true", "test": "true"},
     "paths": {"risk": {}, "protected": []},
 }

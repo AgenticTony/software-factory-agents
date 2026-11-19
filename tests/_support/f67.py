@@ -148,8 +148,12 @@ def reference_queue() -> dict:
 
 _PROFILE = """\
 # The pilot-shaped fixture project (F-67): a self project on the zai
-# default provider, with the landed reference queue in place.
+# default provider, with the landed reference queue in place. F-100: the
+# standard stack's anthropic seats are admitted.
 name: pilot-demo
+
+providers_allowed:
+  - anthropic
 
 repo:
   path: .
@@ -182,6 +186,11 @@ _BEDROCK_PROFILE = """\
 # A client bedrock project (the F-59 shape) for the provider-stamp tests.
 name: pilot-demo
 data_owner: client
+# F-100: the client's recorded restriction answer (none — open default).
+model_restrictions:
+  value: none
+  answered_by: owner
+  answered_at: "2026-11-19T08:00:00Z"
 provider:
   kind: bedrock
   region: eu-north-1
@@ -190,7 +199,8 @@ provider:
     reviewer: model-rev
     verifier: model-ver
     importer: model-imp
-providers_allowed: [bedrock]
+providers_allowed: [bedrock, anthropic, zai]  # F-100: standard's
+  # zai seats (round 2: standard is zai-only) + final-review seats
 
 repo:
   path: .

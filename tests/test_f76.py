@@ -272,7 +272,7 @@ def test_ac_1(tmp_path: Path, monkeypatch):
     # run secret, a fence-breaking ``` and a bidi override in the first
     # run's failing text are scrubbed/escaped before the progress log.
     secret = fake_token("f76-flake")
-    monkeypatch.setattr(orch, "run_secrets", lambda profile: (secret,))
+    monkeypatch.setattr(orch, "run_secrets", lambda profile, config=None: (secret,))
     env = Env76(tmp_path / "flake-note")
     assert env.run_once().outcome == "pr_opened"
     env.advance_remote_main(None, extra_file="remote_only.txt")
@@ -295,7 +295,7 @@ def test_ac_1(tmp_path: Path, monkeypatch):
     # parses it from command output) — the whole assembled flaked line
     # crosses the seam: id, file:line and text.
     secret2 = fake_token("f76-file")
-    monkeypatch.setattr(orch, "run_secrets", lambda profile: (secret2,))
+    monkeypatch.setattr(orch, "run_secrets", lambda profile, config=None: (secret2,))
     env = Env76(tmp_path / "flake-file")
     assert env.run_once().outcome == "pr_opened"
     env.advance_remote_main(None, extra_file="remote_only.txt")
@@ -1058,7 +1058,7 @@ def test_ac_3(tmp_path: Path, monkeypatch):
     _seams(monkeypatch, env, Actions(failed_default=[FAILED_RUN],
                                      logs={101: attack_tail}))
     monkeypatch.setattr(orch, "run_secrets",
-                        lambda profile: (SEAT_TOKEN,))
+                        lambda profile, config=None: (SEAT_TOKEN,))
     seats = Seats(impl_files=[{}, {"impl.py": IMPL_FIXED}])
     assert env.run_once(seats, ci_state=CI(default=GREEN)).outcome \
         == "pr_opened"

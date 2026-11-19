@@ -325,6 +325,19 @@ class TraceWriter:
             "turns": turns,
             "model": getattr(record, "model", None),
             "duration_ms": getattr(record, "duration_ms", None),
+            # F-100 AC-4: the registry role, the resolved stack and the
+            # requested (alias-expanded) model, off the parent-stamped
+            # provider record — what actually ran is on the trace too.
+            "role": (getattr(record, "provider", None) or {}).get("role")
+                if isinstance(getattr(record, "provider", None), dict)
+                else None,
+            "stack": (getattr(record, "provider", None) or {}).get("stack")
+                if isinstance(getattr(record, "provider", None), dict)
+                else None,
+            "requested_model": (
+                getattr(record, "provider", None) or {}).get("model")
+                if isinstance(getattr(record, "provider", None), dict)
+                else None,
             "sandbox_bypass_denials": getattr(record, "sandbox_bypass_denials", 0) or 0,
             "egress_denials": getattr(record, "egress_denials", 0) or 0,
         })

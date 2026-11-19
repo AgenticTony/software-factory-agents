@@ -121,6 +121,10 @@ from factory.mergeorder import (
     gh_ci_state,
     gh_pr_state,
 )
+from factory.models import (
+    resolve_role,
+    reviewer_seat_role,
+)
 from factory.prbody import PRBodyError, build_pr_body, check_pr_body, fence
 from factory.progress import ProgressLog
 from factory.prompts import (
@@ -1837,6 +1841,7 @@ def run_accept_verifier_fanout(
     run_dir,
     profile: dict,
     factory_root,
+    config=None,
     protected,
     system_prompt,
     srt_bin_path,
@@ -1862,7 +1867,7 @@ def run_accept_verifier_fanout(
     fanout = run_verifier_fanout(
         live, diff, findings,
         runner=runner, run_dir=run_dir, profile=profile,
-        factory_root=factory_root, protected=protected,
+        factory_root=factory_root, config=config, protected=protected,
         system_prompt=system_prompt, srt_bin_path=srt_bin_path,
         run_id=run_id, task_id=task_id, toolkit=toolkit,
         parallel=_verifier_parallel(profile),
@@ -1870,7 +1875,8 @@ def run_accept_verifier_fanout(
         # Round 3: the repair draws on the SAME window the waves did.
         collect_vote=lambda session, one, ordinal: accept_collect_vote(
             session, one, ordinal, runner=runner, run_dir=run_dir,
-            profile=profile, factory_root=factory_root, base=base,
+            profile=profile, factory_root=factory_root, config=config,
+            base=base,
             protected=protected, system_prompt=system_prompt,
             srt_bin_path=srt_bin_path, run_id=run_id, task_id=task_id,
             toolkit=toolkit,
@@ -1897,6 +1903,7 @@ def accept_collect_vote(
     run_dir,
     profile: dict,
     factory_root,
+    config,
     base: Path,
     protected,
     system_prompt,
@@ -1942,6 +1949,9 @@ def accept_collect_vote(
             max_turns=REPAIR_TURN_CAP, timeout_min=remaining,
             protected=protected,
             system_prompt=system_prompt,
+            # F-100 (R2): the verifier's own role and the registry
+            # config — the repair resumes under what it is repairing.
+            role="verifier", config=config,
             srt_bin_path=srt_bin_path,
             run_id=run_id, task_id=task_id,
             toolkit=toolkit,
@@ -1990,6 +2000,7 @@ def run_verifier_fanout(
     run_dir,
     profile: dict,
     factory_root,
+    config=None,
     protected,
     system_prompt,
     srt_bin_path,
@@ -2113,6 +2124,7 @@ def run_verifier_fanout(
         records = run_sessions_parallel(
             specs, run_dir, profile,
             runner=runner, factory_root=factory_root,
+            config=config,
             max_turns=max_turns,
             protected=protected, system_prompt=system_prompt,
             srt_bin_path=srt_bin_path, run_id=run_id,
@@ -2859,9 +2871,11 @@ def run_once(
     # changed groups and the fix command.
     from factory.doctor import preflight_run
     preflight_run(queue_path, profile_path, factory_root=factory_root)
-    profile = load_profile(profile_path)
     factory_root = Path(factory_root) if factory_root else FACTORY_ROOT_DEFAULT
     config = config if config is not None else load_config(factory_root / CONFIG_FILE)
+    # F-100: the profile loads WITH the registry — a stack the project's
+    # approval does not cover refuses here, named, before anything runs.
+    profile = load_profile(profile_path, config=config)
     now = now or (lambda: datetime.now(timezone.utc))
     # F-63 AC-2: the profile's security-relevant content must match an
     # owner approval BEFORE anything else happens — before admission's gh
@@ -3724,6 +3738,7 @@ class Revalidation:
 
 def _revalidate_gate_pass(
     queue: TaskQueue, profile: dict, task_id: str, *,
+    config,
     work: RunDir, merged_sha: str, pr_sha: str, default_sha: str,
     branch: str, factory_root: Path, srt_bin_path: Path | None,
     gate_timeout_sec: int, ledger: "ApprovalLedger | None",
@@ -3747,7 +3762,8 @@ def _revalidate_gate_pass(
             clean.root, clean.settings_path,
             srt_bin_path=srt_bin_path,
             on_escapee=_sweep_trace_sink(
-                factory_root, project, work.run_id, task_id, profile=profile),
+                factory_root, project, work.run_id, task_id, profile=profile,
+                config=config),
         )
         live = queue.get(task_id)
         l0 = run_l0(profile, clean.root, default_sha, merged_sha,
@@ -3833,7 +3849,11 @@ def revalidate_pr_base(
     work: RunDir, pr_sha: str, default_sha: str, branch: str,
     factory_root: Path, srt_bin_path: Path | None,
     gate_timeout_sec: int, ledger: "ApprovalLedger | None" = None,
+    config=None,
 ) -> Revalidation:
+    # R5: a None config here is a MISSED CALLER on the seat/secrets
+    # path (the sweep's scrub list would silently lose the stack-role
+    # tokens) — refuse loudly instead of degrading.
     """Re-validate a PR merged onto a new default head (F-26, F-76).
 
     Merges ``pr_sha`` onto ``default_sha`` in the scratch clone
@@ -3864,7 +3884,7 @@ def revalidate_pr_base(
     report_path = reports_dir / f"{work.run_id}-revalidate.json"
     pair = (pr_sha, default_sha)
 
-    report_secrets = run_secrets(profile)
+    report_secrets = run_secrets(profile, config=config)
 
     def done(reports: dict, note: str | None, flaked: tuple = (),
              failed_twice: bool = False) -> Revalidation:
@@ -3931,7 +3951,7 @@ def revalidate_pr_base(
         queue, profile, task_id, work=work, merged_sha=merged_sha,
         pr_sha=pr_sha, default_sha=default_sha, branch=branch,
         factory_root=factory_root, srt_bin_path=srt_bin_path,
-        gate_timeout_sec=gate_timeout_sec, ledger=ledger)
+        gate_timeout_sec=gate_timeout_sec, ledger=ledger, config=config)
     if note is None or not _revalidate_command_failure(l0, l1):
         return done(
             {"L0": l0.to_dict() if l0 else None,
@@ -3946,7 +3966,7 @@ def revalidate_pr_base(
         queue, profile, task_id, work=work, merged_sha=merged_sha,
         pr_sha=pr_sha, default_sha=default_sha, branch=branch,
         factory_root=factory_root, srt_bin_path=srt_bin_path,
-        gate_timeout_sec=gate_timeout_sec, ledger=ledger)
+        gate_timeout_sec=gate_timeout_sec, ledger=ledger, config=config)
     flaked: tuple[str, ...] = ()
     if note2 is None:
         # R1-F4 + R2-2: the first run's failing findings — text AND the
@@ -3956,7 +3976,7 @@ def revalidate_pr_base(
         # is scrubbed at done() (run secrets redacted, structure kept —
         # no current consumer reads it back into a prompt or PR body;
         # the publish path's PR-body projection scrubs again anyway).
-        secrets = run_secrets(profile)
+        secrets = run_secrets(profile, config=config)
 
         def flaked_line(f) -> str:
             # R2-2: the session controls the FILE field too (new_error
@@ -3995,8 +4015,13 @@ def revalidate_stale_pr(
     factory_root: Path, srt_bin_path: Path | None = None,
     gate_timeout_sec: int = 600,
     ledger: "ApprovalLedger | None" = None,
+    config=None,
 ) -> Revalidation:
     """Re-validate a parked stale_base PR's CURRENT head (F-76 AC-2).
+
+    R5: a None config refuses here — the revalidation sweep's scrub list
+    would silently lose the stack-role tokens (a missed caller, never a
+    defaults read).
 
     The owner's word behind ``factory recover <task-id> --revalidate``:
     both heads are read from the REMOTE (never trusted from the queue —
@@ -4029,7 +4054,8 @@ def revalidate_stale_pr(
             queue, profile, task_id, work=work, pr_sha=pr_sha,
             default_sha=default_sha, branch=branch,
             factory_root=factory_root, srt_bin_path=srt_bin_path,
-            gate_timeout_sec=gate_timeout_sec, ledger=ledger)
+            gate_timeout_sec=gate_timeout_sec, ledger=ledger,
+            config=config)
     finally:
         cleanup_run(work)
 
@@ -4320,7 +4346,8 @@ def _sweep_stale_prs(
                 queue, profile, task_id, work=work, pr_sha=pr_sha,
                 default_sha=default_sha, branch=branch,
                 factory_root=factory_root, srt_bin_path=srt_bin_path,
-                gate_timeout_sec=gate_timeout_sec, ledger=ledger)
+                gate_timeout_sec=gate_timeout_sec, ledger=ledger,
+                config=config)
             if rv.note is not None:
                 return _sweep_escalation(
                     queue, factory_root, profile, task_id,
@@ -4443,7 +4470,13 @@ def _sweep_ci_fix_round(
     ``_run_task`` — F-75's own round loop, never a copy.
     """
     repo_cfg = profile["repo"]
-    config = config if config is not None else FactoryConfig()
+    # R5: no FactoryConfig() substitution on a path that reaches
+    # run_secrets (~4534) — the caller's real config flows (the sweep's
+    # callers all hold one; run_loop loads it).
+    if config is None:
+        raise ProviderError(
+            "_sweep_ci_fix_round needs the run's factory config — a "
+            "None config would scrub the wrong token set")
     task_id = task["id"]
     url = task["links"]["pr"]
     branch = task["links"]["branch"]
@@ -4511,7 +4544,7 @@ def _sweep_ci_fix_round(
             ready.append(f"{url} against "
                          f"{repo_cfg['default_branch']}@{default_sha[:12]}")
         return None
-    secrets = run_secrets(profile)
+    secrets = run_secrets(profile, config=config)
     findings = _ci_finding_lines(settled, secrets)
     if settled.partial:
         findings.append(
@@ -4582,7 +4615,7 @@ def _abort_requeue_status(task: dict) -> str:
 
 def _sweep_trace_sink(
     factory_root: Path, project: str, run_id: str, task_id: str,
-    profile: dict | None = None,
+    profile: dict | None = None, *, config,
 ) -> "Callable[[dict], None]":
     """A trace sink for the stale-PR sweep's gate runner (F-47, I-9).
 
@@ -4593,7 +4626,7 @@ def _sweep_trace_sink(
     token the profile's run would hold (:func:`factory.provider.
     run_secrets`) — a Bedrock project's sweep scrubs its own token."""
     writer: list[TraceWriter] = []
-    secrets = run_secrets(profile or {})
+    secrets = run_secrets(profile or {}, config=config)
 
     def sink(event: dict) -> None:
         if not writer:
@@ -4748,6 +4781,11 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
     # reviewer_systems[N - 1].
     reviewer_system = assemble_reviewer_prompt(profile)
     reviewer_systems = reviewer_seat_prompts(profile, ctx.config.reviewers)
+    # F-100: each reviewer seat's registry role, seat for seat with the
+    # prompts above — seat 1 runs reviewer.conformance, seat 2
+    # reviewer.hunt (different models, not just different lenses).
+    reviewer_roles = [reviewer_seat_role(n, ctx.config.reviewers)
+                      for n in range(1, ctx.config.reviewers + 1)]
     verifier_system = assemble_verifier_prompt(profile)
     session_seconds = 0.0
     # F-22: the project's vetted toolkit, per seat (a seat section in the
@@ -4855,14 +4893,17 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
     # the flag resets with every round.
     round_attempt_landed = False
 
-    # F-59: the attempt's provider record comes from the PARENT's
-    # resolver — the implementer seat's spec — resolved once, before any
-    # session or run dir exists. A profile whose provider cannot run
-    # here (vertex today) refuses as an environment failure that spends
-    # no attempt, with the reason named.
+    # F-59 → F-100: the attempt's provider record comes from the PARENT's
+    # resolver — the implementer seat's spec, resolved through the ONE
+    # role resolver against the run's registry config — resolved once,
+    # before any session or run dir exists. A profile whose provider
+    # cannot run here (vertex today), or whose stack falls outside what
+    # the project approved, refuses as an environment failure that
+    # spends no attempt, with the reason named. The record carries the
+    # role, the stack and the alias-expanded requested model (AC-4).
     try:
-        provider_record = resolve_provider(
-            profile, "implementer").provider_record()
+        provider_record = resolve_role(
+            profile, ctx.config, "implementer").provider_record()
     except ProviderError as exc:
         raise RunError(f"the project's provider cannot run here: {exc}") \
             from exc
@@ -4874,7 +4915,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
     # seat override's — one resolver helper, not five copies). One tuple
     # feeds the trace writer AND the egress seam below, so no channel
     # scrubs a different set.
-    egress_secrets = run_secrets(profile)
+    egress_secrets = run_secrets(profile, config=ctx.config)
     # F-30: this run's live trace — one writer per run, appended to as the
     # events happen and never allowed to change the run itself (AC-5's
     # failure policy lives in the writer). The seat token is handed over
@@ -5290,7 +5331,9 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                     resume=session.session_id,
                     max_turns=REPAIR_TURN_CAP, timeout_min=fit.wall,
                     protected=protected,
+                    # F-94: the seat's own lens; F-100: its own role.
                     system_prompt=reviewer_systems[seat_no - 1],
+                    role=reviewer_roles[seat_no - 1], config=ctx.config,
                     srt_bin_path=ctx.srt_bin_path,
                     run_id=work.run_id, task_id=task_id,
                     trace_sink=trace.append, toolkit=toolkit_reviewer,
@@ -5395,12 +5438,15 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
             record = complete_records(run_sessions_parallel(
                 [("reviewer", prompt)], clean.root, profile,
                 runner=ctx.session_runner, factory_root=ctx.factory_root,
+                config=ctx.config,
                 settings_path=base.with_name(
                     base.name + f"-retry{seat_no}"),
                 max_turns=retry_turns, timeout_min=retry_wall,
                 protected=protected,
                 # F-94: a fresh retry of seat N keeps seat N's lens.
                 system_prompt=reviewer_systems[seat_no - 1],
+                # F-100: …and seat N's registry role.
+                seat_roles=[reviewer_roles[seat_no - 1]],
                 srt_bin_path=ctx.srt_bin_path,
                 run_id=work.run_id, task_id=task_id,
                 trace_sink=trace.append, toolkit=toolkit_reviewer,
@@ -5545,6 +5591,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                     resume=session.session_id,
                     max_turns=REPAIR_TURN_CAP, timeout_min=remaining,
                     protected=protected, system_prompt=verifier_system,
+                    role="verifier", config=ctx.config,
                     srt_bin_path=ctx.srt_bin_path,
                     run_id=work.run_id, task_id=task_id,
                     trace_sink=trace.append, toolkit=toolkit_reviewer,
@@ -5786,6 +5833,9 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                     impl = ctx.session_runner(
                         "implementer", prompt, work.root, profile,
                         factory_root=ctx.factory_root, max_turns=budget["max_turns"],
+                        # F-100: the seat's role and the registry config —
+                        # the ONE resolver reads them.
+                        role="implementer", config=ctx.config,
                         # F-64: the implementer may spend the budget MINUS
                         # the review reserve — the fan-out runs inside the
                         # reserve this window leaves.
@@ -5969,6 +6019,8 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                                 egress_secrets),
                                             work.root, profile,
                                             factory_root=ctx.factory_root,
+                                            role="implementer",
+                                            config=ctx.config,
                                             max_turns=fit.turns,
                                             timeout_min=fit.wall,
                                             protected=protected,
@@ -6258,12 +6310,15 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                     clean.root, profile,
                                     runner=ctx.session_runner,
                                     factory_root=ctx.factory_root,
+                                    config=ctx.config,
                                     max_turns=REVIEWER_TURN_CAP,
                                     timeout_min=remaining_review,
                                     protected=protected,
                                     system_prompt=reviewer_system,
                                     # F-94: each seat's own lens.
                                     seat_system_prompts=reviewer_systems,
+                                    # F-100: …and each seat's own role.
+                                    seat_roles=reviewer_roles,
                                     srt_bin_path=ctx.srt_bin_path,
                                     # The reviewers sit in the clean gate clone,
                                     # but their vents belong to the task's run.
@@ -6339,6 +6394,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                         runner=ctx.session_runner,
                                         run_dir=clean.root, profile=profile,
                                         factory_root=ctx.factory_root,
+                                        config=ctx.config,
                                         protected=protected,
                                         system_prompt=verifier_system,
                                         srt_bin_path=ctx.srt_bin_path,
@@ -6550,12 +6606,15 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                     clean.root, profile,
                                     runner=ctx.session_runner,
                                     factory_root=ctx.factory_root,
+                                    config=ctx.config,
                                     max_turns=REVIEWER_TURN_CAP,
                                     timeout_min=remaining_final,
                                     protected=protected,
                                     system_prompt=reviewer_system,
                                     # F-94: each seat's own lens.
                                     seat_system_prompts=reviewer_systems,
+                                    # F-100: …and each seat's own role.
+                                    seat_roles=reviewer_roles,
                                     srt_bin_path=ctx.srt_bin_path,
                                     run_id=work.run_id, task_id=task_id,
                                     trace_sink=trace.append,  # F-30
@@ -6614,6 +6673,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                         runner=ctx.session_runner,
                                         run_dir=clean.root, profile=profile,
                                         factory_root=ctx.factory_root,
+                                        config=ctx.config,
                                         protected=protected,
                                         system_prompt=verifier_system,
                                         srt_bin_path=ctx.srt_bin_path,
@@ -6792,6 +6852,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                 "arbiter",
                                 _arbiter_prompt(task, arb_diff, arb_findings),
                                 work.root, profile,
+                                role="arbiter", config=ctx.config,
                                 factory_root=ctx.factory_root,
                                 max_turns=ARBITER_TURN_CAP,
                                 timeout_min=remaining_arb,
@@ -7017,6 +7078,12 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                 # sum that misreported wo21's round.
                                 implementer_turns=_turns_by_seat(
                                     records).get("implementer"),
+                                # F-100 AC-4: the implementer's model,
+                                # from the parent's resolver record
+                                # (alias-expanded; the final reviewer's
+                                # joins when F-97 lands its seats).
+                                implementer_model=provider_record.get(
+                                    "model"),
                             )
                             if len(body) <= _PR_BODY_LIMIT:
                                 break
@@ -7637,10 +7704,11 @@ def recover_accept_round(
             "first"
         )
     profile_path = Path(queue.path).parent / "project.yaml"
-    profile = load_profile(profile_path)
-    require_profile_approval(profile, factory_root, origin=str(profile_path))
     config = config if config is not None else load_config(
         factory_root / CONFIG_FILE)
+    # F-100: load with the registry — the stack guard refuses here.
+    profile = load_profile(profile_path, config=config)
+    require_profile_approval(profile, factory_root, origin=str(profile_path))
     repo_cfg = profile["repo"]
     # The waiver first (idempotent): a re-run after a crash reuses it.
     if not ledger.has_escalation_waiver(task_id, escalation, sha,
@@ -7765,7 +7833,8 @@ def _recover_accept_leased(
         try:
             _gate_settings(profile, clean, factory_root)
             escapee_sink = _sweep_trace_sink(
-                factory_root, project, work.run_id, task_id, profile=profile)
+                factory_root, project, work.run_id, task_id, profile=profile,
+                config=config)
             gate_runner = sandboxed_runner(
                 clean.root, clean.settings_path,
                 srt_bin_path=srt_bin_path, on_escapee=escapee_sink)
@@ -7821,6 +7890,10 @@ def _recover_accept_leased(
                         max_turns=REPAIR_TURN_CAP, timeout_min=60.0,
                         protected=protected,
                         system_prompt=reviewer_systems[seat_no - 1],
+                        # F-94: the seat's own lens; F-100 (R2): its own
+                        # role and the registry config.
+                        role=reviewer_seat_role(seat_no, config.reviewers),
+                        config=config,
                         srt_bin_path=srt_bin_path,
                         run_id=work.run_id, task_id=task_id,
                         toolkit=toolkit_reviewer,
@@ -7848,10 +7921,14 @@ def _recover_accept_leased(
                 record = complete_records(run_sessions_parallel(
                     [("reviewer", prompt)], clean.root, profile,
                     runner=runner, factory_root=factory_root,
+                    config=config,
                     settings_path=base_settings,
                     max_turns=REVIEWER_TURN_CAP,
                     timeout_min=60.0, protected=protected,
                     system_prompt=reviewer_systems[seat_no - 1],
+                    # F-100: seat N's registry role on the retry too.
+                    seat_roles=[reviewer_seat_role(
+                        seat_no, config.reviewers)],
                     srt_bin_path=srt_bin_path,
                     run_id=work.run_id, task_id=task_id,
                     toolkit=toolkit_reviewer,
@@ -7862,9 +7939,12 @@ def _recover_accept_leased(
             reviews = complete_records(run_sessions_parallel(
                 [("reviewer", prompt)] * config.reviewers, clean.root, profile,
                 runner=runner, factory_root=factory_root,
+                config=config,
                 max_turns=REVIEWER_TURN_CAP, timeout_min=60.0,
                 protected=protected, system_prompt=reviewer_systems[0],
                 seat_system_prompts=reviewer_systems,
+                seat_roles=[reviewer_seat_role(n, config.reviewers)
+                            for n in range(1, config.reviewers + 1)],
                 srt_bin_path=srt_bin_path, run_id=work.run_id,
                 task_id=task_id,
                 toolkit=toolkit_reviewer,
@@ -7889,7 +7969,8 @@ def _recover_accept_leased(
                 vote = run_accept_verifier_fanout(
                     live, diff, union.findings,
                     runner=runner, run_dir=clean.root, profile=profile,
-                    factory_root=factory_root, protected=protected,
+                    factory_root=factory_root, config=config,
+                    protected=protected,
                     system_prompt=verifier_system,
                     srt_bin_path=srt_bin_path,
                     run_id=work.run_id, task_id=task_id,

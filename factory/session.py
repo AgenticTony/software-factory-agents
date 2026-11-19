@@ -2983,6 +2983,7 @@ def run_session_sandboxed(
     max_turns: int,
     timeout_min: float,
     role: str | None = None,
+    config: "Any" = None,
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
     protected: "Sequence[str]" = (),
     model: str | None = None,
@@ -3115,7 +3116,14 @@ def run_session_sandboxed(
     # credential for ITS provider refuses here, naming the provider and
     # its keychain item.
     try:
-        spec = resolve_provider(profile, role if role is not None else seat)
+        # F-100: the ONE role resolver — the registry's stack, the
+        # AC-3 guard and the restriction answers — through the config
+        # the caller carries (None: the default registry).
+        from factory.models import resolve_role as _resolve_role
+        from factory.models import seat_role
+
+        spec = _resolve_role(
+            profile, config, role if role is not None else seat_role(seat))
     except ProviderError as exc:
         raise SessionConfigError(str(exc)) from exc
     credential = provider_token(spec.kind, base_url=spec.base_url)
@@ -3180,7 +3188,8 @@ def run_session_sandboxed(
             factory_root=factory_root, max_turns=max_turns,
             timeout_min=timeout_min, spec=spec,
             timeout_ms=timeout_ms,
-            protected=protected, model=model, system_prompt=system_prompt,
+            protected=protected, model=model, role=role, config=config,
+            system_prompt=system_prompt,
             cli_path=cli_path, srt_bin_path=srt_bin_path,
             teardown_grace_sec=teardown_grace_sec,
             read_only=review_guard, writable_roots=reviewer_writable,
@@ -3313,6 +3322,8 @@ def run_sessions_parallel(
     settings_path: Path | None = None,
     keep_scratch: bool = False,
     seat_system_prompts: "Sequence[str] | None" = None,
+    seat_roles: "Sequence[str] | None" = None,
+    config: "Any" = None,
     ordinal_offset: int = 0,
     max_workers: "int | None" = None,
     admit: "Callable[[int], bool] | None" = None,
@@ -3422,6 +3433,12 @@ def run_sessions_parallel(
             f"run_sessions_parallel: {len(seat_system_prompts)} seat system "
             f"prompts for {len(specs)} sessions — one per session"
         )
+    if seat_roles is not None and len(seat_roles) != len(specs):
+        raise SessionConfigError(
+            f"run_sessions_parallel: {len(seat_roles)} seat roles for "
+            f"{len(specs)} sessions — one registry role per session "
+            "(F-100: the lens roles, reviewer.conformance/hunt)"
+        )
     if isinstance(ordinal_offset, bool) or not isinstance(ordinal_offset, int) \
             or ordinal_offset < 0:
         raise SessionConfigError(
@@ -3443,6 +3460,8 @@ def run_sessions_parallel(
             factory_root=factory_root, settings_path=settings_path,
             keep_scratch=keep_scratch,
             seat_system_prompts=seat_system_prompts,
+            seat_roles=seat_roles,
+            config=config,
             ordinal_offset=ordinal_offset,
             max_workers=max_workers,
             admit=admit,
@@ -3452,10 +3471,15 @@ def run_sessions_parallel(
             **session_kwargs,
         )
     # A test (or alternative) runner: same signature, same concurrency,
-    # none of the shared sandbox state. factory_root rides through so a
-    # stub sees the kwargs a real call would have.
+    # none of the shared sandbox state. factory_root and the F-100
+    # config ride through so a stub sees the kwargs a real call would
+    # have.
     if factory_root is not None:
         session_kwargs.setdefault("factory_root", factory_root)
+    # Unconditional (F-100 R3): every seat call carries an explicit
+    # config — a missed one reaches resolve_role's loud refusal, never
+    # a silent default registry.
+    session_kwargs.setdefault("config", config)
     stop_flag = threading.Event()
     on_record_lock = (threading.Lock() if on_record is not None
                       else contextlib.nullcontext())
@@ -3468,7 +3492,8 @@ def run_sessions_parallel(
             return None
         if admit is not None and not admit(index):
             return None
-        kwargs = _seat_kwargs(base_kwargs, seat_system_prompts, index)
+        kwargs = _seat_kwargs(base_kwargs, seat_system_prompts,
+                              seat_roles, index)
         if timeout_for is not None:
             kwargs["timeout_min"] = timeout_for(index)
         record = runner(seat, prompt, run_dir, profile, **kwargs)
@@ -3505,12 +3530,19 @@ def complete_records(
 
 def _seat_kwargs(session_kwargs: dict,
                  seat_system_prompts: "Sequence[str] | None",
+                 seat_roles: "Sequence[str] | None",
                  index: int) -> dict:
     """One fan-out session's kwargs: the shared ones, with that seat's
-    own system prompt when the caller gave one per seat (F-94)."""
-    if seat_system_prompts is None:
-        return session_kwargs
-    return {**session_kwargs, "system_prompt": seat_system_prompts[index]}
+    own system prompt when the caller gave one per seat (F-94) and its
+    own registry role when the fan-out spans lenses (F-100: seat 1 is
+    reviewer.conformance, seat 2 reviewer.hunt — different models, not
+    just different prompts)."""
+    kwargs = dict(session_kwargs)
+    if seat_system_prompts is not None:
+        kwargs["system_prompt"] = seat_system_prompts[index]
+    if seat_roles is not None:
+        kwargs["role"] = seat_roles[index]
+    return kwargs
 
 
 def _fanout_sandboxed(
@@ -3522,6 +3554,8 @@ def _fanout_sandboxed(
     settings_path: Path | None = None,
     keep_scratch: bool = False,
     seat_system_prompts: "Sequence[str] | None" = None,
+    seat_roles: "Sequence[str] | None" = None,
+    config: "Any" = None,
     ordinal_offset: int = 0,
     max_workers: "int | None" = None,
     admit: "Callable[[int], bool] | None" = None,
@@ -3585,6 +3619,9 @@ def _fanout_sandboxed(
         on_record_lock = (threading.Lock() if on_record is not None
                           else contextlib.nullcontext())
         base_kwargs = dict(session_kwargs)
+        # F-100 (R3): config reaches _run_prepared as an explicit named
+        # parameter below (never through **kwargs, where the guard
+        # could not see it).
         if timeout_for is not None:
             base_kwargs.pop("timeout_min", None)
 
@@ -3600,14 +3637,15 @@ def _fanout_sandboxed(
                 return None
             if admit is not None and not admit(index):
                 return None
-            kwargs = _seat_kwargs(base_kwargs, seat_system_prompts, index)
+            kwargs = _seat_kwargs(base_kwargs, seat_system_prompts,
+                                  seat_roles, index)
             if timeout_for is not None:
                 # F-96 round 5: the window each session gets is read at
                 # ITS admission, never at pool start.
                 kwargs["timeout_min"] = timeout_for(index)
             record = _run_prepared(
                 seat, prompt, run_dir, profile, per_session[index],
-                factory_root=factory_root,
+                factory_root=factory_root, config=config,
                 read_only=True, scratch=per_scratch[index],
                 **kwargs,
             )
@@ -3675,6 +3713,8 @@ def _run_prepared(
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
     protected: "Sequence[str]" = (),
     model: str | None = None,
+    role: str | None = None,
+    config: "Any" = None,
     system_prompt: str | None = None,
     cli_path: Path | None = None,
     srt_bin_path: Path | None = None,
@@ -3737,7 +3777,15 @@ def _run_prepared(
     # refusal, never a fallback to another provider.
     if spec is None:
         try:
-            spec = resolve_provider(profile, seat)
+            # F-100: the ONE role resolver — the seat's role (the lens
+            # role at a fan-out, the seat's default otherwise) against
+            # the config's registry. No call site keeps a provider or
+            # model default of its own.
+            from factory.models import resolve_role as _resolve_role
+            from factory.models import seat_role
+
+            spec = _resolve_role(
+                profile, config, role if role is not None else seat_role(seat))
         except ProviderError as exc:
             raise SessionConfigError(str(exc)) from exc
     credential = provider_token(spec.kind, base_url=spec.base_url) or ""
@@ -3811,6 +3859,11 @@ def _run_prepared(
                 "timeout_ms": timeout_ms,
                 "protected": list(protected),
                 "model": model,
+                # F-100 AC-4: the registry role and stack this seat
+                # resolved from, on the staged spec (the record and the
+                # trace carry them through the provider block).
+                "role": spec.role,
+                "stack": spec.stack,
                 "system_prompt": system_prompt,
                 "cli_path": str(cli),
                 # F-27: what a vent is recorded against — the in-sandbox

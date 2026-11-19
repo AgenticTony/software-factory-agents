@@ -22,6 +22,7 @@ import pytest
 import yaml
 from claude_agent_sdk import ResultMessage
 
+from factory.config import FactoryConfig
 from factory.contract import ContractError, load_profile, load_tasks
 from factory.l1 import run_l1
 from factory.l2 import L2Report, parse_verdict
@@ -1044,9 +1045,11 @@ def test_review9_session_builds_read_only_settings_for_the_reviewer(
 
     session_module.run_session_sandboxed(
         "reviewer", "review it", repo, profile,
+        config=FactoryConfig(),
         settings_path=settings_path, max_turns=5, timeout_min=1, cli_path=Path("/bin/echo"))
     session_module.run_session_sandboxed(
         "implementer", "build it", repo, profile,
+        config=FactoryConfig(),
         settings_path=settings_path, max_turns=5, timeout_min=1,
         cli_path=Path("/bin/echo"),
     )
@@ -1087,6 +1090,7 @@ def test_review9_workspace_integrity_checked_after_review(tmp_path, monkeypatch)
     monkeypatch.setattr(session_module, "run_sandboxed", mutating_run)
     record = session_module.run_session_sandboxed(
         "reviewer", "review it", repo, profile,
+        config=FactoryConfig(),
         settings_path=tmp_path / "s.json", factory_root=tmp_path,
         max_turns=5, timeout_min=1,
         cli_path=Path("/bin/echo"),
@@ -1130,6 +1134,7 @@ def test_review9_clean_review_passes_the_integrity_check(tmp_path, monkeypatch):
     for seat in ("reviewer", "implementer"):
         record = session_module.run_session_sandboxed(
             seat, "do it", repo, profile,
+            config=FactoryConfig(),
             settings_path=tmp_path / "s.json", factory_root=tmp_path,
             max_turns=5, timeout_min=1,
             cli_path=Path("/bin/echo"),
@@ -1213,6 +1218,7 @@ def test_review10_review_leaves_real_scratch_dirs(tmp_path, monkeypatch):
     monkeypatch.setattr(session_module, "run_sandboxed", quiet_run)
     record = session_module.run_session_sandboxed(
         "reviewer", "review it", repo, profile,
+        config=FactoryConfig(),
         settings_path=tmp_path / "s.json", factory_root=tmp_path,
         max_turns=5, timeout_min=1,
         cli_path=Path("/bin/echo"),
@@ -1248,6 +1254,7 @@ def test_review10_implementer_scratch_writable_after_a_review(tmp_path, monkeypa
     monkeypatch.setattr(session_module, "run_sandboxed", quiet_run)
     session_module.run_session_sandboxed(
         "reviewer", "review it", repo, profile,
+        config=FactoryConfig(),
         settings_path=tmp_path / "s.json", factory_root=tmp_path,
         max_turns=5, timeout_min=1,
         cli_path=Path("/bin/echo"),
@@ -1289,6 +1296,7 @@ def _commit_and_break(repo: Path) -> None:
 def _review(session_module, repo, profile, tmp_path):
     return session_module.run_session_sandboxed(
         "reviewer", "review it", repo, profile,
+        config=FactoryConfig(),
         settings_path=tmp_path / "s.json", factory_root=tmp_path,
         max_turns=5, timeout_min=1, cli_path=Path("/bin/echo"),
     )

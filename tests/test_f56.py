@@ -32,6 +32,7 @@ from _support.f63 import importer_fixture_approve
 from _support.tokens import fake_token
 from claude_agent_sdk import ResultMessage
 
+from factory.config import FactoryConfig
 from factory.sandbox import SRT_PIN
 from factory.session import (
     SessionConfigError,
@@ -159,6 +160,7 @@ def test_ac_1(tmp_path: Path, monkeypatch):
     record = session_mod.run_session_sandboxed(
         "implementer", "p", run.root, {},
         factory_root=tmp_path, max_turns=1, timeout_min=1,
+        config=FactoryConfig(),
     )
     assert record.status == "completed"
     assert record.result == "x" * (2 << 20), "the full 2 MB record did not arrive"
@@ -182,6 +184,7 @@ def test_ac_1(tmp_path: Path, monkeypatch):
     records = session_mod.run_sessions_parallel(
         [("reviewer", "r1"), ("verifier", "v1")], run.root, {},
         factory_root=tmp_path, max_turns=1, timeout_min=1,
+        config=FactoryConfig(),
     )
     assert [r.status for r in records] == ["completed", "completed"]
     assert len(seen) == 2 and seen[0] != seen[1], seen
@@ -205,6 +208,7 @@ def test_ac_1(tmp_path: Path, monkeypatch):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
             factory_root=tmp_path, max_turns=1, timeout_min=1,
+            config=FactoryConfig(),
         )
 def test_ac_1_real_srt_record_dir_persists_on_the_host(tmp_path: Path):
     """The record path must be a carve-out that persists on the host: on
@@ -272,6 +276,7 @@ def test_ac_2(tmp_path: Path, monkeypatch):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
             factory_root=tmp_path, max_turns=1, timeout_min=1,
+        config=FactoryConfig(),
     )
     message = str(excinfo.value)
     assert "exit 1" in message, message
@@ -295,6 +300,7 @@ def test_ac_2(tmp_path: Path, monkeypatch):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
             factory_root=tmp_path, max_turns=1, timeout_min=1,
+        config=FactoryConfig(),
     )
     assert "SIGKILL" in str(excinfo.value), str(excinfo.value)
 
@@ -310,6 +316,7 @@ def test_ac_2(tmp_path: Path, monkeypatch):
             factory_root=tmp_path, max_turns=1, timeout_min=1,
 # --------------------------------------------- AC-3: permission_denials bound --
 
+            config=FactoryConfig(),
         )
 def test_ac_3():
     """permission_denials is bounded where the record is built: each
@@ -386,6 +393,7 @@ def test_ac_4(tmp_path: Path, monkeypatch):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
             factory_root=tmp_path, max_turns=1, timeout_min=1,
+        config=FactoryConfig(),
     )
     message = str(excinfo.value)
     assert "srt reported killing the command" in message, message
@@ -397,6 +405,7 @@ def test_ac_4(tmp_path: Path, monkeypatch):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
             factory_root=tmp_path, max_turns=1, timeout_min=1,
+        config=FactoryConfig(),
     )
     assert "killed by a signal" in str(excinfo.value), str(excinfo.value)
 
@@ -521,6 +530,7 @@ def test_review_timeout_after_record_written_uses_it(tmp_path, monkeypatch):
     record = session_mod.run_session_sandboxed(
         "implementer", "p", run.root, {},
         factory_root=tmp_path, max_turns=1, timeout_min=1,
+        config=FactoryConfig(),
     )
     assert record.status == "completed"
     assert record.result == "done before the hang"
@@ -552,6 +562,7 @@ def test_review_timeout_without_record_keeps_diagnostics(
             "implementer", "p", run.root, {},
             factory_root=tmp_path, max_turns=1, timeout_min=1,
             trace_sink=events.append,
+            config=FactoryConfig(),
         )
     notes = getattr(excinfo.value, "__notes__", [])
     assert notes and "hung in teardown" in notes[-1], notes
@@ -581,6 +592,7 @@ def test_review_fake_stdout_record_line_is_ignored(tmp_path, monkeypatch):
     record = session_mod.run_session_sandboxed(
         "implementer", "p", run.root, {},
         factory_root=tmp_path, max_turns=1, timeout_min=1,
+        config=FactoryConfig(),
     )
     assert record.result == "the real one"
 def test_review_settings_carve_out_the_record_dir(tmp_path, monkeypatch):
@@ -613,6 +625,7 @@ def test_review_settings_carve_out_the_record_dir(tmp_path, monkeypatch):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
             factory_root=tmp_path, max_turns=1, timeout_min=1,
+            config=FactoryConfig(),
         )
     settings = captured["settings"]
     record_dir = _record_file(run.settings_path).parent
@@ -680,6 +693,7 @@ def test_review_non_regular_record_files_are_refused(tmp_path, monkeypatch):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
             factory_root=tmp_path, max_turns=1, timeout_min=1,
+            config=FactoryConfig(),
         )
     # A FIFO at the record path — must not hang.
     def plant_fifo(spec, record_path):
@@ -695,6 +709,7 @@ def test_review_non_regular_record_files_are_refused(tmp_path, monkeypatch):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
             factory_root=tmp_path, max_turns=1, timeout_min=1,
+            config=FactoryConfig(),
         )
     # Non-UTF-8 bytes.
     def plant_bytes(spec, record_path):
@@ -709,6 +724,7 @@ def test_review_non_regular_record_files_are_refused(tmp_path, monkeypatch):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
             factory_root=tmp_path, max_turns=1, timeout_min=1,
+            config=FactoryConfig(),
         )
     # A record nested past the parse's recursion limit: refused (the
     # F-49 parse-boundary rule — the record file is session-writable, so
@@ -721,6 +737,7 @@ def test_review_non_regular_record_files_are_refused(tmp_path, monkeypatch):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
             factory_root=tmp_path, max_turns=1, timeout_min=1,
+            config=FactoryConfig(),
         )
 def test_review_stderr_tail_is_capped(tmp_path, monkeypatch):
     """The stderr tail in the message is capped (2000 chars): a 50 KB
@@ -735,6 +752,7 @@ def test_review_stderr_tail_is_capped(tmp_path, monkeypatch):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
             factory_root=tmp_path, max_turns=1, timeout_min=1,
+        config=FactoryConfig(),
     )
     assert "E" * 2000 in str(excinfo.value)
     assert "E" * 2001 not in str(excinfo.value)
@@ -768,6 +786,7 @@ def test_review_fanout_cleans_up_record_dirs(tmp_path, monkeypatch):
     session_mod.run_sessions_parallel(
         [("reviewer", "r1"), ("reviewer", "r2")], run.root, {},
         factory_root=tmp_path, max_turns=1, timeout_min=1,
+        config=FactoryConfig(),
     )
     assert all(not p.parent.exists() for p in paths), paths
 
@@ -854,6 +873,7 @@ def test_review_record_read_is_single_open(monkeypatch, tmp_path):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
             factory_root=tmp_path, max_turns=1, timeout_min=1,
+        config=FactoryConfig(),
     )
     assert len(opens) <= 1, opens
 # =======================================================================
@@ -878,6 +898,7 @@ def test_review_round1_named_saved_files_exist(tmp_path, monkeypatch):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
             factory_root=tmp_path, max_turns=1, timeout_min=1,
+        config=FactoryConfig(),
     )
     message = str(excinfo.value)
     import re as _re
@@ -902,6 +923,7 @@ def test_review_round1_named_saved_files_exist(tmp_path, monkeypatch):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
             factory_root=tmp_path, max_turns=1, timeout_min=1,
+        config=FactoryConfig(),
     )
     message = str(excinfo.value)
     assert "stderr copy was not written" in message, message
@@ -927,6 +949,7 @@ def test_review_round1_record_read_is_size_bounded(tmp_path, monkeypatch):
         session_mod.run_session_sandboxed(
             "implementer", "p", run.root, {},
             factory_root=tmp_path, max_turns=1, timeout_min=1,
+            config=FactoryConfig(),
         )
 
     # Just under the cap: parses and is used (the whole serialized record
@@ -942,6 +965,7 @@ def test_review_round1_record_read_is_size_bounded(tmp_path, monkeypatch):
     record = session_mod.run_session_sandboxed(
         "implementer", "p", run.root, {},
         factory_root=tmp_path, max_turns=1, timeout_min=1,
+        config=FactoryConfig(),
     )
     assert record.status == "completed" and record.result == "y" * 400
 def test_review_round1_nondict_denial_entries_are_bounded():
@@ -996,6 +1020,7 @@ def test_review_round1_timeout_record_use_is_visible(tmp_path, monkeypatch):
         "implementer", "p", run.root, {},
         factory_root=tmp_path, max_turns=1, timeout_min=1,
         trace_sink=events.append,
+        config=FactoryConfig(),
     )
     assert record.status == "completed"
     kinds = [e["type"] for e in events]
