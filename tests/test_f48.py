@@ -346,10 +346,13 @@ def test_ac_3(tmp_path: Path):
     assert "false positive" not in clean_line, clean_line
 
     # A quota-voided L2 is still no verdict — never a pass or a fail.
+    # (F-102: the line names the VOID and its reason — "L2 voided (no
+    # verdict) (verifier_quota)" — never the cause as the label.)
     voided = run_seed(repo, clean, session_runner=QuotaReviewers())
     voided_line = _clean_review_summary(voided)
-    assert "no verdict" in voided_line and "quota-voided" in voided_line, (
+    assert "no verdict" in voided_line and "L2 voided" in voided_line, (
         voided_line)
+    assert "(verifier_quota)" in voided_line, voided_line
     assert "L0 pass" in voided_line and "L1 pass" in voided_line, voided_line
 
     # The false-fail aggregate is per layer: L0's failed clean runs (every

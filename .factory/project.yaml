@@ -432,6 +432,13 @@ paths:
     # review (same precedent).
     - "tests/test_f101.py"
     - "tests/_support/f101.py"
+    # F-102: the honest-numbers contract tests judge the eval's
+    # drop-cost rule (each drop judged by the seed's own catch rule,
+    # undecidable restores counted), the slot table, the neutral
+    # deleted-await contract, the marker-source doc pin and the
+    # verifier-session cap — same precedent, protected from the day
+    # they exist.
+    - "tests/test_f102.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 

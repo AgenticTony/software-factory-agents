@@ -1201,7 +1201,7 @@ def test_on_record_fires_as_each_session_ends(tmp_path: Path):
 # ------------------------------------------------- round 6 (final review) --
 
 
-def test_eval_starved_pool_venes_the_review(tmp_path: Path, monkeypatch):
+def test_eval_starved_pool_voids_the_review(tmp_path: Path, monkeypatch):
     """Round-6 A: a starved verifier pool voids the EVAL review exactly
     like quota — no verdict is scored over findings that were not all
     voted, and the void's reason is visible on the record."""

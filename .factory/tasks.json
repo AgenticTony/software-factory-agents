@@ -7158,6 +7158,90 @@
       },
       "attempts": [],
       "links": {}
+    },
+    {
+      "acceptance": [
+        {
+          "check": {
+            "ref": "tests/test_f102.py::test_ac_1",
+            "type": "test"
+          },
+          "id": "AC-1",
+          "text": "A drop costs a catch only if keeping it would have caught the seed: for each found-then-dropped finding on a missed run the seed's own catch rule is re-applied with that ONE finding restored (_blocks for caller-break, the sibling rule for the sibling seed, F-16's marker rule plus a failing L2 verdict for the rest); the entry carries would_have_caught, the count line counts only those over the missed runs' drops, an undecidable restore counts with its reason named, and old reports render as today."
+        },
+        {
+          "check": {
+            "ref": "tests/test_f102.py::test_ac_2",
+            "type": "test"
+          },
+          "id": "AC-2",
+          "text": "The report maps slots to seeds: a slot -> seed id table (outside the pinned F-16 record shape, one top-level key) so EVAL-07 in a session trace resolves without reading eval.py; old reports render without it."
+        },
+        {
+          "check": {
+            "ref": "tests/test_f102.py::test_ac_3",
+            "type": "test"
+          },
+          "id": "AC-3",
+          "text": "deleted-await's contract stops requesting the change: its contract_title becomes neutral intent ('tidy the checkin-count fetch'), never naming or requesting the defect; the F-99 leak sweep stays green."
+        },
+        {
+          "check": {
+            "ref": "tests/test_f102.py::test_ac_4",
+            "type": "test"
+          },
+          "id": "AC-4",
+          "text": "VALIDATOR-SPEC's F-99 paragraph names the gates' own output as an allowed marker source (Python's 'coroutine' in a failing test's output), pinned by a doc-line test."
+        },
+        {
+          "check": {
+            "ref": "tests/test_f102.py::test_ac_5",
+            "type": "test"
+          },
+          "id": "AC-5",
+          "text": "Each eval verifier session's timeout is capped at SEAT_TIMEOUT_MIN while the pool window (SEAT_TIMEOUT_MIN x sessions) stays the admission check (the starved branch stays reachable and still voids), and the voided line reads 'L2 voided (no verdict) (<reason>)' for quota and starvation alike."
+        }
+      ],
+      "attempts": [],
+      "budget": {
+        "max_attempts": 3,
+        "max_turns": 150,
+        "size": "M",
+        "wall_clock_min": 120
+      },
+      "depends_on": [
+        "F-96"
+      ],
+      "gates": {
+        "deploy": "human",
+        "merge": "human",
+        "spec_approval": true
+      },
+      "id": "F-102",
+      "kind": "build",
+      "links": {},
+      "priority": "P1",
+      "risk": [
+        "factory_control"
+      ],
+      "scope": {
+        "paths": [
+          "factory/eval.py",
+          "factory/orchestrator.py",
+          "tests/test_f102.py",
+          "tests/test_f99.py",
+          "tests/test_f96.py",
+          "tests/test_f48.py",
+          "VALIDATOR-SPEC.md",
+          "BUILD-ORDER.md",
+          ".factory/tasks.json",
+          ".factory/project.yaml",
+          ".factory/BOOTSTRAP.md"
+        ]
+      },
+      "source": "BUILD-ORDER.md#f-102--the-evals-drop-cost-line-counts-only-drops-that-cost-a-catch-and-the-eval-says-what-it-ran",
+      "status": "draft",
+      "title": "The eval's drop-cost line counts only drops that cost a catch, and the eval says what it ran"
     }
   ]
 }
