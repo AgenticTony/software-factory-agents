@@ -145,6 +145,7 @@ from factory.contract import (
     iter_schema_violations,
     load_profile,
     load_tasks,
+    read_file,
     scope_pattern_error,
     validate_queue,
 )
@@ -1493,6 +1494,13 @@ class ImportPlan:
     # write refuses if the disk queue no longer matches it, so a change
     # made while the confirm prompt waits is never silently reverted.
     base_doc: dict | None = None
+    # F-66 AC-4: the base queue failed validation under the current
+    # rules and was parsed as plain JSON for the re-proposal (every
+    # task draft). The apply path then writes through the raw-document
+    # guarantees instead of TaskQueue (which cannot load it), and the
+    # summary tells the owner to review the WHOLE diff as a first
+    # import.
+    stale_base: bool = False
     # Planning docs the listing cap dropped (F-49 AC-3, m-4): the
     # summary names them, so the owner knows the proposal was built from
     # a capped view. Set by run_import (which sees the repo); a directly
@@ -1920,6 +1928,7 @@ def plan_import(
     doc_texts: dict[str, str] | None = None,
     repo: Path | None = None,
     profile: dict | None = None,
+    stale_base: bool = False,
 ) -> ImportPlan:
     """Build the import plan: merged document, per-task changes,
     out-of-scope matches and the full diff. Validates the merged
@@ -2172,6 +2181,12 @@ def plan_import(
         proposed_doc["tasks"] = merged
     else:
         proposed_doc = {"version": 1, "project": project, "tasks": merged}
+    # F-66 AC-1: the proposal carries the CURRENT contract epoch — a
+    # queue re-imported from a stale base shows the epoch change in the
+    # diff the owner reviews (an unchanged re-import on a current queue
+    # is a no-op, so byte-identity holds).
+    from factory.epochs import stamp_version
+    stamp_version(proposed_doc)
     try:
         validate_queue(proposed_doc, f"proposed tasks.json for {project}")
     except ContractError as exc:
@@ -2203,6 +2218,7 @@ def plan_import(
         matches=matches,
         diff=diff,
         base_doc=copy.deepcopy(existing_doc),
+        stale_base=stale_base,
         gate_overrides=gate_overrides,
         risk_additions=risk_additions,
         budget_clamps=budget_clamps,
@@ -2422,6 +2438,146 @@ def render_summary(plan: ImportPlan) -> str:
 
 
 # ------------------------------------------------- F-67: reference reading --
+
+
+def _load_existing_queue_for_import(
+    queue_path: Path, repo: Path, factory_root: Path | str | None,
+) -> "tuple[dict | None, bool, str]":
+    """The import's existing-queue read (F-66 AC-2/AC-4).
+
+    Returns ``(existing_doc, stale_base, report_text)``:
+
+    * a queue that loads under the current rules → ``(doc, False, "")``
+      — today's behaviour, plus doctor's report text when it found
+      non-fatal findings (a stale epoch, unapprovable drafts);
+    * a queue that FAILS validation but still parses, with every task
+      ``draft`` → ``(raw doc, True, report text)`` — the AC-4
+      re-proposal base, reviewed as a first import;
+    * anything else (unparseable, wrong shape, a task past draft, or a
+      profile the current rules refuse) → raises ImportRefused with
+      doctor's FULL report, naming the tasks past draft.
+
+    The profile side mirrors today's tolerance exactly: with an
+    existing queue a missing profile file is not a finding (the
+    real-session path keeps its own strict load); with no queue at all
+    the profile must load, as it must today.
+    """
+    from factory import doctor
+    from factory.epochs import EpochError
+
+    def _report(**kwargs) -> "doctor.Report":
+        try:
+            return doctor.project_report(
+                profile_path, queue_path, factory_root=factory_root,
+                approval_check=False, **kwargs)
+        except EpochError as exc:
+            raise ContractError(str(exc)) from exc
+
+    profile_path = repo / ".factory" / "project.yaml"
+    if not queue_path.is_file():
+        report = _report(queue_required=False)
+        if _fatal_profile_findings(report):
+            raise ImportRefused(doctor.render([report]).rstrip())
+        text = doctor.render([report]).rstrip() if report.findings else ""
+        return None, False, text
+    try:
+        existing_doc = load_tasks(queue_path)
+    except ContractError as load_error:
+        report = _report(queue_required=True, profile_required=False)
+        raw, non_draft = _read_stale_queue(queue_path)
+        # R1 (review round 1): a queue naming a NEWER epoch than this
+        # factory's register is never a re-proposal base — the AC-1
+        # ceiling, import-side: a factory older than the queue's epoch
+        # never rewrites it under rules it doesn't know. The refusal
+        # uses the ceiling's own words.
+        from factory.epochs import version_ceiling_error
+        if raw is not None:
+            ceiling = version_ceiling_error(raw.get("version"))
+            if ceiling is not None:
+                raise ImportRefused(f"{queue_path}: {ceiling}") \
+                    from load_error
+        profile_bad = _fatal_profile_findings(report)
+        if raw is None or non_draft or profile_bad:
+            detail = ""
+            if non_draft:
+                detail = (
+                    "\ntask(s) past draft — the owner's per-task action "
+                    "(edit the contract, then `factory approve <task>`): "
+                    + ", ".join(non_draft)
+                )
+            raise ImportRefused(
+                doctor.render([report]).rstrip() + detail
+            ) from load_error
+        return raw, True, doctor.render([report]).rstrip()
+    report = _report(queue_required=True, profile_required=False)
+    if _fatal_profile_findings(report):
+        # The queue loads but the profile cannot: today's own load below
+        # would refuse with the single bare error — refuse here with the
+        # full report instead (F-66 AC-2).
+        raise ImportRefused(doctor.render([report]).rstrip())
+    text = doctor.render([report]).rstrip() if report.findings else ""
+    return existing_doc, False, text
+
+
+def _fatal_profile_findings(report) -> list:
+    """The profile findings a load would refuse on."""
+    return [f for f in report.findings
+            if f.check.startswith("profile-") and f.fatal]
+
+
+def _read_stale_queue(queue_path: Path) -> "tuple[dict | None, list[str]]":
+    """A failed-validation queue as plain JSON: ``(raw doc, [])`` when
+    every task is ``draft`` (the AC-4 re-proposal base), ``(None,
+    non-draft ids)`` when tasks are past draft, ``(None, [])`` when the
+    file does not parse, has no queue shape, or is HOSTILE. Bounded and
+    defensive: this is exactly the read :func:`read_reference_queue`
+    does, on the import's own queue path.
+
+    Hostile is not stale (F-62's lesson, re-learned by F-66's own gate):
+    a queue fails the SEMANTIC safety layer — path-traversal project
+    slug, control characters, duplicate ids, a scope that climbs — is
+    never re-proposable, whatever epoch it claims. Only a queue whose
+    failures are the schema's rule shapes (over-cap budgets, post-hoc
+    required fields) may be re-proposed, and only draft-only."""
+    from factory.contract import _semantic_violations
+    from factory.runs import ProjectSlugError, project_component
+
+    try:
+        text = read_file(queue_path, str(queue_path))
+    except ContractError:
+        return None, []
+    try:
+        raw = json.loads(text)
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        return None, []
+    if not isinstance(raw, dict) or not isinstance(raw.get("tasks"), list) \
+            or not isinstance(raw.get("project"), str):
+        return None, []
+    try:
+        project_component(raw["project"])
+    except ProjectSlugError:
+        return None, []  # the F-62 hostile-project shape: never a base
+    if _semantic_violations(raw["tasks"], str(queue_path)):
+        return None, []  # hostile or corrupt: never a base
+    version = raw.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) \
+            or version < 1:
+        return None, []
+    non_draft: list[str] = []
+    for task in raw["tasks"]:
+        if not isinstance(task, dict):
+            non_draft.append("<malformed task entry>")
+            continue
+        status = task.get("status")
+        tid = task.get("id") if isinstance(task.get("id"), str) \
+            else "<missing id>"
+        if status != "draft":
+            shown = status if isinstance(status, str) \
+                else f"status={status!r}"
+            non_draft.append(f"{tid} ({shown})")
+    if non_draft:
+        return None, non_draft
+    return raw, []
 
 
 def read_reference_queue(repo: Path | str) -> dict | None:
@@ -2950,6 +3106,30 @@ def apply_import(
     if path.is_file():
         if plan.base_doc is None:
             raise stale
+        if plan.stale_base:
+            # F-66 AC-4: the plan was built from a queue that predates
+            # the current rules (parsed as plain JSON; every task was
+            # draft). TaskQueue cannot load it, so the write takes the
+            # same guarantees directly: the writer lock, the disk queue
+            # still being the one the plan was built from, attempts
+            # append-only, and full validation of what is written.
+            doc = copy.deepcopy(plan.proposed_doc)
+            doc["updated_at"] = now_iso()
+            from factory.epochs import stamp_version
+            stamp_version(doc)
+            validate_queue(doc, str(path))
+            with queue_writer_lock(path):
+                try:
+                    raw = json.loads(read_file(path, str(path)))
+                except (json.JSONDecodeError, ContractError,
+                        RecursionError, ValueError) as exc:
+                    raise stale from exc
+                if canonical_json(raw) != canonical_json(plan.base_doc):
+                    raise stale
+                from factory.state import _check_attempts_append_only
+                _check_attempts_append_only(raw, doc)
+                _atomic_write_json(path, doc)
+            return True
         queue = TaskQueue(path)
         # The baseline check: the queue this instance loaded must be the
         # one the plan was built from. From here on save()'s own
@@ -3455,6 +3635,7 @@ def _repair_refused_proposal(
     secrets: "Sequence[str]",
     reference: dict | None = None,
     doc_texts: dict[str, str] | None = None,
+    stale_base: bool = False,
 ) -> "tuple[ImportPlan | None, dict, ImportRefused | None]":
     """Run the ONE repair session for a refused real-session proposal
     (F-57 AC-2). Returns ``(plan, facts, final_refusal)`` — exactly one
@@ -3681,7 +3862,7 @@ def _repair_refused_proposal(
                     plan = plan_import(
                         existing_doc, proposal, records, project=project,
                         reference=reference, doc_texts=doc_texts, repo=repo,
-                        profile=profile,
+                        profile=profile, stale_base=stale_base,
                     )
                 except ImportRefused as second:
                     writer.append({
@@ -4000,7 +4181,17 @@ def run_import(
         queue_path = repo / ".factory" / "tasks.json"
     queue_path = Path(queue_path)
     records = read_out_of_scope(repo)
-    existing_doc = load_tasks(queue_path) if queue_path.is_file() else None
+    # F-66 AC-2/AC-3/AC-4: the doctor preflight and the stale-queue
+    # re-proposal gate. Every rule this repo must meet is reported
+    # together BEFORE any single loader's first-error refusal (the
+    # F-13 import refused with one bare schema error at exactly this
+    # step). A queue that fails validation but still parses, with every
+    # task draft, is re-proposed below — reviewed as a first import
+    # (AC-4); anything else (a task past draft, a file that does not
+    # parse, a profile the current rules refuse) refuses with the FULL
+    # report, naming the tasks.
+    existing_doc, stale_base, stale_report_text = (
+        _load_existing_queue_for_import(queue_path, repo, factory_root))
     profile: dict | None = None
     if existing_doc is not None:
         project = existing_doc["project"]
@@ -4215,7 +4406,7 @@ def run_import(
             plan = plan_import(existing_doc, proposal, records,
                                project=project, reference=reference,
                                doc_texts=doc_texts, repo=repo,
-                               profile=profile)
+                               profile=profile, stale_base=stale_base)
         except ImportRefused as exc:
             refused = exc
         if refused is not None:
@@ -4237,6 +4428,7 @@ def run_import(
                 import_timeout=effective_timeout,
                 secrets=egress_secrets,
                 reference=reference, doc_texts=doc_texts,
+                stale_base=stale_base,
             )
             # The main session's proposal was refused: its record says
             # so (F-67 AC-2), naming the kept original the repair works
@@ -4279,6 +4471,23 @@ def run_import(
         # names them — the same capped set the prompt described.
         plan.truncated_docs = listing.dropped
         summary = render_summary(plan)
+        # F-66 AC-4: the re-proposal banner — the owner reviews the
+        # WHOLE diff against the old file exactly as a first import,
+        # with doctor's report of what the old queue violated beside it.
+        if stale_base or stale_report_text:
+            from factory.epochs import current_epoch
+            summary = (
+                f"(re-proposal under contract epoch {current_epoch()} — "
+                + (
+                    "the queue on disk predates the current rules; review "
+                    "the WHOLE diff below as a first import"
+                    if stale_base else
+                    "the queue on disk is stale against the current epoch; "
+                    "the next write re-stamps it"
+                )
+                + ")\n" + (stale_report_text + "\n" if stale_report_text
+                           else "") + summary
+            )
         if repair:
             turns_text = (
                 f"{repair['turns']} turns"

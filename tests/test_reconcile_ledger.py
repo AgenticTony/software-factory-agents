@@ -160,6 +160,9 @@ OWNER_PENDING = {
             "rehearsal fixture (BOOTSTRAP §F-59 runbook)",
     "F-67": "its own ACs are proven, but reconcile walks the dep chain: "
             "F-57 AC-4 and F-59 AC-7 (the owner's paid runs) land first",
+    "F-66": "its own ACs are proven, but reconcile walks the dep chain: "
+            "F-59 AC-7 (the owner's paid bedrock run) lands first — the "
+            "F-67 precedent",
 }
 
 

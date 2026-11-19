@@ -262,20 +262,30 @@ def scope_pattern_error(pattern: Any) -> str | None:
 
 def _check_task_scope(task: dict, origin: str, tid: str) -> None:
     """Refuse a malformed declared scope, naming the task and pattern."""
+    for _tag, message in _task_scope_violations(task, origin, tid):
+        raise ContractError(message)
+
+
+def _task_scope_violations(task: dict, origin: str,
+                           tid: str) -> list[tuple[str, str]]:
+    """Every malformed declared scope of one task as ``(tag, message)``
+    (F-66's all-errors mode; ``_check_task_scope`` raises the first)."""
     scope = task.get("scope")
     if scope is None:
-        return  # absent is legal (the schema keeps it optional); the
+        return []  # absent is legal (the schema keeps it optional); the
         # approval and run refusals demand it for ELIGIBLE_KINDS
     paths = scope.get("paths") if isinstance(scope, dict) else None
     if not isinstance(paths, list):  # shape is the schema's to describe
-        return
+        return []
+    out: list[tuple[str, str]] = []
     for pattern in paths:
         reason = scope_pattern_error(pattern)
         if reason is not None:
-            raise ContractError(
+            out.append(("scope", (
                 f"{origin}: task {tid} declares scope pattern {pattern!r} "
                 f"that {reason} (F-65)"
-            )
+            )))
+    return out
 
 
 # F-63 R2-1(b): the control classes no PROFILE string may carry, and no
@@ -307,7 +317,19 @@ def _iter_string_paths(value: Any, path: str):
 def _check_control_strings(
     value: Any, origin: str, where: str, *, free_text_newline: bool
 ) -> None:
-    """Refuse control characters in every string under ``value``.
+    """Refuse control characters in every string under ``value`` (the
+    first offending string; :func:`_control_string_violations` collects
+    them all for ``factory doctor``, F-66)."""
+    for message in _control_string_violations(
+            value, origin, where, free_text_newline=free_text_newline):
+        raise ContractError(message)
+
+
+def _control_string_violations(
+    value: Any, origin: str, where: str, *, free_text_newline: bool
+) -> list[str]:
+    """Every control-character refusal under ``value`` (F-66's
+    all-errors mode): same messages, same order.
 
     Args:
         value: The JSON-shaped value to walk (a profile, a task).
@@ -320,6 +342,7 @@ def _check_control_strings(
             profile string may carry any control, newline and tab
             included.
     """
+    out: list[str] = []
     for path, text in _iter_string_paths(value, where):
         exempt = free_text_newline and path.rsplit(".", 1)[-1] in _TASK_FREE_TEXT_KEYS
         for position, char in enumerate(text):
@@ -327,12 +350,91 @@ def _check_control_strings(
                 continue
             if exempt and char in ("\n", "\t"):
                 continue
-            raise ContractError(
+            out.append(
                 f"{origin}: {where}: {path} carries the control character "
                 f"U+{ord(char):04X} at offset {position} — control "
                 "sequences and bidi controls are refused at load: they "
                 "can rewrite the terminal an approval prompt prints to"
             )
+    return out
+
+
+def _semantic_violations(tasks: Any, origin: str) -> "list[tuple[str, str]]":
+    """Every queue semantic violation as ``(check tag, message)``.
+
+    The all-errors mode behind :func:`_check_semantics` (F-66 AC-2:
+    ``factory doctor`` collects ALL violations instead of stopping at
+    the first). Same checks, same messages, same per-task order — only
+    the stopping differs. The tag names which epoch's rule fired
+    (``scope`` → F-65; everything else is baseline), mapped to its
+    epoch through the epoch register's ``checks``.
+    """
+    if not isinstance(tasks, list):
+        return []
+    out: "list[tuple[str, str]]" = []
+    seen_ids: set[str] = set()
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        tid = task.get("id")
+        if isinstance(tid, str):
+            if tid in seen_ids:
+                out.append(("baseline", (
+                    f"{origin}: duplicate task id {tid}; task ids must be "
+                    "unique or dependency and attempt records become ambiguous"
+                )))
+            seen_ids.add(tid)
+        tid = tid if isinstance(tid, str) else "<missing id>"
+        # F-63 R2-1(b): control characters refused in every task string
+        # (newline/tab exempt in the free-text fields only).
+        out.extend(
+            ("baseline", message)
+            for message in _control_string_violations(
+                task, origin, f"task {tid}", free_text_newline=True)
+        )
+        # F-65 AC-1: every declared scope pattern is a well-formed
+        # repo-relative glob (a malformed scope refuses the load).
+        out.extend(_task_scope_violations(task, origin, tid))
+        risk = task.get("risk")
+        # bound once so the isinstance guard narrows the .get below
+        gates_value = task.get("gates")
+        gates = gates_value if isinstance(gates_value, dict) else {}
+
+        if risk and gates.get("merge") == "auto":
+            out.append(("baseline", (
+                f"{origin}: task {tid} has risk flags {risk} but gates.merge=auto; "
+                "any risk flag forces human merge (TASK-CONTRACT §2)"
+            )))
+        kind = _field(task, "kind")
+        status = _field(task, "status")
+        if kind in NON_EXECUTABLE_KINDS and status not in NON_EXECUTABLE_STATUSES:
+            shown = status if status is not None else "<missing>"
+            allowed = ", ".join(sorted(NON_EXECUTABLE_STATUSES))
+            out.append(("baseline", (
+                f"{origin}: task {tid} is kind={kind} but status={shown}; "
+                f"{kind} tasks are never executable — allowed statuses: {allowed}"
+            )))
+        if kind == "owner_only" and status == "done":
+            # F-29: no contract to freeze; done means every owner step ticked.
+            # Total over malformed shapes (F-66 R2): a non-list
+            # owner_steps or non-dict entries read as unticked — the
+            # schema describes the shape, this check never crashes on it.
+            raw_steps = task.get("owner_steps")
+            steps = ([step for step in raw_steps if isinstance(step, dict)]
+                     if isinstance(raw_steps, list) else [])
+            if not steps or not all(step.get("done") for step in steps):
+                out.append(("baseline", (
+                    f"{origin}: task {tid} is an owner_only task marked done, but "
+                    "it needs at least one owner step and every one ticked (factory tick)"
+                )))
+        elif status in POST_APPROVAL_STATUSES:
+            missing = [k for k in ("acceptance_hash", "approved_at") if not task.get(k)]
+            if missing:
+                out.append(("baseline", (
+                    f"{origin}: task {tid} is {status} but has no {' or '.join(missing)}; "
+                    "approve the spec first so the contract is frozen (factory approve)"
+                )))
+    return out
 
 
 def _check_semantics(tasks: Any, origin: str) -> None:
@@ -349,62 +451,9 @@ def _check_semantics(tasks: Any, origin: str) -> None:
     Raises:
         ContractError: On the first semantic violation found.
     """
-    if not isinstance(tasks, list):
-        return
-    seen_ids: set[str] = set()
-    for task in tasks:
-        if not isinstance(task, dict):
-            continue
-        tid = task.get("id")
-        if isinstance(tid, str):
-            if tid in seen_ids:
-                raise ContractError(
-                    f"{origin}: duplicate task id {tid}; task ids must be "
-                    "unique or dependency and attempt records become ambiguous"
-                )
-            seen_ids.add(tid)
-        tid = tid if isinstance(tid, str) else "<missing id>"
-        # F-63 R2-1(b): control characters refused in every task string
-        # (newline/tab exempt in the free-text fields only).
-        _check_control_strings(task, origin, f"task {tid}",
-                               free_text_newline=True)
-        # F-65 AC-1: every declared scope pattern is a well-formed
-        # repo-relative glob (a malformed scope refuses the load).
-        _check_task_scope(task, origin, tid)
-        risk = task.get("risk")
-        # bound once so the isinstance guard narrows the .get below
-        gates_value = task.get("gates")
-        gates = gates_value if isinstance(gates_value, dict) else {}
-
-        if risk and gates.get("merge") == "auto":
-            raise ContractError(
-                f"{origin}: task {tid} has risk flags {risk} but gates.merge=auto; "
-                "any risk flag forces human merge (TASK-CONTRACT §2)"
-            )
-        kind = _field(task, "kind")
-        status = _field(task, "status")
-        if kind in NON_EXECUTABLE_KINDS and status not in NON_EXECUTABLE_STATUSES:
-            shown = status if status is not None else "<missing>"
-            allowed = ", ".join(sorted(NON_EXECUTABLE_STATUSES))
-            raise ContractError(
-                f"{origin}: task {tid} is kind={kind} but status={shown}; "
-                f"{kind} tasks are never executable — allowed statuses: {allowed}"
-            )
-        if kind == "owner_only" and status == "done":
-            # F-29: no contract to freeze; done means every owner step ticked.
-            steps = task.get("owner_steps") or []
-            if not steps or not all(step.get("done") for step in steps):
-                raise ContractError(
-                    f"{origin}: task {tid} is an owner_only task marked done, but "
-                    "it needs at least one owner step and every one ticked (factory tick)"
-                )
-        elif status in POST_APPROVAL_STATUSES:
-            missing = [k for k in ("acceptance_hash", "approved_at") if not task.get(k)]
-            if missing:
-                raise ContractError(
-                    f"{origin}: task {tid} is {status} but has no {' or '.join(missing)}; "
-                    "approve the spec first so the contract is frozen (factory approve)"
-                )
+    violations = _semantic_violations(tasks, origin)
+    if violations:
+        raise ContractError(violations[0][1])
 
 
 def read_file(path: Path, origin: str) -> str:
@@ -579,6 +628,20 @@ def validate_queue(
     """
     _check_semantics(data.get("tasks") if isinstance(data, dict) else None, origin)
     _validate(data, schema_path or SCHEMA_DIR / "tasks.schema.json", origin)
+    if isinstance(data, dict):
+        # F-66 AC-1: the queue's version is the contract epoch it was
+        # last written under. A NEWER epoch than this factory's register
+        # refuses (a downgrade never reinterprets a newer queue); an
+        # older one loads — stale, reported by `factory doctor`, and
+        # healed by the next factory write's re-stamp.
+        from factory.epochs import EpochError, version_ceiling_error
+
+        try:
+            problem = version_ceiling_error(data.get("version"))
+        except EpochError as exc:
+            raise ContractError(str(exc)) from exc
+        if problem is not None:
+            raise ContractError(f"{origin}: {problem}")
     if isinstance(data, dict) and "project" in data:
         try:
             project_component(data["project"])
@@ -1020,7 +1083,15 @@ def _provider_base_url_error(base_url: str) -> str | None:
 
 
 def _check_provider_semantics(data: dict, origin: str) -> None:
-    """F-59: the provider choice is load-refused prose-and-steel.
+    """F-59: the provider choice is load-refused prose-and-steel (the
+    first refusal; :func:`_provider_semantic_violations` collects them
+    all for ``factory doctor``, F-66)."""
+    for message in _provider_semantic_violations(data, origin):
+        raise ContractError(message)
+
+
+def _provider_semantic_violations(data: dict, origin: str) -> list[str]:
+    """Every F-59 provider refusal, same messages, same order.
 
     Every rule here is the front half of the WO's goal — the owner
     approves the provider — made mechanical at load: a client project
@@ -1037,13 +1108,18 @@ def _check_provider_semantics(data: dict, origin: str) -> None:
         vertex_hosts,
     )
 
+    out: list[str] = []
     owner = data.get("data_owner", "self")
     block = data.get("provider")
     allowed = data.get("providers_allowed") or []
-    seats = data.get("seat_providers") or {}
+    # Total over malformed shapes (F-66 R2): the schema types these
+    # blocks, but the all-errors collector walks past the first
+    # violation into shapes the raise-first path never reached.
+    seats_value = data.get("seat_providers")
+    seats = seats_value if isinstance(seats_value, dict) else {}
 
     if owner == "client" and not isinstance(block, dict):
-        raise ContractError(
+        out.append(
             f"{origin}: a client project (data_owner: client) must "
             "declare an explicit provider block — client source may not "
             "reach the default Z.ai endpoint (F-59); name the owner-"
@@ -1052,7 +1128,7 @@ def _check_provider_semantics(data: dict, origin: str) -> None:
     if isinstance(block, dict):
         kind = block.get("kind")
         if owner == "client" and kind == "zai":
-            raise ContractError(
+            out.append(
                 f"{origin}: provider.kind is zai on a client project — "
                 "client source may not go to the Z.ai endpoint (no DPA, "
                 "processing outside the EU, a consumer plan); F-59 "
@@ -1061,16 +1137,16 @@ def _check_provider_semantics(data: dict, origin: str) -> None:
         error = _provider_field_error(str(kind), block, seat=None,
                                       origin=origin)
         if error is not None:
-            raise ContractError(f"{origin}: {error} (F-59)")
+            out.append(f"{origin}: {error} (F-59)")
         models = block.get("models")
         if not isinstance(models, dict) or not models:
-            raise ContractError(
+            out.append(
                 f"{origin}: provider.models is required — one model id "
                 "per seat (implementer, reviewer, verifier, importer); "
                 "the schema types the map"
             )
     if owner == "client" and "zai" in allowed:
-        raise ContractError(
+        out.append(
             f"{origin}: providers_allowed names zai on a client project "
             "— no seat of a client project may reach the Z.ai endpoint "
             "(F-59)"
@@ -1080,7 +1156,7 @@ def _check_provider_semantics(data: dict, origin: str) -> None:
             continue  # the schema types the block
         kind = str(entry.get("kind"))
         if kind not in allowed:
-            raise ContractError(
+            out.append(
                 f"{origin}: seat_providers.{seat} names provider "
                 f"{kind!r} which is not in the project's "
                 f"providers_allowed {allowed!r} — a seat runs the "
@@ -1089,7 +1165,7 @@ def _check_provider_semantics(data: dict, origin: str) -> None:
         error = _provider_field_error(kind, entry, seat=str(seat),
                                       origin=origin)
         if error is not None:
-            raise ContractError(f"{origin}: {error} (F-59)")
+            out.append(f"{origin}: {error} (F-59)")
     # "No other model endpoint" (AC-3): an egress allowlist entry naming
     # a model host that is not EXACTLY one of the project's own (or a
     # seat override's) inference hosts refuses — otherwise a client
@@ -1120,7 +1196,7 @@ def _check_provider_semantics(data: dict, origin: str) -> None:
                 continue
             if entry in own_hosts:
                 continue
-            raise ContractError(
+            out.append(
                 f"{origin}: {key} entry {entry!r} is a model-provider "
                 f"host of kind {provider_kind!r}, not this project's "
                 "own inference host — the sandbox allowlist is the "
@@ -1129,11 +1205,20 @@ def _check_provider_semantics(data: dict, origin: str) -> None:
                 "endpoint (or another region of its own kind) through "
                 "it (F-59 AC-3)"
             )
+    return out
 
 
 def _check_allowlist_hosts(data: dict, origin: str) -> None:
     """Refuse any network/docs allowlist entry that is not one exact
-    lowercase DNS host (F-63 AC-3).
+    lowercase DNS host (F-63 AC-3) — the first; the collector lists all.
+    """
+    for message in _allowlist_host_violations(data, origin):
+        raise ContractError(message)
+
+
+def _allowlist_host_violations(data: dict, origin: str) -> list[str]:
+    """Every non-exact-host allowlist entry, same messages (F-66's
+    all-errors mode).
 
     The srt allowlist is the egress boundary of sessions that hold the
     shared provider token, and pinned srt 0.0.79 matches a bare entry
@@ -1142,6 +1227,7 @@ def _check_allowlist_hosts(data: dict, origin: str) -> None:
     the exact-host form; anything broader or stranger is a misconfigured
     or hostile entry and refuses the profile at load, the entry named.
     """
+    out: list[str] = []
     for key in ("network_allowlist", "docs_allowlist"):
         entries = data.get(key)
         if not isinstance(entries, list):
@@ -1151,7 +1237,7 @@ def _check_allowlist_hosts(data: dict, origin: str) -> None:
                 not _ALLOWLIST_HOST_RE.fullmatch(entry)
                 or entry.rsplit(".", 1)[-1].isdigit()
             ):
-                raise ContractError(
+                out.append(
                     f"{origin}: {key} entry {entry!r} is not one exact "
                     "lowercase DNS host (labels [a-z0-9-], at least one dot, "
                     "final label not all-numeric) — no wildcard, scheme, "
@@ -1159,6 +1245,101 @@ def _check_allowlist_hosts(data: dict, origin: str) -> None:
                     "the allowlist is the egress boundary of a session that "
                     "holds the provider token"
                 )
+    return out
+
+
+def _profile_semantic_violations(data: dict, origin: str, *,
+                                 toolkit_root: Path | str | None = None,
+                                 ) -> "list[tuple[str, str]]":
+    """Every profile semantic violation as ``(check tag, message)``.
+
+    The all-errors mode behind :func:`_check_profile_semantics` (F-66
+    AC-2: ``factory doctor`` collects ALL violations). Same checks,
+    same messages, same order. Tags: ``provider``/``allowlist`` (→
+    F-59's epoch), ``floor`` (F-71 — unregistered, attributes to the
+    baseline), ``scope`` (F-65's generated-glob rule); everything else
+    is baseline.
+    """
+    out: "list[tuple[str, str]]" = []
+    out.extend(("provider", message)
+               for message in _provider_semantic_violations(data, origin))
+    # F-71 AC-3: a budget floor above the task schema's F-64 caps would
+    # refuse every contract (nothing could satisfy it), so it refuses at
+    # load, the field named.
+    floor = data.get("budget_floor")
+    if isinstance(floor, dict):
+        for field, cap in budget_caps().items():
+            value = floor.get(field)
+            if isinstance(value, int) and not isinstance(value, bool) \
+                    and value > cap:
+                out.append(("floor", (
+                    f"{origin}: budget_floor.{field} is {value}, above the "
+                    f"task budget cap of {cap} (F-64) — a floor no contract "
+                    "can satisfy; lower the floor or raise the cap by owner "
+                    "decision"
+                )))
+    # Total over malformed shapes (F-66 R2): non-dict sentinels/paths
+    # and non-sized sentinel values read as empty — the schema describes
+    # the shape; these checks never crash on it.
+    sentinels_value = data.get("sentinels")
+    sentinels = sentinels_value if isinstance(sentinels_value, dict) else {}
+    paths_value = data.get("paths")
+    paths = paths_value if isinstance(paths_value, dict) else {}
+    risk_globs_value = paths.get("risk")
+    risk_globs = risk_globs_value if isinstance(risk_globs_value, dict) \
+        else {}
+    for flag, entries in sentinels.items():
+        if not risk_globs.get(flag):
+            count = len(entries) if hasattr(entries, "__len__") else 0
+            out.append(("baseline", (
+                f"{origin}: sentinels.{flag} has no paths.risk globs, so its "
+                f"{count} sentinel(s) could never run — add "
+                f"paths.risk.{flag} globs or drop the sentinels key "
+                "(a skipped-forever sentinel reads as checked when it can't be)"
+            )))
+    # F-65 AC-4: generated-path globs obey the declared-scope rules —
+    # a catch-all or climbing pattern would widen every task's scope
+    # implicitly, so it refuses at load, the pattern named.
+    generated = paths.get("generated")
+    if isinstance(generated, list):
+        for pattern in generated:
+            reason = scope_pattern_error(pattern)
+            if reason is not None:
+                out.append(("scope", (
+                    f"{origin}: paths.generated pattern {pattern!r} {reason} "
+                    "(F-65)"
+                )))
+    # F-62 AC-3: the profile's name feeds the same factory-root path
+    # builders the queue's project does; the schema's ``^…$`` pattern
+    # admits a trailing newline (Python re ``$``), so the fullmatch
+    # here is the load-bearing spelling (queue-side: validate_queue).
+    # Runs BEFORE the control-string walk (F-63 R2-1) so a bad name gets
+    # the slug refusal that NAMES the value, not the control-character
+    # one that names the key path — the slug rule subsumes controls.
+    if "name" in data:
+        try:
+            project_component(data["name"])
+        except ProjectSlugError as exc:
+            out.append(("baseline", f"{origin}: {exc}"))
+    # F-63 AC-3: exact-host egress entries, refused at load (see
+    # _check_allowlist_hosts).
+    out.extend(("allowlist", message)
+               for message in _allowlist_host_violations(data, origin))
+    # F-63 R2-1(b): no control character in ANY profile string — the
+    # profile feeds the approval prompt and the run's own paths.
+    out.extend(("baseline", message)
+               for message in _control_string_violations(
+                   data, origin, "profile", free_text_newline=False))
+    try:
+        toolkit_section = data.get("toolkit")
+        if toolkit_section is None or isinstance(toolkit_section, dict):
+            _check_profile_toolkit(toolkit_section, origin,
+                                   toolkit_root=toolkit_root)
+        # a non-dict toolkit section is the schema's to describe (F-66
+        # R2: total, never a crash)
+    except ContractError as exc:
+        out.append(("baseline", str(exc)))
+    return out
 
 
 def _check_profile_semantics(data: dict, origin: str, *,
@@ -1174,64 +1355,10 @@ def _check_profile_semantics(data: dict, origin: str, *,
     Raises:
         ContractError: On the first semantic violation found.
     """
-    _check_provider_semantics(data, origin)
-    # F-71 AC-3: a budget floor above the task schema's F-64 caps would
-    # refuse every contract (nothing could satisfy it), so it refuses at
-    # load, the field named.
-    floor = data.get("budget_floor")
-    if isinstance(floor, dict):
-        for field, cap in budget_caps().items():
-            value = floor.get(field)
-            if isinstance(value, int) and not isinstance(value, bool) \
-                    and value > cap:
-                raise ContractError(
-                    f"{origin}: budget_floor.{field} is {value}, above the "
-                    f"task budget cap of {cap} (F-64) — a floor no contract "
-                    "can satisfy; lower the floor or raise the cap by owner "
-                    "decision"
-                )
-    sentinels = data.get("sentinels") or {}
-    risk_globs = (data.get("paths") or {}).get("risk") or {}
-    for flag, entries in sentinels.items():
-        if not risk_globs.get(flag):
-            raise ContractError(
-                f"{origin}: sentinels.{flag} has no paths.risk globs, so its "
-                f"{len(entries)} sentinel(s) could never run — add "
-                f"paths.risk.{flag} globs or drop the sentinels key "
-                "(a skipped-forever sentinel reads as checked when it can't be)"
-            )
-    # F-65 AC-4: generated-path globs obey the declared-scope rules —
-    # a catch-all or climbing pattern would widen every task's scope
-    # implicitly, so it refuses at load, the pattern named.
-    generated = (data.get("paths") or {}).get("generated")
-    if isinstance(generated, list):
-        for pattern in generated:
-            reason = scope_pattern_error(pattern)
-            if reason is not None:
-                raise ContractError(
-                    f"{origin}: paths.generated pattern {pattern!r} {reason} "
-                    "(F-65)"
-                )
-    # F-62 AC-3: the profile's name feeds the same factory-root path
-    # builders the queue's project does; the schema's ``^…$`` pattern
-    # admits a trailing newline (Python re ``$``), so the fullmatch
-    # here is the load-bearing spelling (queue-side: validate_queue).
-    # Runs BEFORE the control-string walk (F-63 R2-1) so a bad name gets
-    # the slug refusal that NAMES the value, not the control-character
-    # one that names the key path — the slug rule subsumes controls.
-    if "name" in data:
-        try:
-            project_component(data["name"])
-        except ProjectSlugError as exc:
-            raise ContractError(f"{origin}: {exc}") from exc
-    # F-63 AC-3: exact-host egress entries, refused at load (see
-    # _check_allowlist_hosts).
-    _check_allowlist_hosts(data, origin)
-    # F-63 R2-1(b): no control character in ANY profile string — the
-    # profile feeds the approval prompt and the run's own paths.
-    _check_control_strings(data, origin, "profile", free_text_newline=False)
-    _check_profile_toolkit(data.get("toolkit"), origin,
-                           toolkit_root=toolkit_root)
+    violations = _profile_semantic_violations(
+        data, origin, toolkit_root=toolkit_root)
+    if violations:
+        raise ContractError(violations[0][1])
 
 
 def runner_config_policy(schema_path: Path | None = None) -> dict:

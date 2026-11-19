@@ -2616,6 +2616,14 @@ class TaskQueue:
         """
         candidate = copy.deepcopy(self.doc)
         candidate["updated_at"] = now_iso()
+        # F-66 AC-1: every factory write stamps the queue's top-level
+        # version as the current contract epoch — the ONE automatic
+        # rewrite (epochs.json's restamp-version): it runs only on a
+        # queue that already validates under the current rules (the
+        # load above refused anything else) and touches no task field,
+        # so no approved contract's hash covers it.
+        from factory.epochs import stamp_version
+        stamp_version(candidate)
         try:
             validate_queue(candidate, str(self.path), self._schema_path)
             with self._exclusive_lock():

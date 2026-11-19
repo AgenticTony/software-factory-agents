@@ -98,6 +98,7 @@ FACTORY_ROOT_PINNED_MODULES = (
     "factory.approve",
     "factory.cli",
     "factory.dashboard",
+    "factory.doctor",
     "factory.eval",
     "factory.importer",
     "factory.orchestrator",

@@ -293,14 +293,27 @@ class ApprovalLedger(ProgressLog):
     def record_profile_for(self, profile: dict, *,
                            approved_by: str = "owner") -> dict:
         """Record approval of the profile's security-relevant content
-        (the SAME loaded-and-defaulted dict the run will use)."""
-        return self._append({
+        (the SAME loaded-and-defaulted dict the run will use).
+
+        F-66 AC-2: the entry also records the profile's repo path
+        (expanded+resolved, exactly the form the ``repo.path`` security
+        group hashes), so ``factory doctor`` can enumerate every
+        onboarded repo from the ledger alone. Approvals that predate
+        the field lack it; doctor names the re-approval owed."""
+        repo_path = (profile.get("repo") or {}).get("path") \
+            if isinstance(profile.get("repo"), dict) else None
+        entry = {
             "kind": "profile",
             "project": self.project,
             "groups": profile_group_hashes(profile),
             "approved_by": approved_by,
             "approved_at": now_iso(),
-        })
+        }
+        if isinstance(repo_path, str) and repo_path:
+            entry["repo_path"] = str(
+                Path(repo_path).expanduser().resolve()
+            )
+        return self._append(entry)
 
     # ------------------------------------------------- F-72 escalation waivers --
 

@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factory.local/schema/epochs.schema.json",
+  "title": "Contract epoch register (factory/data/schema/epochs.json, F-66)",
+  "description": "The declared history of every rule change the factory loads a project under. Each entry: the epoch number, its date, the work order, the surfaces it tightens (queue, profile, or both), what changed in one line, whether it tightens, the check tags it introduced (doctor maps a violation to its epoch through them), and its migration — a named automatic rewrite (IMPLEMENTED_AUTOMATIC only) or an owner action with the exact command. Only the LATEST entry carries the fingerprint CI compares the live rule surfaces against. Loader-side structural rules (factory/epochs.py): a tightening must raise the epoch by exactly one; a non-tightening entry must not raise it; an automatic migration must name an implemented rewrite.",
+  "type": "object",
+  "required": ["entries"],
+  "additionalProperties": false,
+  "properties": {
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["epoch", "date", "wo", "surfaces", "change", "tightens", "migration"],
+        "additionalProperties": false,
+        "properties": {
+          "epoch": { "type": "integer", "minimum": 1, "description": "The contract epoch this entry belongs to. The current epoch is the highest number; it is stamped as the queue's version on every factory write." },
+          "date": { "type": "string", "format": "date", "description": "When the change landed (YYYY-MM-DD)." },
+          "wo": { "type": "string", "minLength": 1, "description": "The work order that changed the rules." },
+          "surfaces": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": { "enum": ["queue", "profile"] },
+            "description": "Which rule surfaces the entry tightens or touches."
+          },
+          "change": { "type": "string", "minLength": 1, "description": "What changed, in one line — this is what a stale project is told." },
+          "tightens": { "type": "boolean", "description": "True when the change refuses something that loaded before. A tightening must raise the epoch; a refactor/addition/loosening records false and leaves the epoch where it is." },
+          "checks": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": { "type": "string", "minLength": 1 },
+            "description": "The violation tags this epoch introduced (budget, scope, provider, allowlist). factory doctor maps a violation to the epoch whose entry claims its tag; unclaimed tags attribute to epoch 1 (baseline)."
+          },
+          "migration": {
+            "type": "object",
+            "required": ["kind"],
+            "additionalProperties": false,
+            "properties": {
+              "kind": { "enum": ["none", "owner_action", "automatic"] },
+              "command": { "type": "string", "minLength": 1, "description": "kind=owner_action: the exact command the owner runs (a real factory subcommand)." },
+              "name": { "type": "string", "minLength": 1, "description": "kind=automatic: the named rewrite, from IMPLEMENTED_AUTOMATIC (restamp-version). The only edits a migration may make without a session; never on an approved task's contract fields." },
+              "note": { "type": "string", "description": "Scope conditions and per-task paths the command alone cannot say." }
+            }
+          },
+          "fingerprint": {
+            "type": "object",
+            "required": ["schemas", "functions"],
+            "additionalProperties": false,
+            "description": "ONLY the latest entry may carry it: sha256 per schema file (raw bytes) and per rule-bearing top-level binding of factory/contract.py. A change to any of them without a new/updated entry fails CI.",
+            "properties": {
+              "schemas": {
+                "type": "object",
+                "minProperties": 2,
+                "additionalProperties": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+              },
+              "functions": {
+                "type": "object",
+                "minProperties": 1,
+                "additionalProperties": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

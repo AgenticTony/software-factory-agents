@@ -2,9 +2,9 @@
 
 ``approve`` (F-04), ``run`` and ``loop`` (F-10), ``status`` (F-11),
 ``tick`` (F-29), ``trace`` (F-30), ``sentinels replay`` (F-33),
-``import`` (F-12) and ``toolkit vet`` (F-22) are real. Every other
-subcommand is a stub naming the work order that implements it
-(BUILD-ORDER.md).
+``import`` (F-12), ``toolkit vet`` (F-22) and ``doctor`` (F-66) are
+real. Every other subcommand is a stub naming the work order that
+implements it (BUILD-ORDER.md).
 """
 
 import argparse
@@ -434,6 +434,23 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"importer session wall-clock budget in minutes, above 0 and "
              f"at most {TIMEOUT_MIN_CEILING:g} (default: scaled with the "
              "planning docs, from 20)",
+    )
+
+    doctor_cmd = sub.add_parser(
+        "doctor",
+        help="read-only health check of every onboarded project (F-66): "
+             "the approval ledger's repos plus --repo, every violation "
+             "through all-errors loaders, each with its contract epoch, "
+             "the work order that introduced it and the exact fix",
+    )
+    doctor_cmd.add_argument(
+        "--repo", action="append", default=None, metavar="PATH",
+        help="a repo to check in addition to every repo the approval "
+             "ledger records (repeatable)",
+    )
+    doctor_cmd.add_argument(
+        "--factory-root", default=None,
+        help="factory root holding the approval ledger (default: ~/factory)",
     )
 
     for name, wo in STUBS.items():
@@ -927,6 +944,32 @@ def _run_toolkit_vet(args: argparse.Namespace) -> int:
     return 0 if result.clean else 1
 
 
+def _run_doctor(args: argparse.Namespace) -> int:
+    """Dispatch the doctor subcommand (F-66 AC-2). Read-only: reports
+    every finding for every repo the approval ledger records plus any
+    ``--repo``, exits 1 on any finding, 0 with a clean summary. Known
+    failures exit 2 with a message, never a traceback."""
+    from factory import doctor
+    from factory.epochs import EpochError
+
+    root = Path(args.factory_root) if args.factory_root else None
+    try:
+        reports = doctor.factory_report(root, extra_repos=[
+            Path(repo) for repo in (args.repo or [])
+        ])
+        print(doctor.render(reports), end="")
+        clean = [report for report in reports if not report.findings]
+        if reports and len(clean) == len(reports):
+            print("factory doctor: all checked repos clean")
+        return 0 if len(clean) == len(reports) else 1
+    except (ContractError, EpochError, OSError) as exc:
+        print(f"factory doctor: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("factory doctor: interrupted", file=sys.stderr)
+        return 130
+
+
 def _run_extra(result) -> str:
     """The detail printed after a run's outcome.
 
@@ -1085,6 +1128,8 @@ def main(argv: list | None = None) -> int:
         return _run_eval(args)
     if args.command == "import":
         return _run_import(args)
+    if args.command == "doctor":
+        return _run_doctor(args)
     print(
         f"factory {args.command}: not implemented yet (scheduled in {STUBS[args.command]})",
         file=sys.stderr,

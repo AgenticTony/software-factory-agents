@@ -853,7 +853,12 @@ def test_reimport_preserves_the_queues_key_order(tmp_path: Path):
     """#61 finding 2, fixture form: a queue written by TaskQueue (keys
     version, project, updated_at, tasks) re-imports with no diff."""
     queue_path = tmp_path / "tasks.json"
-    doc = {"version": 1, "project": "proj", "updated_at": "2026-10-01T00:00:00Z",
+    # F-66: an unchanged re-import of a CURRENT-epoch queue has no
+    # diff; the write path stamps the epoch, so a version-1 fixture
+    # would (correctly) show the re-stamp as a change.
+    from factory.epochs import current_epoch
+    doc = {"version": current_epoch(), "project": "proj",
+           "updated_at": "2026-10-01T00:00:00Z",
            "tasks": [{**_wo("WO-1"), "status": "draft", "attempts": []}]}
     queue_path.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
     loaded = load_tasks(queue_path)

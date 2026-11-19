@@ -20,6 +20,7 @@
       "description": "kind=profile: group name -> SHA-256 of that group's canonical content (a missing key hashes as null). Group names: factory.approvals.PROFILE_SECURITY_GROUPS.",
       "additionalProperties": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
     },
+    "repo_path": { "type": "string", "minLength": 1, "description": "kind=profile (F-66): the profile's repo.path, expanded+resolved — the form the repo.path security group hashes. What `factory doctor` enumerates onboarded repos from; approvals recorded before F-66 lack it and doctor names the re-approval owed. Never load-bearing for any approval decision (the hash is)." },
     "escalation": { "type": "string", "enum": ["new_dependency", "risk_path_touched"], "description": "kind=escalation_waiver: the ONE class waived (F-72 AC-4 — the only two classes recover --accept answers)." },
     "sha": { "type": "string", "pattern": "^[0-9a-f]{40,64}$", "description": "kind=escalation_waiver: the exact PR head SHA the waiver covers; any new commit on the branch voids it." },
     "released_sha": { "type": "string", "pattern": "^[0-9a-f]{40,64}$", "description": "kind=escalation_waiver, optional (F-72 R2-F1 guard 2): the clean commit the accept released (same parent, same tree, no [skip ci], lease-pushed) — the sweep's waiver match accepts it as the same acceptance; any other new commit matches neither and voids the waiver." },

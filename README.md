@@ -41,6 +41,27 @@ the public internet) are deselected by the main CI job and run in the named
 `live-network` job instead. CI (`.github/workflows/ci.yml`) runs the same
 steps plus the `typecheck` (pyright) and `wheel` install jobs.
 
+## Operating: doctor every onboarded project (F-66)
+
+`factory doctor [--repo PATH] [--factory-root ROOT]` is a read-only health
+check of every repo the approval ledger records (each profile approval
+carries its repo path) plus any `--repo` given. It loads each repo's
+profile and queue through all-errors modes of the real loaders and reports
+every finding — schema and semantic violations, tasks approval would refuse
+(a missing `scope.paths`, an over-cap budget), profile approvals that no
+longer match, a queue older than the current contract epoch — each with
+the epoch, the work order that introduced the rule, and the exact fix
+command. Any finding exits non-zero; a clean repo prints `clean` and exits
+0. It starts no session and writes nothing.
+
+`factory run`/`loop`/`import` run the same checks for their own repo
+first and refuse with the full report instead of one bare schema error
+(the F-13 pilot met three rule changes that way). A queue that fails
+validation but still parses, with every task `draft`, is re-proposed by
+`factory import` under the current rules — you review the whole diff as
+a first import; a task past `draft`, or a file that doesn't parse,
+refuses with the tasks named.
+
 ## Operating: review a contract before you approve it (F-80)
 
 `factory review-contract <task-id>` runs one read-only model session that
