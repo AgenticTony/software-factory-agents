@@ -1,7 +1,7 @@
 {
   "version": 5,
   "project": "software-factory",
-  "updated_at": "2026-11-19T13:00:21Z",
+  "updated_at": "2026-11-19T22:37:31Z",
   "tasks": [
     {
       "id": "F-00",
@@ -7258,7 +7258,7 @@
       "source": "BUILD-ORDER.md#f-100--every-model-the-factory-uses-is-set-in-one-place-and-each-project-picks-a-stack",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-96"
       ],
@@ -7393,7 +7393,10 @@
           "VALIDATOR-SPEC.md",
           "docs/provider-options-2026-11-05.md"
         ]
-      }
+      },
+      "acceptance_hash": "1001c59ee1a456406ff38577945eea145624008ba31a7637fa764e8db09f290b",
+      "approved_at": "2026-11-19T22:37:31Z",
+      "approved_by": "Anthony"
     }
   ]
 }
