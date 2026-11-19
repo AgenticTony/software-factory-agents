@@ -1,7 +1,7 @@
 {
   "version": 4,
   "project": "software-factory",
-  "updated_at": "2026-11-19T06:52:20Z",
+  "updated_at": "2026-11-19T13:00:21Z",
   "tasks": [
     {
       "id": "F-00",
@@ -7100,7 +7100,7 @@
       "source": "BUILD-ORDER.md#f-101--accepting-an-escalated-pr-works-when-its-branch-exists-only-on-github",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-96"
       ],
@@ -7160,7 +7160,10 @@
         ]
       },
       "attempts": [],
-      "links": {}
+      "links": {},
+      "acceptance_hash": "70bc4bcb8b3ae8920b13865cdd41b8fd498c5a84814aaa28e0579dca719f65a2",
+      "approved_at": "2026-11-19T13:00:18Z",
+      "approved_by": "Anthony"
     },
     {
       "acceptance": [
@@ -7243,8 +7246,11 @@
         ]
       },
       "source": "BUILD-ORDER.md#f-102--the-evals-drop-cost-line-counts-only-drops-that-cost-a-catch-and-the-eval-says-what-it-ran",
-      "status": "draft",
-      "title": "The eval's drop-cost line counts only drops that cost a catch, and the eval says what it ran"
+      "status": "done",
+      "title": "The eval's drop-cost line counts only drops that cost a catch, and the eval says what it ran",
+      "acceptance_hash": "4f6547537a03fa036ed5070be669cca1542fc88a5d3fffb3249764f0363b5358",
+      "approved_at": "2026-11-19T13:00:21Z",
+      "approved_by": "Anthony"
     }
   ]
 }
