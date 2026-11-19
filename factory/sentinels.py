@@ -632,9 +632,17 @@ def _flag_weakened_assertions(change, scan_path: str, findings: list) -> None:
     on code lines — so an honest consolidation that reduces the count
     still escalates to a human, exactly as F-25 intended.
     """
+    # A removed line that held nothing but string content in the base
+    # file (docstring prose: "the phrase assertion went red…") removed
+    # no assertion — JobFinderOS J-1 failed L0 on every attempt for
+    # deleting a helper whose docstring said "assertion". Only Python
+    # bases the tokenizer read carry the set; everything else keeps the
+    # broad scan.
+    in_strings = getattr(change, "removed_in_strings", frozenset())
     removed = [
         (no, text) for no, text in change.removed_lines
-        if _is_code_line(text) and any(p.search(text) for p in ASSERTION_PATTERNS)
+        if no not in in_strings
+        and _is_code_line(text) and any(p.search(text) for p in ASSERTION_PATTERNS)
     ]
     added = [
         text.strip() for _no, text in change.added_lines

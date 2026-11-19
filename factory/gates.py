@@ -9,8 +9,10 @@ drifting between layer modules. The layer modules (``factory.l0``,
 
 import fnmatch
 import functools
+import io
 import re
 import subprocess
+import tokenize
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, ClassVar
@@ -90,6 +92,11 @@ class FileChange:
     from the unified diff (new-file / old-file numbering respectively);
     name-status-only diffs leave them empty. For renames, ``path`` is the
     new path, ``old_path`` the previous one.
+
+    ``removed_in_strings``: the old-file line numbers of a Python file
+    that hold nothing but string content (docstring prose, the inside of
+    a multi-line string) — see :func:`string_only_lines`. Empty for any
+    other file, and for a base Python can't tokenize.
     """
 
     path: str
@@ -97,6 +104,7 @@ class FileChange:
     old_path: str | None = None
     added_lines: list = field(default_factory=list)
     removed_lines: list = field(default_factory=list)
+    removed_in_strings: frozenset = field(default_factory=frozenset)
 
 
 @dataclass
@@ -495,7 +503,64 @@ def diff_file_changes(repo: Path, base_ref: str, head_ref: str) -> list:
     for change in changes:
         added, removed = hunks.get(change.path, ([], []))
         change.added_lines, change.removed_lines = added, removed
+    _mark_removed_string_lines(repo, base_ref, head_ref, changes)
     return changes
+
+
+def _mark_removed_string_lines(repo: Path, base_ref: str, head_ref: str,
+                               changes: list) -> None:
+    """Set ``removed_in_strings`` on each changed Python file that lost
+    lines: the base side of ``base...head`` is the merge-base, so its
+    copy of the file is the one the removed line numbers index. Any git
+    failure leaves the set empty — the sentinels' broad scan stands."""
+    wanted = [c for c in changes if c.removed_lines
+              and (c.old_path or c.path).endswith(".py")]
+    if not wanted:
+        return
+    try:
+        merge_base = git(repo, "merge-base", base_ref, head_ref).strip()
+    except GateError:
+        return
+    for change in wanted:
+        try:
+            source = git(repo, "show", f"{merge_base}:{change.old_path or change.path}",
+                         errors="replace")
+        except GateError:
+            continue
+        change.removed_in_strings = string_only_lines(source)
+
+
+_NON_CODE_TOKENS = frozenset({
+    tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT,
+    tokenize.COMMENT, tokenize.ENDMARKER, tokenize.ENCODING,
+})
+_STRING_TOKENS = frozenset(
+    {tokenize.STRING}
+    | {getattr(tokenize, name) for name in
+       ("FSTRING_START", "FSTRING_MIDDLE", "FSTRING_END",
+        "TSTRING_START", "TSTRING_MIDDLE", "TSTRING_END")
+       if hasattr(tokenize, name)}
+)
+
+
+def string_only_lines(source: str) -> frozenset:
+    """The 1-based lines of Python ``source`` that hold nothing but
+    string content: a docstring's lines, the inside of a multi-line
+    string. A line any code token touches (a name, an operator, a
+    number — ``assert x, "message"`` included) is never in the set, so a
+    real assertion can never hide here. Source Python cannot tokenize
+    gives the empty set: the caller's broad scan stands (fail safe)."""
+    string_rows: set[int] = set()
+    code_rows: set[int] = set()
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+            if tok.type in _NON_CODE_TOKENS:
+                continue
+            rows = range(tok.start[0], tok.end[0] + 1)
+            (string_rows if tok.type in _STRING_TOKENS else code_rows).update(rows)
+    except (tokenize.TokenError, SyntaxError, ValueError):
+        return frozenset()
+    return frozenset(string_rows - code_rows)
 
 
 def _unquote_git_path(token: str) -> str:
