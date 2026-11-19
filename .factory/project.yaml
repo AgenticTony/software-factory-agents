@@ -425,6 +425,13 @@ paths:
     # and the drop-cost rendering — the numbers `factory eval` reports
     # to the owner rest on them (the test_f95 precedent).
     - "tests/test_f99.py"
+    # F-101: the accept-path contract tests judge what `recover
+    # --accept` validates (the real ref, the reachability proof, the
+    # unfiltered work clone, the by-ref clean clone) — the tests that
+    # keep the accept from ever judging a commit the owner did not
+    # review (same precedent).
+    - "tests/test_f101.py"
+    - "tests/_support/f101.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 
