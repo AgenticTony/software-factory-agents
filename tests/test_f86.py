@@ -48,7 +48,7 @@ IN_PEAK = datetime(2026, 11, 16, 9, 0, tzinfo=STOCKHOLM)  # a Monday
 
 def test_ac_1(tmp_path):
     """One repair round per attempt: a purely mechanical lint failure gets
-    ONE implementer-seat session in the same clone (cap 10, funded by the
+    ONE implementer-seat session in the same clone (LINT_REPAIR_TURN_CAP, funded by the
     attempt's own budgets), the full L0 runs again, and a pass continues
     to L1 and review as if L0 had passed first time."""
     env = env86(tmp_path)
@@ -71,7 +71,11 @@ def test_ac_1(tmp_path):
 
     # ONE repair ran, in the same clone, at the named cap.
     assert seats.repairs == 1
-    assert seats.repair_kwargs[0]["max_turns"] == LINT_REPAIR_TURN_CAP == 10
+    # The named cap, shrunk to what the attempt's implementer budget
+    # still holds: the fixture's 20-turn budget minus the 3 turns the
+    # implementer used (LINT_REPAIR_TURN_CAP is 20 since 2026-11-20).
+    assert LINT_REPAIR_TURN_CAP == 20
+    assert seats.repair_kwargs[0]["max_turns"] == min(LINT_REPAIR_TURN_CAP, 20 - 3)
     # its wall window is what remains beyond the review reserve
     assert 0 < seats.repair_kwargs[0]["timeout_min"] <= 15.0
 
