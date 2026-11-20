@@ -1055,7 +1055,6 @@
     "tests/test_f57.py::test_r2_1_each_contract_field_alone_demotes[risk-override0]": 0.19260783400386572,
     "tests/test_f57.py::test_r2_1_not_buildable_and_draft_are_left": 0.29951095796423033,
     "tests/test_f57.py::test_r2_2_forged_propose_calls_never_render[-1]": 0.2874635000480339,
-    "tests/test_f57.py::test_r2_2_forged_propose_calls_never_render[SEAT-TOKEN-zqy3e0lzilzlkys31vmykt6r]": 0.34090933395782486,
     "tests/test_f57.py::test_r2_2_forged_propose_calls_never_render[True]": 0.3796468750224449,
     "tests/test_f57.py::test_r2_2_forged_propose_calls_never_render[calls1]": 0.31708433403400704,
     "tests/test_f57.py::test_r2_2_forged_repair_turns_never_render": 1.2338511670241132,
