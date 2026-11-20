@@ -428,13 +428,14 @@ def test_ac_4():
     while it provably cannot resolve below the floor.
     """
     pins = _dev_extras()
-    for tool in ["pytest", "ruff", "pytest-xdist", "pyright", "build"]:
+    # pytest-split decides which tests each CI shard runs: a gate tool.
+    for tool in ["pytest", "ruff", "pytest-xdist", "pytest-split", "pyright", "build"]:
         assert tool in pins, f"{tool} missing from the dev extra"
     for tool in ["pytest", "ruff"]:  # the gate's own tools, the letter of m-22
         assert re.fullmatch(re.escape(tool) + r"==\d+(\.\d+)*", pins[tool]), (
             f"{tool} is not exactly pinned: {pins[tool]!r}"
         )
-    for tool in ["pyright", "build", "pytest-xdist"]:  # gate tools, same rule
+    for tool in ["pyright", "build", "pytest-xdist", "pytest-split"]:  # gate tools, same rule
         assert re.fullmatch(re.escape(tool) + r"==\d+(\.\d+)*", pins[tool]), (
             f"{tool} is not exactly pinned: {pins[tool]!r}"
         )

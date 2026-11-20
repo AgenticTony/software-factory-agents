@@ -346,7 +346,9 @@ def test_ac_3():
     sandbox = jobs[sandbox_ids[0]]
     pytest_steps = [s.get("run", "").strip() for s in sandbox["steps"]
                     if "pytest" in s.get("run", "")]
-    assert pytest_steps == ['pytest -q -n auto -m "not live_network"'], (
+    assert pytest_steps == [
+        'pytest -q -n auto -m "not live_network" --splits 3 --group ${{ matrix.group }}'
+    ], (
         f"the sandbox job's pytest step must deselect exactly live_network, "
         f"got {pytest_steps!r}"
     )
@@ -375,6 +377,14 @@ def test_ac_3():
     # a separately named job still selects exactly live_network.
     assert sandbox["strategy"]["fail-fast"] is False
     assert sandbox["strategy"]["matrix"]["python-version"] == ["3.11", "3.13"]
+    # The shards: the --splits count in the step equals the matrix's
+    # group list, numbered 1..N, so no group number is missing (a
+    # missing group is a third of the suite silently never run).
+    splits = int(re.search(r"--splits (\d+)", pytest_steps[0]).group(1))
+    assert sandbox["strategy"]["matrix"]["group"] == list(range(1, splits + 1)), (
+        f"--splits {splits} needs matrix groups 1..{splits}, got "
+        f"{sandbox['strategy']['matrix']['group']!r}"
+    )
     live_jobs = [jid for jid, text in steps_text.items()
                  if "pytest" in text and "live_network" in text
                  and "not live_network" not in text]
@@ -1470,3 +1480,36 @@ def test_r3_github_accepts_the_workflow():
                 f"{job_id} step {index}: exactly one of run/uses required, "
                 f"got {has}"
             )
+
+
+def test_ci_shards_run_the_whole_suite():
+    """The CI shards are a partition: each group's collection (the
+    sandbox job's own command, its --splits N, every --group 1..N) is
+    disjoint from the others and together they are exactly the unsharded
+    collection — a test the durations file does not know still lands in
+    one group. Collection only: nothing runs."""
+    jobs = yaml.safe_load(CI_YML.read_text())["jobs"]
+    sandbox = next(job for job in jobs.values()
+                   if "bubblewrap" in "\n".join(s.get("run", "") for s in job["steps"]))
+    step = next(s["run"].strip() for s in sandbox["steps"] if "pytest" in s.get("run", ""))
+    splits = int(re.search(r"--splits (\d+)", step).group(1))
+    assert (REPO / ".test_durations").is_file(), "the shards' durations file is missing"
+
+    def collected(*extra: str) -> set[str]:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", "--collect-only", "-q",
+             "-p", "no:cacheprovider", "-m", "not live_network", *extra],
+            cwd=REPO, capture_output=True, text=True,
+        )
+        assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-2000:]
+        return {line.strip() for line in proc.stdout.splitlines() if "::" in line}
+
+    whole = collected()
+    groups = [collected("--splits", str(splits), "--group", str(n))
+              for n in range(1, splits + 1)]
+    assert whole, "the unsharded collection is empty"
+    for i, a in enumerate(groups):
+        for b in groups[i + 1:]:
+            assert not (a & b), f"a test runs in two shards: {sorted(a & b)[:5]}"
+    missing = whole - set().union(*groups)
+    assert not missing, f"tests no shard runs: {sorted(missing)[:10]}"

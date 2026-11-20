@@ -24,6 +24,13 @@ jobs:
       matrix:
         # 3.11 = declared floor (requires-python); 3.13 = local dev version
         python-version: ["3.11", "3.13"]
+        # The suite runs in three duration-balanced shards per interpreter
+        # (pytest-split, timings in .test_durations): one job held ~35 min
+        # of end-to-end gate tests. Every test lands in exactly one group,
+        # so the three groups together are the whole suite — pinned by
+        # tests/test_f58.py (the shard count equals the group list, and
+        # the groups' collections are disjoint and cover the full run).
+        group: [1, 2, 3]
     steps:
       # Full history, not the default depth-1 shallow checkout: create_run
       # makes `git clone --filter=blob:none` partial clones of this repo, and
@@ -62,7 +69,7 @@ jobs:
       # mandatory here; only the internet-dependent tests move to the
       # live-network job (an endpoint outage reddens that named job, not
       # every PR).
-      - run: pytest -q -n auto -m "not live_network"
+      - run: pytest -q -n auto -m "not live_network" --splits 3 --group ${{ matrix.group }}
 
   live-network-ubuntu-2404:
     name: live-network (ubuntu-24.04)
