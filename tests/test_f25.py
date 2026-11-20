@@ -1055,3 +1055,77 @@ def test_review13_skip_marker_findings_redact_their_line_echo(tmp_path):
     dumped = json.dumps(report.to_dict())
     assert token not in dumped
     assert "[redacted]" in dumped
+
+
+# --- removed docstring prose is not a removed assertion ----------------------
+
+_DOC_HELPER_BASE = textwrap.dedent(
+    '''
+    import re
+
+
+    def _normws(text):
+        """Collapse whitespace: the WO-21 phrase assertion went red on the
+        ubuntu runner exactly this way, so containment is compared
+        wrap-insensitively."""
+        return re.sub(r"\\s+", " ", text).strip()
+
+
+    def test_phrase():
+        """Every part of the name, extracted and asserted."""
+        assert _normws("a  b") == "a b"
+    '''
+).lstrip()
+
+
+def test_removed_docstring_prose_is_not_a_removed_assertion(tmp_path):
+    """JobFinderOS J-1: deleting a helper whose DOCSTRING says
+    'assertion' (and a one-line docstring saying 'asserted') removed no
+    assertion; every real assert stayed. The weakened-test guard read
+    the prose lines as deleted assertions and failed L0 on every
+    attempt, though the contract required deleting that helper."""
+    repo = _repo(tmp_path, "doc", {"tests/test_a.py": _DOC_HELPER_BASE})
+    _change(repo, {"tests/test_a.py": textwrap.dedent(
+        '''
+        from app.text import squash
+
+
+        def test_phrase():
+            assert squash("a  b") == "a b"
+        '''
+    ).lstrip()})
+    report = _run(repo)
+    assert "assertion_removed" not in _finding_ids(report), [
+        f.text for f in report.findings]
+
+
+def test_guard_still_counts_real_asserts_beside_removed_docstrings(tmp_path):
+    """The other side: a real assert removed in the same diff as
+    docstring prose is still flagged — and the finding names the assert
+    line, never the prose. An assert carrying a string message is a code
+    line, never skipped."""
+    repo = _repo(tmp_path, "real", {"tests/test_a.py": _DOC_HELPER_BASE + (
+        '\n\ndef test_msg():\n    assert _normws("x") == "x", "keeps one '
+        'assertion message"\n')})
+    _change(repo, {"tests/test_a.py": "def test_phrase():\n    pass\n"})
+    report = _run(repo)
+    removed = [f for f in report.findings if f.id == "assertion_removed"]
+    assert removed, "deleted real asserts must still flag"
+    flagged = " ".join(f.text for f in removed)
+    assert 'assert _normws("a  b") == "a b"' in flagged, flagged
+    assert "keeps one assertion message" in flagged, flagged
+    assert "phrase assertion went red" not in flagged, flagged
+    assert "extracted and asserted" not in flagged, flagged
+
+
+def test_untokenizable_base_keeps_the_broad_scan(tmp_path):
+    """A base file Python cannot tokenize gets today's broad scan — a
+    format the tokenizer cannot read fails safe (flags), never quiet."""
+    broken = ('def test_a(:\n    """the phrase assertion went red"""\n'
+              "    assert total() == 3\n")
+    repo = _repo(tmp_path, "broken", {"tests/test_a.py": broken})
+    _change(repo, {"tests/test_a.py": "def test_a():\n    total()\n"})
+    report = _run(repo)
+    flagged = " ".join(f.text for f in report.findings
+                       if f.id == "assertion_removed")
+    assert "phrase assertion went red" in flagged, flagged
