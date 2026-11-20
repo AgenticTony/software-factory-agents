@@ -341,6 +341,9 @@ def test_ac_4():
             "pytest -q", "pytest -q -n auto",
             'pytest -q -m "not live_network"',
             'pytest -q -n auto -m "not live_network"',
+            # Duration-balanced shards: tests/test_f58.py pins that the
+            # groups' collections are disjoint and cover the whole run.
+            'pytest -q -n auto -m "not live_network" --splits 3 --group ${{ matrix.group }}',
             "pytest -q -rs -m live_network",
         ), (
             f"the suite must run whole (no marker/path filters): {run!r}"

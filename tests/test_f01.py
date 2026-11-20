@@ -55,6 +55,9 @@ def test_ac_2():
     assert {
         "pytest -q", "pytest -q -n auto",
         'pytest -q -m "not live_network"', 'pytest -q -n auto -m "not live_network"',
+        # Duration-balanced shards; tests/test_f58.py pins that the
+        # groups together run the whole suite.
+        'pytest -q -n auto -m "not live_network" --splits 3 --group ${{ matrix.group }}',
         "pytest -q -rs -m live_network",
     } & set(runs), (
         "CI must run `pytest -q` as its own step"
