@@ -3,13 +3,11 @@
 name: software-factory
 
 # F-100: the registry stack this project runs (owner-maintained factory
-# config ~/factory/config.yaml `models`), and the seats the standard
-# stack names beyond the project's own zai (the defect-hunt reviewer and
-# the final-review tiers run anthropic; model_stack and
-# providers_allowed are F-63 security groups — re-approval owed).
+# config ~/factory/config.yaml `models`). `standard` is zai-only (owner
+# decision 2026-11-19), so this project allows no provider beyond its own
+# zai: a stack edit can never move its code to another provider without
+# a re-approved providers_allowed (both are F-63 security groups).
 model_stack: standard
-providers_allowed:
-  - anthropic
 
 repo:
   path: ~/Developer/Software_Factory_Agents
