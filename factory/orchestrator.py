@@ -273,20 +273,26 @@ _REVIEW_TURN_FLOOR = 2
 # session_end events, 2026-11-09): reviewer n=8 median 10 / max 15
 # turns; verifier n=1: 5 turns. 20/10 give headroom over the observed
 # maxima; the samples are thin — revisit after F-13's first runs.
-REVIEWER_TURN_CAP = 20
-VERIFIER_TURN_CAP = 10
+# Raised 2026-11-20 (owner: the factory must not stop on turn limits),
+# from the traces of every run to date: reviewer n=25 median 8 / max 16,
+# verifier n=13 median 5 / max 8, contract reviewer n=12 max 19 — and
+# one contract review (JobFinderOS J-2, 5 ACs over 7 files) failed at
+# 20. Each cap is now about 2.5x the largest observed use; wall-clock
+# limits still bound every session.
+REVIEWER_TURN_CAP = 40
+VERIFIER_TURN_CAP = 20
 # F-72 AC-2: the arbiter seat's fixed parent-side turn cap — the third
 # judge seat, granted like the reviewer's (never a remainder, never a
 # number a session record funds). Sized with REVIEWER_TURN_CAP: the
 # arbiter reads a contract, a diff and a handful of findings — the
 # reviewer's own workload minus the fan-out.
-ARBITER_TURN_CAP = 20
+ARBITER_TURN_CAP = 40
 # F-80 AC-1: the contract reviewer's fixed parent-side turn cap — the
 # pre-approval review reads one contract, its source document and as
 # much of the clone as the scope lens needs. Granted like the arbiter's
 # (never a remainder, never a number a session record funds); used by
 # factory.contractreview, which runs the seat outside any task run.
-CONTRACT_REVIEWER_TURN_CAP = 20
+CONTRACT_REVIEWER_TURN_CAP = 50
 # F-85 AC-1: the repair turn's fixed parent-side turn cap. A repair
 # resumes the SAME session (the SDK's resume) with one instruction —
 # re-emit the verdict/vote you just produced, correctly formatted. That
@@ -300,7 +306,7 @@ REPAIR_TURN_CAP = 4
 # second implementation). Granted like every F-64 cap (never a number a
 # session record funds), then shrunk to what the attempt's implementer
 # budget still holds.
-LINT_REPAIR_TURN_CAP = 10
+LINT_REPAIR_TURN_CAP = 20
 # F-86: the smallest implementer-turn remainder that may fund a repair
 # round — below it the repair is refused (the refusal names the cap),
 # because a session that cannot take one turn cannot fix anything.

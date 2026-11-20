@@ -630,8 +630,10 @@ def test_owner_confirmed_budget_values():
         FREE_QUOTA_REQUEUES_TOTAL,
     )
 
-    assert REVIEWER_TURN_CAP == 20
-    assert VERIFIER_TURN_CAP == 10
+    # Raised by the owner 2026-11-20 (from 20/10), sized from every
+    # run's traces: the factory must not stop on a review seat's turns.
+    assert REVIEWER_TURN_CAP == 40
+    assert VERIFIER_TURN_CAP == 20
     assert REVIEW_WALL_RESERVE_MIN == 15.0
     assert _MIN_IMPLEMENTER_WALL_MIN == 1.0
     assert FREE_QUOTA_REQUEUES_PER_DAY == 3

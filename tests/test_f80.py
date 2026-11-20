@@ -138,7 +138,7 @@ def test_ac_1(tmp_path: Path, monkeypatch, capsys):
 
     # (1) the seat: the verifier's exact sandbox contract, resolved
     # through the one resolver, defaulting to the reviewer's.
-    assert CONTRACT_REVIEWER_TURN_CAP == 20 == ARBITER_TURN_CAP
+    assert CONTRACT_REVIEWER_TURN_CAP == 50 and ARBITER_TURN_CAP == 40
     assert replace(SEATS["contract_reviewer"], name="verifier") == SEATS["verifier"]
     base = {"name": "p", "provider": {"kind": "anthropic", "models": {
         "implementer": "m-i", "reviewer": "m-r", "verifier": "m-v",
