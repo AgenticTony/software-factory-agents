@@ -1020,6 +1020,22 @@ Re-approval owed: profile (`tests/test_f102.py` protected; `test_f99`, `test_f96
 
 Residuals, named: the seed-side per-diff voided line still reads "L2 quota-voided, not judged" for any void (the aggregate `l2_quota_voided` count likewise) — the AC renamed the line that carries the reason (the clean-diff line); the seed-side rename touches two more protected suites and is a follow-up if the owner wants it; the union stores a drop PRE-ruling (`sibling_claim` beside a false `sibling`) — production behavior unchanged, but a future consumer of `verifier_dropped` must know the flag is unsettled there; the owner's paid `factory eval --repeats 3` after F-96 merges is the first run that produces the honest number.
 
+### F-106 — A run that records a merge acts on it in the same run
+
+Commit message: `fix: a run re-reads readiness after recording merges (F-106)`
+
+Status: **draft, 2026-11-21** (spec in `docs/next-work-orders.md` §F-106; from the JobFinderOS J-1 → J-3 handoff).
+
+`run_once` closes merged tasks and syncs readiness BEFORE the pick, but the gh-backed merge stamp (`links.merged`, the PR sweep) lands AFTER it. On 2026-11-20 the first `factory loop` after J-1's PR merged printed `-: idle` / `stopped (queue_empty)`: it stamped J-1 merged after picking nothing, and J-3 (depending on J-1) needed a second manual invocation. Every dependent pays one wasted loop and a human noticing.
+
+Acceptance:
+- AC-1 A run reports how many NEW `links.merged` stamps its sweep wrote (`RunResult.merges_stamped`; a stamp of a URL the task already held is not new, and 0 on outcomes reached before the sweep). `run_loop` treats an idle run with new stamps as go-again: the next pass's own close-merged and `sync_readiness` read the STAMPED QUEUE — F-93's one `_is_merged` definition, never the sweep's in-memory view — and pick the dependents the merge unblocked. An idle pass with no new stamps stops `queue_empty` exactly as today. Picking a task whose dependency is not really merged costs more than a missed pass, so readiness never comes from the sweep's list. Test `tests/test_f106.py::test_ac_1`.
+- AC-2 Bounded: the extra pass happens only when the previous pass stamped something new, and a stamp is terminal (never re-polled), so a gh that reports the same merged PR on every call causes exactly one extra pass and the loop then stops. Every other stop reason (peak window, `concurrency_wait`, quota, error) still stops, whatever the sweep stamped. Test `tests/test_f106.py::test_ac_2`.
+
+Re-approval owed: profile (`tests/test_f106.py` new and protected).
+
+Residuals, named: a merge observed outside the peak window whose extra pass lands inside it stops `peak_window` with the dependent picked-but-refused (it runs at the next off-peak invocation) — the window rule is older and stays; the extra pass is per external merge event, so a queue where merges keep landing can keep the loop going, exactly as successive manual invocations would.
+
 ### F-108 — A contract review's malformed output gets one repair turn
 
 Commit message: `feat: contract review repairs a malformed findings object once (F-108)`
