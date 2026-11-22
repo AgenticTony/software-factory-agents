@@ -1020,6 +1020,22 @@ Re-approval owed: profile (`tests/test_f102.py` protected; `test_f99`, `test_f96
 
 Residuals, named: the seed-side per-diff voided line still reads "L2 quota-voided, not judged" for any void (the aggregate `l2_quota_voided` count likewise) — the AC renamed the line that carries the reason (the clean-diff line); the seed-side rename touches two more protected suites and is a follow-up if the owner wants it; the union stores a drop PRE-ruling (`sibling_claim` beside a false `sibling`) — production behavior unchanged, but a future consumer of `verifier_dropped` must know the flag is unsettled there; the owner's paid `factory eval --repeats 3` after F-96 merges is the first run that produces the honest number.
 
+### F-108 — A contract review's malformed output gets one repair turn
+
+Commit message: `feat: contract review repairs a malformed findings object once (F-108)`
+
+Status: **draft, 2026-11-21** (from the JobFinderOS J-3 and J-8 contract reviews).
+
+Twice on 2026-11-20/21 a `factory review-contract` run failed with "the session's output is not a valid review (… not exactly one JSON object …)", and nothing was stored. The whole session was re-run by hand. F-85 gives review seats one repair turn (`REPAIR_TURN_CAP` = 4, resuming the same session) for exactly this; `factory/contractreview.py` has no such path; it parses once and refuses. A well-done review with a bad format is stored after one cheap repair; a stored review that says something the session never concluded costs more than a lost review, so the repair only re-emits, the parse stays exactly as strict, and a second failure refuses as today.
+
+Acceptance:
+- AC-1 One repair, same session: on a parse failure of a COMPLETED, resumable session, resume the SAME session once at `REPAIR_TURN_CAP` — the parse error verbatim, the required findings schema, and "re-emit the findings object you just produced, correctly formatted; change no finding" (F-85's prompt, written in `contractreview.py`). A repaired reply passes the UNCHANGED strict parse and is stored with `repaired: true`, the repair's usage and turns added to the stored total, and `factory approve` showing it exactly like any other with one "(format repaired)" note on the header line. A second malformed reply refuses with today's message and stores nothing; a repair that cannot run (no resumable id, no wall clock left, a dead or raising repair session) refuses cleanly — nothing stored, no traceback. Test `tests/test_f108.py::test_ac_1`.
+- AC-2 The repair cannot change what was reviewed: it runs on the same read-only `contract_reviewer` seat sandbox; its object passes the same `validate_contract_findings` against the task's criterion ids (an unknown criterion or valid JSON of the wrong shape refuses); and the review is stored under the contract hash computed BEFORE the first session — a contract edited between the session and the store (the hash recomputed at store time differs) refuses and stores nothing, repaired or not (the session's object carries no hash of its own; the parent adds it). Test `::test_ac_2`.
+
+Re-approval owed: profile (`tests/test_f108.py` new and protected). The stored review's `repaired` field is validated nowhere stricter than `load_stored_review`'s existing checks (an unknown top-level key in the store file is not a refusal today; the flag only ADDS the approval note) — stated for the record.
+
+Review: one round. Size S.
+
 ## Phase 1c — First outside project
 
 ### F-13 — Onboard JobFinderOS (pilot)
