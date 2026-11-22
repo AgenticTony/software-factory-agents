@@ -464,6 +464,11 @@ paths:
     - "tests/test_f100.py"
     - "tests/_support/f100.py"
     - "factory/models.py"
+    # F-106: the loop's act-on-stamped-merge contract tests judge the
+    # protected orchestrator path (the merges_stamped count and the
+    # run_loop extra pass) — same precedent, protected from the day
+    # they exist.
+    - "tests/test_f106.py"
     # F-107: the re-approval contract tests judge the protected
     # state/approve writers (the reject's budget-reset marker and its
     # one-writer rule, adopt's refreeze-on-changed-acceptance) and the
