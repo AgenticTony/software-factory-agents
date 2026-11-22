@@ -29,7 +29,7 @@ from pathlib import Path
 
 from _support.tokens import fake_github_token
 
-from factory.gates import diff_file_changes
+from factory.gates import FileChange, diff_file_changes
 from factory.l0 import run_l0
 from factory.sentinels import builtin_sentinel_findings
 
@@ -386,27 +386,45 @@ def test_ac_1(tmp_path):
 
 
 def test_ac_2(tmp_path):
-    """A fixture diff in the exact J-2 shape — a new typed ``except``
-    inserted above an unchanged ``except Exception as e:  # noqa: BLE001``
-    that git re-aligns as removed plus added — passes L0's sentinel."""
+    """A diff in the exact J-2 shape — a new typed ``except`` inserted
+    above an unchanged ``except Exception as e:  # noqa: BLE001`` that git
+    re-aligned as removed plus added — passes L0's sentinel.
+
+    Whether git re-aligns that line is git's choice, and it differs by
+    version: the factory's macOS git re-aligned the real J-2 hunk, CI's
+    Ubuntu git aligns this fixture without moving it. So the shape is
+    pinned twice: (1) hand-built exactly as the real attempt-1 diff
+    showed it, which needs no particular git; (2) replayed through real
+    git and L0 end to end, which must pass whichever way git aligns."""
+    noqa = "    except Exception as e:  # noqa: BLE001"
+    shaped = FileChange(
+        J2_PATH, "M",
+        removed_lines=[(8, noqa)],
+        added_lines=[
+            (8, "    except OriginalCvUnreadableError as e:"),
+            (9, "        application.status = \"failed\""),
+            (10, "        application.error = CV_UNREADABLE_MESSAGE"),
+            (11, "        return"),
+            (12, noqa),
+        ],
+    )
+
+    def lint(changes):
+        return [f for f in builtin_sentinel_findings(changes, RISK)
+                if f.id == "lint_suppression_added"]
+
+    # (1) The re-aligned shape is quiet: the file gains nothing it lost.
+    assert lint([shaped]) == []
+    # Non-vacuous: the same additions WITHOUT the removal flag exactly
+    # once, so the quiet result above comes from the netting.
+    unbalanced = FileChange(J2_PATH, "M", added_lines=shaped.added_lines)
+    assert len(lint([unbalanced])) == 1, [f.text for f in lint([unbalanced])]
+
+    # (2) Real git: whatever alignment this git picks, nothing flags.
     repo = _repo(tmp_path, "j2", {J2_PATH: J2_BASE})
     _commit(repo, {J2_PATH: J2_HEAD})
     changes = diff_file_changes(repo, "main", "feature")
-    change = next(c for c in changes if c.path == J2_PATH)
-
-    # The fixture REALLY re-aligns the unchanged noqa line: it appears on
-    # both sides of the diff with identical text. Without this pin the
-    # row below could pass vacuously if a fixture edit stopped aligning.
-    removed = [text for _no, text in change.removed_lines if "noqa" in text]
-    added = [text for _no, text in change.added_lines if "noqa" in text]
-    assert removed == ["    except Exception as e:  # noqa: BLE001"], removed
-    assert added == ["    except Exception as e:  # noqa: BLE001"], added
-
-    # The sentinel pass itself: quiet (the file gains nothing it lost).
-    assert [
-        f for f in builtin_sentinel_findings(changes, RISK)
-        if f.id == "lint_suppression_added"
-    ] == []
+    assert lint(changes) == []
 
     # End to end through L0: the attempt that cost $3.04 passes its gate.
     profile = dict(BASE_PROFILE)
