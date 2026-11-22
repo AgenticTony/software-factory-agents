@@ -456,6 +456,15 @@ class RunResult:
     # findings, when the writer kept an owner-touched draft, or on every
     # outcome that never published.
     followup: "tuple[str, int] | None" = None
+    # F-106: how many NEW ``links.merged`` stamps this run's sweep wrote
+    # (tasks that failed the one :func:`factory.state._is_merged` test
+    # before the write). ``run_loop`` treats an idle run with stamps as
+    # "go again": the next pass's own close-merged and sync_readiness
+    # read the stamped queue — F-93's definition, never the sweep's
+    # in-memory view — and pick the dependents the merge unblocked. 0 on
+    # every outcome reached before the sweep (the peak-window return):
+    # no sweep ran, nothing was stamped.
+    merges_stamped: int = 0
 
 
 @dataclass
@@ -467,6 +476,9 @@ class LoopResult:
     ``error``. F-72: a ``needs_human`` run no longer stops the loop — the
     task is parked (its result carried in ``parked``) and the loop picks
     the next eligible task; ``escalation`` is no longer a stop reason.
+    F-106: an ``idle`` run whose sweep stamped a new merge is not
+    ``queue_empty`` yet — the loop runs one more pass first, so a merge
+    and its dependents' work land in the same invocation.
 
     ``parked``: the ``needs_human`` results of this loop, in park order —
     one escalation per entry, each carrying ``task_id``, ``escalation``
@@ -2990,6 +3002,9 @@ def run_once(
     # queue's writes serialise on their own lock), and the sweep's dirs
     # are cleaned up in its own finally blocks before the lease releases.
     ci_fix: list = []
+    # F-106: the task ids whose links.merged this sweep writes NEW (the
+    # count rides the result, and run_loop's extra pass follows it).
+    merged_stamps: list[str] = []
     with queue.idle_lease():
         stale = _sweep_stale_prs(
             queue, profile, factory_root=factory_root,
@@ -2997,11 +3012,13 @@ def run_once(
             states=states, recovery=recovery, ready=ready,
             ci_state=ci_for_sweep, not_ready=not_ready, config=config,
             ledger=ledger, now=now, ci_fix=ci_fix,
+            merged_stamps=merged_stamps,
         )
     if stale is not None:
         stale.ready_prs = ready
         stale.not_ready_prs = not_ready
         stale.unledgered = unledgered
+        stale.merges_stamped = len(merged_stamps)
         return stale
     # F-76 AC-3: the sweep may hand back ONE fix round for an in-review
     # PR whose CI settled red. It runs in THIS run, as this run's work —
@@ -3034,7 +3051,8 @@ def run_once(
         pick = Pick(task=fix_task, slice=fix_slice)
     if pick is None:
         return RunResult("idle", ready_prs=ready, not_ready_prs=not_ready,
-                         unledgered=unledgered)
+                         unledgered=unledgered,
+                         merges_stamped=len(merged_stamps))
     task_id = pick.task["id"]
     # F-26 AC-2: at most `repo.concurrency` (default 1) open factory PRs
     # per repo — counted on GitHub's word, not the queue's statuses: an
@@ -3064,7 +3082,8 @@ def run_once(
         return RunResult("concurrency_wait", task_id=task_id,
                          open_prs=open_urls, unresolved_prs=unresolved_urls,
                          ready_prs=ready, not_ready_prs=not_ready,
-                         unledgered=unledgered)
+                         unledgered=unledgered,
+                         merges_stamped=len(merged_stamps))
 
     # The F-31 incident (run 20261029T130912Z-1e4eb9): a venv interpreter
     # whose own files the sandbox denied started as its bare base, and
@@ -3098,6 +3117,7 @@ def run_once(
             result.ready_prs = ready
             result.not_ready_prs = not_ready
             result.unledgered = unledgered
+            result.merges_stamped = len(merged_stamps)
             return result
         except BaseException:
             # The run didn't reach a recorded end state: re-queue it (the
@@ -4075,6 +4095,7 @@ def _sweep_stale_prs(
     ledger: "ApprovalLedger | None" = None,
     now: Callable[[], datetime] | None = None,
     ci_fix: list | None = None,
+    merged_stamps: list[str] | None = None,
 ) -> RunResult | None:
     """F-26 AC-3: bring every open factory PR's readiness up to date.
 
@@ -4138,6 +4159,14 @@ def _sweep_stale_prs(
         when one qualifies, rides the ``ci_fix`` out-param — it does
         not end the sweep.
 
+    F-106: each NEW ``links.merged`` stamp (a task that failed F-93's
+    one :func:`factory.state._is_merged` test immediately before the
+    write — both stamp sites, the recovery stamp and the open-PR stamp)
+    appends the task id to ``merged_stamps`` when given, so
+    :func:`run_once` reports the count and :func:`run_loop` runs the
+    pass that reads the stamped queue. A stamp of a URL the task
+    already held is not new and is not counted.
+
     Raises:
         RunError: The remote (or the PR branch on it) can't be fetched.
     """
@@ -4150,6 +4179,14 @@ def _sweep_stale_prs(
     # in-review PR that qualifies fills this and later candidates only
     # report their lines.
     fix_flag = [False]
+
+    def _count_stamp(task_id: str, links: dict) -> None:
+        # F-106's one count rule, shared by both stamp sites: a stamp
+        # counts when it is NEW — the task was not merged by F-93's one
+        # test a moment before the write.
+        if merged_stamps is not None and not _is_merged(links):
+            merged_stamps.append(task_id)
+
     # F-63 AC-1: the sweep ACTS on tasks (recovery edges from GitHub's
     # PR state, stale-base re-validation, merged closes) — every acted-on
     # task needs a ledger match for its current contract. Unledgered ones
@@ -4192,6 +4229,7 @@ def _sweep_stale_prs(
             # F-79 AC-3: the same edge for ANY park holding a normal PR
             # link — a hand-merged PR ends the park whatever it was — and
             # the writer drops any kept fix-round work with the move.
+            _count_stamp(task["id"], task["links"])  # F-106: before the write
             queue.recover_pr_merged(task["id"], merged_url=task["links"]["pr"])
             wipstore.discard(factory_root, project, task["id"])
             _progress_best_effort(
@@ -4260,6 +4298,7 @@ def _sweep_stale_prs(
             # again. The task waits in in_review for the F-14 deploy
             # gate, except on a no-deploy profile, where the close pass
             # takes it to done/awaiting_owner in this same run.
+            _count_stamp(task_id, links)  # F-106: before the write
             links["merged"] = links["pr"]
             links.pop("wip", None)  # F-79: merged — nothing to resume
             queue.save()
@@ -8081,6 +8120,17 @@ def run_loop(queue_path: Path | str, profile_path: Path | str | None = None,
     eligible task runs. The parked tasks ride the result
     (:attr:`LoopResult.parked`) for the caller to print and to make the
     process exit honest.
+
+    F-106: an ``idle`` run whose sweep stamped at least one NEW merge
+    runs another pass instead of stopping ``queue_empty`` — the sweep
+    stamps ``links.merged`` after the pick, so the dependents that merge
+    unblocked are picked by the NEXT pass's own close-merged and
+    ``sync_readiness``, reading the stamped queue (F-93's one
+    definition, never the sweep's in-memory view). Bounded: the extra
+    pass follows only a new stamp, and a stamp is terminal (never
+    re-polled), so a gh reporting the same merged PR on every call
+    costs exactly one extra pass. Every other stop keeps its meaning —
+    a ``concurrency_wait`` still names its PRs and stops.
     """
     results: list[RunResult] = []
     parked: list[RunResult] = []
@@ -8098,4 +8148,10 @@ def run_loop(queue_path: Path | str, profile_path: Path | str | None = None,
             parked.append(_with_park_label(queue_path, result))  # F-72
             continue
         if result.outcome in stops:
+            # F-106: idle with new stamps is "go again", not empty — the
+            # next pass picks up what the merge unblocked. Only idle:
+            # every real stop (quota, window, concurrency, error) still
+            # stops, whatever the sweep stamped.
+            if result.outcome == "idle" and result.merges_stamped:
+                continue
             return LoopResult(stops[result.outcome], results, parked=parked)
