@@ -464,6 +464,11 @@ paths:
     - "tests/test_f100.py"
     - "tests/_support/f100.py"
     - "factory/models.py"
+    # F-106: the loop's act-on-stamped-merge contract tests judge the
+    # protected orchestrator path (the merges_stamped count and the
+    # run_loop extra pass) — same precedent, protected from the day
+    # they exist.
+    - "tests/test_f106.py"
     # F-105: the net-count contract tests judge the protected sentinel
     # scanner (sentinels.py is protected above) — the J-2 re-alignment
     # class these tests pin is exactly the gate a session must not

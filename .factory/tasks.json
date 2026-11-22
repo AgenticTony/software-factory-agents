@@ -7399,6 +7399,51 @@
       "approved_by": "Anthony"
     },
     {
+      "id": "F-106",
+      "title": "A run that records a merge acts on it in the same run",
+      "source": "BUILD-ORDER.md#f-106--a-run-that-records-a-merge-acts-on-it-in-the-same-run",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-93"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "A run reports how many NEW links.merged stamps its sweep wrote (RunResult.merges_stamped; a stamp of a URL the task already held is not new, and 0 on outcomes reached before the sweep). run_loop treats an idle run with new stamps as go-again: the next pass's own close-merged and sync_readiness read the stamped queue (F-93's one _is_merged definition, never the sweep's in-memory view) and pick the dependents the merge unblocked — one `factory loop` stamps the dependency and runs the dependent, no second invocation. An idle pass with no new stamps stops queue_empty exactly as today.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f106.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "Bounded: the extra pass happens only when the previous pass stamped something new, and a stamp is terminal (never re-polled), so a gh that reports the same merged PR on every call causes exactly one extra pass and the loop then stops queue_empty. Every other stop reason (peak window, concurrency_wait, quota, error) still stops, whatever the sweep stamped.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f106.py::test_ac_2"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 60,
+        "wall_clock_min": 45
+      }
+    },
+    {
       "id": "F-105",
       "title": "The lint-suppression sentinel counts net added suppressions, like assertion_removed",
       "source": "BUILD-ORDER.md#f-105--the-lint-suppression-sentinel-counts-net-added-suppressions-like-assertion_removed",
