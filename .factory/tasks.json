@@ -1,7 +1,7 @@
 {
   "version": 5,
   "project": "software-factory",
-  "updated_at": "2026-11-19T22:37:31Z",
+  "updated_at": "2026-11-22T00:30:00Z",
   "tasks": [
     {
       "id": "F-00",
@@ -7397,6 +7397,65 @@
       "acceptance_hash": "1001c59ee1a456406ff38577945eea145624008ba31a7637fa764e8db09f290b",
       "approved_at": "2026-11-19T22:37:31Z",
       "approved_by": "Anthony"
+    },
+    {
+      "id": "F-107",
+      "title": "A contract re-approved after a reject or a scope widen starts clean",
+      "source": "BUILD-ORDER.md#f-107--a-contract-re-approved-after-a-reject-or-a-scope-widen-starts-clean",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-79"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "`factory recover --reject` itself appends one schema-valid `attempt_resets` marker (evidence \"escalation rejected; the contract must be re-approved before any run\", `done_by` the owner — the same source `--reset-attempts` uses, `prior_attempts` the current count, the slice) in the same queue write that returns the task to draft; nothing else writes one (a plain approval, `--redraft`), a second reject cycle grants a fresh budget from its own point, and after a reject + cut-down + re-approval the next run starts attempt 1 of N (published, not parked `attempts_exhausted` at 0 turns) with `factory status` showing the reset and its evidence. Test tests/test_f107.py::test_ac_1.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f107.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "When `factory approve --adopt` records a task whose current `acceptance_hash(acceptance)` differs from its stored one, it also writes the new `acceptance_hash`, `approved_at` and `approved_by` in the same write as the ledger record; an unchanged acceptance is not rewritten (no new `approved_at`), a declined task is never touched, and the J-4 sequence (park, widen scope AND change AC text, adopt, recover, loop) runs the task instead of demoting it to draft. Test ::test_ac_2.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f107.py::test_ac_2"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 60,
+        "wall_clock_min": 30
+      },
+      "scope": {
+        "paths": [
+          "factory/state.py",
+          "factory/approve.py",
+          "factory/status.py",
+          "factory/cli.py",
+          "tests/test_f107.py",
+          "TASK-CONTRACT.md",
+          ".factory/project.yaml",
+          ".factory/tasks.json",
+          "BUILD-ORDER.md",
+          ".factory/BOOTSTRAP.md"
+        ]
+      }
     }
   ]
 }

@@ -218,9 +218,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--reject", action="store_true",
         help="F-72: reject the escalation draft PR — closes it and "
              "returns the task to draft with its approval markers "
-             "cleared (the contract can change; re-approval required). "
-             "Any class holding an escalation draft PR (F-92); "
-             "interactive, no --yes",
+             "cleared (the contract can change; re-approval required) "
+             "and its attempt budget reset (F-107: the reject appends "
+             "the attempt_resets marker, so the re-approval that "
+             "follows runs on a fresh budget). Any class holding an "
+             "escalation draft PR (F-92); interactive, no --yes",
     )
     recover.add_argument(
         "--revalidate", action="store_true",
@@ -579,7 +581,8 @@ def _run_recover(args: argparse.Namespace) -> int:
                   "`factory approve` it)")
         elif status == "draft":
             print(f"{args.task_id}: needs_human -> draft "
-                  "(escalation rejected; contract re-approval required)")
+                  "(escalation rejected; contract re-approval required; "
+                  "attempt budget reset)")
         else:
             print(f"{args.task_id}: needs_human -> {status} (fix round queued)")
         return 0
