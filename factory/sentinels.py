@@ -33,14 +33,24 @@ silently orphan a sentinel result behind an always-``pass`` row:
   next round cannot un-leak it from the branch history ("retrying
   can't make it safe").
 - ``lint_suppression_added`` — ``# noqa``, ``type: ignore`` or a
-  lint-disable comment on an added line in a file under a ``paths.risk``
-  glob, and only where that syntax is a comment in the file's language:
-  ``# noqa`` inside JSON or markdown prose quotes the pattern, it cannot
-  silence a linter there (F-33 corpus: PRs #25/#37 documenting these
-  sentinels). Outside risk paths the same comment is ordinary code
-  review territory. The echoed line goes through :func:`redact_credentials`,
-  as do the skip-marker and assertion echoes, so a credential on the same
-  line prints as ``[redacted]``.
+  lint-disable comment a file under a ``paths.risk`` glob GAINS more of
+  than the diff removes (F-105, the ``assertion_removed`` arithmetic
+  applied to suppressions): counted per file and per normalised
+  suppression — the matched comment with all whitespace stripped, rule
+  code(s) kept, so ``# noqa: BLE001`` and ``# noqa: E501`` are different
+  keys and a bare ``# noqa`` is its own — and only where that syntax is
+  a comment in the file's language: ``# noqa`` inside JSON or markdown
+  prose quotes the pattern, it cannot silence a linter there (F-33
+  corpus: PRs #25/#37 documenting these sentinels). Git routinely
+  re-aligns an unchanged suppression line as removed plus added when a
+  similar line is inserted near it (the JobFinderOS J-2 run lost a
+  $3.04 attempt to exactly that, and taught the model to strip the
+  ``noqa`` to pass), so only a surplus flags: a re-aligned or moved
+  suppression nets to zero, a rule-code swap or a bare ``# noqa``
+  replacing a coded one does not. Outside risk paths the same comment is
+  ordinary code review territory. The echoed line goes through
+  :func:`redact_credentials`, as do the skip-marker and assertion
+  echoes, so a credential on the same line prints as ``[redacted]``.
 - ``skip_marker_added`` — a skip/xfail/only marker added on an existing
   test. Substring-level against the line with quoted spans blanked, so
   every statement shape fires (a decorator, module-level ``pytestmark``,
@@ -394,7 +404,10 @@ def _is_code_line(text: str) -> bool:
 # that syntax introduces a comment in the changed file: a noqa inside
 # JSON or markdown prose QUOTES the pattern, it cannot silence a linter
 # there (F-33 corpus: PRs #25 and #37 documenting these sentinels
-# tripped the unfiltered scan).
+# tripped the unfiltered scan). F-105 nets these per file per key: the
+# key is the matched comment (from the marker to end of line, where the
+# comment lives) with all whitespace removed — rule codes kept, so a
+# `noqa: BLE001` and a `noqa: E501` never cancel each other.
 LINT_SUPPRESSION_PATTERNS = (
     ("hash", re.compile(r"#\s*noqa")),
     ("hash", re.compile(r"#\s*type:\s*ignore\b")),
@@ -506,7 +519,7 @@ def _credential_shape(text: str) -> str | None:
 
 
 def builtin_sentinel_findings(changes, risk_globs: dict) -> list:
-    """Scan the diff with all four built-in sentinels.
+    """Scan the diff with all five built-in sentinels.
 
     Args:
         changes: ``FileChange`` list from ``diff_file_changes``.
@@ -535,14 +548,6 @@ def builtin_sentinel_findings(changes, risk_globs: dict) -> list:
         # new path, one renamed OUT by its old.
         scan_path = change.old_path if is_test_file(change.old_path or "") else change.path
         test_file = is_test_file(scan_path)
-        # The comment-syntax lookup deliberately reads the NEW path: the
-        # added lines live in the file at its new path, and a suppression
-        # only takes effect where the file's actual format makes that
-        # syntax a comment — a `.py` renamed to `.json` with a noqa
-        # comment added suppresses nothing there (F-46 AC-3's pinned
-        # choice; a `.py` renamed to `.txt` keeps every syntax, since
-        # formats the map doesn't know fail safe).
-        syntaxes = _comment_syntaxes(change.path)
         for no, text in change.added_lines:
             shape = _credential_shape(text)
             if shape is not None:
@@ -571,18 +576,6 @@ def builtin_sentinel_findings(changes, risk_globs: dict) -> list:
                         line=no,
                     )
                 )
-            if in_risk_path and any(
-                s in syntaxes and p.search(text)
-                for s, p in LINT_SUPPRESSION_PATTERNS
-            ):
-                findings.append(
-                    Finding(
-                        "lint_suppression_added",
-                        f"lint suppression added in {change.path}:{no}: {echo}",
-                        file=change.path,
-                        line=no,
-                    )
-                )
             code_line = _outside_strings(text)
             # Session/reporting hooks: test files only — a conftest is
             # their registered surface (see _SESSION_HOOK_PATTERNS);
@@ -608,6 +601,8 @@ def builtin_sentinel_findings(changes, risk_globs: dict) -> list:
                 )
         if test_file:
             _flag_weakened_assertions(change, scan_path, findings)
+        if in_risk_path:
+            _flag_net_lint_suppressions(change, findings)
     findings.sort(key=lambda f: (f.id, f.file or "", f.line or 0))
     return findings
 
@@ -666,6 +661,105 @@ def _flag_weakened_assertions(change, scan_path: str, findings: list) -> None:
                 line=no,
             )
         )
+
+
+def _normalised_suppressions(text: str, syntaxes: frozenset) -> list:
+    """The normalised suppression keys one diff line carries.
+
+    A key is the matched comment with ALL whitespace removed, read
+    outside string literals (:func:`_outside_strings` — a suppression
+    quoted in a string is data, not code). Rule code(s) stay part of the
+    key, so ``# noqa: BLE001`` and ``# noqa: E501`` are different keys
+    and a bare ``# noqa`` is its own; whitespace removal makes
+    ``#noqa:BLE001`` and ``# noqa: BLE001`` one key and folds CRLF
+    endings into it. The span runs from the marker to end of line —
+    that is where the comment lives in every syntax this set covers —
+    so a second suppression co-located on the same line lands inside
+    the first key as well as its own (over-counting, the safe side).
+    """
+    code = _outside_strings(text)
+    return [
+        "".join(code[m.start():].split())
+        for syntax, pattern in LINT_SUPPRESSION_PATTERNS
+        if syntax in syntaxes
+        for m in pattern.finditer(code)
+    ]
+
+
+def _flag_net_lint_suppressions(change, findings: list) -> None:
+    """Append ``lint_suppression_added`` findings for net-added suppressions.
+
+    F-105 (the JobFinderOS J-2 run): git routinely re-aligns an
+    UNCHANGED suppression line as removed plus added when a similar line
+    is inserted near it, and the per-added-line scan flagged the re-added
+    copy — attempt 1 ($3.04) failed L0 on exactly that, and attempt 2
+    passed only by deleting the ``noqa``: the gate taught the model to
+    strip suppressions. The count is now per-file arithmetic, keyed by
+    the normalised suppression (:func:`_normalised_suppressions`): a
+    removed occurrence cancels the first added occurrence of the same
+    key (a move or re-alignment is quiet, exactly as moved assertions
+    are under :func:`_flag_weakened_assertions`), and only the surplus
+    added lines flag, each naming the counts and the key.
+
+    Two asymmetries, both toward flagging (a real new suppression that
+    slips through costs more than a false positive):
+
+    - The comment-syntax filter reads each side's own territory — added
+      lines the NEW path, removed lines the old — so an inert removal
+      (a ``# noqa`` leaving a file where '#' is not a comment) cancels
+      nothing, while an inert addition still counts nothing (F-46 AC-3's
+      pinned choice, applied per side).
+    - A removed line that held nothing but string content in the base
+      file (docstring prose mentioning ``noqa``) never cancels — the
+      J-1 lesson: prose is not a suppression, and letting it neutralise
+      a real added one would be an evasion. Added lines have no such
+      set, so docstring prose ADDED still counts (over-inclusive, the
+      safe side; a human reviews).
+
+    The finding text redacts BOTH the echoed line and the key it names
+    (round 1): the key is built from the raw comment, which can carry a
+    credential-shaped string, and findings travel into reports, prompts
+    and PR bodies.
+    """
+    added_syntaxes = _comment_syntaxes(change.path)
+    added: dict = {}
+    for no, text in change.added_lines:
+        for key in _normalised_suppressions(text, added_syntaxes):
+            added.setdefault(key, []).append((no, text))
+    if not added:
+        return
+    removed_syntaxes = _comment_syntaxes(change.old_path or change.path)
+    in_strings = getattr(change, "removed_in_strings", frozenset())
+    removed: dict = {}
+    for no, text in change.removed_lines:
+        if no in in_strings:
+            continue
+        for key in _normalised_suppressions(text, removed_syntaxes):
+            removed[key] = removed.get(key, 0) + 1
+    for key, occurrences in added.items():
+        surplus = [
+            (no, text)
+            for no, text in occurrences[removed.get(key, 0):]
+        ]
+        n_added, n_removed = len(occurrences), removed.get(key, 0)
+        # The arithmetic stays on RAW keys (redacting both sides would
+        # merge distinct keys — two different tokens both become
+        # ``[redacted]`` — and wrongly cancel one against the other);
+        # only the finding's display text is redacted (round 1: the key
+        # is built from the raw comment, which can carry a credential).
+        shown_key = redact_credentials(key)
+        for no, text in surplus:
+            findings.append(
+                Finding(
+                    "lint_suppression_added",
+                    f"lint suppression added in {change.path}:{no} "
+                    f"(net +{len(surplus)}: {n_added} added vs "
+                    f"{n_removed} removed of {shown_key}): "
+                    f"{redact_credentials(text.strip())}",
+                    file=change.path,
+                    line=no,
+                )
+            )
 
 
 def builtin_sentinel_pass(profile: dict, changes, matched: set):
