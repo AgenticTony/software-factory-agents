@@ -71,7 +71,10 @@ testability, scope, ambiguity, budget, and (F-94) the defect class: a
 criterion that fixes one site of a defect that occurs elsewhere is a
 finding naming the other sites. A valid review is stored under
 `<factory-root>/contract-reviews/`, keyed by the contract hash, and
-`factory approve <task-id>` shows it above the y/N, blockers first. It is
+`factory approve <task-id>` shows it above the y/N, blockers first. A
+reply that mis-formats the findings object gets one repair turn on the
+same session (F-108) — the parse never loosens, and a repaired review is
+flagged "(format repaired)" at approval. It is
 advice: nothing blocks on it and nothing is edited for you; any change to
 the contract makes the stored review stale. It spends one session, so run
 it outside the peak window (TASK-CONTRACT §3).
