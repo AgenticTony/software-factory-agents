@@ -7444,6 +7444,64 @@
       }
     },
     {
+      "id": "F-108",
+      "title": "A contract review's malformed output gets one repair turn",
+      "source": "BUILD-ORDER.md#f-108--a-contract-reviews-malformed-output-gets-one-repair-turn",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-80"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "On a parse failure of a COMPLETED, resumable contract-review session, the SAME session is resumed once at REPAIR_TURN_CAP with F-85's repair instruction (the parse error verbatim, the required findings schema, 're-emit the findings object you just produced, correctly formatted; change no finding'). A repaired reply passes the UNCHANGED strict parse and is stored with `repaired: true`, the repair turn's usage and turns added to the stored total, and `factory approve` showing it exactly like any other plus one '(format repaired)' note on its header line. A second malformed reply refuses with today's message and stores nothing; a repair that cannot run (no resumable id, no wall clock, a dead or raising repair session) refuses cleanly, nothing stored, no traceback. Test: tests/test_f108.py::test_ac_1.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f108.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "The repair cannot change what was reviewed: it runs on the same read-only contract_reviewer seat sandbox; its object passes the same validate_contract_findings against the task's criterion ids (a repair naming a criterion the contract does not have, or valid JSON of the wrong shape, refuses); and the review is stored under the contract hash computed before the first session — a contract edited between the session and the store (the hash recomputed at store time differs) refuses and stores nothing, repaired or not. Test: tests/test_f108.py::test_ac_2.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f108.py::test_ac_2"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 60,
+        "wall_clock_min": 90
+      },
+      "scope": {
+        "paths": [
+          "factory/contractreview.py",
+          "tests/test_f108.py",
+          "TASK-CONTRACT.md",
+          "VALIDATOR-SPEC.md",
+          "README.md",
+          "BUILD-ORDER.md",
+          ".factory/tasks.json",
+          ".factory/project.yaml",
+          ".factory/BOOTSTRAP.md"
+        ]
+      }
+    },
+    {
       "id": "F-107",
       "title": "A contract re-approved after a reject or a scope widen starts clean",
       "source": "BUILD-ORDER.md#f-107--a-contract-re-approved-after-a-reject-or-a-scope-widen-starts-clean",

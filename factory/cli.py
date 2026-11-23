@@ -139,7 +139,9 @@ def build_parser() -> argparse.ArgumentParser:
              "contract and source document before you approve it (F-80): "
              "findings by lens (purpose, testability, scope, ambiguity, "
              "budget, defect_class — F-94) are stored under the factory root, keyed by the "
-             "contract hash, and shown by `factory approve`. Advice only "
+             "contract hash, and shown by `factory approve`. A malformed "
+             "reply gets one same-session repair turn (F-108); the parse "
+             "never loosens. Advice only "
              "— it never blocks, edits or approves; drives one model "
              "session, never inside the peak window")
     review.add_argument("task_id", help="task id whose contract to review")

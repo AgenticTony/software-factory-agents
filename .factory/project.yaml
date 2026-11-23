@@ -469,6 +469,12 @@ paths:
     # run_loop extra pass) — same precedent, protected from the day
     # they exist.
     - "tests/test_f106.py"
+    # F-108: the contract-review repair contract tests judge the
+    # protected contractreview module (the ONE same-session repair turn,
+    # the unchanged strict parse, the repaired flag and summed usage,
+    # the store-time contract-hash recheck) — the same precedent as
+    # F-85's repair tests.
+    - "tests/test_f108.py"
     # F-107: the re-approval contract tests judge the protected
     # state/approve writers (the reject's budget-reset marker and its
     # one-writer rule, adopt's refreeze-on-changed-acceptance) and the
