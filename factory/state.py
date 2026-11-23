@@ -1819,8 +1819,10 @@ class TaskQueue:
                          pr_closed: bool = False,
                          ledger=None) -> str:
         """Re-queue an ``attempts_exhausted`` (or, F-75, ``ci_failed``)
-        task with a fresh budget: the one writer of that edge, and the
-        only writer of ``attempt_resets`` markers.
+        task with a fresh budget: the one writer of that edge, and one
+        of the two writers of ``attempt_resets`` markers (the other is
+        :meth:`reject_escalation`, F-107 — also an explicit owner act
+        after which nothing runs until re-approval).
 
         Like the credential exit, the gate lives HERE, not in the command:
         the generic :meth:`transition` refuses an attempts_exhausted or
@@ -2120,7 +2122,8 @@ class TaskQueue:
         self.save()
         return "in_review"
 
-    def reject_escalation(self, task_id: str) -> str:
+    def reject_escalation(self, task_id: str, *, done_by: str | None = None,
+                          ) -> str:
         """Reject an escalation draft PR: the one writer of the F-72
         reject edge (``needs_human → draft`` — the contract-changed edge's
         pair, gated here on a park holding an escalation draft PR instead;
@@ -2134,8 +2137,24 @@ class TaskQueue:
         F-63 hash check: a changed contract has no ledger entry). Every
         attempt record stays (append-only).
 
+        F-107 AC-1: the reject also appends an ``attempt_resets``
+        marker — HERE, not at the later approval (an approval cannot
+        know what preceded it, and the reject is already an explicit
+        owner act after which nothing runs until the owner re-approves).
+        Without it, the J-3 shape: a rejected-and-cut-down contract was
+        re-approved and the next loop parked it straight back on
+        ``attempts_exhausted`` at 0 turns, on the budget the reject
+        kept. The marker lands in the SAME queue write that returns the
+        task to draft (:meth:`_to_draft` saves once), and
+        :func:`attempt_budget_used` counts only attempts at or after
+        its ``prior_attempts`` — a re-approval then runs with a fresh
+        budget while every old attempt record stays in the log.
+
         Args:
             task_id: A parked task holding an escalation draft PR.
+            done_by: Who rejected; recorded in the reset marker (the
+                same source ``--reset-attempts`` uses — the command
+                passes ``--done-by`` or the default approver).
 
         Returns:
             ``"draft"``.
@@ -2151,6 +2170,20 @@ class TaskQueue:
                 "that holds an escalation draft PR (links.pr + "
                 "links.escalation_pr)"
             )
+        # Appended BEFORE _to_draft so its one save carries both the
+        # draft move and the marker (the same queue write). Eligibility
+        # guarantees an escalated last attempt, so the list is never
+        # empty here; prior_attempts names what the fresh budget starts
+        # after, whatever the slice.
+        attempts = task.get("attempts") or []
+        task.setdefault("attempt_resets", []).append({
+            "at": now_iso(),
+            "evidence": "escalation rejected; the contract must be "
+                        "re-approved before any run",
+            "done_by": (done_by or "").strip() or getpass.getuser(),
+            "slice_id": attempts[-1].get("slice_id") or task_id,
+            "prior_attempts": len(attempts),
+        })
         return self._to_draft(task)
 
     def redraft(self, task_id: str, *, evidence: str) -> str:
@@ -2189,7 +2222,8 @@ class TaskQueue:
     def _to_draft(self, task: dict) -> str:
         """``needs_human → draft`` with the approval markers cleared —
         shared by the reject and redraft writers (their gates differ;
-        what they write does not)."""
+        the reject also appends its F-107 reset marker BEFORE this
+        call, so its single save carries both)."""
         reason = ALLOWED_TRANSITIONS.get((_status_of(task), "draft"))
         assert reason is not None  # needs_human → draft is in the table
         _check_kind_rules(task, _status_of(task), "draft")

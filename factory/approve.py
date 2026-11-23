@@ -515,6 +515,32 @@ def _check_approvable(task: dict, *, require_scope: bool = True) -> None:
         raise ApprovalError(
             f"{task_id}: only draft contracts can be approved; it is {status}"
         )
+    _check_contract(task, require_scope=require_scope)
+
+
+def _check_contract(task: dict, *, require_scope: bool = True) -> None:
+    """The contract checks every path that FREEZES one runs (F-107 R1-A):
+    ``_check_approvable`` (whose kind and draft gates run first, so the
+    kind check repeats harmlessly there) and ``adopt_queue``'s refreeze
+    of a changed acceptance — an adopt that re-approves a contract runs
+    the same checks a plain approval does, so nothing becomes runnable
+    unchecked. The refusal order is ``_check_approvable``'s own, minus
+    the draft gate (a frozen status is adopt's subject).
+
+    Raises:
+        ApprovalError: A non-executable kind, no acceptance items
+            (AC-1), a non-human merge/deploy gate
+            (:func:`check_v0_gates`, F-67), — F-65 — a kind the picker
+            runs with no declared file scope, or — F-71 AC-2 — a check
+            a runner cannot run.
+    """
+    task_id = task.get("id")
+    kind = task.get("kind")
+    if kind in NON_EXECUTABLE_KINDS:
+        raise ApprovalError(
+            f"{task_id}: kind={kind} is never executed, so approving it has "
+            "no meaning — it is surfaced to you, not run"
+        )
     if not task.get("acceptance"):
         raise ApprovalError(
             f"{task_id}: refusing to approve a contract with no acceptance "
@@ -1414,9 +1440,12 @@ def _recover_escalation_pr(
     the new findings and the PR draft.
 
     ``--reject``: close the escalation PR, move the task
-    ``needs_human → draft`` and clear the contract's approval markers —
+    ``needs_human → draft``, clear the contract's approval markers —
     the contract can now change, and the old approval authorises nothing
-    (the F-63 hash check).
+    (the F-63 hash check) — and (F-107) append one ``attempt_resets``
+    marker: the reject is the explicit owner act, so the re-approval
+    that follows runs on a fresh budget instead of parking
+    ``attempts_exhausted`` at 0 turns on the budget the reject kept.
     """
     from factory.publish import gh_pr_close, gh_pr_head_sha, gh_pr_ready
     from factory.runs import RunError
@@ -1467,16 +1496,19 @@ def _recover_escalation_pr(
             + (f"  branch: {branch} (kept on the remote; unlinked)\n"
                if branch else "")
             + "  reject closes the PR and returns the task to draft with "
-            "its approval markers cleared — the contract can change, and "
-            "re-approval is required before anything runs again."
+            "its approval markers cleared and its attempt budget reset "
+            "(F-107) — the contract can change, and re-approval is "
+            "required before anything runs again."
         )
         if not confirm(f"Reject the escalation PR for {task_id}?"):
             raise ApprovalDeclined(f"{task_id}: escalation rejection declined")
         # R1-F8: the STATE moves first — a close failure then leaves a
         # draft task with an open PR (visible, closable by hand), never a
         # needs_human task holding a PR gh already closed (which a retry
-        # would refuse on).
-        new_status = queue.reject_escalation(task_id)
+        # would refuse on). F-107: the reject itself appends the
+        # attempt_resets marker (done_by the same source --reset-attempts
+        # uses), so a re-approval runs on a fresh budget.
+        new_status = queue.reject_escalation(task_id, done_by=who)
         _discard_wip(queue, factory_root, task_id)  # R1-1: a fresh run
         try:
             (pr_close or gh_pr_close)(url)
@@ -1498,7 +1530,8 @@ def _recover_escalation_pr(
                 "pr": url,
                 **({"branch": branch} if branch else {}),
                 "note": f"escalation PR {url} closed; {task_id} rejected "
-                        f"to draft by {who} (approval markers cleared)",
+                        f"to draft by {who} (approval markers cleared; "
+                        "attempt budget reset)",
             })
         except ProgressLogError as exc:
             raise ApprovalError(
@@ -2492,6 +2525,23 @@ def adopt_queue(
     risk-flagged task can never be adopted non-interactively — the
     approve rule). Done tasks are skipped: merged work needs no entry.
 
+    F-107 AC-2: adopting refreezes what it records. When the task's
+    current :func:`~factory.contract.acceptance_hash` differs from its
+    stored one — the J-4 shape, an owner who widened a parked task's
+    scope and AC text and recorded it here — the same confirm also
+    rewrites the task's ``acceptance_hash``/``approved_at``/
+    ``approved_by`` in one queue save, so the ledger and the task agree
+    and the next loop's contract audit runs the task instead of
+    demoting it on the stale hash. An unchanged acceptance is NOT
+    rewritten (no new ``approved_at``); a scope-only widen changes only
+    the whole-contract hash the ledger records. R1-A: a changed
+    acceptance is a RE-APPROVAL, so the refreeze runs approval's own
+    checks first — :func:`_check_contract` (acceptance items, gates,
+    the declared scope, runnable refs) and :func:`_prespend_checks`
+    (risk coverage, the budget floor) — with the protected-ref warnings
+    rendered before the y/N; a refusal records a ``failed`` result and
+    writes nothing, exactly as ``factory approve`` refuses.
+
     Returns:
         One :class:`ReconcileResult` per task, action ``adopted``,
         ``skipped`` or ``failed``.
@@ -2510,18 +2560,74 @@ def adopt_queue(
             continue
         if ledger.has_contract(task.get("id", ""), contract_hash(task)):
             continue
-        echo(render_contract(task))
-        if not confirm(f"Adopt {task.get('id')} (currently {status}) "
-                       "into the owner ledger?"):
+        # F-107 R1-A: a CHANGED acceptance makes this adopt a
+        # re-approval, so it earns approval's own checks — the contract
+        # checks and the pre-spend checks, BEFORE anything is shown,
+        # asked or written (before F-107 a changed acceptance was
+        # demoted and had to pass `factory approve`; the refreeze must
+        # not become a way around them). A refusal records a `failed`
+        # result and writes nothing, neither ledger nor queue. The
+        # protected-ref warnings ride the same pre-spend pass into the
+        # contract render, in view before the y/N.
+        warnings: list = []
+        changed = task.get("acceptance_hash") != acceptance_hash(
+            task.get("acceptance") or [])
+        if changed:
+            try:
+                _check_contract(task)
+                warnings = _prespend_checks(task, queue)
+            except ApprovalError as exc:
+                results.append(ReconcileResult(task.get("id"), "failed",
+                                               str(exc)))
+                continue
+        echo(render_contract(task, warnings=warnings))
+        question = (
+            f"Adopt {task.get('id')} (currently {status}) into the owner "
+            "ledger?" if not changed else
+            f"Adopt {task.get('id')} (currently {status}) and re-approve "
+            "its changed acceptance criteria?")
+        if not confirm(question):
             results.append(ReconcileResult(task.get("id"), "skipped", "declined"))
             continue
+        # The refreeze decision BEFORE anything is written: an unchanged
+        # acceptance (scope-only widen, a pre-ledger queue whose hashes
+        # are still true) rewrites nothing. The freeze fields are
+        # stamped first so the ledger entry's approved_at is the task's
+        # own; if the ledger then refuses, they roll back (the
+        # approve_task rule: a refused entry writes nothing to the
+        # queue — a later task's save must not flush a half-adopt).
+        # Ledger first, then one queue save — the approve_task order, so
+        # a crash between the two leaves a task the ledger covers but
+        # whose stored hash is stale: the audit demotes it, fail closed,
+        # never an unledgered frozen contract.
+        refrozen = False
+        absent = object()  # rollback restores ABSENCE, never a None key
+        previous = {field: task.get(field, absent)
+                    for field in ("acceptance_hash", "approved_at",
+                                  "approved_by")}
+        if changed:
+            task["acceptance_hash"] = acceptance_hash(
+                task.get("acceptance") or [])
+            task["approved_at"] = now_iso()
+            task["approved_by"] = approved_by
+            refrozen = True
         try:
-            ledger.record_task_for(task, approved_by=approved_by)
+            ledger.record_task_for(task, approved_by=approved_by,
+                                   approved_at=task.get("approved_at"))
         except ApprovalLedgerError as exc:
+            if refrozen:
+                for field, value in previous.items():
+                    if value is absent:
+                        task.pop(field, None)
+                    else:
+                        task[field] = value
             results.append(ReconcileResult(task.get("id"), "failed", str(exc)))
             continue
+        if refrozen:
+            queue.save()
         results.append(
             ReconcileResult(task.get("id"), "adopted",
-                            f"recorded at status {status}")
+                            f"recorded at status {status}"
+                            + ("; contract refrozen" if refrozen else ""))
         )
     return results
