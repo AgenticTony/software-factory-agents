@@ -7559,6 +7559,63 @@
           ".factory/BOOTSTRAP.md"
         ]
       }
+    },
+    {
+      "id": "F-105",
+      "title": "The lint-suppression sentinel counts net added suppressions, like assertion_removed",
+      "source": "BUILD-ORDER.md#f-105--the-lint-suppression-sentinel-counts-net-added-suppressions-like-assertion_removed",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-100"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "Net count per file and per suppression: for each file a diff touches in a risk path, suppression occurrences are counted in removed and added lines, keyed by the normalised suppression (the matched comment with all whitespace stripped, rule code(s) kept, read outside string literals); a file flags only where added exceeds removed for a key, naming the surplus added lines with the counts and the key. One removed occurrence cancels one added occurrence of the same key (re-alignments and moves within a file are quiet); a `# noqa: E501` added where a `# noqa: BLE001` is removed does not cancel (different keys); a bare `# noqa` replacing a coded one flags (it widens); a suppression moved to a different file flags in the receiving file; the counts stay per file. The comment-syntax filter reads each side's own path (added lines the new path, removed lines the old — F-46 AC-3's pinned choice per side), and a removed line that held nothing but string content in the base file (`removed_in_strings`, the J-1 lesson) never cancels: prose is not a suppression, and letting it neutralise a real added one would be an evasion.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f105.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "The J-2 case, replayed: a fixture diff in the exact J-2 shape — a new typed `except` inserted above an unchanged `except Exception as e:  # noqa: BLE001` that git re-aligns as removed plus added — passes L0's sentinel; the test pins that the fixture really carries the line on both sides of the parsed diff, so it cannot pass vacuously.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f105.py::test_ac_2"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 60,
+        "wall_clock_min": 90
+      },
+      "scope": {
+        "paths": [
+          "factory/sentinels.py",
+          "tests/test_f105.py",
+          "tests/_support/tokens.py",
+          "VALIDATOR-SPEC.md",
+          "BUILD-ORDER.md",
+          ".factory/tasks.json",
+          ".factory/project.yaml",
+          ".factory/BOOTSTRAP.md"
+        ]
+      }
     }
   ]
 }

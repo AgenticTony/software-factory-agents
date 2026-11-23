@@ -481,6 +481,11 @@ paths:
     # status page's reset line — same precedent, protected from the
     # day they exist.
     - "tests/test_f107.py"
+    # F-105: the net-count contract tests judge the protected sentinel
+    # scanner (sentinels.py is protected above) — the J-2 re-alignment
+    # class these tests pin is exactly the gate a session must not
+    # weaken.
+    - "tests/test_f105.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 

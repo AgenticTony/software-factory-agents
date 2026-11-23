@@ -1070,6 +1070,22 @@ Re-approval owed: profile (`tests/test_f107.py` protected; `factory/state.py`, `
 
 Residuals, named: a no-attempts task cannot be rejected at all (a park IS an escalated attempt; the command's gate refuses first), so the marker writer never sees `prior_attempts` 0 — asserted as the refusal in test_ac_1 arm 5; the adopt refreeze keys on the ACCEPTANCE hash, so a scope-only widen records the new whole-contract hash in the ledger but rewrites none of the task's three fields (the audit compares acceptance hashes, so the task is safe) — pinned in test_ac_2 arm 3.
 
+### F-105 — The lint-suppression sentinel counts net added suppressions, like assertion_removed
+
+Commit message: `fix: lint_suppression_added counts net suppressions, not re-aligned lines (F-105)`
+
+Status: **draft, 2026-11-21** (from the JobFinderOS J-2 run).
+
+Found by the J-2 run (`j2-sdk-errors-stay-internal`, attempt 1, run `20261120T153807Z-84e974`, $3.04 / 90 turns): the implementer inserted a new typed `except` above an unchanged `except Exception as e:  # noqa: BLE001` (`backend/app/services/draft_service.py:1387`) and git re-aligned the unchanged line as removed plus added; the sentinel flagged every ADDED suppression line without looking at what was removed, so L0 failed on that finding alone. Attempt 2 passed only by deleting the `noqa` — the gate taught the model to strip suppressions to get through. `assertion_removed` already nets per file (`_flag_weakened_assertions`); this gives the suppression sentinel the same arithmetic.
+
+Acceptance:
+- AC-1 Net count per file and per suppression. For each file a diff touches in a risk path, suppression occurrences are counted in removed and added lines, keyed by the normalised suppression: the matched comment with all whitespace stripped, rule code(s) kept, read outside string literals (`_outside_strings`). A file flags only where added exceeds removed for a key, naming the surplus added lines with the counts and the key. One removed occurrence cancels one added occurrence of the same key (re-alignments and moves within a file are quiet); a `# noqa: E501` added where a `# noqa: BLE001` is removed does not cancel (different keys), a bare `# noqa` replacing a coded one flags (it widens), a suppression moved to a different file flags in the receiving file, and the counts stay per file. The comment-syntax filter reads each side's own path (added lines the new path, removed lines the old — F-46 AC-3's pinned choice per side), and a removed line that held nothing but string content in the base file (`removed_in_strings`, the J-1 lesson) never cancels: prose is not a suppression, and letting it neutralise a real added one would be an evasion. Test `tests/test_f105.py::test_ac_1`, one table over real-git diff fixtures.
+- AC-2 The J-2 case, replayed. A fixture diff in the exact J-2 shape — a new typed `except` inserted above an unchanged `except Exception as e:  # noqa: BLE001` that git re-aligns as removed plus added — passes L0's sentinel; the test pins that the fixture really carries the line on both sides of the parsed diff, so it cannot pass vacuously. Test `::test_ac_2`.
+
+Not in scope (named, not built): a suppression added in a NON-risk file still never flags at L0 — pre-existing scope, unchanged (F-86's residual, the owner's call); the corpus is not re-triaged (its six known catch-all hits are pure additions, unchanged under the net rule).
+
+Re-approval owed: profile (`tests/test_f105.py` new and protected; `factory/sentinels.py` is a protected path that changed).
+
 ## Phase 1c — First outside project
 
 ### F-13 — Onboard JobFinderOS (pilot)

@@ -78,6 +78,13 @@ def fake_stripe_key(label: str) -> str:
     return "sk_live_" + _body("stripe:" + label, 24, _LOWER_DIGITS)
 
 
+def fake_github_token(label: str) -> str:
+    """``ghp_`` + exactly 36 alnum chars — the GitHub token shape the
+    sentinel pattern ``ghp_[A-Za-z0-9]{36,}`` requires (F-105: the lint
+    finding's key text must redact it)."""
+    return "ghp_" + _body("github:" + label, 36, _LETTERS_DIGITS)
+
+
 def fake_jwt(label: str) -> str:
     """A JWT-shaped value whose segments derive from ``label``: both
     visible segments are base64url of real JSON (so both start ``eyJ``,
