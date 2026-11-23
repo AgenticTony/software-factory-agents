@@ -193,6 +193,27 @@
             }
           }
         },
+        "review_rerates": {
+          "type": "array",
+          "description": "F-103: the severity re-rates the L2 verifier applied or had refused, each with BOTH verifier sessions' re-rate reasons — the audit side of the re-rate-down rule (a re-rate needs two agreeing votes, a quoted scenario, and never touches a unanimous finding or a sibling's severity). Deliberately NOT rendered into the PR body; the rerated finding itself rides it as the minor/note it became.",
+          "items": {
+            "type": "object",
+            "required": ["id", "text", "from", "to", "reasons"],
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string" },
+              "axis": { "type": "string" },
+              "file": { "type": "string" },
+              "line": { "type": "integer" },
+              "text": { "type": "string" },
+              "reported_by": { "type": "array", "items": { "type": "integer" }, "description": "1-based reviewer numbers that reported the finding." },
+              "from": { "type": "string", "description": "The severity the finding carried before the vote." },
+              "to": { "type": "string", "description": "The severity the sessions voted (applied, or refused)." },
+              "reasons": { "type": "array", "items": { "type": "string" }, "description": "Both verifier sessions' re-rate reasons, session order." },
+              "refused": { "enum": ["unanimous", "sibling"], "description": "Present only when the re-rate was refused, naming the rule that refused it." }
+            }
+          }
+        },
         "sentinels": {
           "type": "array",
           "description": "Sentinel results recorded for this attempt (F-25): every sentinel L0 ran, pass or fail, so the human merge sees what was checked.",

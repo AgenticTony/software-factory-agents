@@ -117,10 +117,24 @@
         "kind": "owner_action",
         "command": "factory approve --profile",
         "note": "record the client's onboarding answer in the profile's model_restrictions block (the default answer is none — clients are open by default, F-59's blanket client/zai refusal is replaced by that answer) and re-approve the profile"
+      }
+    },
+    {
+      "epoch": 5,
+      "date": "2026-11-23",
+      "wo": "F-103",
+      "surfaces": [
+        "queue"
+      ],
+      "change": "tasks.schema.json's attempt record gains the optional review_rerates field (F-103: the severity re-rates the verifier applied or had refused, with both sessions' reasons) — additive: nothing that loaded before refuses, no stored attempt changes shape",
+      "tightens": false,
+      "migration": {
+        "kind": "none",
+        "note": "an addition that tightens nothing; no project needs to act"
       },
       "fingerprint": {
         "schemas": {
-          "tasks.schema.json": "b80198f679024fc14acf308882d7ad5beae13f4956f4e6b9b5192de746d58add",
+          "tasks.schema.json": "e4c1101d8c51b9b9d9e73dddbfb563f25f42b2d64b0c82c8baefeb0fc318dd94",
           "project.schema.json": "9fdf5d92ec0dcdff03fbf47f0959ce47e598665b311dbf5bebd7b104455a873d"
         },
         "functions": {

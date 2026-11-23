@@ -50,16 +50,41 @@ gate output). Then tag it:
   pre-existing must name where the old code has it.
 
 A `blocking` or `major` finding is never noise: drop it only on positive
-evidence it is wrong, never to slim the list. Severity is the reviewer's
-to set and yours to challenge only with a drop plus reason — do not
-re-rate by tag. A `blocking` or `major` finding gets TWO independent
-verifier sessions, and this is one of them: your drop alone does not
-remove it — both sessions must agree, and a finding every reviewer
-reported cannot be dropped at all (your drop is recorded, the finding
-survives tagged `important`). Vote your judgement anyway — a unanimous
-finding you genuinely disprove is exactly what the owner needs to see
-flagged in the ledger — but know the mechanism before you spend your
-reasoning on it.
+evidence it is wrong, never to slim the list. A `blocking` or `major`
+finding gets TWO independent verifier sessions, and this is one of them:
+your drop alone does not remove it — both sessions must agree, and a
+finding every reviewer reported cannot be dropped at all (your drop is
+recorded, the finding survives tagged `important`). Vote your judgement
+anyway — a unanimous finding you genuinely disprove is exactly what the
+owner needs to see flagged in the ledger — but know the mechanism before
+you spend your reasoning on it.
+
+## Re-rating down (F-103)
+
+Severity belongs to the severity rubric below, not to how the review
+felt, and you may challenge it in ONE direction: down. When you vote to
+KEEP a `blocking` or `major` finding whose own scenario cannot reach any
+A cost (the rubric below defines A), your vote may carry `rerate`:
+`"minor"` or `"note"`, with your reason showing why that scenario
+reaches no A cost. The bar is deliberately higher than keeping:
+
+- Your reason must QUOTE the finding's own scenario — copy the part of
+  the finding's `text` that names the input or state, inside double
+  quotes — then say why it cannot reach any A cost. A re-rate reason
+  that quotes no scenario does not count: the vote reads as a plain
+  keep.
+- `rerate` only ever goes DOWN, to `"minor"` or `"note"`: re-rating UP
+  is never yours, and a rerate on anything but a `blocking` or `major`
+  finding is a protocol violation that voids your vote.
+- The same two-session rule as drops: BOTH verifier sessions must vote
+  the same re-rate. One vote — or a failed session — keeps the original
+  severity. A finding every reviewer reported cannot be re-rated either
+  (your re-rate is recorded, the severity stands), and a sibling's
+  severity is never touched.
+
+Every applied re-rate lands in the report's ledger with both sessions'
+reasons, so the owner can audit exactly what moved a finding off the
+round-failing list.
 
 ## Siblings
 
@@ -98,6 +123,11 @@ for one:
   non-empty.
 - `tag` is required on a keep and must be exactly one of the three
   values above; a drop carries no tag.
+- `rerate` is optional and only ever the JSON literal `"minor"` or
+  `"note"`, on a KEEP vote for a `blocking` or `major` finding, with the
+  scenario quote in your `reason` exactly as the re-rating section above
+  says. A `rerate` on a drop vote, on a lesser finding, or any other
+  value voids the whole vote — the finding then survives you.
 - A vote for an id you were not given, a second vote, a missing tag, or
   any other shape violation makes the whole vote invalid — and an
   invalid vote drops nothing: the finding then survives you. Vote

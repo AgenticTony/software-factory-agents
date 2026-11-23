@@ -1314,6 +1314,18 @@ def _review_drops(l2) -> list | None:
     return drops
 
 
+def _review_rerates(l2) -> list | None:
+    """The attempt record's ``review_rerates`` (F-103 AC-2): the re-rates
+    the L2 verifier applied or had refused, each with BOTH sessions'
+    reasons — the audit side of the re-rate-down rule, mirroring
+    :func:`_review_drops`. Absent fields are omitted (the schema has no
+    nullable keys); None when none happened (the field stays absent,
+    not empty)."""
+    if l2 is None or not getattr(l2, "rerated", None):
+        return None
+    return [dict(entry) for entry in l2.rerated]
+
+
 def _final_review_field(l2, repeat: bool) -> dict:
     """The attempt record's ``final_review`` summary (F-41 AC-5): the
     final full review's verdict, its findings, and whether it was a
@@ -6949,6 +6961,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                             sentinels=list(l0.sentinel_results)
                             if l0 is not None else None,
                             review_drops=_review_drops(l2),
+                            review_rerates=_review_rerates(l2),
                             final_review=final_field,
                             pr=url,
                         )
@@ -6982,6 +6995,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                             sentinels=list(l0.sentinel_results)
                             if l0 is not None else None,
                             review_drops=_review_drops(l2),
+                            review_rerates=_review_rerates(l2),
                             final_review=final_field,
                             pr=url,
                         )
@@ -7248,6 +7262,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                                  pr=url,
                                                  sentinels=list(cast("Any", l0).sentinel_results),
                                                  review_drops=_review_drops(l2),
+                                                 review_rerates=_review_rerates(l2),
                                                  final_review=final_field,
                                                  note=(
                                                      "published under the factory "
@@ -7504,6 +7519,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                         escalation=escalation, note=note,
                         sentinels=list(l0.sentinel_results) if l0 is not None else None,
                         review_drops=_review_drops(l2),
+                        review_rerates=_review_rerates(l2),
                         final_review=final_field,
                         pr=url,
                     )
@@ -7535,6 +7551,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                         escalation=escalation, note=note,
                         sentinels=list(l0.sentinel_results) if l0 is not None else None,
                         review_drops=_review_drops(l2),
+                        review_rerates=_review_rerates(l2),
                         final_review=final_field,
                         pr=url,
                     )
@@ -7563,6 +7580,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                         note=note,
                         sentinels=list(l0.sentinel_results) if l0 is not None else None,
                         review_drops=_review_drops(l2),
+                        review_rerates=_review_rerates(l2),
                         final_review=final_field,
                         pr=url,
                     )
@@ -7582,6 +7600,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                         note=exhaust_note,
                         sentinels=list(l0.sentinel_results) if l0 is not None else None,
                         review_drops=_review_drops(l2),
+                        review_rerates=_review_rerates(l2),
                         final_review=final_field,
                         pr=url,
                     )
@@ -7593,6 +7612,7 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                     attempt_no, started, "fail", records, path,
                     sentinels=list(l0.sentinel_results) if l0 is not None else None,
                     review_drops=_review_drops(l2),
+                    review_rerates=_review_rerates(l2),
                     final_review=final_field,
                 )
                 finish(attempt, None, findings, finding_keys=round_keys)
