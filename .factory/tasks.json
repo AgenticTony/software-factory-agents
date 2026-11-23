@@ -7616,6 +7616,64 @@
           ".factory/BOOTSTRAP.md"
         ]
       }
+    },
+    {
+      "id": "F-109",
+      "title": "Command and session text never crashes the queue it is recorded in",
+      "source": "BUILD-ORDER.md#f-109--command-and-session-text-never-crashes-the-queue-it-is-recorded-in",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-63"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "The attempt writer escapes: TaskQueue.append_attempt passes every string in the record through factory.contract.escape_recorded_text — every character the queue loader refuses (C0, DEL, C1, bidi and isolate controls) becomes its visible escape (`\\n`, `\\x1b`, `\\u202e` as text), the loader's free-text newline/tab exemption is mirrored exactly, and the loader is never loosened. A project sentinel whose command prints a newline, an ANSI clear-screen and a bidi override ends `sentinel_failed` (never `orchestrator_error`), the saved queue loads, and the stored detail shows the escapes as text.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f109.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "The other queue writers of session- or command-derived text escape too: record_followup (L2 finding text into the follow-up draft), record_wip, recover_revalidated, vouch_pushed_head, recover_pr_merged (gate-pinned: a hostile URL refuses as a foreign PR before anything is stored), recover_attempts and reject_escalation (the attempt_resets markers) and tick_owner_steps (owner evidence). Each, fed the same hostile text, leaves a queue that loads, with the escapes visible; a hand-written queue carrying a raw control character is still refused at load.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f109.py::test_ac_2"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 60,
+        "wall_clock_min": 90
+      },
+      "scope": {
+        "paths": [
+          "factory/contract.py",
+          "factory/state.py",
+          "tests/test_f109.py",
+          "TASK-CONTRACT.md",
+          "VALIDATOR-SPEC.md",
+          "BUILD-ORDER.md",
+          ".factory/tasks.json",
+          ".factory/project.yaml",
+          ".factory/BOOTSTRAP.md"
+        ]
+      }
     }
   ]
 }

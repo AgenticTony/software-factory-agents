@@ -486,6 +486,11 @@ paths:
     # class these tests pin is exactly the gate a session must not
     # weaken.
     - "tests/test_f105.py"
+    # F-109: the recorded-text escape tests pin the writer-side half of
+    # the terminal-safety rule — every queue writer of outside text
+    # stores the loader-refused characters escaped, and the loader's own
+    # refusal stays (test_loader_still_refuses_raw_control).
+    - "tests/test_f109.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 
