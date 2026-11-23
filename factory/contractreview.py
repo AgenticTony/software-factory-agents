@@ -22,7 +22,17 @@ is that reading:
   earlier review.
 * **The output** is parsed strictly (:func:`factory.l2.parse_contract_review`):
   anything but one valid findings object fails the whole review —
-  nothing is stored and the command exits non-zero.
+  nothing is stored and the command exits non-zero. A COMPLETED session
+  whose reply failed that parse gets ONE repair turn on the SAME session
+  (F-108, F-85's model): the parse error verbatim, the findings schema,
+  and "re-emit the findings object you just produced, correctly
+  formatted; change no finding". The repair cannot change what was
+  reviewed: the same read-only seat, the same strict parse against the
+  task's criterion ids, and the store's hash recheck — a contract edited
+  mid-review refuses and stores nothing. A repaired review is stored
+  with ``repaired: true`` (approval shows "(format repaired)") and the
+  repair's usage and turns added to the total; a second failure refuses
+  exactly as the first would have.
 * **The store.** A valid review lands at
   ``<factory_root>/contract-reviews/<project>/<task>/<contract-hash>.json``
   with the provider record and the session's reported usage. The key is
@@ -184,7 +194,17 @@ FILE_LIST_MAX_PATHS = 2_000
 FILE_LIST_MAX_PATH_CHARS = 300
 # The session's wall-clock bound, minutes (the turn cap is
 # factory.orchestrator.CONTRACT_REVIEWER_TURN_CAP, beside the arbiter's).
+# F-108: the bound spans the session AND its one repair turn — a repair
+# runs on the minutes the session left, so the whole review stays inside
+# it.
 REVIEW_WALL_CLOCK_MIN = 15.0
+
+# F-108 AC-1: the one instruction the repair turn carries (the brief's
+# exact words; tests/test_f108.py pins it by literal).
+_REPAIR_INSTRUCTION = (
+    "Re-emit the findings object you just produced, correctly formatted; "
+    "change no finding."
+)
 
 _HEADING_RE = re.compile(r"(#{1,6})[ \t]+(.*?)[ \t#]*")
 _SOURCE_FORBIDDEN_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\\]")
@@ -405,6 +425,49 @@ def build_prompt(task: dict, *, source: _Source, profile: dict,
     return "\n".join(parts)
 
 
+def _repair_prompt(parse_error: str, criterion_ids: list[str]) -> str:
+    """F-108 AC-1: the ONE follow-up turn a contract-review session whose
+    reply failed the strict parse gets — F-85's reviewer repair
+    (:func:`factory.orchestrator._repair_reviewer_prompt` is the model),
+    written here over the findings protocol. The parse error verbatim
+    (the session's own text quoted back to the same session), the
+    required schema, and the instruction that bounds what a repair may
+    do. The parse itself is never weakened."""
+    lens = " | ".join(f'"{name}"' for name in CONTRACT_REVIEW_LENSES)
+    severity = " | ".join(f'"{name}"' for name in CONTRACT_REVIEW_SEVERITIES)
+    return "\n".join([
+        "Your previous reply was not a valid review, so it could not be "
+        "used:",
+        "",
+        parse_error,
+        "",
+        "Emit the findings again as exactly one JSON object and nothing "
+        "else that could be mistaken for one:",
+        "",
+        "```json",
+        "{",
+        '  "findings": [',
+        "    {",
+        '      "id": "CR-1",',
+        f'      "lens": {lens},',
+        f'      "severity": {severity},',
+        '      "text": "<the finding>",',
+        '      "criterion": "<acceptance id>" | null,',
+        '      "suggested_change": "<a change to the contract>" | null',
+        "    }",
+        "  ]",
+        "}",
+        "```",
+        "",
+        f"`criterion` is one of {json.dumps(criterion_ids)} or null, as "
+        "the task message defined. An unknown key, a value outside the "
+        "lists above, a repeated finding or any text outside the object "
+        "still fails the whole review.",
+        "",
+        _REPAIR_INSTRUCTION,
+    ])
+
+
 # -------------------------------------------------------------- the store --
 
 _TASK_COMPONENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", re.ASCII)
@@ -613,9 +676,16 @@ def approval_lines(factory_root: Path | str, project: str,
         findings = stored.review["findings"]
         when = stored.review.get("reviewed_at")
         stamp = f", reviewed {_show(when)[:40]}" if isinstance(when, str) else ""
+        # F-108: a repaired review shows exactly like any other, with
+        # ONE added note — the reply was re-emitted once after a parse
+        # failure (the findings themselves are not marked: the strict
+        # parse is the gate, and it passed).
+        repaired = (" (format repaired)"
+                    if stored.review.get("repaired") is True else "")
         return [
             f"  contract review (F-80) of this contract (hash {short}"
-            f"{stamp}): {_counts(findings)} — advice, the decision is yours",
+            f"{stamp}): {_counts(findings)} — advice, the decision is "
+            f"yours{repaired}",
             *finding_lines(findings),
         ]
     if stored.state == "stale":
@@ -667,6 +737,30 @@ def _turns(record: SessionRecord) -> int | None:
     return None
 
 
+def _sum_usage(first: dict | None, second: dict | None) -> dict | None:
+    """Two session-REPORTED usage blocks summed, holding the F-59 rule
+    both were validated under (``factory.orchestrator._attempt_usage``
+    semantics): a count unknown on either side makes that total unknown —
+    None, never 0 — and a pair that reported nothing omits the block.
+    Telemetry only; it drives no decision."""
+    if first is None and second is None:
+        return None
+    blocks = [first or {}, second or {}]
+    return {
+        key: (None if any(block.get(key) is None for block in blocks)
+              else sum(block[key] for block in blocks))
+        for key in ("input", "cache_read", "cache_write", "output")
+    }
+
+
+def _sum_turns(first: int | None, second: int | None) -> int | None:
+    """The same rule over the turn counts: one unknown makes the total
+    unknown, never the known side presented as the whole (R1-6)."""
+    if first is None or second is None:
+        return None
+    return first + second
+
+
 def review_contract(
     queue_path: Path | str,
     task_id: str,
@@ -687,7 +781,10 @@ def review_contract(
     peak window, the seat's provider — all refusals before any spend —
     then, under the queue's run lease, a disposable clone of the remote
     default branch, the bounded source read, ONE session, the strict
-    parse and the atomic store write. The queue file is only ever read.
+    parse — and, when a completed session's reply failed it, ONE repair
+    turn on that SAME session (F-108, F-85's model) — the store-time
+    contract-hash recheck and the atomic store write. The queue file is
+    only ever read.
 
     Args:
         queue_path: The project's ``.factory/tasks.json``.
@@ -709,9 +806,11 @@ def review_contract(
 
     Raises:
         ContractReviewError: The review was refused (peak window, an
-            unreadable source, a hostile task id) or failed (the session
-            did not complete, or its output was not a valid review).
-            Nothing was stored.
+            unreadable source, a hostile task id, the contract changed
+            while the review ran) or failed (the session did not
+            complete, or its output — after one repair turn (F-108) when
+            the session was completed and resumable — was not a valid
+            review). Nothing was stored.
         ContractError: The queue, profile or ledger refused (an
             unapproved profile, a mismatched pair, an unknown task, a
             held run lease).
@@ -803,6 +902,74 @@ def review_contract(
                 srt_bin_path=srt_bin_path,
                 run_id=work.run_id, task_id=task_id,
             )
+            # F-108: the parse runs while the run — and the session's
+            # scratch HOME, the only place the transcript a repair
+            # resumes lives (``cleanup_run`` below removes it) — is
+            # still alive. A COMPLETED, resumable session whose reply
+            # failed the strict parse gets ONE repair turn on the SAME
+            # session (the runner's ``resume``), F-85's model at
+            # REPAIR_TURN_CAP: the parse error verbatim, the findings
+            # schema, and one instruction — re-emit, change no finding.
+            # The parse is never loosened: a repaired reply passes the
+            # SAME strict parse, and a second failure refuses below
+            # exactly as before.
+            criterion_ids = _criterion_ids(task)
+            parsed = parse_contract_review(record.result, criterion_ids)
+            repaired = False
+            repair_record: SessionRecord | None = None
+            repair_error: str | None = None
+            repair_note: str | None = None
+            if (parsed.error is not None and record.status == "completed"
+                    and record.session_id):
+                from factory.orchestrator import REPAIR_TURN_CAP
+
+                remaining = REVIEW_WALL_CLOCK_MIN - (
+                    time.monotonic() - started) / 60.0
+                if remaining > 0:
+                    try:
+                        repair_record = runner(
+                            "contract_reviewer",
+                            _repair_prompt(parsed.error, criterion_ids),
+                            work.root, profile,
+                            factory_root=factory_root,
+                            role="contract_reviewer", config=config,
+                            max_turns=REPAIR_TURN_CAP,
+                            timeout_min=remaining,
+                            protected=list(
+                                (profile.get("paths") or {})
+                                .get("protected") or []),
+                            system_prompt=SYSTEM_PROMPT,
+                            srt_bin_path=srt_bin_path,
+                            run_id=work.run_id, task_id=task_id,
+                            resume=record.session_id,
+                        )
+                    except Exception as exc:  # noqa: BLE001 — clean refusal
+                        repair_note = (
+                            "its one repair turn could not run "
+                            f"({type(exc).__name__}: "
+                            f"{escape_approval_text(str(exc))[:200]})")
+                    else:
+                        if repair_record.status == "completed":
+                            reparsed = parse_contract_review(
+                                repair_record.result, criterion_ids)
+                            if reparsed.error is None:
+                                parsed, repaired = reparsed, True
+                            else:
+                                # The SECOND failure the owner saw twice:
+                                # today's refusal, naming the newest
+                                # parse error.
+                                repair_error = reparsed.error
+                        else:
+                            why = escape_approval_text(scrub_session_text(
+                                str(repair_record.reason
+                                    or "no reason given"), secrets))[:200]
+                            repair_note = (
+                                f"its one repair turn ended "
+                                f"{repair_record.status} ({why})")
+                else:
+                    repair_note = (
+                        "its one repair turn did not run (the session had "
+                        "spent the review's wall clock)")
             seconds = round(time.monotonic() - started, 1)
         except GateError as exc:
             raise RunError(f"contract review: {exc}") from exc
@@ -815,15 +982,24 @@ def review_contract(
         raise ContractReviewError(
             f"contract review failed: the session ended {record.status} "
             f"({why}) — nothing was stored")
-    parsed = parse_contract_review(record.result, _criterion_ids(task))
     if parsed.error is not None:
+        final_error = (repair_error if repair_error is not None
+                       else parsed.error)
         why = escape_approval_text(scrub_session_text(
-            parsed.error, secrets))[:500]
+            final_error, secrets))[:500]
+        note = f"; {repair_note}" if repair_note is not None else ""
         raise ContractReviewError(
             f"contract review failed: the session's output is not a valid "
-            f"review ({why}) — nothing was stored")
+            f"review ({why}){note} — nothing was stored")
     findings = scrub_session_value(parsed.findings, secrets)
     provider = getattr(record, "provider", None)
+    turns = _turns(record)
+    usage = _usage(record)
+    if repaired and repair_record is not None:
+        # F-108 AC-1: the repair's usage and turns ride the stored
+        # total (unknown counts stay unknown — the F-59 rule, never 0).
+        turns = _sum_turns(turns, _turns(repair_record))
+        usage = _sum_usage(usage, _usage(repair_record))
     review = {
         "version": _STORE_VERSION,
         "project": project,
@@ -841,10 +1017,28 @@ def review_contract(
         # credential.
         "provider": (provider if isinstance(provider, dict)
                      and provider.get("kind") else spec.provider_record()),
-        "turns": _turns(record),
+        "turns": turns,
         "session_seconds": seconds,
-        "usage": _usage(record),
+        "usage": usage,
         "findings": findings,
     }
+    if repaired:
+        # F-108: the honesty flag — the reply was re-emitted once, and
+        # approval says so ("(format repaired)"). The strict parse is
+        # the only gate this review passed; the flag is what it cost.
+        review["repaired"] = True
+    # F-108 AC-2: the review is stored under the hash computed BEFORE
+    # the first session. The queue is only ever read here, but the owner
+    # may edit the contract while a review runs; a review landing
+    # stale-on-arrival would mis-key the store. Refuse instead —
+    # repaired or not. (An edit between this re-read and the atomic
+    # write is still caught by the store's own keying: the loader
+    # matches the stored contract_hash against the task's current hash
+    # and calls a mismatch stale, never current.)
+    if contract_hash(TaskQueue(queue_path).get(task_id)) != chash:
+        raise ContractReviewError(
+            "contract review refused: the task's contract changed while "
+            "the review ran (the review covers the earlier contract) — "
+            "nothing was stored; run it again for the new contract")
     _store(path, review)
     return ReviewResult(path=path, review=review)
