@@ -1062,6 +1062,10 @@ def render_task_status(
 ) -> str:
     """``factory status <task>`` (F-83): one task's honest numbers.
 
+    Every ``attempt_resets`` marker gets a header line with its evidence
+    (F-107): the budget counts only post-reset attempts, so the marker
+    is what says why the attempt numbering restarted and who granted it.
+
     Per attempt: the implementer's turns against the budget cap (the
     number ``max_turns`` bounds — F-83 AC-1), the per-seat turn spread
     (``turns_by_seat``), the validated token columns and the cost total
@@ -1111,6 +1115,19 @@ def render_task_status(
         lines.append(f"- parked: {reason or 'no escalation recorded'}")
         if note:
             lines.append(f"- parked note: {parked_note(note)}")
+    # F-107: every budget reset, with its evidence — the budget counts
+    # only post-reset attempts (the table shows them all), so the
+    # marker is what says why the numbering restarted.
+    for marker in task.get("attempt_resets") or []:
+        slice_id = marker.get("slice_id")
+        slice_note = (f" [{slice_id}]"
+                      if slice_id and slice_id != task_id else "")
+        lines.append(
+            f"- attempt reset{slice_note} at {marker.get('at', '?')} by "
+            f"{marker.get('done_by', '?')} (budget counts attempts after "
+            f"{marker.get('prior_attempts', '?')}): "
+            f"{marker.get('evidence', '')}"
+        )
 
     def turns_cell(attempt: dict) -> str:
         turns = attempt.get("turns")

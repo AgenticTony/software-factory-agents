@@ -1052,6 +1052,24 @@ Re-approval owed: profile (`tests/test_f108.py` new and protected). The stored r
 
 Review: one round. Size S.
 
+### F-107 — A contract re-approved after a reject or a scope widen starts clean
+
+Commit message: `fix: re-approval after reject/adopt resets the budget and refreezes the hash (F-107)`
+
+Status: **draft, 2026-11-21** (from the JobFinderOS J-3 and J-4 runs; spec in `docs/next-work-orders.md` §F-107).
+
+Two approval-lifecycle holes, each of which re-parked a task the owner had just fixed. J-3: `recover --reject` returns the task to draft and clears the approval markers but leaves the attempt budget spent — after the owner cut the contract down and re-approved it, the next loop parked it again, `attempts_exhausted` at 0 turns, and the owner then needed `--reset-attempts` with an invented `--evidence`. J-4: the owner widened a parked task's scope plus one AC sentence and recorded it with `approve --adopt`, but adopt writes the owner ledger and never the task's `acceptance_hash` — the next loop's contract audit saw the stale hash and demoted the task to draft, so the widening needed a third approval. A reject or a widen followed by the owner's re-approval must give a task that runs.
+
+Which failure costs more: silently granting more attempts than the owner meant. So the reset is a normal `attempt_resets` marker (schema fields, visible in `factory status` and the PR body's attempt numbering through `attempt_budget_used`), and only a reject writes it — a reject is already an explicit owner act that clears the approval, so nothing runs until the owner re-approves, and no approval needs to know what preceded it.
+
+Acceptance:
+- AC-1 `recover --reject` itself appends one schema-valid `attempt_resets` marker (evidence "escalation rejected; the contract must be re-approved before any run", `done_by` the owner — the same source `--reset-attempts` uses — `prior_attempts` the current count, the slice) in the same queue write that returns the task to draft; every attempt record stays. Nothing else writes one: a plain first approval and `--redraft` add no marker. Rejecting through a second park→reject→approve cycle resets again from that point (the budget is `max_attempts` fresh, never cumulative). After a reject + edit + re-approval the next run starts attempt 1 of N and publishes instead of parking `attempts_exhausted` at 0 turns, and `factory status` shows each reset with its evidence. Test `tests/test_f107.py::test_ac_1`.
+- AC-2 When `approve --adopt` records a task whose current `acceptance_hash(acceptance)` differs from its stored one, the same confirm also writes the new `acceptance_hash`, `approved_at` and `approved_by` in the same write as the ledger record — the ledger and the task agree, and `demote_changed_contracts` leaves the task alone. The refreeze is a re-approval and runs approval's own checks first (contract checks, risk coverage, budget floor, with the protected-ref warnings rendered before the y/N; a refusal records a `failed` result and writes nothing); the confirm asks the re-approval question when the acceptance changed. An unchanged acceptance is not rewritten (no new `approved_at`); a declined task is never touched; the ledger refusal rolls the fields back (the approve_task rule: a refused entry writes nothing to the queue). Test `tests/test_f107.py::test_ac_2` (the J-4 replay: park, widen scope AND change AC text, adopt, recover, loop — the task runs, not demoted; plus the refusal, budget-floor, warning and prompt arms).
+
+Re-approval owed: profile (`tests/test_f107.py` protected; `factory/state.py`, `factory/approve.py` — protected files — changed).
+
+Residuals, named: a no-attempts task cannot be rejected at all (a park IS an escalated attempt; the command's gate refuses first), so the marker writer never sees `prior_attempts` 0 — asserted as the refusal in test_ac_1 arm 5; the adopt refreeze keys on the ACCEPTANCE hash, so a scope-only widen records the new whole-contract hash in the ledger but rewrites none of the task's three fields (the audit compares acceptance hashes, so the task is safe) — pinned in test_ac_2 arm 3.
+
 ### F-105 — The lint-suppression sentinel counts net added suppressions, like assertion_removed
 
 Commit message: `fix: lint_suppression_added counts net suppressions, not re-aligned lines (F-105)`

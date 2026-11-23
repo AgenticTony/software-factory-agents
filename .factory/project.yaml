@@ -475,6 +475,12 @@ paths:
     # the store-time contract-hash recheck) — the same precedent as
     # F-85's repair tests.
     - "tests/test_f108.py"
+    # F-107: the re-approval contract tests judge the protected
+    # state/approve writers (the reject's budget-reset marker and its
+    # one-writer rule, adopt's refreeze-on-changed-acceptance) and the
+    # status page's reset line — same precedent, protected from the
+    # day they exist.
+    - "tests/test_f107.py"
     # F-105: the net-count contract tests judge the protected sentinel
     # scanner (sentinels.py is protected above) — the J-2 re-alignment
     # class these tests pin is exactly the gate a session must not
