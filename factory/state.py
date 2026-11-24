@@ -55,6 +55,7 @@ from factory.contract import (
     acceptance_hash,
     canonical_json,
     contract_hash,
+    escape_recorded_text,
     load_tasks,
     scope_pattern_error,
     validate_queue,
@@ -1464,8 +1465,8 @@ class TaskQueue:
                 "in_progress task holding a normal PR link whose "
                 "links.pushed_head is exactly the kept commit's parent"
             )
-        task["links"] = {**links, "wip": {"sha": sha, "parent": parent,
-                                           "run_id": run_id}}
+        task["links"] = {**links, "wip": escape_recorded_text(
+            {"sha": sha, "parent": parent, "run_id": run_id})}
         self.save()
 
     def clear_wip(self, task_id: str) -> "dict | None":
@@ -1561,7 +1562,10 @@ class TaskQueue:
             return {"action": "removed", "id": followup_id,
                     "reason": "the round published with no findings open",
                     "task": None, "count": 0}
-        built = _build_followup(task, findings, floor)
+        # F-109: the finding text is session-derived — escape it HERE,
+        # at the writer, instead of trusting the caller to have (the
+        # criteria would refuse the queue's next load raw).
+        built = escape_recorded_text(_build_followup(task, findings, floor))
         if existing is None:
             self.doc.setdefault("tasks", []).append(built)
             self.save()
@@ -1705,9 +1709,11 @@ class TaskQueue:
         task["status"] = "in_review"
         # R1-B1: pushed_head records the owner's vouch — the sweep's CI
         # fix round may build on exactly this head if its CI goes red.
+        # F-109: the pair is read from the remote through gh/git.
         task["links"] = {**(task.get("links") or {}),
-                         "revalidated": {"pr": pr_sha, "default": default_sha},
-                         "pushed_head": pr_sha}
+                         "revalidated": escape_recorded_text(
+                             {"pr": pr_sha, "default": default_sha}),
+                         "pushed_head": escape_recorded_text(pr_sha)}
         self.save()
         return "in_review"
 
@@ -1755,7 +1761,8 @@ class TaskQueue:
                 "an open normal PR (no escalation draft, not merged) — "
                 "everything else keeps its own exit"
             )
-        task["links"] = {**links, "pushed_head": pr_sha}
+        # F-109: the SHA is the caller's remote read.
+        task["links"] = {**links, "pushed_head": escape_recorded_text(pr_sha)}
         self.save()
         return "in_review"
 
@@ -1808,7 +1815,10 @@ class TaskQueue:
         _check_slice_rules(task, "in_review")
         _check_owner_step_rules(task, "in_review")
         task["status"] = "in_review"
-        task["links"] = {**(task.get("links") or {}), "merged": merged_url}
+        # F-109: the URL came from GitHub through gh (the gate above has
+        # already pinned it to the task's own link).
+        task["links"] = {**(task.get("links") or {}),
+                         "merged": escape_recorded_text(merged_url)}
         _drop_wip(task)  # F-79: merged — nothing is left to resume
         self.save()
         return "in_review"
@@ -1952,13 +1962,14 @@ class TaskQueue:
         _check_slice_rules(task, new_status)
         _check_owner_step_rules(task, new_status)
         task["status"] = new_status
-        task.setdefault("attempt_resets", []).append({
+        # F-109: the marker carries owner-typed evidence and names.
+        task.setdefault("attempt_resets", []).append(escape_recorded_text({
             "at": now_iso(),
             "evidence": evidence.strip(),
             "done_by": (done_by or "").strip() or getpass.getuser(),
             "slice_id": slice_id,
             "prior_attempts": len(task.get("attempts") or []),
-        })
+        }))
         if new_status != "in_review":
             _drop_wip(task)  # F-79: a fresh run resumes nothing
         self.save()
@@ -2176,14 +2187,15 @@ class TaskQueue:
         # empty here; prior_attempts names what the fresh budget starts
         # after, whatever the slice.
         attempts = task.get("attempts") or []
-        task.setdefault("attempt_resets", []).append({
+        # F-109: the marker carries the owner's name (done_by).
+        task.setdefault("attempt_resets", []).append(escape_recorded_text({
             "at": now_iso(),
             "evidence": "escalation rejected; the contract must be "
                         "re-approved before any run",
             "done_by": (done_by or "").strip() or getpass.getuser(),
             "slice_id": attempts[-1].get("slice_id") or task_id,
             "prior_attempts": len(attempts),
-        })
+        }))
         return self._to_draft(task)
 
     def redraft(self, task_id: str, *, evidence: str) -> str:
@@ -2322,9 +2334,13 @@ class TaskQueue:
         candidate = copy.deepcopy(task)
         stamp = now_iso()
         for number in step_numbers:
-            candidate["owner_steps"][number - 1].update(
-                done=True, done_at=stamp, done_by=done_by, evidence=evidence.strip()
-            )
+            # F-109: the tick carries owner-typed evidence and a name —
+            # escaped under their own keys, so the evidence key keeps the
+            # loader's free-text newline allowance.
+            candidate["owner_steps"][number - 1].update(escape_recorded_text({
+                "done": True, "done_at": stamp, "done_by": done_by,
+                "evidence": evidence.strip(),
+            }))
         current = _status_of(candidate)
         path: list = []
         if not open_owner_steps(candidate):
@@ -2348,6 +2364,15 @@ class TaskQueue:
     def append_attempt(self, task_id: str, attempt: dict) -> None:
         """Append one attempt record to a task's append-only log.
 
+        Every string in the record — the note, the sentinel details, the
+        review drops, the session-reported model — goes through
+        :func:`factory.contract.escape_recorded_text` first (F-109): a
+        failing sentinel's command output carries newlines and terminal
+        controls, and a record stored raw would refuse the queue's next
+        load, ending the run ``orchestrator_error`` with the real
+        finding lost. The record the caller holds is not mutated (the
+        walker builds fresh containers).
+
         Args:
             task_id: Task id.
             attempt: Attempt record; must satisfy the schema's ``attempt``
@@ -2361,7 +2386,7 @@ class TaskQueue:
             ConcurrentWriteError: If another writer changed the file.
         """
         task = self.get(task_id)
-        task.setdefault("attempts", []).append(attempt)
+        task.setdefault("attempts", []).append(escape_recorded_text(attempt))
         self.save()
 
     def demote_changed_contracts(self, ledger=None) -> ContractAudit:

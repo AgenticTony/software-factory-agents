@@ -359,6 +359,72 @@ def _control_string_violations(
     return out
 
 
+# F-109: the three C0 characters whose escape has a standard readable
+# form; every other refused character goes through the \xNN / \uNNNN
+# forms (the same mapping egress.escape_approval_text prints).
+_RECORDED_ESCAPE_NAMES = {"\n": "\\n", "\t": "\\t", "\r": "\\r"}
+
+
+def escape_recorded_text(value: Any) -> Any:
+    """Escape every character the queue loader refuses, so text the
+    factory records from a command or a session always loads (F-109).
+
+    The refusal (:func:`_control_string_violations`, F-63) is right: a
+    recorded string that can rewrite the owner's terminal must never
+    reach an approval prompt, and a newline that refuses the next queue
+    load costs the run its real finding. The writers therefore store the
+    recordable form — every refused character becomes its visible
+    escape — and the loader is never loosened.
+
+    The walk mirrors the refusal exactly, so its output always loads:
+
+    - ``\\n``, ``\\t`` and ``\\r`` escape by name; the other C0, DEL and
+      C1 characters escape as ``\\xNN``; the bidi and isolate controls
+      escape as ``\\uNNNN``;
+    - dict values under the loader's free-text keys
+      (:data:`_TASK_FREE_TEXT_KEYS` — ``note``, ``evidence``, ``text``)
+      keep their raw newline and tab, the one exemption
+      ``_control_string_violations`` grants task strings — a list item
+      under such a key loses it, exactly as the loader's path check does
+      (``note[0]`` is not ``note``);
+    - dict KEYS pass through unchanged: the loader's string walk checks
+      values only, and the schemas constrain the keys.
+
+    Idempotent: the escapes are plain text the regex does not match, so
+    a stored value passed through this again comes back unchanged.
+    """
+    return _escape_recorded_value(value, key=None)
+
+
+def _escape_recorded_value(value: Any, *, key: "str | None") -> Any:
+    """The :func:`escape_recorded_text` walker; ``key`` is the dict key
+    this value sits under (``None`` for list items and top-level
+    strings, which the loader's path check never exempts)."""
+    if isinstance(value, str):
+        exempt = key in _TASK_FREE_TEXT_KEYS
+        out: list[str] = []
+        for char in value:
+            if not _DISALLOWED_CONTROL_RE.match(char):
+                out.append(char)
+            elif exempt and char in ("\n", "\t"):
+                out.append(char)  # the loader's own allowance
+            elif char in _RECORDED_ESCAPE_NAMES:
+                out.append(_RECORDED_ESCAPE_NAMES[char])
+            elif ord(char) < 0x100:
+                out.append(f"\\x{ord(char):02x}")
+            else:
+                out.append(f"\\u{ord(char):04x}")
+        return "".join(out)
+    if isinstance(value, dict):
+        return {
+            dict_key: _escape_recorded_value(item, key=dict_key)
+            for dict_key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_escape_recorded_value(item, key=None) for item in value]
+    return value
+
+
 def _semantic_violations(tasks: Any, origin: str) -> "list[tuple[str, str]]":
     """Every queue semantic violation as ``(check tag, message)``.
 

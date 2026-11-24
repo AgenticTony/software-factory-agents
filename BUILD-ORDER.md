@@ -1120,6 +1120,22 @@ Residuals, named: the nit budget stays a COMBINED minor+note budget ranked worst
 
 Re-approval owed: profile (prompt hashes change: the verifier prompt file and every reviewer/verifier assembled prompt; `tests/test_f103.py` and `tests/_support/f96.py` new and protected; `tasks.schema.json` gained `review_rerates`); AC-5 paid eval owed by the owner.
 
+### F-109 — Command and session text never crashes the queue it is recorded in
+
+Commit message: `fix: recorded command output is escaped, never refused at load (F-109)`
+
+Status: **draft, 2026-11-23** (found reviewing F-107: `tests/test_f72.py::test_ac_1` failed on a host running Node 20).
+
+A failing project sentinel stores the last 200 characters of its command output as `attempts[].sentinels[].detail` (`factory/sentinels.py`), redacted then cut. The queue loader refuses control characters in every string (F-63's terminal-safety rule), so any multi-line output — a newline included — makes the NEXT queue load fail: the run ends `orchestrator_error` with the real `sentinel_failed` finding lost. On a Node 20 host the sandbox prints an `ExperimentalWarning` into every command's output, which is how it showed up; any project sentinel with multi-line output hits it. The loader's refusal is right (a recorded string that can rewrite the owner's terminal must never reach an approval prompt), so the fix is at the writers: every refused character is stored as its visible escape (`\n`, `\x1b`, `‮` as text); the loader is never loosened.
+
+Acceptance:
+- AC-1 The attempt writer escapes. `TaskQueue.append_attempt` — the one writer of attempt records — passes every string in the record through `factory.contract.escape_recorded_text`, which escapes exactly the characters the loader refuses (C0, DEL, C1, bidi and isolate controls) to their visible escapes and mirrors the loader's one exemption (raw newline and tab kept in the `note`/`evidence`/`text` free-text keys). A sentinel whose command prints `line1\nline2\x1b[2J` + U+202E ends `sentinel_failed` (never `orchestrator_error`), the saved queue loads, and the stored detail shows the escapes as text. Test `tests/test_f109.py::test_ac_1` (real run, F-72 harness).
+- AC-2 The other queue writers of session- or command-derived text escape too: `record_followup` (L2 finding text → the follow-up draft), `record_wip`, `recover_revalidated`, `vouch_pushed_head`, `recover_pr_merged` (gate-pinned: a hostile URL refuses as a foreign PR before anything is stored), `recover_attempts` and `reject_escalation` (the `attempt_resets` markers), and `tick_owner_steps` (owner evidence). Each, fed the same hostile text, leaves a queue that loads with the escapes visible. Test `::test_ac_2`.
+
+Mutations: the helper removed from `append_attempt` → AC-1 RED; the loader's refusal relaxed instead → the loader-still-refuses test RED (`tests/test_f109.py::test_loader_still_refuses_raw_control` — a hand-written queue carrying a raw control refuses at load, unchanged); one listed writer bypassing the helper → AC-2 RED.
+
+Re-approval owed: profile (`tests/test_f109.py` new and protected).
+
 ## Phase 1c — First outside project
 
 ### F-13 — Onboard JobFinderOS (pilot)
