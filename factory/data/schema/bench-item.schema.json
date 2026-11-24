@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://factory.local/schema/bench-item.schema.json",
+  "title": "Factory bench item (bench/<project>/<slot>/item.json, F-104)",
+  "description": "One replayable merged task: the repo it came from, the base commit the replay starts from, the merged head the hidden tests were proven on, the approved contract the implementer is prompted with, and the hidden tests' refs and files (the file bytes live beside this file under hidden/). Written only by `factory bench add`, which refuses an item whose hidden tests do not fail on the base and pass on the merged head; validated against this schema on every load (the F-02 rule for a new state surface).",
+  "type": "object",
+  "required": [
+    "slot",
+    "project",
+    "source_task",
+    "source_pr",
+    "repo_path",
+    "default_branch",
+    "base",
+    "head",
+    "added",
+    "contract",
+    "hidden_refs",
+    "hidden_files"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "slot": {
+      "type": "string",
+      "pattern": "^BENCH-[0-9]{2,}$",
+      "description": "The item's opaque handle — the task id, the branch and the commit messages a replay runs on (F-99's rule: no name that identifies the source task reaches a seat)."
+    },
+    "project": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]+$",
+      "description": "The project slug the item belongs to (must match the profile's name)."
+    },
+    "source_task": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The real task id the item was added from — a report label only, never prompted."
+    },
+    "source_pr": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The PR number GitHub reported merged — a report label only."
+    },
+    "repo_path": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The project repo's absolute path at add time — where the replay re-reads the base and head commits from."
+    },
+    "default_branch": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The repo's default branch name; the sanitized origin holds exactly this branch, at the base commit."
+    },
+    "base": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "The commit the replay starts from (the merge-base of the pushed head and the default branch)."
+    },
+    "head": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "The pushed head the PR merged — where the hidden tests were proven green."
+    },
+    "added": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When `factory bench add` accepted the item."
+    },
+    "contract": {
+      "type": "object",
+      "required": [
+        "title",
+        "acceptance",
+        "scope"
+      ],
+      "additionalProperties": false,
+      "description": "The approved contract, verbatim from the merged task — what the replayed implementer is prompted with. States the task, never the answer (checked at add against the merged diff, F-99's rule).",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The spec doc path (+ optional #heading) the real task named — validated present on the base commit at add."
+        },
+        "acceptance": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "text",
+              "check"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^AC-[0-9]+$"
+              },
+              "text": {
+                "type": "string"
+              },
+              "check": {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "type": {
+                    "enum": [
+                      "test",
+                      "command",
+                      "holdout",
+                      "prod_probe",
+                      "manual"
+                    ]
+                  },
+                  "ref": {
+                    "type": "string"
+                  },
+                  "expect": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "scope": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "risk": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The source task's risk flags, carried so the replay's gates match the original."
+        },
+        "out_of_scope": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "dependencies": {
+          "type": "array",
+          "description": "The source task's declared dependencies (F-71), carried so the replay's install rules match the original.",
+          "items": {
+            "type": "object",
+            "required": [
+              "ecosystem",
+              "name"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "ecosystem": {
+                "enum": [
+                  "pypi",
+                  "npm"
+                ]
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    "hidden_refs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "The contract's test node ids — the refs the parent runs on the replay head, outside the session, after the attempt settles."
+    },
+    "hidden_files": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "The hidden tests' repo-relative paths; their bytes live verbatim under hidden/<path> beside this file."
+    }
+  }
+}

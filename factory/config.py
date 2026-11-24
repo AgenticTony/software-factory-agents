@@ -12,7 +12,9 @@ The file is YAML at ``<factory_root>/config.yaml`` (absent = defaults).
 The ``models`` block (F-100) is the owner-maintained registry — the
 documented example here is the shipped default (``factory.models.
 DEFAULT_REGISTRY``); the owner's file is theirs, never written by the
-factory::
+factory. An implementer model change (an alias bump or a stack edit) is
+preceded by a ``factory bench run`` with the new model against the
+current baseline, whose diff the owner reads first (F-104)::
 
     peak_window:
       timezone: Europe/Stockholm

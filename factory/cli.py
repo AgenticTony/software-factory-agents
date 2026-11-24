@@ -468,6 +468,56 @@ def build_parser() -> argparse.ArgumentParser:
         help="factory root holding the approval ledger (default: ~/factory)",
     )
 
+    bench = sub.add_parser(
+        "bench",
+        help="replay benchmark of merged tasks with hidden tests "
+             "(F-104) — measures the implementer before a model swap; "
+             "drives real model sessions, never in CI",
+    )
+    bench_sub = bench.add_subparsers(dest="bench_command", required=True)
+    bench_add_cmd = bench_sub.add_parser(
+        "add",
+        help="add one benchmark item from a merged task: the approved "
+             "contract plus its hidden tests, proven fail-on-base / "
+             "pass-on-head (3 green runs) before it counts",
+    )
+    bench_add_cmd.add_argument("project", help="project slug (the ledger's name)")
+    bench_add_cmd.add_argument(
+        "source", metavar="task-id | pr-number",
+        help="the merged task's id, or its PR number")
+    bench_add_cmd.add_argument(
+        "--factory-root", default=None,
+        help="factory root (default: ~/factory)")
+    bench_run_cmd = bench_sub.add_parser(
+        "run",
+        help="replay every item through the real pipeline with "
+             "publishing replaced by scoring; writes the report under "
+             "<factory-root>/bench/<project>/reports/",
+    )
+    bench_run_cmd.add_argument("project", help="project slug")
+    bench_run_cmd.add_argument(
+        "--repeats", type=int, default=None,
+        help="replay each item N times (default 1, a swap check; "
+             "--repeats 3 for a baseline — every replay is a paid session)")
+    bench_run_cmd.add_argument(
+        "--role", action="append", default=None, metavar="ROLE=MODEL",
+        help="run this replay with one registry role overridden "
+             "(repeatable; the swap check: --role implementer=<new "
+             "model>). This run only: never written to any profile or "
+             "to the registry, named in the report, still inside the "
+             "project's providers_allowed (F-100 AC-5)")
+    bench_run_cmd.add_argument(
+        "--against", default=None, metavar="REPORT",
+        help="diff against an earlier bench report; regressions "
+             "(pass -> fail) are listed first")
+    bench_run_cmd.add_argument(
+        "--keep", action="store_true",
+        help="keep the replay scratch (the sanitized origin) for "
+             "inspection")
+    bench_run_cmd.add_argument(
+        "--factory-root", default=None,
+        help="factory root (default: ~/factory)")
+
     for name, wo in STUBS.items():
         sub.add_parser(name, help=f"stub — implemented in {wo}")
     return parser
@@ -872,9 +922,10 @@ def _run_sentinels_replay(args: argparse.Namespace) -> int:
         return 1
 
 
-def parse_role_overrides(pairs: "list[str] | None", config):
-    """Parse ``--role ROLE=MODEL`` pairs into the eval's override map
-    (F-100 AC-5).
+def parse_role_overrides(pairs: "list[str] | None", config, *,
+                         command: str = "eval"):
+    """Parse ``--role ROLE=MODEL`` pairs into the override map
+    (F-100 AC-5; the eval and the bench both carry it).
 
     Each value must name a registry role (``implementer``,
     ``reviewer.hunt``, …) and a model id or alias; a pair without ``=``,
@@ -891,14 +942,14 @@ def parse_role_overrides(pairs: "list[str] | None", config):
 
         if not sep or role not in MODEL_ROLES or not model:
             print(
-                f"factory eval: --role needs ROLE=MODEL with ROLE one of "
-                f"{list(MODEL_ROLES)} (e.g. --role reviewer.hunt="
+                f"factory {command}: --role needs ROLE=MODEL with ROLE "
+                f"one of {list(MODEL_ROLES)} (e.g. --role reviewer.hunt="
                 "claude-sonnet-5-5); "
                 f"got {pair!r}",
                 file=sys.stderr)
             raise SystemExit(2)
         if role in overrides:
-            print(f"factory eval: --role names {role!r} twice",
+            print(f"factory {command}: --role names {role!r} twice",
                   file=sys.stderr)
             raise SystemExit(2)
         try:
@@ -906,7 +957,8 @@ def parse_role_overrides(pairs: "list[str] | None", config):
             # typo'd alias refuses here, named, not at session time.
             expand_alias(config.models, model)
         except RegistryError as exc:
-            print(f"factory eval: --role {role!r}: {exc}", file=sys.stderr)
+            print(f"factory {command}: --role {role!r}: {exc}",
+                  file=sys.stderr)
             raise SystemExit(2) from exc
         overrides[role] = model
     return overrides
@@ -1159,6 +1211,62 @@ def _run_orchestrator(args: argparse.Namespace) -> int:
         return 130
 
 
+def _run_bench(args: argparse.Namespace) -> int:
+    """Dispatch ``factory bench add|run`` (F-104). Both refuse loudly
+    (exit 2, never a traceback); ``run`` prints the rendered report.
+
+    ``run`` drives real model sessions by default — it is the owner's
+    paid measurement (exactly like ``factory eval``), never called from
+    ``run``/``loop``/CI. ``--role`` rides the config in memory only and
+    is named in the report."""
+    import dataclasses
+
+    from factory.bench import BenchError, bench_add, bench_run
+
+    root = Path(args.factory_root) if args.factory_root else None
+    try:
+        if args.bench_command == "add":
+            out = bench_add(root, args.project, args.source)
+            print(f"{args.project}: added {out['slot']} "
+                  f"(from {out['item'].source_task}, PR #"
+                  f"{out['item'].source_pr}) — {out['item_dir']}")
+            return 0
+        repeats = args.repeats if args.repeats is not None else 1
+        if repeats < 1:
+            print(f"factory bench run: --repeats must be an integer "
+                  f">= 1, got {repeats}", file=sys.stderr)
+            return 2
+        loaded = load_config(
+            (root if root is not None else FACTORY_ROOT_DEFAULT) /
+            CONFIG_FILE)
+        overrides = parse_role_overrides(args.role, loaded,
+                                         command="bench run")
+        config = (dataclasses.replace(loaded,
+                                      role_overrides=overrides)
+                  if overrides else loaded)
+        result = bench_run(
+            root, args.project, repeats=repeats,
+            against=args.against, config=config, keep=args.keep)
+    except (BenchError, ConfigError, ContractError, GateError,
+            PublishError, PushRefused, RunError, SandboxError,
+            SessionConfigError) as exc:
+        print(f"factory bench: {exc}", file=sys.stderr)
+        return 2
+    print(result["rendered_path"].read_text(), end="")
+    print(f"factory bench run: report written to "
+          f"{result['report_path']}")
+    # A9: a replay that errored is recorded in the report, and the
+    # command says so — a partially-errored benchmark is evidence, not
+    # a clean run.
+    errors = result["report"].get("errors") or []
+    if errors:
+        print(f"factory bench run: {len(errors)} item(s) errored: "
+              f"{', '.join(errors)} — see their factory_outcome fields",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list | None = None) -> int:
     """Parses arguments and dispatches a subcommand.
 
@@ -1214,6 +1322,8 @@ def main(argv: list | None = None) -> int:
         return _run_import(args)
     if args.command == "doctor":
         return _run_doctor(args)
+    if args.command == "bench":
+        return _run_bench(args)
     print(
         f"factory {args.command}: not implemented yet (scheduled in {STUBS[args.command]})",
         file=sys.stderr,

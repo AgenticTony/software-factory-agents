@@ -500,6 +500,18 @@ paths:
     # stores the loader-refused characters escaped, and the loader's own
     # refusal stays (test_loader_still_refuses_raw_control).
     - "tests/test_f109.py"
+    # F-104: the replay-benchmark contract tests judge what a model swap
+    # is judged on — the item store's self-proof, the future-free
+    # sanitized clone, the real-pipeline replay with publish replaced
+    # by scoring, the report's regressions-first diff and the swap-rule
+    # note. factory/bench.py IS that judge (the eval's sibling for the
+    # implementer): a session weakening it edits what measures it, so it
+    # is protected like factory/eval.py's tests are. The support module
+    # carries the merged-task fixture and the scripted seats those
+    # verdicts rest on (the test_f95 precedent).
+    - "tests/test_f104.py"
+    - "tests/_support/f104.py"
+    - "factory/bench.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 

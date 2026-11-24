@@ -174,5 +174,43 @@ or to the registry, named in the report, still inside the fixture's
 allowed providers. A before/after pair of reports is the evidence for a
 registry change.
 
+The implementer is measured the same way, on real past work (F-104): an
+implementer model change — an alias bump or a stack edit — is preceded
+by a `factory bench run <project> --role implementer=<new model>
+--against <latest report>` whose diff the owner reads before approving
+the registry edit. `factory doctor` notes a registry whose implementer
+model differs from the one the latest bench report ran.
+
+## Operating: the replay benchmark of merged tasks (F-104)
+
+The eval measures the reviewers; the bench measures the implementer, on
+real past work. `factory bench add <project> <task-id | pr-number>`
+records a MERGED task as one item: its approved contract plus its
+hidden tests (the files its test-checked acceptance refs name), proven
+at add — the hidden tests must fail on the base commit and pass on the
+merged head three times, and a contract that quotes the merged diff
+refuses. Items live under `<factory-root>/bench/<project>/`, outside
+every sandbox, schema-validated on load.
+
+`factory bench run <project> [--repeats N] [--role implementer=<alias>]
+[--against <report>]` replays each item through the real pipeline
+(implementer, L0, L1, L2 with the verifiers) in a clone of the repo as
+it was BEFORE the work: one branch at the base, no remote, no tags,
+packs rebuilt, and verified to hold no commit from base..head before
+any session starts. Publishing is replaced by scoring — after the
+attempt settles the parent copies the hidden tests onto the replay's
+head, outside the session, and runs them. A replay is a **clean merge**
+only when the hidden tests pass AND the factory would have published:
+an escalation is never a clean merge. The report gives per item k/N
+clean merges, the yield figure (clean merges per unit cost), cost per
+clean merge, the models that ran per role, and the `--against` diff
+with regressions (pass → fail) first.
+
+Paid sessions: every replay with the default seat runner spends real
+money (~$25–35 per 1-repeat run of 8 items, an estimate). It is the
+owner's command, like `factory eval` — never in CI, never from
+`factory run`/`loop`. Default repeats is 1 (a swap check); use 3 for a
+baseline.
+
 
 Private by design. Nothing here deploys anywhere; it's a CLI.
