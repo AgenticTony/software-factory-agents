@@ -1,7 +1,7 @@
 {
   "version": 5,
   "project": "software-factory",
-  "updated_at": "2026-11-22T00:30:00Z",
+  "updated_at": "2026-11-23T00:00:00Z",
   "tasks": [
     {
       "id": "F-00",
@@ -7614,6 +7614,94 @@
           ".factory/tasks.json",
           ".factory/project.yaml",
           ".factory/BOOTSTRAP.md"
+        ]
+      }
+    },
+    {
+      "id": "F-103",
+      "title": "A finding blocks only when it can cost production",
+      "source": "BUILD-ORDER.md#f-103--a-finding-blocks-only-when-it-can-cost-production",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "depends_on": [
+        "F-96"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "One severity-rubric block (the spec's A/B/C table plus 'a blocking or major finding states its failure scenario: the input or state, and the wrong result'), defined once as factory.prompts.SEVERITY_RUBRIC and included byte-for-byte in every assembled reviewer seat prompt (both lenses and the one-seat fan-out — the final full review runs on the same assembled prompts) and the verifier prompt, exactly once each, in the system prompt above the untrusted contract/diff/finding text; prompt_versions hashes it with the rest.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f103.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "The verifier may re-rate a blocking/major finding DOWN to minor/note only when BOTH its verifier sessions vote the same target, each reason quoting the finding's own scenario (a reason quoting none counts as a keep, the refusal named on the finding); one vote, a failed session, an empty reason, an up-re-rate or a rerate on a lesser finding voids or is ignored, keeping the severity; a unanimous finding and a sibling's severity are refused (recorded in the report's rerated ledger with both reasons, refused: unanimous|sibling); every applied re-rate replaces the severity before the verdict is recomputed, lands in the stored report and the attempt record's review_rerates with both sessions' reasons, and the rerated finding rides the PR body's open-findings section and the F-82 draft.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f103.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "The stop rule is pinned: a round whose surviving findings are all minor/note passes and publishes, the minors land in the PR body's open-findings section and the F-82 draft, and a note beyond the nit budget is cut and recorded (verifier_dropped, reason nit_budget, and the attempt record's review_drops).",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f103.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "VALIDATOR-SPEC's L2 section carries the same rubric block and the re-rate rule; README and BUILD-ORDER §F-41 carry no 'rate it major' style statement the rubric replaces.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f103.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "Measured, not assumed: the OWNER runs 'factory eval --repeats 3' before and after (paid; never from the build). Pass bar: no seed's catch rate (k/3) drops and 'Drops that cost a catch' does not rise; a drop in catches reverts the re-rate half before merge. OWED by the owner at reconcile.",
+          "check": {
+            "type": "manual"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "S",
+        "max_attempts": 3,
+        "max_turns": 60,
+        "wall_clock_min": 90
+      },
+      "scope": {
+        "paths": [
+          "factory/prompts.py",
+          "factory/data/prompts/verifier.md",
+          "factory/l2.py",
+          "factory/orchestrator.py",
+          "factory/data/schema/tasks.schema.json",
+          "tests/test_f103.py",
+          "tests/test_f09.py",
+          "tests/_support/f96.py",
+          "VALIDATOR-SPEC.md",
+          "README.md",
+          "BUILD-ORDER.md",
+          ".factory/tasks.json",
+          ".factory/project.yaml",
+          ".factory/BOOTSTRAP.md",
+          "tests/test_reconcile_ledger.py",
+          "factory/data/schema/epochs.json"
         ]
       }
     }

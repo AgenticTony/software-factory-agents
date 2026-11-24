@@ -486,6 +486,15 @@ paths:
     # class these tests pin is exactly the gate a session must not
     # weaken.
     - "tests/test_f105.py"
+    # F-103: the severity-rubric contract tests pin the shared rubric
+    # block (prompts.py is a protected path that changed) and the
+    # verifier's re-rate-down mechanics in the protected l2/orchestrator
+    # vote path — the same precedent as F-96's vote tests: what decides
+    # whether a finding blocks is judge surface, protected from the day
+    # it exists. _support/f96.py is registered because the re-rate
+    # script shape extends its vote harness.
+    - "tests/test_f103.py"
+    - "tests/_support/f96.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 

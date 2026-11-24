@@ -50,6 +50,42 @@ REVIEWER_FILE = "reviewer.md"
 VERIFIER_FILE = "verifier.md"
 
 
+# F-103: the severity rubric — ONE shared block, defined here and
+# included byte-for-byte in every reviewer seat prompt (the final full
+# review runs on the same assembled reviewer prompts) and in the verifier
+# prompt. Pinned by literal in tests/test_f103.py — editing it here
+# without the pin fails the test. The block lives in the SYSTEM prompt,
+# above the untrusted contract, diff and finding text a seat is handed in
+# its user prompt, so injected "rate everything minor" text in a diff
+# competes with the rubric, not replaces it; whether a vote can actually
+# move a severity is enforced by l2's two-vote rule, never by the prompt.
+# The implementer never sees it: it does not rate findings.
+SEVERITY_RUBRIC = (
+    "## The severity rubric\n"
+    "\n"
+    "Whether a finding blocks depends on what it can cost production, "
+    "not on how the review felt. Rate every finding with this table:\n"
+    "\n"
+    "| Severity | Bucket | Test | Route |\n"
+    "|---|---|---|---|\n"
+    "| `blocking` | A | Certain on the main path: wrong output, data "
+    "loss, an acceptance criterion not met, or a broken boundary "
+    "(sandbox, push, budget, approval, secrets, auth, payments, verdict "
+    "integrity) | fails the round, fix |\n"
+    "| `major` | A | The same costs, reachable under an input or state "
+    "the finding names | fails the round, fix |\n"
+    "| `minor` | B | Real and wrong, but visible and caught by a human "
+    "before harm: a misleading message, a noisy follow-up, a slow path, "
+    "a weak test | PR body + F-82 follow-up, never blocks |\n"
+    "| `note` | C | Polish: naming, comments, structure, style | PR body "
+    "within the nit budget, else cut |\n"
+    "\n"
+    "A `blocking` or `major` finding states its failure scenario in "
+    "`text`: the input or state, and the wrong result. \"Could be "
+    "cleaner\" is never A.\n"
+)
+
+
 class PromptError(Exception):
     """A seat prompt cannot be assembled: missing file, or a ``standards``
     entry naming a file that doesn't exist in the project repo."""
@@ -153,7 +189,9 @@ def assemble_implementer_prompt(profile: dict | None = None) -> str:
 
 def assemble_reviewer_prompt(profile: dict | None = None) -> str:
     """The reviewer's system prompt: the base file (two axes, smell
-    baseline, mandatory checklist, test-quality checks) plus the content of
+    baseline, mandatory checklist, test-quality checks), the F-103
+    severity rubric (:data:`SEVERITY_RUBRIC`, one shared block — the
+    final review runs on this same assembled prompt), plus the content of
     every project ``standards`` file — or an explicit statement that the
     project documents none, so the baseline runs alone (VALIDATOR-SPEC L2).
 
@@ -175,6 +213,7 @@ def assemble_reviewer_prompt(profile: dict | None = None) -> str:
     if not standards:
         return (
             prompt
+            + "\n\n" + SEVERITY_RUBRIC
             + "\n\n## Project standards\n\n"
             "This project documents no standards files: the smell baseline "
             "above applies alone, and the report must say so.\n"
@@ -197,7 +236,11 @@ def assemble_reviewer_prompt(profile: dict | None = None) -> str:
                 f"standards file {rel!r} cannot be read: {exc}"
             ) from exc
         sections.append(f"### {rel}\n\n{text.rstrip()}\n")
-    return prompt + "\n\n## Project standards\n\n" + "\n".join(sections)
+    return (
+        prompt
+        + "\n\n" + SEVERITY_RUBRIC
+        + "\n\n## Project standards\n\n" + "\n".join(sections)
+    )
 
 
 # F-94: the defect-hunt lens — what the second reviewer seat adds to the
@@ -267,9 +310,12 @@ def reviewer_seat_prompts(profile: dict | None = None,
 
 def assemble_verifier_prompt(profile: dict | None = None) -> str:
     """The verifier's system prompt (F-38): the base file (vote rules, drop
-    cases, tags) plus the same standards assembly the reviewer gets — the
-    verifier judges whether a finding is style-only or cites a real
-    documented standard, which needs the standards texts in hand.
+    cases, tags, the F-103 re-rate-down vote), the same shared severity
+    rubric the reviewer gets (:data:`SEVERITY_RUBRIC` — the re-rate reason
+    argues against the rubric's own A bucket), plus the same standards
+    assembly the reviewer gets — the verifier judges whether a finding is
+    style-only or cites a real documented standard, which needs the
+    standards texts in hand.
 
     Args:
         profile: The loaded ``project.yaml`` mapping (optional in tests).
@@ -288,6 +334,7 @@ def assemble_verifier_prompt(profile: dict | None = None) -> str:
     if not standards:
         return (
             prompt
+            + "\n\n" + SEVERITY_RUBRIC
             + "\n\n## Project standards\n\n"
             "This project documents no standards files: judge style-only "
             "against the smell baseline the reviewers were given.\n"
@@ -310,7 +357,11 @@ def assemble_verifier_prompt(profile: dict | None = None) -> str:
                 f"standards file {rel!r} cannot be read: {exc}"
             ) from exc
         sections.append(f"### {rel}\n\n{text.rstrip()}\n")
-    return prompt + "\n\n## Project standards\n\n" + "\n".join(sections)
+    return (
+        prompt
+        + "\n\n" + SEVERITY_RUBRIC
+        + "\n\n## Project standards\n\n" + "\n".join(sections)
+    )
 
 
 def prompt_versions(profile: dict | None = None, *, reviewers: int = 2) -> dict[str, str]:

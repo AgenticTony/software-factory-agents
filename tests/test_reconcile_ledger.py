@@ -163,6 +163,9 @@ OWNER_PENDING = {
     "F-66": "its own ACs are proven, but reconcile walks the dep chain: "
             "F-59 AC-7 (the owner's paid bedrock run) lands first — the "
             "F-67 precedent",
+    "F-103": "AC-5 is the owner's: the paid `factory eval --repeats 3` "
+             "before and after (a drop in catches reverts the re-rate "
+             "half before merge)",
 }
 
 
