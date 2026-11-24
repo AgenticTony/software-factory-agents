@@ -121,6 +121,25 @@ its sessions agree, any failed session keeps its finding, and the
 unanimous rule stays on top. A mistake on one finding can no longer
 spill onto the others.
 
+F-103 adds the severity rubric's mechanical half. Whether a finding
+blocks is decided by what it can cost production (the rubric itself is
+one shared prompt block, ``factory.prompts.SEVERITY_RUBRIC``), and the
+verifier may re-rate a ``blocking``/``major`` finding DOWN — never up —
+with MORE evidence than keeping it needs: both its sessions voting the
+same target (:func:`combine_finding_votes`, which enforces the
+two-outcome floor the serious-drop rule already has), each reason
+quoting the finding's own scenario (:func:`_quotes_scenario`; a reason
+that quotes none counts as a keep, never a re-rate), a failed session
+keeping the severity, and the refusals on top in :func:`apply_vote` —
+a sibling's severity is untouched (the parent's ruling exists only
+after :func:`mark_siblings`, which runs after the fold) and a unanimous
+finding is never re-rated. An applied re-rate replaces the severity
+before the verdict is recomputed, so the finding stops failing the
+round in the same pass and rides the PR body and the F-82 draft as the
+minor/note it now is; every outcome — applied or refused — lands in the
+report's ``rerated`` ledger with both sessions' reasons, and the
+attempt record carries the same list as ``review_rerates``.
+
 Running the reviewer sessions themselves is F-10's wiring; everything here is
 pure parsing and judgement over the text sessions produced.
 """
@@ -228,7 +247,16 @@ class L2Finding:
     predates this diff and is another site of the class; ``sibling`` is
     the PARENT's ruling (:func:`mark_siblings`) — True only when the
     reviewer claimed it AND the parent proved the file is outside the
-    diff. A sibling cannot block and is not sent to the implementer."""
+    diff. A sibling cannot block and is not sent to the implementer.
+    F-103 adds two vote-artifact fields: ``rerate`` is the re-rate-down
+    target BOTH of the finding's verifier sessions voted (set only by
+    :func:`combine_finding_votes`, which enforces the two-vote rule) —
+    :func:`apply_vote` then applies it (the severity is replaced and the
+    round re-judged) or refuses it, clearing the field either way, and
+    the outcome lands in the report's ``rerated`` ledger with both
+    reasons; ``rerate_reasons`` carries those reasons between the fold
+    and the application. Neither field is ever set by a parse alone: one
+    session's vote is never a re-rate."""
 
     id: str
     text: str
@@ -244,6 +272,8 @@ class L2Finding:
     tag: str | None = None
     sibling_claim: bool = False
     sibling: bool = False
+    rerate: str | None = None
+    rerate_reasons: list = field(default_factory=list)
 
 
 def _normalise_summary(text: str) -> str:
@@ -304,6 +334,15 @@ class L2Report(GateReport):
     kept with the failure on its ``verifier_reason`` — a broken session
     degrades its finding to kept, never the whole review to silently
     lost findings.
+
+    F-103 adds ``rerated``: one flat entry per re-rate the verifier
+    applied or had refused — ``{id, text, from, to, reasons[, refused,
+    axis, file, line, reported_by]}``, ``reasons`` carrying BOTH
+    sessions' re-rate reasons and ``refused`` (``unanimous`` |
+    ``sibling``) present only on a refusal. Like ``verifier_dropped``
+    it lands in the attempt record and the stored report, never the PR
+    body — the finding itself (rerated to ``minor``/``note``) rides the
+    body's open-findings section as the survivor it is.
     """
 
     layer: ClassVar[str] = "L2"
@@ -314,6 +353,7 @@ class L2Report(GateReport):
     no_progress_reason: str | None = None
     verifier_dropped: list = field(default_factory=list)
     verifier_error: str | None = None
+    rerated: list = field(default_factory=list)
     # F-94: each reviewer seat's own declared verdict, seat 1 first (set
     # by merge_reviews; empty for a single parsed verdict). Not stored:
     # mark_siblings reads it to tell a seat's fail that rests only on
@@ -333,6 +373,7 @@ class L2Report(GateReport):
             "no_progress_reason": self.no_progress_reason,
             "verifier_dropped": self.verifier_dropped,
             "verifier_error": self.verifier_error,
+            "rerated": self.rerated,
         }
 
 
@@ -1088,6 +1129,7 @@ def apply_convergence(
         no_progress_reason=reason,
         verifier_dropped=report.verifier_dropped,
         verifier_error=report.verifier_error,
+        rerated=report.rerated,
     )
 
 
@@ -1330,12 +1372,73 @@ class VerifierOutcome(NamedTuple):
 
     F-96 parses ONE session's vote over ONE finding (:func:`parse_verifier_vote`
     with a one-finding list); :func:`combine_finding_votes` folds the
-    sessions into the one outcome :func:`apply_vote` consumes.
+    sessions into the one outcome :func:`apply_vote` consumes. F-103's
+    re-rate rides ``kept`` — the agreed target on the surviving
+    finding's ``rerate`` field — never a separate ledger here: the
+    refusals (the parent's sibling ruling, the unanimous rule) and the
+    application are :func:`apply_vote`'s, and its report carries the
+    ``rerated`` ledger.
     """
 
     kept: list
     dropped: list
     error: str | None
+
+
+# F-103: a re-rate reason must quote the finding's own scenario — the
+# shortest engagement the mechanical layer can demand. A double-quoted
+# span of at least this many characters (whitespace-normalised) that
+# appears verbatim in the finding's text counts as quoting it; a reason
+# that quotes nothing names no scenario and the vote counts as a keep.
+_MIN_SCENARIO_QUOTE = 8
+
+
+def _quotes_scenario(reason: str, finding_text: str) -> bool:
+    """Whether a re-rate reason quotes the finding's own scenario (F-103).
+
+    The rubric requires a ``blocking``/``major`` finding to state its
+    failure scenario in ``text``; a re-rate that shows the scenario
+    reaches no A cost must engage with THAT scenario, not gesture at the
+    finding. The mechanical proxy: the reason carries a double-quoted
+    span of at least :data:`_MIN_SCENARIO_QUOTE` characters whose
+    whitespace-normalised text appears verbatim in the finding's text.
+    A reason that quotes nothing from the finding — "I disagree, this
+    feels minor" — names no scenario, and the vote counts as a keep,
+    never a re-rate: the safer direction costs a round, while a lazy
+    re-rate costs the defect. Verbatim, case-sensitive on purpose — the
+    verifier prompt says to copy the span out of the finding's text.
+    """
+    text = " ".join(finding_text.split())
+    for quote in re.findall(r'"([^"\n]+)"', reason):
+        span = " ".join(quote.split())
+        if len(span) >= _MIN_SCENARIO_QUOTE and span in text:
+            return True
+    return False
+
+
+def _rerate_entry(finding: L2Finding, to: str, reasons: "Sequence[str]",
+                  refused: str | None = None) -> dict:
+    """One rerate ledger entry (F-103): the finding, the severity it
+    carried (``from``), the severity voted (``to``), and BOTH sessions'
+    re-rate reasons — the record the stored report and the attempt
+    record's ``review_rerates`` carry. ``refused`` names the rule that
+    refused the re-rate (``unanimous`` | ``sibling``) and is present
+    only on a refusal. Absent optional fields are omitted (the schema
+    has no nullable keys)."""
+    entry: dict = {
+        "id": finding.id,
+        "text": finding.text,
+        "from": finding.severity,
+        "to": to,
+        "reasons": [str(reason) for reason in reasons],
+    }
+    for key in ("axis", "file", "line", "reported_by"):
+        value = getattr(finding, key, None)
+        if value is not None:
+            entry[key] = value
+    if refused is not None:
+        entry["refused"] = refused
+    return entry
 
 
 def verifier_sessions_for(findings: Sequence) -> list:
@@ -1384,6 +1487,19 @@ def combine_finding_votes(
       missing second vote) — a caller bug must degrade to keeping, the
       fail-open direction, never to a one-vote drop.
     * **A minor or note follows its single vote**, drop or keep.
+    * **A re-rate needs every session's vote (F-103).** A ``blocking``
+      or ``major`` finding is re-rated DOWN only when EVERY outcome for
+      it is a keep carrying the SAME ``rerate`` target and the finding
+      has the two outcomes its drop rule already requires — one vote,
+      a failed session, a split (keep beside re-rate, or two different
+      targets) or a drop beside it keeps the ORIGINAL severity, any
+      lone re-rate recorded as a dissent on the surviving keep. The
+      rule is enforced HERE, not trusted from the vote: a serious
+      finding that arrives with fewer than two outcomes cannot be
+      re-rated at all. The refusals on top — the parent's sibling
+      ruling (``mark_siblings`` runs after this fold, so the sibling
+      check CANNOT live here) and the unanimous rule — stay in
+      :func:`apply_vote`.
     * The unanimous rule stays on top, in :func:`apply_vote`: it can
       refuse a drop this function recorded. A finding with NO session
       at all (a caller bug, not a script the factory runs) is kept
@@ -1454,6 +1570,50 @@ def combine_finding_votes(
                 f"{finding.id}: {len(outcomes)} of 2 votes for a "
                 "blocking/major finding")
             continue
+        if serious and outcomes and len(outcomes) >= 2:
+            # F-103: the re-rate tally. A keep carrying `rerate` is one
+            # session's vote to re-rate down; only EVERY session's vote,
+            # on the SAME target, moves the severity — anything less
+            # falls through to the keep branch below, which clears the
+            # lone re-rate as a dissent. The two-outcome floor is the
+            # same rule the drop above enforces, restated here: a
+            # caller bug that collapses the plan must degrade to
+            # keeping, never to a one-vote re-rate.
+            rerate_keeps = [
+                o.kept[0] for o in outcomes
+                if o.kept and not o.dropped
+                and isinstance(o.kept[0], L2Finding)
+                and o.kept[0].rerate in ("minor", "note")
+            ]
+            if len(rerate_keeps) == len(outcomes):
+                voted_targets: set[str] = {
+                    k.rerate for k in rerate_keeps if k.rerate is not None
+                }
+                targets = sorted(voted_targets)
+                reasons = [str(k.verifier_reason) for k in rerate_keeps]
+                if len(targets) > 1:
+                    detail = " | ".join(
+                        f"{k.rerate}: {k.verifier_reason}"
+                        for k in rerate_keeps)
+                    kept.append(replace(
+                        finding,
+                        verifier_reason=(
+                            "kept (split re-rate — the sessions "
+                            f"disagreed on the target): {detail}"),
+                        rerate=None,
+                        rerate_reasons=[],
+                    ))
+                    continue
+                # Agreed: apply_vote owns the refusals (the parent's
+                # sibling ruling — mark_siblings runs AFTER this fold —
+                # and the unanimous rule) and the application; carry
+                # the target and both reasons there.
+                kept.append(replace(
+                    finding,
+                    rerate=targets[0],
+                    rerate_reasons=reasons,
+                ))
+                continue
         if keep_votes:
             survivor = keep_votes[0].kept[0]
             reason = survivor.verifier_reason
@@ -1465,10 +1625,26 @@ def combine_finding_votes(
                 dissent = str(drop_votes[0].dropped[0].get("reason"))
                 reason = (f"kept (split vote): {reason} | "
                           f"dissent: {dissent}")
+            # F-103: a re-rate only stands when every session voted it
+            # (above) — any keep outcome here keeps the ORIGINAL
+            # severity, a lone re-rate recorded as a dissent on the
+            # surviving keep, exactly like the split drop's dissent.
+            rerate_attempt = next(
+                (k.kept[0] for k in keep_votes
+                 if isinstance(k.kept[0], L2Finding) and k.kept[0].rerate),
+                None,
+            )
+            if rerate_attempt is not None:
+                reason = (
+                    f"{reason} | rerate not applied (a re-rate needs "
+                    f"every session's vote): {rerate_attempt.rerate} — "
+                    f"{rerate_attempt.verifier_reason}")
             kept.append(replace(
                 finding,
                 verifier_reason=reason,
                 tag=survivor.tag,
+                rerate=None,
+                rerate_reasons=[],
             ))
             continue
         kept.append(replace(finding))  # unvoted: kept, untagged
@@ -1765,12 +1941,20 @@ def parse_verifier_vote(output: Any, findings: Sequence[L2Finding]) -> VerifierO
     """Parse the verifier's vote over the union findings (F-38).
 
     The protocol is one object ``{"votes": [{"id", "keep", "reason",
-    "tag?"}]}`` — extracted with the same candidate machinery as the
-    reviewer's verdict (fences, balanced objects, last-wins, duplicate
-    keys rejected). Every violation makes the WHOLE vote invalid: the
-    verifier that cannot speak the vote protocol voted on nothing, and
-    every finding survives it — the fail-open direction here is keeping
-    findings, never dropping them.
+    "tag?", "rerate?"}]}`` — extracted with the same candidate machinery
+    as the reviewer's verdict (fences, balanced objects, last-wins,
+    duplicate keys rejected). Every violation makes the WHOLE vote
+    invalid: the verifier that cannot speak the vote protocol voted on
+    nothing, and every finding survives it — the fail-open direction
+    here is keeping findings, never dropping them. F-103 adds the
+    optional ``rerate``: a re-rate-down vote (``"minor"`` | ``"note"``,
+    a keep of a ``blocking``/``major`` finding only, everything else
+    voiding the vote) whose reason must quote the finding's own
+    scenario (:func:`_quotes_scenario`) — one that quotes none counts
+    as a plain keep, the refusal named on the finding. The parse only
+    ever ANNOTATES the vote: a re-rate stands or falls in
+    :func:`combine_finding_votes` (both sessions) and
+    :func:`apply_vote` (the unanimous rule), never here.
 
     Args:
         output: The verifier session's result text (or None / non-text
@@ -1811,6 +1995,30 @@ def parse_verifier_vote(output: Any, findings: Sequence[L2Finding]) -> VerifierO
         reason = vote.get("reason")
         if not isinstance(reason, str) or not reason.strip():
             return invalid(f"vote for {vid!r} carries no reason")
+        rerate = vote.get("rerate")
+        if rerate is not None:
+            # F-103: a re-rate rides a keep for a blocking/major finding
+            # and only ever goes DOWN. Anything else — a rerate on a
+            # drop vote, on a lesser finding (which has no lower
+            # severity to be voted to), or any value but the two legal
+            # targets — is a protocol violation and voids the whole
+            # vote, like every shape violation here: the finding then
+            # survives.
+            if not vote["keep"]:
+                return invalid(
+                    f"vote for {vid!r} carries a rerate on a drop "
+                    "vote: a re-rate keeps the finding")
+            target = by_id[vid]
+            if target.severity not in _ROUND_FAILING_SEVERITIES:
+                return invalid(
+                    f"vote for {vid!r} carries a rerate on a "
+                    f"{target.severity!r} finding: only a blocking or "
+                    "major finding can be re-rated")
+            if rerate not in ("minor", "note"):
+                return invalid(
+                    f"vote for {vid!r} re-rates to {rerate!r}: a "
+                    "verifier may only re-rate down to minor or note "
+                    "(re-rating up is never the verifier's)")
         if vote["keep"]:
             tag = vote.get("tag")
             if tag not in VALID_TAGS:
@@ -1831,13 +2039,34 @@ def parse_verifier_vote(output: Any, findings: Sequence[L2Finding]) -> VerifierO
             # default tag comes from severity at vote-application time).
             kept.append(replace(finding))
         elif vote["keep"]:
-            kept.append(
-                replace(
-                    finding,
-                    verifier_reason=vote["reason"],
-                    tag=vote["tag"],
+            rerate = vote.get("rerate")
+            if rerate is not None and not _quotes_scenario(
+                    vote["reason"], finding.text):
+                # F-103: a re-rate reason that quotes no scenario from
+                # the finding names no scenario — the vote counts as a
+                # plain keep (the safer direction: the severity stands).
+                # The refusal is named on the finding, so the audit
+                # shows a re-rate was attempted and why it did not
+                # count.
+                kept.append(
+                    replace(
+                        finding,
+                        verifier_reason=(
+                            f"{vote['reason']} | rerate to {rerate} "
+                            "refused: the reason quotes no scenario "
+                            "from the finding"),
+                        tag=vote["tag"],
+                    )
                 )
-            )
+            else:
+                kept.append(
+                    replace(
+                        finding,
+                        verifier_reason=vote["reason"],
+                        tag=vote["tag"],
+                        rerate=rerate,
+                    )
+                )
         else:
             dropped.append(
                 {"finding": dict(finding.__dict__), "reason": vote["reason"]}
@@ -1885,6 +2114,22 @@ def apply_vote(
       is kept — a refused drop with no why is a hole in the audit). A
       finding fewer than all reviewers reported keeps the vote's full
       semantics, drop and all.
+    * **A re-rate never touches a unanimous finding or a sibling
+      (F-103).** The fold (:func:`combine_finding_votes`) lets a
+      re-rate through only when BOTH sessions voted the same target;
+      here two refusals run first: a sibling (the PARENT's ruling —
+      :func:`mark_siblings` re-stamped the vote's survivors above this
+      call, so the check lives here) and a finding every reviewer
+      reported. Either keeps the severity, the refusal recorded in the
+      report's ``rerated`` ledger (``refused: "sibling" |
+      "unanimous"``) with both sessions' reasons and named on the
+      finding. An agreed re-rate on anything else is APPLIED — the
+      severity is replaced before the ranking and the verdict, so a
+      finding re-rated to ``minor``/``note`` stops failing the round in
+      this pass and rides the PR body and the F-82 draft as the minor
+      it now is — and lands in the ``rerated`` ledger with both
+      reasons. The ledger, like ``verifier_dropped``, reaches the
+      attempt record and the stored report, never the PR body.
     * Survivors are ranked by severity first (the Anthropic record's
       "sorted by severity"), then by tag (important, nit, pre-existing),
       then by union order.
@@ -1934,6 +2179,55 @@ def apply_vote(
             **entry,
             "reason": f"override_refused: {entry.get('reason')}",
         })
+
+    # F-103: the re-rate ledger, over what the fold AGREED on — a
+    # re-rate reaches this function only through the fold's two-vote
+    # rule, so one session's vote never moves a severity here. The
+    # refusals run first: a sibling's severity is untouched (the
+    # PARENT's ruling — mark_siblings re-stamped the vote's survivors
+    # above this call, which is why the refusal lives here and not in
+    # the fold), then the unanimous rule. The application replaces the
+    # severity BEFORE the ranking and the verdict below, so a
+    # re-rated-down finding stops failing the round in the same pass.
+    # A refused re-rate keeps the severity and is named on the finding
+    # and in the ledger, with both sessions' reasons, exactly like a
+    # refused drop.
+    rerates: list = []
+    voted: list = []
+    for finding in kept:
+        if isinstance(finding, L2Finding) and finding.rerate:
+            target = finding.rerate
+            reasons = list(finding.rerate_reasons)
+            if finding.sibling:
+                rerates.append(_rerate_entry(finding, target, reasons,
+                                             refused="sibling"))
+                voted.append(replace(
+                    finding,
+                    rerate=None,
+                    rerate_reasons=[],
+                    verifier_reason=(
+                        f"{finding.verifier_reason} | rerate to {target} "
+                        "refused (a sibling's severity is untouched)"),
+                ))
+                continue
+            if _unanimous(finding, reviewers):
+                rerates.append(_rerate_entry(finding, target, reasons,
+                                             refused="unanimous"))
+                voted.append(replace(
+                    finding,
+                    rerate=None,
+                    rerate_reasons=[],
+                    verifier_reason=(
+                        f"{finding.verifier_reason} | rerate to {target} "
+                        "refused (every reviewer reported it)"),
+                ))
+                continue
+            rerates.append(_rerate_entry(finding, target, reasons))
+            voted.append(replace(finding, severity=target,
+                                 rerate=None, rerate_reasons=[]))
+            continue
+        voted.append(finding)
+    kept = voted
 
     decorated: list[tuple] = []
     for index, finding in enumerate(kept):
@@ -1987,6 +2281,7 @@ def apply_vote(
         parse_error=report.parse_error,
         verifier_dropped=drops,
         verifier_error=outcome.error,
+        rerated=rerates,
     )
 
 

@@ -70,7 +70,10 @@ class VoteSeats(LensSeats):
     finding gets more sessions than scripts). One script is one of:
 
     * ``{"drop": True, "reason": str}`` — a vote to drop;
-    * ``{"tag": str, "reason": str}`` — a vote to keep, tagged;
+    * ``{"tag": str, "reason": str}`` — a vote to keep, tagged; an
+      optional ``"rerate": "minor" | "note"`` key plays a re-rate vote
+      (F-103 — any other value rides too, so the parse's refusal of an
+      up-re-rate is exercised, not assumed);
     * ``"invalid"`` — a completed session whose vote does not parse;
     * ``"invalid_resumable"`` — the same, WITH a ``session_id`` (the
       shape F-85's repair turn resumes — the test observes the repair
@@ -104,6 +107,7 @@ class VoteSeats(LensSeats):
         # max-in-flight would read 1 whatever the pool size).
         self.pause = pause
         self.verifier_prompts: list[str] = []
+        self.verifier_system_prompts: list[str] = []
         self.verifier_id_lists: list[list] = []
         self.max_inflight = 0
         self._inflight = 0
@@ -160,9 +164,15 @@ class VoteSeats(LensSeats):
                 votes.append({"id": fid, "keep": False,
                               "reason": script["reason"]})
             else:
-                votes.append({"id": fid, "keep": True,
-                              "reason": script["reason"],
-                              "tag": script.get("tag", "important")})
+                vote = {"id": fid, "keep": True,
+                        "reason": script["reason"],
+                        "tag": script.get("tag", "important")}
+                # F-103: a scripted re-rate vote — `rerate` rides a keep,
+                # only ever "minor" or "note" (any other value is a
+                # protocol violation the parse must refuse).
+                if script.get("rerate"):
+                    vote["rerate"] = script["rerate"]
+                votes.append(vote)
         result = None
         if status == "completed":
             # "invalid" is a COMPLETED session whose text is not a vote
@@ -192,6 +202,8 @@ class VoteSeats(LensSeats):
             match = _FINDING_ARRAY.search(prompt)
             found = json.loads(match.group(1)) if match else []
             self.verifier_prompts.append(prompt)
+            self.verifier_system_prompts.append(
+                kwargs.get("system_prompt") or "")
             self.verifier_id_lists.append([f["id"] for f in found])
             ordinals = {}
             for f in found:

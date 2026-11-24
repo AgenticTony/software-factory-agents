@@ -61,8 +61,10 @@ PROMPT_PINS = {
     IMPLEMENTER_FILE: "6cce5ef8e41d576cb46672690ee82f4b22f3bc9017fd92ad91f21402a2679fe5",
     # F-41; re-pinned for AC-6 (a surviving major fails the round).
     REVIEWER_FILE: "9787ab3630bfc3a8a815386600fe4f7eb78b5e9292996510cd6e27218ef0f0e1",
-    # F-38; re-pinned in its review round (the unanimous-rule paragraph).
-    VERIFIER_FILE: "9f9423ffe7d165dc04f6af3448f83e999c4e9ac9d4659e2c52fd4e15c4ee7f4b",
+    # F-38; re-pinned in its review round (the unanimous-rule paragraph);
+    # re-pinned for F-103 (the re-rating-down vote replaces the
+    # do-not-re-rate rule).
+    VERIFIER_FILE: "f007adcd64b83715b1a334fa9168712b257f274db74e33cd10c1c4a203d21f28",
 }
 
 
