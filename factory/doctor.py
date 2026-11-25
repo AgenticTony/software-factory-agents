@@ -65,6 +65,8 @@ CHECKS = (
     "queue-epoch",          # the recorded epoch against the current one
     "task-approvability",   # what `factory approve` would refuse
     "ledger-repo-path",     # the ledger records repo paths (F-66)
+    "bench-swap",           # F-104: the registry implementer the latest
+                            # bench report did not run
 )
 
 # ELIGIBLE_KINDS lives in factory.state (which imports this module's
@@ -478,6 +480,27 @@ def factory_report(
         repo_report = _repo_report(resolved, root)
         repo_report.findings[0:0] = findings
         reports.append(repo_report)
+    # F-104 AC-5: the model-registry swap note — factory-root-scoped,
+    # not one repo's, so it rides its own block. Informational (never
+    # fatal): the swap rule is the owner's to follow; the note says the
+    # registry's implementer model has no bench report behind it. Built
+    # directly (not through _finding): F-104 changed no contract rule,
+    # so there is no epoch entry to attribute it to — a fabricated one
+    # would mislabel the finding.
+    from factory.bench import bench_swap_note
+    from factory.epochs import current_epoch
+
+    note = bench_swap_note(root)
+    if note:
+        reports.append(Report(repo="model-registry", findings=[Finding(
+            repo="model-registry", check="bench-swap", message=note,
+            tag="bench_swap", fatal=False,
+            epoch=current_epoch(),
+            wo="F-104",
+            change="replay benchmark of merged tasks with hidden tests",
+            fix="run `factory bench run <project> --role "
+                "implementer=<new model> --against <latest report>` and "
+                "read the diff before approving the registry edit")]))
     return reports
 
 

@@ -7762,6 +7762,91 @@
           ".factory/BOOTSTRAP.md"
         ]
       }
+    },
+    {
+      "id": "F-104",
+      "title": "Replay real past tasks to measure the implementer before a model swap",
+      "kind": "build",
+      "status": "draft",
+      "priority": "P1",
+      "source": "BUILD-ORDER.md#f-104--replay-real-past-tasks-to-measure-the-implementer-before-a-model-swap",
+      "depends_on": [
+        "F-103"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "An item proves itself before it counts: `factory bench add <project> <task-id | pr-number>` records a merged task's approved contract plus its hidden tests (the files its test-checked acceptance refs name) and refuses, named, an item whose hidden tests pass on the base commit, fail on the merged head (three green runs at add — the flake guard), whose contract quotes the merged diff, whose task is not merged, or whose head is already an item; items live under <factory_root>/bench/<project>/, outside every sandbox, schema-validated on load.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f104.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "The future is unreachable: each replay runs in a fresh clone made from the base commit alone — one branch, no remote, no tags, packs rebuilt, verified by `git cat-file --batch-all-objects` holding no commit from base..head before any session starts; the hidden tests are absent from the run dir and every built prompt (checked against all parent-built state pre-session and probed from inside the session); task ids, branches and commit messages use opaque BENCH-NN slots.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f104.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "The replay is the real pipeline (implementer, L0, L1, L2 with F-96's verifiers) with publish replaced by scoring: a correct scripted fix scores a clean merge; a fix that passes its own L1 proof but not the hidden tests scores a fail; an escalation is recorded as such and is never a clean merge; per item the record carries hidden pass/fail, the factory outcome, review rounds and turns, tokens and cost per role, wall time; nothing touches GitHub or the project repo.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f104.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "Comparison is the point: `factory bench run <project> [--repeats N] [--role implementer=<alias>] [--against <report>]` gives per item k/N clean merges, the yield figure (clean merges per unit cost), cost per clean merge, the models that ran per role; --against lists regressions (pass → fail) first, every section sorted by slot; the override is recorded in the report and never persisted anywhere.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f104.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "The swap rule is written down: README and the F-100 registry docs (the config docstring) say an implementer model change is preceded by a bench run with the new model against the current baseline; `factory doctor` notes a registry whose implementer model differs from the one the latest bench report ran, and the note clears after a report on the new model.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f104.py::test_ac_5"
+          }
+        }
+      ],
+      "attempts": [],
+      "links": {},
+      "budget": {
+        "size": "M",
+        "max_attempts": 2,
+        "max_turns": 100,
+        "wall_clock_min": 150
+      },
+      "scope": {
+        "paths": [
+          "factory/bench.py",
+          "factory/cli.py",
+          "factory/doctor.py",
+          "factory/config.py",
+          "factory/data/schema/bench-item.schema.json",
+          "tests/test_f104.py",
+          "tests/_support/f104.py",
+          "tests/_support/f63.py",
+          "README.md",
+          "BUILD-ORDER.md",
+          ".factory/tasks.json",
+          ".factory/project.yaml"
+        ]
+      }
     }
   ]
 }

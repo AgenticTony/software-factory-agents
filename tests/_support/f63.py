@@ -96,6 +96,7 @@ FACTORY_ROOT_PINNED_MODULES = (
     "factory.runs",
     "factory.approvals",
     "factory.approve",
+    "factory.bench",
     "factory.cli",
     "factory.dashboard",
     "factory.doctor",
