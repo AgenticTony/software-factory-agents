@@ -491,10 +491,9 @@ paths:
     # verifier's re-rate-down mechanics in the protected l2/orchestrator
     # vote path — the same precedent as F-96's vote tests: what decides
     # whether a finding blocks is judge surface, protected from the day
-    # it exists. _support/f96.py is registered because the re-rate
-    # script shape extends its vote harness.
+    # it exists. _support/f96.py (the re-rate script shape extends its
+    # vote harness) is already registered under F-96 above.
     - "tests/test_f103.py"
-    - "tests/_support/f96.py"
     # F-109: the recorded-text escape tests pin the writer-side half of
     # the terminal-safety rule — every queue writer of outside text
     # stores the loader-refused characters escaped, and the loader's own
