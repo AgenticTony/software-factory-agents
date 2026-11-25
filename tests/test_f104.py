@@ -57,6 +57,28 @@ from factory.bench import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_peak_window(monkeypatch):
+    """Every bench test runs with the peak window disabled: the owner's
+    default window (weekday mornings, Stockholm) would otherwise make
+    every replay escalate peak_window whenever the suite runs inside it.
+    The peak-window behaviour itself is pinned by
+    test_peak_window_refuses_and_midrun_is_error, through config=."""
+    import dataclasses
+
+    import factory.bench as bench_module
+    import factory.cli as cli_module
+
+    # Both call-time globals: bench_run's own load and the CLI's (which
+    # loads the config itself and passes it in, for --role).
+    for module in (bench_module, cli_module):
+        real = module.load_config
+        monkeypatch.setattr(
+            module, "load_config",
+            lambda path, _real=real: dataclasses.replace(
+                _real(path), peak_window=None))
+
+
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(
         ["git", "-C", str(repo), *args], check=True, capture_output=True,
@@ -832,3 +854,94 @@ def test_assertless_hidden_tests_refuse(tmp_path: Path) -> None:
                     "        raise SystemExit('wrong answer')\n")
     with pytest.raises(BenchError, match="no assert lines"):
         bench_add(env.factory_root, "fixture", TASK_ID)
+
+
+# A merged fix whose docstring and comment restate the criterion's own
+# words, and whose user-facing message the criterion names exactly: the
+# shape every real JobFinderOS task has (the implementer copies the
+# contract's wording into prose; the contract names the copy it needs).
+PROSE_CRITERION = (
+    "answer() returns 42 and says 'the stored configuration id is the "
+    "answer' when asked"
+)
+PROSE_FIX_IMPL = (
+    "def answer():\n"
+    '    """Return the id.\n'
+    "\n"
+    "    answer() returns 42 and says 'the stored configuration id is\n"
+    '    """\n'
+    "    # answer() returns 42 and says 'the stored configuration id is\n"
+    "    _message = (\n"
+    '        "the stored configuration id is the answer",\n'
+    "    )\n"
+    "    return 42\n"
+)
+
+
+def test_quote_check_counts_code_only(tmp_path: Path) -> None:
+    """F-99's rule guards the ANSWER, and the answer is code: an added
+    docstring, comment or string-literal line the contract also holds
+    is prose and never refuses the item; a quoted code line still does
+    (test_ac_1's QUOTE_CRITERION arm)."""
+    from factory.contract import acceptance_hash
+
+    env = Env104(tmp_path / "prose", answer_impl=PROSE_FIX_IMPL)
+    env.task["acceptance"][0]["text"] = PROSE_CRITERION
+    env.task["acceptance_hash"] = acceptance_hash(env.task["acceptance"])
+    env.queue_path.write_text(json.dumps(
+        {"version": 1, "project": "fixture", "tasks": [env.task]},
+        indent=2) + "\n")
+    # The fixture really carries the prose lines in the contract text.
+    assert "answer() returns 42 and says 'the stored configuration id is" \
+        in PROSE_CRITERION
+    assert '"the stored configuration id is the answer",' not in \
+        PROSE_CRITERION
+    assert "the stored configuration id is the answer" in PROSE_CRITERION
+    item = bench_add(env.factory_root, "fixture", TASK_ID)
+    assert item["slot"] == "BENCH-01"
+
+    # Non-Python files: comments and string-only lines are prose, code
+    # around a literal is code.
+    from factory.bench import _generic_prose
+
+    assert _generic_prose("// answer() returns 42 and says")
+    assert _generic_prose('"key": "the stored configuration id is",')
+    assert _generic_prose("* the stored configuration id is the answer")
+    assert not _generic_prose('const MSG = "the stored configuration id";')
+    assert not _generic_prose('throw new Error("the answer")')
+
+
+def test_peak_window_refuses_and_midrun_is_error(tmp_path: Path) -> None:
+    """A bench run never scores the peak window as the implementer's
+    failure: it refuses to start inside the window (before any spend,
+    no report), and a replay the window refuses mid-run is an errored
+    replay — named, the run exits non-zero — never a factory failure."""
+    from datetime import datetime, timedelta, timezone
+
+    from factory.config import DAYS, FactoryConfig, PeakWindow
+
+    env = Env104(tmp_path / "peak")
+    bench_add(env.factory_root, "fixture", TASK_ID)
+    reports = env.factory_root / "bench" / "fixture" / "reports"
+
+    always = FactoryConfig(peak_window=PeakWindow(
+        "UTC", tuple(DAYS), "00:00", "23:59"))
+    seats = Seats("good")
+    with pytest.raises(BenchError, match="inside the peak window"):
+        bench_run(env.factory_root, "fixture", session_runner=seats,
+                  config=always)
+    assert seats.seats() == [], "no session may start inside the window"
+    assert not reports.exists() or not any(reports.iterdir())
+
+    # Mid-run: the run starts outside the window (its own clock says
+    # yesterday), the pipeline then meets it (the real clock is today).
+    today = datetime.now(timezone.utc)
+    window = FactoryConfig(peak_window=PeakWindow(
+        "UTC", (DAYS[today.weekday()],), "00:00", "23:59"))
+    out = bench_run(env.factory_root, "fixture", session_runner=Seats("good"),
+                    config=window, now=lambda: today - timedelta(days=1))
+    record = out["report"]["items"][0]["repeats"][0]
+    assert record["factory_outcome"].startswith("error:"), record
+    assert "peak window opened mid-run" in record["factory_outcome"]
+    assert record["clean"] is False
+    assert out["report"]["errors"] == ["BENCH-01"]
