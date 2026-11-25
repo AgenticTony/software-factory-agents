@@ -1,7 +1,7 @@
 {
   "version": 5,
   "project": "software-factory",
-  "updated_at": "2026-11-23T00:00:00Z",
+  "updated_at": "2026-11-25T07:38:14Z",
   "tasks": [
     {
       "id": "F-00",
@@ -7404,7 +7404,7 @@
       "source": "BUILD-ORDER.md#f-106--a-run-that-records-a-merge-acts-on-it-in-the-same-run",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-93"
       ],
@@ -7441,7 +7441,10 @@
         "max_attempts": 3,
         "max_turns": 60,
         "wall_clock_min": 45
-      }
+      },
+      "acceptance_hash": "800d848d7a6310e9bc663f197a7b0e6b39a086ef9fc034fc44e3423a19bd4d87",
+      "approved_at": "2026-11-25T07:38:09Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-108",
@@ -7449,7 +7452,7 @@
       "source": "BUILD-ORDER.md#f-108--a-contract-reviews-malformed-output-gets-one-repair-turn",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-80"
       ],
@@ -7499,7 +7502,10 @@
           ".factory/project.yaml",
           ".factory/BOOTSTRAP.md"
         ]
-      }
+      },
+      "acceptance_hash": "7154740bf946d10bb0a01658a56611803f049534cc933d761f0154f590c46310",
+      "approved_at": "2026-11-25T07:38:10Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-107",
@@ -7507,7 +7513,7 @@
       "source": "BUILD-ORDER.md#f-107--a-contract-re-approved-after-a-reject-or-a-scope-widen-starts-clean",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-79"
       ],
@@ -7558,7 +7564,10 @@
           "BUILD-ORDER.md",
           ".factory/BOOTSTRAP.md"
         ]
-      }
+      },
+      "acceptance_hash": "f9f24b33a73126b590134ba65c5bba61849cecf5df5b12d07bb90c081ca90e0b",
+      "approved_at": "2026-11-25T07:38:11Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-105",
@@ -7566,7 +7575,7 @@
       "source": "BUILD-ORDER.md#f-105--the-lint-suppression-sentinel-counts-net-added-suppressions-like-assertion_removed",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-100"
       ],
@@ -7615,7 +7624,10 @@
           ".factory/project.yaml",
           ".factory/BOOTSTRAP.md"
         ]
-      }
+      },
+      "acceptance_hash": "87194cbc4e359c77ff19fcb432041606b3acd29ab846fa73bbfa539236449f79",
+      "approved_at": "2026-11-25T07:38:11Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-103",
@@ -7623,7 +7635,7 @@
       "source": "BUILD-ORDER.md#f-103--a-finding-blocks-only-when-it-can-cost-production",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-96"
       ],
@@ -7703,7 +7715,10 @@
           "tests/test_reconcile_ledger.py",
           "factory/data/schema/epochs.json"
         ]
-      }
+      },
+      "acceptance_hash": "d8c6184481dc5bf57535860114f87329a5c34a94011712c3b2777e1dc3e482f1",
+      "approved_at": "2026-11-25T07:38:12Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-109",
@@ -7711,7 +7726,7 @@
       "source": "BUILD-ORDER.md#f-109--command-and-session-text-never-crashes-the-queue-it-is-recorded-in",
       "kind": "build",
       "priority": "P1",
-      "status": "draft",
+      "status": "done",
       "depends_on": [
         "F-63"
       ],
@@ -7761,13 +7776,16 @@
           ".factory/project.yaml",
           ".factory/BOOTSTRAP.md"
         ]
-      }
+      },
+      "acceptance_hash": "e0c917dd518cbfee74737b5d32955398016ff8fd29b88e612acace2e1b018fa8",
+      "approved_at": "2026-11-25T07:38:13Z",
+      "approved_by": "Anthony"
     },
     {
       "id": "F-104",
       "title": "Replay real past tasks to measure the implementer before a model swap",
       "kind": "build",
-      "status": "draft",
+      "status": "done",
       "priority": "P1",
       "source": "BUILD-ORDER.md#f-104--replay-real-past-tasks-to-measure-the-implementer-before-a-model-swap",
       "depends_on": [
@@ -7846,7 +7864,10 @@
           ".factory/tasks.json",
           ".factory/project.yaml"
         ]
-      }
+      },
+      "acceptance_hash": "f019e1fa598f77a243a14d09852afa69a9ccc7c5fe20594e045ccea89e37dc5f",
+      "approved_at": "2026-11-25T07:38:14Z",
+      "approved_by": "Anthony"
     }
   ]
 }
