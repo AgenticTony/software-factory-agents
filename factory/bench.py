@@ -67,7 +67,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from factory.approvals import ApprovalLedger
-from factory.config import CONFIG_FILE, FactoryConfig, load_config
+from factory.config import (
+    CONFIG_FILE,
+    FactoryConfig,
+    in_peak_window,
+    load_config,
+)
 from factory.contract import (
     SCHEMA_DIR as _CONTRACT_SCHEMA_DIR,
 )
@@ -339,16 +344,115 @@ def _git_ok(repo: Path, *args: str) -> bool:
 
 
 def _added_lines(repo: Path, base: str, head: str) -> list:
-    """The diff's added lines (``base...head``), stripped."""
-    diff = _git_out(repo, "diff", "--no-color", "--no-ext-diff",
+    """The diff's added CODE lines (``base...head``), stripped.
+
+    F-99's rule guards against a contract that hands over the answer,
+    and the answer is code. Prose is not: an implementer routinely
+    copies the contract's own wording into comments and docstrings, and
+    a contract may legitimately name the exact user-facing text it
+    requires (string literals). So only code lines count: docs files
+    are skipped, Python lines are classified by the tokenizer (a line
+    made only of strings, comments and joining punctuation is prose),
+    other files by stripping string literals and comments. A Python
+    file the tokenizer cannot read counts every line as code — the
+    check fails toward refusing.
+    """
+    diff = _git_out(repo, "diff", "--no-color", "--no-ext-diff", "-U0",
                     f"{base}...{head}")
-    lines: list[str] = []
+    per_file: dict[str, list] = {}
+    path: str | None = None
+    new_line = 0
+    # File headers come only between `diff --git` and the first hunk: an
+    # ADDED line whose text starts "++ " reads "+++ …" in the diff and
+    # must never be taken for a header (that would skip the file's rest).
+    in_header = False
     for line in diff.splitlines():
-        if line.startswith("+") and not line.startswith("+++"):
-            stripped = line[1:].strip()
-            if len(stripped) >= QUOTE_MIN_LINE:
-                lines.append(stripped)
+        if line.startswith("diff --git "):
+            in_header, path = True, None
+            continue
+        if in_header:
+            if line.startswith("+++ "):
+                target = line[4:].strip().strip('"')
+                path = target[2:] if target.startswith("b/") else None
+            elif line.startswith("@@"):
+                in_header = False
+            if in_header:
+                continue
+        if line.startswith("@@"):
+            match = re.match(r"@@ -\S+ \+(\d+)", line)
+            new_line = int(match.group(1)) if match else 0
+            continue
+        if line.startswith("+") and path is not None:
+            per_file.setdefault(path, []).append((new_line, line[1:]))
+            new_line += 1
+    lines: list[str] = []
+    for file_path, added in per_file.items():
+        suffix = Path(file_path).suffix.lower()
+        if suffix in _PROSE_SUFFIXES:
+            continue
+        prose: set = set()
+        if suffix == ".py":
+            source = _git_out(repo, "show", f"{head}:{file_path}")
+            prose = _python_prose_lines(source)
+        for number, text in added:
+            stripped = text.strip()
+            if len(stripped) < QUOTE_MIN_LINE:
+                continue
+            if suffix == ".py":
+                if number in prose:
+                    continue
+            elif _generic_prose(stripped):
+                continue
+            lines.append(stripped)
     return lines
+
+
+# Files whose added lines are prose by kind (the quote check skips them).
+_PROSE_SUFFIXES = frozenset({".md", ".markdown", ".rst", ".txt", ".adoc"})
+# String literals (double, single, backtick), escapes honoured.
+_STRING_LITERAL_RE = re.compile(
+    r'"(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\'|`(?:[^`\\]|\\.)*`')
+# Punctuation that joins string pieces without making a line code.
+_PROSE_JOINERS = frozenset({",", "+", "(", ")"})
+
+
+def _python_prose_lines(source: str) -> set:
+    """Line numbers of a Python source that hold only prose: strings,
+    comments and joining punctuation (``"text",`` in a call is prose;
+    ``x = "text"`` is code). An unreadable source yields no prose."""
+    import io
+    import tokenize
+
+    prose_types = {tokenize.STRING, tokenize.COMMENT, tokenize.NL,
+                   tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT,
+                   tokenize.ENDMARKER}
+    for name in ("FSTRING_START", "FSTRING_MIDDLE", "FSTRING_END"):
+        if hasattr(tokenize, name):
+            prose_types.add(getattr(tokenize, name))
+    code_lines: set = set()
+    seen: set = set()
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+            rows = range(tok.start[0], tok.end[0] + 1)
+            seen.update(rows)
+            if tok.type in prose_types:
+                continue
+            if tok.type == tokenize.OP and tok.string in _PROSE_JOINERS:
+                continue
+            code_lines.update(rows)
+    except (tokenize.TokenError, SyntaxError):
+        return set()
+    return seen - code_lines
+
+
+def _generic_prose(line: str) -> bool:
+    """A non-Python added line is prose when, once its string literals
+    and comments are removed, nothing word-like is left."""
+    rest = _STRING_LITERAL_RE.sub("", line)
+    rest = re.sub(r"//.*$", "", rest).strip()
+    if rest.startswith(("/*", "*", "#", "<!--", "-->")):
+        return True
+    return re.search(r"[A-Za-z0-9_]", rest) is None
 
 
 def _contract_quote(contract_text: str, added: list) -> str | None:
@@ -1149,6 +1253,13 @@ def _replay_one(item: BenchItem, factory_root: Path, run_root: Path,
     except Exception as exc:  # noqa: BLE001 — recorded, never silent
         outcome_error = f"{type(exc).__name__}: {str(exc)[:300]}"
         outcome = "error"
+    if (escalation or outcome) == "peak_window":
+        # The window opened mid-run: the pipeline never attempted this
+        # replay. Recorded as an errored replay (named, the run exits
+        # non-zero), never as the implementer's failure.
+        raise BenchError(
+            "the peak window opened mid-run: this replay was never "
+            "attempted — re-run the bench outside the window")
 
     task = ctx.queue.get(item.slot)
 
@@ -1326,7 +1437,7 @@ def bench_run(factory_root: Path | str | None, project: str,
               *, repeats: int = 1, role_overrides: dict | None = None,
               against: "str | Path | None" = None, session_runner=None,
               command_runner=None, config: FactoryConfig | None = None,
-              keep: bool = False) -> dict:
+              keep: bool = False, now=None) -> dict:
     """Run the replay benchmark (AC-4): every item, ``repeats`` times
     each, through the real pipeline with publishing replaced by
     scoring. Writes the report under ``<factory_root>/bench/<project>/
@@ -1340,7 +1451,8 @@ def bench_run(factory_root: Path | str | None, project: str,
 
     Raises:
         BenchError: no items, a bad ``repeats``, an unverifiable store,
-            or a leak the run itself refused to score over.
+            a start inside the peak window, or a leak the run itself
+            refused to score over.
     """
     if isinstance(repeats, bool) or not isinstance(repeats, int) \
             or repeats < 1:
@@ -1356,6 +1468,16 @@ def bench_run(factory_root: Path | str | None, project: str,
     # ci_wait_min=0 is the documented pre-F-75 shape (no CI read in the
     # publish path at all). Nothing else about the pipeline changes.
     run_config = dataclasses.replace(loaded, ci_wait_min=0)
+    # The pipeline refuses to start a session inside the peak window,
+    # and a replay it refuses would score as a factory failure — a
+    # corrupted baseline. Refuse the whole run up front, before any
+    # spend, the way `factory review-contract` does.
+    clock = now or (lambda: datetime.now(timezone.utc))
+    if in_peak_window(clock(), run_config.peak_window):
+        raise BenchError(
+            "bench run refused: inside the peak window no replay starts "
+            "(every replay would escalate peak_window and score as a "
+            "failure); run it outside the window set in config.yaml")
 
     stamp = new_run_id()
     run_root = bench_dir(root) / project / ".runs" / stamp

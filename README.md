@@ -188,8 +188,9 @@ real past work. `factory bench add <project> <task-id | pr-number>`
 records a MERGED task as one item: its approved contract plus its
 hidden tests (the files its test-checked acceptance refs name), proven
 at add — the hidden tests must fail on the base commit and pass on the
-merged head three times, and a contract that quotes the merged diff
-refuses. Items live under `<factory-root>/bench/<project>/`, outside
+merged head three times, and a contract that quotes a CODE line of the
+merged diff refuses (comments, docstrings and string literals are prose:
+a contract may name the exact user-facing text it requires). Items live under `<factory-root>/bench/<project>/`, outside
 every sandbox, schema-validated on load.
 
 `factory bench run <project> [--repeats N] [--role implementer=<alias>]
@@ -210,7 +211,11 @@ Paid sessions: every replay with the default seat runner spends real
 money (~$25–35 per 1-repeat run of 8 items, an estimate). It is the
 owner's command, like `factory eval` — never in CI, never from
 `factory run`/`loop`. Default repeats is 1 (a swap check); use 3 for a
-baseline.
+baseline. A bench run refuses to start inside the peak window (no
+session starts there, so every replay would score as a failure), and a
+replay the window refuses mid-run is recorded as an errored replay —
+the run exits non-zero naming it — never as the implementer's failure.
+Start a long baseline early enough to finish before the window opens.
 
 
 Private by design. Nothing here deploys anywhere; it's a CLI.
