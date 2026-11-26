@@ -479,20 +479,40 @@ def build_parser() -> argparse.ArgumentParser:
         "add",
         help="add one benchmark item from a merged task: the approved "
              "contract plus its hidden tests, proven fail-on-base / "
-             "pass-on-head (3 green runs) before it counts",
+             "pass-on-head (3 green runs) before it counts; the hidden "
+             "tests may only use the stated interface (F-110)",
     )
     bench_add_cmd.add_argument("project", help="project slug (the ledger's name)")
     bench_add_cmd.add_argument(
         "source", metavar="task-id | pr-number",
         help="the merged task's id, or its PR number")
     bench_add_cmd.add_argument(
+        "--interface", default=None, metavar="FILE",
+        help="owner-written interface text naming the API the hidden "
+             "tests reach beyond the base commit's own surface (the "
+             "pin analysis names what must be stated); stored on the "
+             "item and shown to every replay as part of the contract, "
+             "quote-checked against the merged diff like the contract")
+    bench_add_cmd.add_argument(
+        "--factory-root", default=None,
+        help="factory root (default: ~/factory)")
+    bench_check_cmd = bench_sub.add_parser(
+        "check",
+        help="re-validate every stored item against the current repo "
+             "(F-110): names each one that would now refuse at add "
+             "(API pins the interface does not state, a moved repo, "
+             "missing base/head or hidden files). Changes nothing.",
+    )
+    bench_check_cmd.add_argument("project", help="project slug")
+    bench_check_cmd.add_argument(
         "--factory-root", default=None,
         help="factory root (default: ~/factory)")
     bench_run_cmd = bench_sub.add_parser(
         "run",
         help="replay every item through the real pipeline with "
              "publishing replaced by scoring; writes the report under "
-             "<factory-root>/bench/<project>/reports/",
+             "<factory-root>/bench/<project>/reports/ incrementally — "
+             "an interrupted run resumes",
     )
     bench_run_cmd.add_argument("project", help="project slug")
     bench_run_cmd.add_argument(
@@ -510,6 +530,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--against", default=None, metavar="REPORT",
         help="diff against an earlier bench report; regressions "
              "(pass -> fail) are listed first")
+    bench_run_cmd.add_argument(
+        "--items", default=None, metavar="SLOTS",
+        help="comma-separated bench slots to replay (default: every "
+             "item in the store)")
+    bench_run_cmd.add_argument(
+        "--resume", default=None, metavar="REPORT",
+        help="append the missing replays to an interrupted report "
+             "(same stamp, same file): recorded replays — whatever "
+             "their result — are never re-run")
     bench_run_cmd.add_argument(
         "--keep", action="store_true",
         help="keep the replay scratch (the sanitized origin) for "
@@ -1212,8 +1241,9 @@ def _run_orchestrator(args: argparse.Namespace) -> int:
 
 
 def _run_bench(args: argparse.Namespace) -> int:
-    """Dispatch ``factory bench add|run`` (F-104). Both refuse loudly
-    (exit 2, never a traceback); ``run`` prints the rendered report.
+    """Dispatch ``factory bench add|check|run`` (F-104/F-110). All
+    refuse loudly (exit 2, never a traceback); ``run`` prints the
+    rendered report.
 
     ``run`` drives real model sessions by default — it is the owner's
     paid measurement (exactly like ``factory eval``), never called from
@@ -1221,18 +1251,45 @@ def _run_bench(args: argparse.Namespace) -> int:
     is named in the report."""
     import dataclasses
 
-    from factory.bench import BenchError, bench_add, bench_run
+    from factory.bench import BenchError, bench_add, bench_check, bench_run
 
     root = Path(args.factory_root) if args.factory_root else None
     try:
         if args.bench_command == "add":
-            out = bench_add(root, args.project, args.source)
+            interface_text = None
+            if args.interface is not None:
+                try:
+                    interface_text = Path(args.interface).read_text(
+                        encoding="utf-8")
+                except OSError as exc:
+                    raise BenchError(
+                        f"cannot read the interface file "
+                        f"{args.interface}: {exc}") from exc
+            out = bench_add(root, args.project, args.source,
+                            interface_text=interface_text)
             print(f"{args.project}: added {out['slot']} "
                   f"(from {out['item'].source_task}, PR #"
                   f"{out['item'].source_pr}) — {out['item_dir']}")
             return 0
-        repeats = args.repeats if args.repeats is not None else 1
-        if repeats < 1:
+        if args.bench_command == "check":
+            report = bench_check(root, args.project)
+            for item in report["items"]:
+                if item["ok"]:
+                    print(f"{item['slot']}: ok "
+                          f"(from {item['source_task']})")
+                else:
+                    print(f"{item['slot']}: would refuse —")
+                    for refusal in item["refusals"]:
+                        print(f"  {refusal}")
+            if report["refused"]:
+                print(f"factory bench check: {len(report['refused'])} "
+                      f"item(s) would refuse — re-add them with "
+                      "`bench add --interface FILE` naming the stated "
+                      "interface", file=sys.stderr)
+                return 1
+            return 0
+        repeats = args.repeats
+        if repeats is not None and repeats < 1:
             print(f"factory bench run: --repeats must be an integer "
                   f">= 1, got {repeats}", file=sys.stderr)
             return 2
@@ -1246,7 +1303,10 @@ def _run_bench(args: argparse.Namespace) -> int:
                   if overrides else loaded)
         result = bench_run(
             root, args.project, repeats=repeats,
-            against=args.against, config=config, keep=args.keep)
+            against=args.against, config=config, keep=args.keep,
+            items=([slot.strip() for slot in args.items.split(",")]
+                   if args.items else None),
+            resume=args.resume)
     except (BenchError, ConfigError, ContractError, GateError,
             PublishError, PushRefused, RunError, SandboxError,
             SessionConfigError) as exc:

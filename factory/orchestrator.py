@@ -2551,6 +2551,18 @@ def _ready_clone(work: RunDir, runner: "Callable | None", command: str | None,
                  timeout_sec: int) -> "str | None":
     """F-73 AC-1: ready the run clone before any session.
 
+    F-110 AC-5: a retry starts CLEAN. A round whose session ended
+    non-completed keeps its working tree uncommitted (the orchestrator
+    commits only completed sessions' trees), and the next round would
+    otherwise judge that dirt as setup's — the BENCH-01 r3 shape: the
+    retry escalated ``setup_failed`` with the first attempt's source
+    edits in the clone, 0 turns, the paid round lost. reset --hard +
+    clean -fd restore the branch's committed state before readying:
+    committed work survives on the branch, ignored files (the setup
+    venv, the excluded ``.home``/``.tmp``) survive the clean, and only
+    the uncommitted leftovers — which no gate ever saw and no later
+    round may build on — go.
+
     The factory identity as repo-local config (every attempt), then the
     profile's ``commands.setup`` through the run clone's own sandboxed
     gate runner — the same runner, sandbox and timeout L0's setup uses,
@@ -2571,6 +2583,8 @@ def _ready_clone(work: RunDir, runner: "Callable | None", command: str | None,
         starts no session.
     """
     _set_clone_identity(work)
+    hardened_git(work.root, "reset", "--hard")
+    hardened_git(work.root, "clean", "-fd")
     if not command:
         return None
     assert runner is not None  # built with the command, in _run_task
@@ -5844,6 +5858,24 @@ def _run_task(ctx: _Ctx, slice_: dict | None,
                                          ctx.gate_timeout_sec)
             if setup_refusal is not None:
                 reason = _esc(setup_refusal)
+                # F-110 AC-4: a setup failure on a branch that already
+                # carries COMMITTED work is a different fact from one on
+                # a pristine clone — with the reset above, only a commit
+                # can change what the retry's setup sees. The marker is
+                # production diagnostics (the owner reading any
+                # setup_failed task sees whether the model's own head
+                # broke the setup) and the bench's error classification
+                # reads the same truth.
+                tip = subprocess.run(
+                    ["git", *GIT_HARDENING, "-C", str(work.root),
+                     "rev-parse", "--verify", "--quiet",
+                     f"refs/heads/{branch}"],
+                    capture_output=True, text=True,
+                ).stdout.strip()
+                if tip and tip != base_sha:
+                    reason += (f" — after committed work on the branch "
+                               f"({tip[:12]}, base {base_sha[:12]}): the "
+                               "setup is judging the model's own head")
                 attempt = attempt_record(
                     attempt_no, started, "fail", [], None,
                     escalation="setup_failed", note=reason)

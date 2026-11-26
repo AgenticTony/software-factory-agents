@@ -7868,6 +7868,95 @@
       "acceptance_hash": "f019e1fa598f77a243a14d09852afa69a9ccc7c5fe20594e045ccea89e37dc5f",
       "approved_at": "2026-11-25T07:38:14Z",
       "approved_by": "Anthony"
+    },
+    {
+      "id": "F-110",
+      "title": "The bench measures the implementer, not the bench",
+      "kind": "build",
+      "priority": "P1",
+      "status": "draft",
+      "source": "BUILD-ORDER.md#f-110--the-bench-measures-the-implementer-not-the-bench",
+      "depends_on": [
+        "F-104"
+      ],
+      "risk": [
+        "factory_control"
+      ],
+      "gates": {
+        "spec_approval": true,
+        "merge": "human",
+        "deploy": "human"
+      },
+      "acceptance": [
+        {
+          "id": "AC-1",
+          "text": "Hidden tests may only use the stated interface: at bench add an AST analysis pins every project name the hidden tests reach (imported modules and names, attributes read from project modules, keyword arguments at calls to project callables, keywords riding a local wrapper's **kwargs) that the base does not already expose under the same path with the same keyword on the same callable, and refuses the item naming each pin as module.name or callable(keyword=). bench add --interface FILE stores owner-written interface text (schema-validated, quote-checked per F-99 beyond the pinned names) that the replay's contract shows the implementer. factory bench check <project> re-validates stored items, names each one that would now refuse, and changes nothing.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f110.py::test_ac_1"
+          }
+        },
+        {
+          "id": "AC-2",
+          "text": "A failure keeps its evidence: every hidden ref runs (never only to the first failure), each recording pass/fail/timeout/not-collected plus an escaped (F-109) and redacted output tail; a non-clean replay keeps its escalation note and setup failure text on the record and a small evidence folder (base..head diff and test output) under bench/<project>/runs/<stamp>/<slot>-rN/, outside the run cleanup's reach; clean replays keep nothing.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f110.py::test_ac_2"
+          }
+        },
+        {
+          "id": "AC-3",
+          "text": "Cost is the sum: a replay's cost is summed over every attempt and every role (one trace per run dir, deduplicated), null only when no session reported a cost, never a fake 0 or a last-attempt n/a after a paid round; totals, yield and cost per clean merge use the summed figure.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f110.py::test_ac_3"
+          }
+        },
+        {
+          "id": "AC-4",
+          "text": "Infrastructure is an error, not a failure: a closed list in code (setup_failed, quota_exhausted, peak_window; a missing credential and a crash arrive as error: outcomes, a dirty clone is setup_failed's arm) decides which replays are errored — except a setup_failed after COMMITTED model work, which is judged; errored replays leave the k/N denominator, the report shows k/N judged E errored per item and in the totals, every other escalation — any reason not on the list included — is judged and counts against the model, and --against treats errored-judged flips as changes, never regressions.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f110.py::test_ac_4"
+          }
+        },
+        {
+          "id": "AC-5",
+          "text": "A retry starts clean: the production ready-clone resets a non-completed round's uncommitted tree before setup (the BENCH-01 r3 / BENCH-09 3x3 / BENCH-07 r3 / BENCH-08 r2 setup_failed root cause — the orchestrator commits only completed sessions' trees, so round 2 judged round 1's dirt as setup's), and an item whose base commit's setup fails is refused at add, named.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f110.py::test_ac_5"
+          }
+        },
+        {
+          "id": "AC-6",
+          "text": "A run survives interruption: the report is written incrementally and atomically after each replay; SIGINT or SIGTERM leaves it marked incomplete; --items runs only the named slots; --resume <report> skips the replays already recorded (whatever their result) and appends the rest under the same report and stamp, never dropping a recorded replay from the file; a resume is one measurement continued: it runs only the report's own items (--items narrows, never widens), adopts the report's role overrides when none are given, refuses changed repeats, a store whose items changed under it, a pre-F-110 report and a second concurrent resume; the run cleanup never deletes finished replays' evidence.",
+          "check": {
+            "type": "test",
+            "ref": "tests/test_f110.py::test_ac_6"
+          }
+        }
+      ],
+      "budget": {
+        "size": "M",
+        "max_attempts": 3,
+        "max_turns": 100,
+        "wall_clock_min": 150
+      },
+      "scope": {
+        "paths": [
+          "factory/bench.py",
+          "factory/cli.py",
+          "factory/orchestrator.py",
+          "factory/data/schema/bench-item.schema.json",
+          "tests/test_f110.py",
+          "tests/_support/f110.py",
+          "README.md",
+          "BUILD-ORDER.md",
+          ".factory/BOOTSTRAP.md"
+        ]
+      },
+      "attempts": []
     }
   ]
 }

@@ -194,6 +194,11 @@
         "minLength": 1
       },
       "description": "The hidden tests' repo-relative paths; their bytes live verbatim under hidden/<path> beside this file."
+    },
+    "interface": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Owner-written interface text (F-110): the API names the hidden tests may reach that the base commit does not already expose. Stored at add via `--interface FILE` after the pin analysis names what must be stated; part of the contract every replay shows the implementer, and itself quote-checked against the merged diff (F-99) beyond the pinned names."
     }
   }
 }
