@@ -511,6 +511,13 @@ paths:
     - "tests/test_f104.py"
     - "tests/_support/f104.py"
     - "factory/bench.py"
+    # F-110: the bench-trust contract tests judge the pin analysis, the
+    # kept evidence, the summed cost, the error list and the resume
+    # flow — the rules that decide whether the bench's numbers mean
+    # anything. Same precedent as F-104's: the support module carries
+    # the pinned-API fixture and scripted seats those verdicts rest on.
+    - "tests/test_f110.py"
+    - "tests/_support/f110.py"
     # Per-task: the orchestrator adds each task's acceptance-test files once the
     # contract is approved, so workers cannot weaken the tests that define "done".
 

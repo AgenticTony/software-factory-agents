@@ -188,24 +188,87 @@ real past work. `factory bench add <project> <task-id | pr-number>`
 records a MERGED task as one item: its approved contract plus its
 hidden tests (the files its test-checked acceptance refs name), proven
 at add — the hidden tests must fail on the base commit and pass on the
-merged head three times, and a contract that quotes a CODE line of the
-merged diff refuses (comments, docstrings and string literals are prose:
+merged head three times, and a contract that quotes a CODE line of
+the merged diff refuses (comments, docstrings and string literals are prose:
 a contract may name the exact user-facing text it requires). Items live under `<factory-root>/bench/<project>/`, outside
 every sandbox, schema-validated on load.
 
+**The hidden tests may only use the stated interface (F-110).** They
+are the original session's own tests, so they reach the API the
+original implementation happened to build — a keyword or module the
+contract never names would score the original's naming, not the
+model's work. At add, an AST analysis pins every project name the
+tests reach (imports, attributes, call keywords — including keywords
+that ride a local wrapper's `**kwargs`) that the BASE commit does not
+already expose under the same path, and refuses the item naming each
+pin. `bench add --interface FILE` stores owner-written interface text
+that states them: it becomes part of the contract every replay shows
+the implementer, and it is itself quote-checked against the merged
+diff (naming the API is its purpose; quoting the answer is not). The
+base commit's own setup must also build — a base that cannot install
+errors every replay before any session. `factory bench check
+<project>` re-validates the stored items after a rule change (or a
+repo move) and names each one that would now refuse; it changes
+nothing.
+
 `factory bench run <project> [--repeats N] [--role implementer=<alias>]
-[--against <report>]` replays each item through the real pipeline
-(implementer, L0, L1, L2 with the verifiers) in a clone of the repo as
-it was BEFORE the work: one branch at the base, no remote, no tags,
-packs rebuilt, and verified to hold no commit from base..head before
-any session starts. Publishing is replaced by scoring — after the
-attempt settles the parent copies the hidden tests onto the replay's
-head, outside the session, and runs them. A replay is a **clean merge**
-only when the hidden tests pass AND the factory would have published:
-an escalation is never a clean merge. The report gives per item k/N
-clean merges, the yield figure (clean merges per unit cost), cost per
-clean merge, the models that ran per role, and the `--against` diff
-with regressions (pass → fail) first.
+[--against <report>] [--items BENCH-03,BENCH-07]` replays each item
+through the real pipeline (implementer, L0, L1, L2 with the verifiers)
+in a clone of the repo as it was BEFORE the work: one branch at the
+base, no remote, no tags, packs rebuilt, and verified to hold no
+commit from base..head before any session starts. Publishing is
+replaced by scoring — after the attempt settles the parent copies the
+hidden tests onto the replay's head, outside the session, and runs
+them. A replay is a **clean merge** only when the hidden tests pass
+AND the factory would have published: an escalation is never a clean
+merge. The report gives per item k/N judged clean merges (E errored),
+the yield figure (clean merges per unit cost), cost per clean merge,
+the models that ran per role, and the `--against` diff with
+regressions (pass → fail) first — an item whose replays flipped
+between errored and judged is listed as a change, never a regression.
+
+**Infrastructure is an error, not a failure (F-110).** A closed list
+decides which outcomes are `error:` — a failed setup on a pristine
+clone, exhausted quota, the peak window; a missing credential and a
+crash arrive as errors too. A `setup_failed` that arrives AFTER
+committed model work is judged, not errored: with the clean retry,
+only the model's own commit can have changed what the setup sees (it
+edited a requirements or setup file), so the failure is its. Errored
+replays leave the k/N denominator and the run exits non-zero naming
+them. Every other escalation, including any reason not on the list,
+is judged and counts against the model: where the classification
+could go either way, the flattering reading is the costlier one. A
+retry starts clean — a round whose session ended mid-work has its
+uncommitted edits DISCARDED before the next round (production
+behaviour change: the alternative, committing them as WIP so the
+retry continues over them, was not built).
+
+**A failure keeps its evidence (F-110).** Every hidden ref runs, not
+only to the first failure; each records its status and an escaped,
+redacted output tail on the report, beside the escalation note and
+setup failure text. A non-clean replay keeps a small evidence folder
+(diff + test output) under `<factory-root>/bench/<project>/runs/
+<stamp>/<slot>-rN/` — outside the run's own scratch, which is
+deleted. A replay's cost is the SUM over every attempt and every
+role; null only when no session reported one.
+
+**A run survives interruption (F-110).** The report is written
+incrementally and atomically after every replay, and EVERY write
+before the report's own set is fully recorded carries an in-progress
+mark — a hard kill (SIGKILL, OOM, a closed terminal) leaves a file
+that says it is unfinished, never a short sample reading as a full
+measurement. SIGINT, SIGTERM and SIGHUP leave it marked `incomplete`
+with the resume command; `factory bench run <project> --resume
+<report>` appends the missing replays under the same report without
+re-running any recorded one (whatever its result). A resume is one
+measurement continued, never changed: it runs only the report's own
+items (`--items` may narrow, never widen), adopts the report's role
+overrides when none are given, keeps its repeats, refuses a store
+whose items changed under it (per-item fingerprints over the contract,
+interface, hidden tests and the base/head/repo it replays from),
+refuses a pre-F-110 report — and every run, fresh included, holds a
+lock on its report file (resolved path), so nothing else writes it
+concurrently.
 
 Paid sessions: every replay with the default seat runner spends real
 money (~$25–35 per 1-repeat run of 8 items, an estimate). It is the
@@ -215,7 +278,7 @@ baseline. A bench run refuses to start inside the peak window (no
 session starts there, so every replay would score as a failure), and a
 replay the window refuses mid-run is recorded as an errored replay —
 the run exits non-zero naming it — never as the implementer's failure.
-Start a long baseline early enough to finish before the window opens.
-
+Start a long baseline early enough to finish before the window opens,
+or resume it after.
 
 Private by design. Nothing here deploys anywhere; it's a CLI.
